@@ -1,0 +1,7 @@
+pandas
+openpyxl
+ipykernel
+jupyter
+python-dotenv
+charset-normalizer
+nbstripout

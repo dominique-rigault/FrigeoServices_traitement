@@ -1,0 +1,17 @@
+# Environnement et secrets
+.venv/
+.env
+
+# Données (jamais dans le dépôt)
+data/
+
+# Évaluation finale (jamais dans le dépôt)
+evaluation/
+
+# Python et Jupyter
+__pycache__/
+.ipynb_checkpoints/
+*.pyc
+
+# Divers
+.vscode/settings.json
