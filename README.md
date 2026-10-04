@@ -14,7 +14,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 
 | Étape | Contenu | Outil | Avancement |
 | --- | --- | --- | --- |
-| 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | En cours |
+| 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | Terminé |
 | 2 | Profilage de chaque fichier | Python, Jupyter | À venir |
 | 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | À venir |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | À venir |
