@@ -20,6 +20,13 @@ from functools import lru_cache
 
 import pandas as pd
 
+from frigeo.confidentialite import (
+    charger_sensibilite,
+    est_sensible,
+    masquer_mesures,
+    verifier_sensibilite,
+)
+
 # Colonnes ajoutées par le chargement, exclues du profil des données.
 COLONNES_LIGNAGE = (
     "fichier_source",
@@ -203,14 +210,24 @@ def profiler_colonne(serie: pd.Series) -> dict:
 
 
 def profiler_table(
-    donnees: pd.DataFrame, nom_table: str, par: str | None = None
+    donnees: pd.DataFrame,
+    nom_table: str,
+    par: str | None = None,
+    masquer_exemples: bool = False,
+    sensibles: dict[str, frozenset[str]] | None = None,
 ) -> pd.DataFrame:
     """Profil de toutes les colonnes de données d'une table (une ligne par colonne).
 
     Avec par="periode_export" ou par="fichier_source", le profil est établi
     séparément pour chaque exemplaire, ce qui révèle un format qui change d'un
     export à l'autre.
+
+    Avec masquer_exemples=True, les colonnes classées sensibles (config/sensibilite.yaml
+    par défaut) n'exposent plus leurs bornes. Le profil est calculé en entier puis
+    filtré : seule la sortie change.
     """
+    if masquer_exemples and sensibles is None:
+        sensibles = charger_sensibilite()
     colonnes = [c for c in donnees.columns if c not in COLONNES_LIGNAGE]
     groupes = [(None, donnees)] if par is None else list(donnees.groupby(par, sort=True))
     lignes = []
@@ -220,27 +237,74 @@ def profiler_table(
             if par is not None:
                 ligne[par] = cle
             ligne["colonne"] = colonne
-            ligne.update(profiler_colonne(sous_table[colonne]))
+            profil = profiler_colonne(sous_table[colonne])
+            masquee = masquer_exemples and est_sensible(sensibles, nom_table, colonne)
+            if masquee:
+                profil = masquer_mesures(profil)
+            ligne.update(profil)
+            if masquer_exemples:
+                ligne["masquee"] = masquee
             lignes.append(ligne)
     return pd.DataFrame(lignes)
 
 
-def profiler_tout(tables: dict[str, pd.DataFrame], par: str | None = None) -> pd.DataFrame:
-    """Profil de l'ensemble des tables chargées, empilé dans un seul tableau."""
+def profiler_tout(
+    tables: dict[str, pd.DataFrame],
+    par: str | None = None,
+    masquer_exemples: bool = False,
+    sensibles: dict[str, frozenset[str]] | None = None,
+) -> pd.DataFrame:
+    """Profil de l'ensemble des tables chargées, empilé dans un seul tableau.
+
+    Avec masquer_exemples=True, la classification est vérifiée avant le calcul :
+    une colonne classée sensible mais introuvable (faute de frappe probable)
+    arrête le traitement, car la vraie colonne serait alors exposée.
+    """
+    if masquer_exemples:
+        if sensibles is None:
+            sensibles = charger_sensibilite()
+        problemes = verifier_sensibilite(tables, sensibles)
+        if problemes:
+            raise RuntimeError(
+                "Classification de sensibilité incohérente\n  " + "\n  ".join(problemes)
+            )
     return pd.concat(
-        [profiler_table(donnees, nom, par=par) for nom, donnees in tables.items()],
+        [
+            profiler_table(
+                donnees, nom, par=par, masquer_exemples=masquer_exemples, sensibles=sensibles
+            )
+            for nom, donnees in tables.items()
+        ],
         ignore_index=True,
     )
 
 
-def detail_signatures(donnees: pd.DataFrame, colonne: str, n: int = 10) -> pd.DataFrame:
+def detail_signatures(
+    donnees: pd.DataFrame,
+    colonne: str,
+    n: int = 10,
+    masquer_exemples: bool = False,
+    sensibles: dict[str, frozenset[str]] | None = None,
+    nom_table: str | None = None,
+) -> pd.DataFrame:
     """Formes observées dans une colonne, avec effectif, part et ligne d'exemple.
 
     La forme est distinguée du type Python : un montant lu comme texte et un
     montant lu comme nombre ont la même forme mais pas le même type. Chaque forme
     renvoie à une ligne source (fichier et numéro de ligne), pour aller voir la
     valeur dans le fichier brut.
+
+    Avec masquer_exemples=True, la valeur d'exemple est retirée pour une colonne
+    classée sensible. Le nom de la table est alors obligatoire.
     """
+    masquee = False
+    if masquer_exemples:
+        if nom_table is None:
+            raise ValueError("nom_table est obligatoire avec masquer_exemples=True")
+        if sensibles is None:
+            sensibles = charger_sensibilite()
+        masquee = est_sensible(sensibles, nom_table, colonne)
+
     serie = donnees[colonne]
     masque = (serie.notna() & (serie.astype(str).str.strip() != "")).to_numpy()
     valeurs = serie[masque]
@@ -248,9 +312,10 @@ def detail_signatures(donnees: pd.DataFrame, colonne: str, n: int = 10) -> pd.Da
     base = donnees.loc[masque, colonnes_lignage].copy()
     base["signature"] = [signature(v) for v in valeurs]
     base["type"] = [type(v).__name__ for v in valeurs]
-    base["valeur_exemple"] = valeurs.to_numpy()
-
-    agregats = {"effectif": ("signature", "size"), "valeur_exemple": ("valeur_exemple", "first")}
+    agregats = {"effectif": ("signature", "size")}
+    if not masquee:
+        base["valeur_exemple"] = valeurs.to_numpy()
+        agregats["valeur_exemple"] = ("valeur_exemple", "first")
     for lignage in ("fichier_source", "num_ligne_source"):
         if lignage in base.columns:
             agregats[f"{lignage}_exemple"] = (lignage, "first")
