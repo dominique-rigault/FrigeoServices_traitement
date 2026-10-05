@@ -1,0 +1,11 @@
+# Colonnes dont les valeurs ne doivent pas apparaître dans un profil partagé.
+# Toute colonne absente de cette liste est traitée comme non sensible.
+colonnes_sensibles:
+  interventions: [intervenant, client, lieu_adresse, commentaire]
+  clients: [raison_sociale, siret, adresse, telephone, email]
+  fournisseurs: [raison_sociale, siret, adresse]
+  intervenants: [nom, prenom, motif_sortie]
+  remunerations: [salaire_brut_mensuel]
+  factures_entetes: [nom_client]
+  achats_entetes: [nom_fournisseur]
+  fec: [CompAuxLib]

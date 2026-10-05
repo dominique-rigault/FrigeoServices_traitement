@@ -3,6 +3,8 @@ openpyxl
 ipykernel
 jupyter
 python-dotenv
+pyyaml
 charset-normalizer
 nbstripout
+pytest
 -e .

@@ -1,0 +1,95 @@
+client: frigeo
+
+periodes:
+  annuelle: "2025"
+  premier_mois: "2026-01"
+
+flux:
+  interventions:
+    emplacement: raw
+    motif: "interventions_{p}.csv"
+    format: texte
+    encodage: utf-8
+    separateur: ";"
+    ligne_entete: 1
+    tables: [interventions]
+
+  pieces_interventions:
+    emplacement: raw
+    motif: "pieces_interventions_{p}.csv"
+    format: texte
+    encodage: utf-8
+    separateur: ";"
+    ligne_entete: 1
+    tables: [pieces_interventions]
+
+  factures:
+    emplacement: raw
+    motif: "factures_{p}.xlsx"
+    format: excel
+    ligne_entete: 1
+    tables:
+      factures_entetes: {feuille: Entetes}
+      factures_lignes: {feuille: Lignes}
+
+  achats:
+    emplacement: raw
+    motif: "achats_{p}.xlsx"
+    format: excel
+    ligne_entete: 1
+    tables:
+      achats_entetes: {feuille: Entetes}
+      achats_lignes: {feuille: Lignes}
+
+  fec:
+    emplacement: raw
+    motif: "FEC_extraction_{p}.txt"
+    motif_annuel: "999000001FEC20251231.txt"
+    format: texte
+    encodage: iso-8859-15
+    separateur: "\t"
+    ligne_entete: 1
+    tables: [fec]
+
+  intervenants:
+    emplacement: referentiels
+    fichier: intervenants.xlsx
+    format: excel
+    ligne_entete: 1
+    tables:
+      intervenants: {feuille: Intervenants}
+      remunerations: {feuille: Remunerations}
+
+  clients:
+    emplacement: referentiels
+    fichier: clients.csv
+    format: texte
+    encodage: cp1252
+    separateur: ";"
+    ligne_entete: 1
+    tables: [clients]
+
+  fournisseurs:
+    emplacement: referentiels
+    fichier: fournisseurs.csv
+    format: texte
+    encodage: utf-8
+    separateur: ";"
+    ligne_entete: 1
+    tables: [fournisseurs]
+
+  catalogue_pieces:
+    emplacement: referentiels
+    fichier: catalogue_pieces.xlsx
+    format: excel
+    ligne_entete: 1
+    tables:
+      catalogue_pieces: {feuille: Catalogue}
+
+  parametres_couts:
+    emplacement: referentiels
+    fichier: parametres_couts.xlsx
+    format: excel
+    ligne_entete: 1
+    tables:
+      parametres_couts: {feuille: Parametres}

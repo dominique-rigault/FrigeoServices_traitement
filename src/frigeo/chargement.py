@@ -1,9 +1,13 @@
 """Chargement des fichiers bruts sans modification, avec lignage.
 
+Les formats (encodage, séparateur, feuille, ligne d'en-tête) sont lus dans la
+configuration des sources, portée par le périmètre. Ce module ne contient aucun
+nom propre à un client.
+
 Chaque ligne chargée conserve
 - fichier_source, le nom du fichier d'origine
 - feuille_source, le nom de la feuille pour un fichier Excel
-- num_ligne_source, le numéro de ligne physique, l'en-tête étant la ligne 1
+- num_ligne_source, le numéro de ligne physique, la première ligne du fichier étant la ligne 1
 - periode_export, la période du fichier
 - date_chargement, l'horodatage du chargement
 
@@ -19,40 +23,35 @@ from pathlib import Path
 import openpyxl
 import pandas as pd
 
-from frigeo.perimetre import Perimetre
-
-# Encodage et séparateur déclarés dans le dossier de données
-FORMATS_TEXTE = {
-    "interventions": ("utf-8", ";"),
-    "pieces_interventions": ("utf-8", ";"),
-    "fec": ("iso-8859-15", "\t"),
-    "clients": ("cp1252", ";"),
-    "fournisseurs": ("utf-8", ";"),
-}
-
-# Table, avec le flux d'origine et le nom de la feuille Excel
-FEUILLES_EXCEL = {
-    "factures_entetes": ("factures", "Entetes"),
-    "factures_lignes": ("factures", "Lignes"),
-    "achats_entetes": ("achats", "Entetes"),
-    "achats_lignes": ("achats", "Lignes"),
-    "intervenants": ("intervenants", "Intervenants"),
-    "remunerations": ("intervenants", "Remunerations"),
-    "catalogue_pieces": ("catalogue_pieces", "Catalogue"),
-    "parametres_couts": ("parametres_couts", "Parametres"),
-}
-
-TABLES = [*FORMATS_TEXTE, *FEUILLES_EXCEL]
+from frigeo.perimetre import Perimetre, tables_du_flux
 
 
-def lire_texte(chemin: Path, encodage: str, sep: str):
+def liste_tables(config: dict) -> list[str]:
+    """Noms des tables déclarées dans la configuration, dans l'ordre des flux."""
+    return [t for flux in config["flux"].values() for t in tables_du_flux(flux)]
+
+
+def _localiser(config: dict, table: str) -> tuple[str, dict]:
+    """Flux d'origine et options d'une table."""
+    for nom, flux in config["flux"].items():
+        tables = tables_du_flux(flux)
+        if table in tables:
+            return nom, tables[table]
+    raise RuntimeError(f"Table {table} absente de la configuration des sources")
+
+
+def lire_texte(chemin: Path, encodage: str, sep: str, ligne_entete: int = 1):
     """Renvoie l'en-tête et la liste des (numéro de ligne physique, valeurs)."""
     try:
         with open(chemin, encoding=encodage, newline="") as fichier:
             lecteur = csv.reader(fichier, delimiter=sep)
-            entete = next(lecteur, None)
+            entete = None
+            for valeurs in lecteur:
+                if lecteur.line_num >= ligne_entete:
+                    entete = valeurs
+                    break
             if entete is None:
-                raise RuntimeError(f"Fichier vide {chemin.name}")
+                raise RuntimeError(f"Fichier vide ou en-tête introuvable {chemin.name}")
             precedent = lecteur.line_num
             lignes = []
             for valeurs in lecteur:
@@ -65,7 +64,7 @@ def lire_texte(chemin: Path, encodage: str, sep: str):
     return entete, lignes
 
 
-def lire_excel(chemin: Path, feuille: str):
+def lire_excel(chemin: Path, feuille: str, ligne_entete: int = 1):
     """Renvoie l'en-tête et la liste des (numéro de ligne, valeurs) d'une feuille."""
     classeur = openpyxl.load_workbook(chemin, read_only=True, data_only=True)
     try:
@@ -74,11 +73,12 @@ def lire_excel(chemin: Path, feuille: str):
         rangees = list(classeur[feuille].iter_rows(values_only=True))
     finally:
         classeur.close()
-    if not rangees:
+    if len(rangees) < ligne_entete:
         raise RuntimeError(f"Feuille {feuille} vide dans {chemin.name}")
-    entete = [None if c is None else str(c) for c in rangees[0]]
+    entete = [None if c is None else str(c) for c in rangees[ligne_entete - 1]]
     lignes = [
-        (numero, list(valeurs)) for numero, valeurs in enumerate(rangees[1:], start=2)
+        (numero, list(valeurs))
+        for numero, valeurs in enumerate(rangees[ligne_entete:], start=ligne_entete + 1)
     ]
     return entete, lignes
 
@@ -102,16 +102,21 @@ def _assembler(entete, lignes, fichier, feuille=None, sep=None) -> pd.DataFrame:
 def charger_table(perimetre: Perimetre, table: str, date_chargement=None) -> pd.DataFrame:
     """Charge et assemble tous les exemplaires d'une table du périmètre."""
     date_chargement = date_chargement or pd.Timestamp.now().floor("s")
+    flux, options = _localiser(perimetre.config, table)
+    spec = perimetre.config["flux"][flux]
+    fichiers = [f for f in perimetre.fichiers if f["flux"] == flux]
+    if not fichiers:
+        raise RuntimeError(f"Aucun fichier retenu dans le périmètre pour la table {table}")
     morceaux = []
-    if table in FORMATS_TEXTE:
-        encodage, sep = FORMATS_TEXTE[table]
-        for f in (f for f in perimetre.fichiers if f["flux"] == table):
-            entete, lignes = lire_texte(f["chemin"], encodage, sep)
-            morceaux.append(_assembler(entete, lignes, f, sep=sep))
-    else:
-        flux, feuille = FEUILLES_EXCEL[table]
-        for f in (f for f in perimetre.fichiers if f["flux"] == flux):
-            entete, lignes = lire_excel(f["chemin"], feuille)
+    for f in fichiers:
+        if spec["format"] == "texte":
+            entete, lignes = lire_texte(
+                f["chemin"], spec["encodage"], spec["separateur"], spec["ligne_entete"]
+            )
+            morceaux.append(_assembler(entete, lignes, f, sep=spec["separateur"]))
+        else:
+            feuille = options["feuille"]
+            entete, lignes = lire_excel(f["chemin"], feuille, spec["ligne_entete"])
             morceaux.append(_assembler(entete, lignes, f, feuille=feuille))
     resultat = pd.concat(morceaux, ignore_index=True)
     resultat["date_chargement"] = date_chargement
@@ -121,7 +126,10 @@ def charger_table(perimetre: Perimetre, table: str, date_chargement=None) -> pd.
 def charger_tout(perimetre: Perimetre) -> dict[str, pd.DataFrame]:
     """Charge toutes les tables avec le même horodatage."""
     horodatage = pd.Timestamp.now().floor("s")
-    return {t: charger_table(perimetre, t, horodatage) for t in TABLES}
+    return {
+        t: charger_table(perimetre, t, horodatage)
+        for t in liste_tables(perimetre.config)
+    }
 
 
 def bilan_chargement(tables: dict[str, pd.DataFrame]) -> pd.DataFrame:
