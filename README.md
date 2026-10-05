@@ -16,6 +16,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | --- | --- | --- | --- |
 | 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | Terminé |
 | 2 | Profilage de chaque fichier | Python, Jupyter | Terminé |
+| 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | Terminé |
 | 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | À venir |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | À venir |
 | 5 | Table des anomalies | Python, Jupyter | À venir |
@@ -31,15 +32,18 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 - **Lignage.** Chaque enregistrement chargé conserve son fichier source, son numéro de ligne physique (en-tête = ligne 1) et sa date de chargement.
 - **Anomalies tracées.** Chaque écart est consigné avec le fichier, la ligne, la clé métier, le champ, la valeur constatée, la règle violée, la gravité et les indicateurs affectés.
 - **Données et secrets hors dépôt.** Les fichiers de données et les identifiants ne sont jamais versionnés (`.gitignore`, variables d'environnement).
+- **Configuration propre au client séparée du code générique.** src/ ne contient aucun nom de fichier ni de colonne d'un client, et config/ porte tout ce qui change d'un client à l'autre.
 
 ## Structure du dépôt
 
 ```
-notebooks/   un notebook par étape (01 à 06)
-src/         fonctions Python réutilisables (lecture, lignage, contrôles)
-sql/         scripts T-SQL (étape 7)
-docs/        documentation
+config/      configuration propre au client (sources, sensibilité)
 data/        données locales, ignorées par Git
+docs/        documentation
+notebooks/   un notebook par étape (01 à 06)
+sql/         scripts T-SQL (étape 7)
+src/         fonctions Python réutilisables (lecture, lignage, contrôles)
+tests/       tests automatisés sur données fictives
 ```
 
 ## Installation
@@ -52,9 +56,10 @@ source .venv/Scripts/activate   # Windows avec Git Bash
 # source .venv/bin/activate     # Linux ou macOS
 python -m pip install -r requirements.txt
 python -m nbstripout --install
+python -m pytest tests
 ```
 
-La dernière commande retire automatiquement les sorties des notebooks à chaque commit.
+La commande `nbstripout --install` retire automatiquement les sorties des notebooks à chaque commit. La commande `pytest` lance les tests automatisés, qui doivent tous réussir avant de traiter des données.
 
 ## Données
 
