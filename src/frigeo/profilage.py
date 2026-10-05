@@ -236,8 +236,10 @@ def profiler_tout(tables: dict[str, pd.DataFrame], par: str | None = None) -> pd
 def detail_signatures(donnees: pd.DataFrame, colonne: str, n: int = 10) -> pd.DataFrame:
     """Formes observées dans une colonne, avec effectif, part et ligne d'exemple.
 
-    Chaque forme renvoie à une ligne source (fichier et numéro de ligne), pour
-    aller voir la valeur dans le fichier brut.
+    La forme est distinguée du type Python : un montant lu comme texte et un
+    montant lu comme nombre ont la même forme mais pas le même type. Chaque forme
+    renvoie à une ligne source (fichier et numéro de ligne), pour aller voir la
+    valeur dans le fichier brut.
     """
     serie = donnees[colonne]
     masque = (serie.notna() & (serie.astype(str).str.strip() != "")).to_numpy()
@@ -245,6 +247,7 @@ def detail_signatures(donnees: pd.DataFrame, colonne: str, n: int = 10) -> pd.Da
     colonnes_lignage = [c for c in ("fichier_source", "num_ligne_source") if c in donnees.columns]
     base = donnees.loc[masque, colonnes_lignage].copy()
     base["signature"] = [signature(v) for v in valeurs]
+    base["type"] = [type(v).__name__ for v in valeurs]
     base["valeur_exemple"] = valeurs.to_numpy()
 
     agregats = {"effectif": ("signature", "size"), "valeur_exemple": ("valeur_exemple", "first")}
@@ -252,7 +255,7 @@ def detail_signatures(donnees: pd.DataFrame, colonne: str, n: int = 10) -> pd.Da
         if lignage in base.columns:
             agregats[f"{lignage}_exemple"] = (lignage, "first")
     resume = (
-        base.groupby("signature", sort=False)
+        base.groupby(["signature", "type"], sort=False)
         .agg(**agregats)
         .sort_values("effectif", ascending=False, kind="stable")
     )
