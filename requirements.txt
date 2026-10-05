@@ -6,4 +6,5 @@ python-dotenv
 pyyaml
 charset-normalizer
 nbstripout
+pytest
 -e .
