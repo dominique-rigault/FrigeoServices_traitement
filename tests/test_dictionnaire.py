@@ -1,8 +1,15 @@
 """Tests de la décision de liste fermée (frigeo.dictionnaire)."""
 
 import pandas as pd
+import pytest
 
-from frigeo.dictionnaire import proposer_liste, proposer_nature, proposer_obligatoire
+from frigeo.dictionnaire import (
+    generer_dictionnaire,
+    generer_table,
+    proposer_liste,
+    proposer_nature,
+    proposer_obligatoire,
+)
 
 
 def _serie(*comptes) -> pd.Series:
@@ -208,3 +215,79 @@ def test_liste_fermee_malgre_quelques_valeurs_ressemblant_a_des_nombres():
     assert resultat["liste_fermee"] is True
     assert resultat["valeurs"] == ["Réalisée", "Annulée"]
     assert resultat["a_arbitrer"] == [{"valeur": "12", "effectif": 4}]
+
+SENSIBLES = {"clients": frozenset({"type_commerce"})}
+
+
+def _table_fictive() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "statut": _serie(
+                ("Réalisée", 700),
+                ("Annulée", 250),
+                ("Reportée", 40),
+                ("OK", 3),
+                ("Fait", 2),
+                (None, 5),
+            ),
+            "type_commerce": _serie(("Boulangerie", 600), ("Restaurant", 400)),
+            "commentaire": pd.Series(
+                [""] * 600 + [f"note {i}" for i in range(400)], dtype=object
+            ),
+            "fichier_source": ["f.csv"] * 1000,
+            "num_ligne_source": range(2, 1002),
+        }
+    )
+
+
+def test_generer_table_exclut_les_colonnes_de_lignage():
+    table = generer_table(_table_fictive(), "clients", SENSIBLES)
+    assert list(table) == ["statut", "type_commerce", "commentaire"]
+
+
+def test_generer_colonne_avec_liste_fermee():
+    colonne = generer_table(_table_fictive(), "clients", SENSIBLES)["statut"]
+    assert colonne["obligatoire"]["regle"] == "obligatoire"
+    assert colonne["obligatoire"]["a_arbitrer"] == {"vides": 5}
+    assert colonne["nature"]["regle"] == "texte"
+    assert colonne["valeurs"]["regle"] == ["Réalisée", "Annulée", "Reportée"]
+    assert colonne["valeurs"]["a_arbitrer"] == [
+        {"valeur": "OK", "effectif": 3},
+        {"valeur": "Fait", "effectif": 2},
+    ]
+
+
+def test_generer_colonne_sans_liste_fermee():
+    colonne = generer_table(_table_fictive(), "clients", SENSIBLES)["commentaire"]
+    assert colonne["obligatoire"]["regle"] == "facultatif"
+    assert colonne["valeurs"]["regle"] == "aucune"
+    assert colonne["valeurs"]["a_arbitrer"] == []
+
+
+def test_colonne_sensible_ne_laisse_fuiter_aucune_valeur():
+    dictionnaire = generer_dictionnaire({"clients": _table_fictive()}, SENSIBLES)
+    colonne = dictionnaire["clients"]["type_commerce"]
+    assert colonne["valeurs"]["regle"] == "aucune"
+    assert colonne["valeurs"]["motif"] == "colonne sensible"
+    assert "Boulangerie" not in repr(colonne)
+    assert "Restaurant" not in repr(colonne)
+
+
+def test_toutes_les_regles_sont_au_statut_observe():
+    dictionnaire = generer_dictionnaire({"clients": _table_fictive()}, SENSIBLES)
+    regles = [
+        regle
+        for colonnes in dictionnaire.values()
+        for colonne in colonnes.values()
+        for regle in colonne.values()
+    ]
+    assert len(regles) == 9
+    assert {regle["statut"] for regle in regles} == {"observé"}
+
+
+def test_incoherence_de_sensibilite_arrete_la_generation():
+    tables = {"clients": _table_fictive()}
+    with pytest.raises(RuntimeError, match="Classification de sensibilité incohérente"):
+        generer_dictionnaire(tables, {"clients": frozenset({"colonne_inconnue"})})
+    with pytest.raises(RuntimeError):
+        generer_dictionnaire(tables, {"autre_table": frozenset({"x"})})

@@ -8,8 +8,8 @@ from __future__ import annotations
 
 import pandas as pd
 
-from .confidentialite import est_sensible
-from .profilage import profiler_colonne
+from .confidentialite import charger_sensibilite, est_sensible, verifier_sensibilite
+from .profilage import COLONNES_LIGNAGE, profiler_colonne
 
 # Seuils par défaut du critère de liste fermée (validés le 05/10/2026, à
 # confirmer sur le profil réel).
@@ -212,3 +212,77 @@ def proposer_nature(
         f"renseignées (minimum {100 * couverture_min:.0f} %)",
         detail,
     )
+
+
+STATUT_INITIAL = "observé"
+
+
+def _regle_observee(regle, motif: str, a_arbitrer) -> dict:
+    return {
+        "regle": regle,
+        "statut": STATUT_INITIAL,
+        "motif": motif,
+        "a_arbitrer": a_arbitrer,
+    }
+
+
+def generer_colonne(
+    serie: pd.Series,
+    table: str,
+    colonne: str,
+    sensibles: dict[str, frozenset[str]],
+) -> dict:
+    """Règles proposées pour une colonne, toutes au statut « observe ».
+
+    Trois règles sont rendues : `obligatoire`, `nature` et `valeurs`. Chacune porte son
+    statut, le motif de la proposition et les écarts à arbitrer. Une colonne sensible
+    n'expose aucune valeur : sa règle `valeurs` est « aucune ».
+    """
+    obligatoire = proposer_obligatoire(serie)
+    nature = proposer_nature(serie)
+    liste = proposer_liste(serie, table, colonne, sensibles)
+    if liste["liste_fermee"]:
+        valeurs = _regle_observee(liste["valeurs"], liste["motif"], liste["a_arbitrer"])
+    else:
+        valeurs = _regle_observee("aucune", liste["motif"], [])
+    return {
+        "obligatoire": _regle_observee(
+            obligatoire["regle"], obligatoire["motif"], obligatoire["a_arbitrer"]
+        ),
+        "nature": _regle_observee(nature["regle"], nature["motif"], nature["a_arbitrer"]),
+        "valeurs": valeurs,
+    }
+
+
+def generer_table(
+    donnees: pd.DataFrame,
+    nom_table: str,
+    sensibles: dict[str, frozenset[str]],
+) -> dict:
+    """Règles proposées pour chaque colonne de données (colonnes de lignage exclues)."""
+    return {
+        colonne: generer_colonne(donnees[colonne], nom_table, colonne, sensibles)
+        for colonne in donnees.columns
+        if colonne not in COLONNES_LIGNAGE
+    }
+
+
+def generer_dictionnaire(
+    tables: dict[str, pd.DataFrame],
+    sensibles: dict[str, frozenset[str]] | None = None,
+) -> dict:
+    """Dictionnaire proposé pour l'ensemble des tables chargées.
+
+    La classification de sensibilité (config/sensibilite.yaml par défaut) est toujours
+    appliquée et vérifiée avant le calcul, comme dans `profiler_tout` avec masquage.
+    """
+    if sensibles is None:
+        sensibles = charger_sensibilite()
+    problemes = verifier_sensibilite(tables, sensibles)
+    if problemes:
+        raise RuntimeError(
+            "Classification de sensibilité incohérente\n  " + "\n  ".join(problemes)
+        )
+    return {
+        nom: generer_table(donnees, nom, sensibles) for nom, donnees in tables.items()
+    }
