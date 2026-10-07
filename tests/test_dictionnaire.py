@@ -9,6 +9,7 @@ from frigeo.dictionnaire import (
     proposer_liste,
     proposer_nature,
     proposer_obligatoire,
+    resumer_dictionnaire,
 )
 
 
@@ -291,3 +292,21 @@ def test_incoherence_de_sensibilite_arrete_la_generation():
         generer_dictionnaire(tables, {"clients": frozenset({"colonne_inconnue"})})
     with pytest.raises(RuntimeError):
         generer_dictionnaire(tables, {"autre_table": frozenset({"x"})})
+
+def test_resumer_dictionnaire():
+    dictionnaire = generer_dictionnaire({"clients": _table_fictive()}, SENSIBLES)
+    resume = resumer_dictionnaire(dictionnaire).set_index("colonne")
+    assert list(resume.columns) == [
+        "table",
+        "obligatoire",
+        "nature",
+        "liste_fermee",
+        "nb_valeurs",
+        "nb_a_arbitrer",
+        "motif_liste",
+    ]
+    assert resume.loc["statut", "liste_fermee"]
+    assert resume.loc["statut", "nb_valeurs"] == 3
+    assert resume.loc["statut", "nb_a_arbitrer"] == 2
+    assert not resume.loc["type_commerce", "liste_fermee"]
+    assert resume.loc["type_commerce", "motif_liste"] == "colonne sensible"

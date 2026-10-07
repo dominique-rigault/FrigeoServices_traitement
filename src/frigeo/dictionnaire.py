@@ -286,3 +286,29 @@ def generer_dictionnaire(
     return {
         nom: generer_table(donnees, nom, sensibles) for nom, donnees in tables.items()
     }
+
+def resumer_dictionnaire(dictionnaire: dict) -> pd.DataFrame:
+    """Tableau de synthèse du dictionnaire, une ligne par colonne.
+
+    Pour une colonne avec liste fermée, `nb_valeurs` est le nombre de valeurs proposées
+    et `nb_a_arbitrer` le nombre de valeurs à arbitrer. Sans liste, `motif_liste` dit
+    pourquoi aucune n'est proposée.
+    """
+    lignes = []
+    for table, colonnes in dictionnaire.items():
+        for colonne, regles in colonnes.items():
+            valeurs = regles["valeurs"]
+            fermee = isinstance(valeurs["regle"], list)
+            lignes.append(
+                {
+                    "table": table,
+                    "colonne": colonne,
+                    "obligatoire": regles["obligatoire"]["regle"],
+                    "nature": regles["nature"]["regle"],
+                    "liste_fermee": fermee,
+                    "nb_valeurs": len(valeurs["regle"]) if fermee else 0,
+                    "nb_a_arbitrer": len(valeurs["a_arbitrer"]),
+                    "motif_liste": valeurs["motif"],
+                }
+            )
+    return pd.DataFrame(lignes)
