@@ -1,9 +1,13 @@
 """Tests de la décision de liste fermée (frigeo.dictionnaire)."""
 
+import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 from frigeo.dictionnaire import (
+    charger_dictionnaire,
+    ecrire_dictionnaire,
     generer_dictionnaire,
     generer_table,
     proposer_liste,
@@ -310,3 +314,119 @@ def test_resumer_dictionnaire():
     assert resume.loc["statut", "nb_a_arbitrer"] == 2
     assert not resume.loc["type_commerce", "liste_fermee"]
     assert resume.loc["type_commerce", "motif_liste"] == "colonne sensible"
+
+
+
+def _regle(regle, statut="observé", a_arbitrer=None):
+    return {
+        "regle": regle,
+        "statut": statut,
+        "motif": "motif fictif",
+        "a_arbitrer": {} if a_arbitrer is None else a_arbitrer,
+    }
+
+
+def _dictionnaire_fictif(valeurs="aucune", statut="observé", a_arbitrer=None):
+    return {
+        "clients": {
+            "ville": {
+                "obligatoire": _regle("obligatoire", a_arbitrer={"vides": 0}),
+                "nature": _regle("texte", a_arbitrer={"hors_nature": 0}),
+                "valeurs": _regle(valeurs, statut, [] if a_arbitrer is None else a_arbitrer),
+            }
+        }
+    }
+
+
+def _ecrire_brut(chemin, tables):
+    """Écrit un fichier sans passer par `ecrire_dictionnaire` (cas d'un fichier modifié à la main)."""
+    texte = yaml.safe_dump({"meta": {}, "tables": tables}, allow_unicode=True)
+    chemin.write_text(texte, encoding="utf-8")
+
+
+def test_aller_retour_du_dictionnaire_genere(tmp_path):
+    dictionnaire = generer_dictionnaire({"clients": _table_fictive()}, SENSIBLES)
+    chemin = ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "config" / "dictionnaire.yaml")
+    assert charger_dictionnaire(chemin) == dictionnaire
+    contenu = yaml.safe_load(chemin.read_text(encoding="utf-8"))
+    assert contenu["meta"]["periode_fin"] == "2026-03"
+    assert contenu["meta"]["seuils"]["effectif_min"] == 200
+    assert "Boulangerie" not in chemin.read_text(encoding="utf-8")
+
+
+def test_aller_retour_des_valeurs_que_yaml_pourrait_deformer(tmp_path):
+    pieges = [
+        "O", "N", "Oui", "Non", "yes", "no", "on", "off", "true", "null", "~",
+        "27", "076", "1e3", "46.80", "2026-03-01", "Gisors  ", "  Gisors", "",
+        "a\u00a0b", "Réalisée", "30 j fin de mois", "clé: valeur", "# note", "- tiret",
+    ]
+    dictionnaire = _dictionnaire_fictif(
+        valeurs=pieges, a_arbitrer=[{"valeur": v, "effectif": 1} for v in pieges]
+    )
+    chemin = ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "dictionnaire.yaml")
+    relu = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]
+    assert relu["regle"] == pieges
+    assert all(isinstance(valeur, str) for valeur in relu["regle"])
+    assert [element["valeur"] for element in relu["a_arbitrer"]] == pieges
+
+
+def test_les_types_numpy_sont_convertis_en_types_natifs(tmp_path):
+    dictionnaire = _dictionnaire_fictif()
+    dictionnaire["clients"]["ville"]["obligatoire"]["a_arbitrer"] = {"vides": np.int64(3)}
+    chemin = ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "dictionnaire.yaml")
+    vides = charger_dictionnaire(chemin)["clients"]["ville"]["obligatoire"]["a_arbitrer"]["vides"]
+    assert vides == 3
+    assert type(vides) is int
+
+
+def test_type_inattendu_refuse_sans_rien_ecrire(tmp_path):
+    dictionnaire = _dictionnaire_fictif()
+    dictionnaire["clients"]["ville"]["nature"]["a_arbitrer"] = {"date": pd.Timestamp("2026-03-01")}
+    with pytest.raises(TypeError, match="Timestamp"):
+        ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "dictionnaire.yaml")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_statut_inconnu_refuse_a_l_ecriture_sans_laisser_de_fichier(tmp_path):
+    dictionnaire = _dictionnaire_fictif(statut="validé")
+    with pytest.raises(ValueError, match="statut inconnu"):
+        ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "dictionnaire.yaml")
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_chargement_liste_tous_les_problemes_en_une_fois(tmp_path):
+    tables = _dictionnaire_fictif(statut="à voir")
+    tables["clients"]["ville"]["nature"]["statut"] = "ok"
+    tables["clients"]["code"] = {"obligatoire": _regle("obligatoire")}
+    del tables["clients"]["ville"]["obligatoire"]["motif"]
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, tables)
+    with pytest.raises(ValueError) as erreur:
+        charger_dictionnaire(chemin)
+    message = str(erreur.value)
+    assert "clients.ville, règle valeurs : statut inconnu 'à voir'" in message
+    assert "clients.ville, règle nature : statut inconnu 'ok'" in message
+    assert "clients.ville, règle obligatoire : champs attendus" in message
+    assert "clients.code : règles attendues" in message
+
+
+def test_statut_en_forme_decomposee_est_normalise(tmp_path):
+    decompose = "observe\u0301"
+    assert decompose != "observ\u00e9"
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, _dictionnaire_fictif(statut=decompose))
+    statut = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]["statut"]
+    assert statut == "observ\u00e9"
+
+
+def test_ecrasement_refuse_si_une_regle_a_ete_revue(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    # Tant que tout est au statut observé, la régénération est libre.
+    ecrire_dictionnaire(_dictionnaire_fictif(valeurs=["A", "B"]), "2026-03", chemin)
+    _ecrire_brut(chemin, _dictionnaire_fictif(valeurs=["A", "B"], statut="valide"))
+    with pytest.raises(FileExistsError, match="1 règles déjà revues"):
+        ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin)
+    assert charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]["statut"] == "valide"
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin, ecraser=True)
+    assert charger_dictionnaire(chemin) == _dictionnaire_fictif()

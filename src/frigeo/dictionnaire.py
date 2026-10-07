@@ -6,8 +6,16 @@ statut « observé »; seul le métier peut le faire passer à « validé ».
 
 from __future__ import annotations
 
-import pandas as pd
+import numbers
+import os
+import unicodedata
+from datetime import date
+from pathlib import Path
 
+import pandas as pd
+import yaml
+
+from . import racine_projet
 from .confidentialite import charger_sensibilite, est_sensible, verifier_sensibilite
 from .profilage import COLONNES_LIGNAGE, profiler_colonne
 
@@ -312,3 +320,142 @@ def resumer_dictionnaire(dictionnaire: dict) -> pd.DataFrame:
                 }
             )
     return pd.DataFrame(lignes)
+
+
+
+STATUTS = ("observé", "valide", "invalide", "documenté")
+REGLES = ("obligatoire", "nature", "valeurs")
+CHAMPS_REGLE = ("regle", "statut", "motif", "a_arbitrer")
+
+
+def chemin_dictionnaire() -> Path:
+    """Emplacement par défaut du dictionnaire : data/config/dictionnaire.yaml.
+
+    Le dictionnaire contient des valeurs observées dans les données : il est rangé
+    avec elles, hors du dépôt.
+    """
+    return racine_projet() / "data" / "config" / "dictionnaire.yaml"
+
+
+def _natif(valeur):
+    """Copie de `valeur` en types Python natifs, seuls acceptés par l'écriture YAML."""
+    if isinstance(valeur, dict):
+        return {cle: _natif(element) for cle, element in valeur.items()}
+    if isinstance(valeur, (list, tuple)):
+        return [_natif(element) for element in valeur]
+    if valeur is None or isinstance(valeur, (str, bool)):
+        return valeur
+    if isinstance(valeur, numbers.Integral):
+        return int(valeur)
+    if isinstance(valeur, numbers.Real):
+        return float(valeur)
+    raise TypeError(f"Type non pris en charge dans le dictionnaire : {type(valeur).__name__}")
+
+
+def _meta(periode_fin: str) -> dict:
+    return {
+        "periode_fin": periode_fin,
+        "genere_le": date.today().isoformat(),
+        "seuils": {
+            "max_valeurs": MAX_VALEURS,
+            "part_min": PART_MIN,
+            "couverture_min": COUVERTURE_MIN,
+            "effectif_min": EFFECTIF_MIN,
+            "vides_max_obligatoire": VIDES_MAX_OBLIGATOIRE,
+            "vides_min_presque_vide": VIDES_MIN_PRESQUE_VIDE,
+        },
+    }
+
+
+def _verifier_et_normaliser(contenu) -> list[str]:
+    """Liste tous les problèmes de structure et normalise les statuts (NFC)."""
+    if not isinstance(contenu, dict) or not isinstance(contenu.get("tables"), dict):
+        return ["clé « tables » absente ou mal formée"]
+    problemes = []
+    for table, colonnes in contenu["tables"].items():
+        if not isinstance(colonnes, dict):
+            problemes.append(f"{table} : liste de colonnes mal formée")
+            continue
+        for colonne, regles in colonnes.items():
+            ou = f"{table}.{colonne}"
+            if not isinstance(regles, dict) or set(regles) != set(REGLES):
+                problemes.append(f"{ou} : règles attendues {', '.join(REGLES)}")
+                continue
+            for nom in REGLES:
+                regle = regles[nom]
+                if not isinstance(regle, dict) or set(regle) != set(CHAMPS_REGLE):
+                    problemes.append(
+                        f"{ou}, règle {nom} : champs attendus {', '.join(CHAMPS_REGLE)}"
+                    )
+                    continue
+                statut = regle["statut"]
+                if isinstance(statut, str):
+                    statut = unicodedata.normalize("NFC", statut)
+                if statut not in STATUTS:
+                    problemes.append(f"{ou}, règle {nom} : statut inconnu {statut!r}")
+                else:
+                    regle["statut"] = statut
+    return problemes
+
+
+def charger_dictionnaire(chemin: str | Path | None = None) -> dict:
+    """Charge le dictionnaire et rend ses tables, après contrôle de la structure.
+
+    Tous les problèmes sont listés en une fois. Un statut hors de `STATUTS` est rejeté.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
+    with open(chemin, encoding="utf-8") as flux:
+        contenu = yaml.safe_load(flux)
+    problemes = _verifier_et_normaliser(contenu)
+    if problemes:
+        raise ValueError(f"Dictionnaire invalide ({chemin})\n  " + "\n  ".join(problemes))
+    return contenu["tables"]
+
+
+def ecrire_dictionnaire(
+    dictionnaire: dict,
+    periode_fin: str,
+    chemin: str | Path | None = None,
+    *,
+    ecraser: bool = False,
+) -> Path:
+    """Écrit le dictionnaire en YAML et vérifie l'écriture par une relecture.
+
+    Sans `ecraser=True`, refuse de remplacer un fichier illisible ou qui porte au
+    moins un statut autre que « observé » (travail de revue à ne pas perdre). Le
+    fichier n'est remplacé qu'une fois la relecture identique au dictionnaire fourni.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
+    tables = _natif(dictionnaire)
+
+    if chemin.exists() and not ecraser:
+        revues = sum(
+            regle["statut"] != STATUT_INITIAL
+            for colonnes in charger_dictionnaire(chemin).values()
+            for regles in colonnes.values()
+            for regle in regles.values()
+        )
+        if revues:
+            raise FileExistsError(
+                f"{chemin} porte {revues} règles déjà revues : écriture refusée "
+                "(ecraser=True pour forcer)"
+            )
+
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    provisoire = chemin.with_name(chemin.name + ".tmp")
+    try:
+        with open(provisoire, "w", encoding="utf-8", newline="\n") as flux:
+            yaml.safe_dump(
+                {"meta": _meta(periode_fin), "tables": tables},
+                flux,
+                allow_unicode=True,
+                sort_keys=False,
+                default_flow_style=False,
+                width=1000,
+            )
+        if charger_dictionnaire(provisoire) != tables:
+            raise RuntimeError("La relecture du dictionnaire écrit diffère de l'original")
+        os.replace(provisoire, chemin)
+    finally:
+        provisoire.unlink(missing_ok=True)
+    return chemin
