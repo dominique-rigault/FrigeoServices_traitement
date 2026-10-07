@@ -367,6 +367,61 @@ def _meta(periode_fin: str) -> dict:
     }
 
 
+def _decrire(valeur) -> str:
+    return f"{valeur!r} (type {type(valeur).__name__})"
+
+
+def _problemes_valeurs(ou: str, regle: dict) -> list[str]:
+    """Problèmes de type, de vide et de doublon dans une règle `valeurs`.
+
+    Une valeur écrite à la main sans guillemets (No, 27, 2026-03-01) est lue par
+    YAML comme un booléen, un nombre ou une date : elle est rejetée ici. Une même
+    valeur ne peut figurer qu'une fois, liste et valeurs à arbitrer confondues.
+    """
+    problemes = []
+    vues = set()
+
+    def controler(valeur, origine):
+        if not isinstance(valeur, str):
+            problemes.append(
+                f"{ou}, {origine} : {_decrire(valeur)} n'est pas un texte, "
+                "mettre la valeur entre guillemets"
+            )
+        elif valeur.strip() == "":
+            problemes.append(f"{ou}, {origine} : valeur vide ou composée d'espaces")
+        elif valeur in vues:
+            problemes.append(f"{ou}, {origine} : valeur {valeur!r} présente plusieurs fois")
+        else:
+            vues.add(valeur)
+
+    liste = regle["regle"]
+    if isinstance(liste, list):
+        if not liste:
+            problemes.append(f"{ou}, liste de valeurs : liste vide (écrire « aucune »)")
+        for valeur in liste:
+            controler(valeur, "liste de valeurs")
+    elif liste != "aucune":
+        problemes.append(
+            f"{ou}, liste de valeurs : {_decrire(liste)} au lieu de « aucune » ou d'une liste"
+        )
+
+    a_arbitrer = regle["a_arbitrer"]
+    if not isinstance(a_arbitrer, list):
+        problemes.append(f"{ou}, valeurs à arbitrer : une liste est attendue")
+        return problemes
+    for element in a_arbitrer:
+        if not isinstance(element, dict) or set(element) != {"valeur", "effectif"}:
+            problemes.append(f"{ou}, valeurs à arbitrer : champs attendus valeur, effectif")
+            continue
+        controler(element["valeur"], "valeurs à arbitrer")
+        effectif = element["effectif"]
+        if isinstance(effectif, bool) or not isinstance(effectif, int) or effectif < 1:
+            problemes.append(
+                f"{ou}, valeurs à arbitrer : effectif {_decrire(effectif)} "
+                f"pour {element['valeur']!r}, un entier d'au moins 1 est attendu"
+            )
+    return problemes
+
 def _verifier_et_normaliser(contenu) -> list[str]:
     """Liste tous les problèmes de structure et normalise les statuts (NFC)."""
     if not isinstance(contenu, dict) or not isinstance(contenu.get("tables"), dict):
@@ -395,6 +450,8 @@ def _verifier_et_normaliser(contenu) -> list[str]:
                     problemes.append(f"{ou}, règle {nom} : statut inconnu {statut!r}")
                 else:
                     regle["statut"] = statut
+                if nom == "valeurs":
+                    problemes.extend(_problemes_valeurs(ou, regle))
     return problemes
 
 

@@ -357,17 +357,23 @@ def test_aller_retour_du_dictionnaire_genere(tmp_path):
 def test_aller_retour_des_valeurs_que_yaml_pourrait_deformer(tmp_path):
     pieges = [
         "O", "N", "Oui", "Non", "yes", "no", "on", "off", "true", "null", "~",
-        "27", "076", "1e3", "46.80", "2026-03-01", "Gisors  ", "  Gisors", "",
+        "27", "076", "1e3", "46.80", "2026-03-01", "Gisors  ", "  Gisors",
         "a\u00a0b", "Réalisée", "30 j fin de mois", "clé: valeur", "# note", "- tiret",
     ]
-    dictionnaire = _dictionnaire_fictif(
-        valeurs=pieges, a_arbitrer=[{"valeur": v, "effectif": 1} for v in pieges]
-    )
-    chemin = ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "dictionnaire.yaml")
+    chemin = tmp_path / "dictionnaire.yaml"
+
+    ecrire_dictionnaire(_dictionnaire_fictif(valeurs=pieges), "2026-03", chemin)
     relu = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]
     assert relu["regle"] == pieges
     assert all(isinstance(valeur, str) for valeur in relu["regle"])
+
+    a_arbitrer = [{"valeur": valeur, "effectif": 1} for valeur in pieges]
+    ecrire_dictionnaire(
+        _dictionnaire_fictif(valeurs=["A"], a_arbitrer=a_arbitrer), "2026-03", chemin
+    )
+    relu = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]
     assert [element["valeur"] for element in relu["a_arbitrer"]] == pieges
+    assert all(isinstance(element["valeur"], str) for element in relu["a_arbitrer"])
 
 
 def test_les_types_numpy_sont_convertis_en_types_natifs(tmp_path):
@@ -430,3 +436,72 @@ def test_ecrasement_refuse_si_une_regle_a_ete_revue(tmp_path):
     assert charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]["statut"] == "valide"
     ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin, ecraser=True)
     assert charger_dictionnaire(chemin) == _dictionnaire_fictif()
+
+
+def test_valeurs_ecrites_a_la_main_sans_guillemets_rejetees(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    dictionnaire = _dictionnaire_fictif(
+        valeurs=["Oui", "PIEGE1", "PIEGE2", "PIEGE3", "PIEGE4"],
+        a_arbitrer=[{"valeur": "PIEGE5", "effectif": 3}],
+    )
+    ecrire_dictionnaire(dictionnaire, "2026-03", chemin)
+    # Saisie à la main, sans guillemets, de valeurs que YAML ne lit pas comme du texte.
+    texte = chemin.read_text(encoding="utf-8")
+    saisies = {
+        "PIEGE1": "No",
+        "PIEGE2": "27",
+        "PIEGE3": "2026-03-01",
+        "PIEGE4": "~",
+        "PIEGE5": "Yes",
+    }
+    for repere, saisie in saisies.items():
+        texte = texte.replace(repere, saisie)
+    chemin.write_text(texte, encoding="utf-8")
+
+    with pytest.raises(ValueError) as erreur:
+        charger_dictionnaire(chemin)
+    message = str(erreur.value)
+    assert "False (type bool)" in message
+    assert "27 (type int)" in message
+    assert "(type date)" in message
+    assert "None (type NoneType)" in message
+    assert "True (type bool)" in message
+    assert message.count("mettre la valeur entre guillemets") == 5
+
+
+def test_valeurs_vides_doublons_et_effectifs_rejetes(tmp_path):
+    tables = _dictionnaire_fictif(
+        valeurs=["A", "A", "  "],
+        a_arbitrer=[
+            {"valeur": "A", "effectif": 2},
+            {"valeur": "B", "effectif": 0},
+            {"valeur": "C", "effectif": True},
+            {"valeur": "D"},
+        ],
+    )
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, tables)
+    with pytest.raises(ValueError) as erreur:
+        charger_dictionnaire(chemin)
+    message = str(erreur.value)
+    assert message.count("valeur 'A' présente plusieurs fois") == 2
+    assert "valeur vide ou composée d'espaces" in message
+    assert "effectif 0 (type int) pour 'B'" in message
+    assert "effectif True (type bool) pour 'C'" in message
+    assert "champs attendus valeur, effectif" in message
+
+
+@pytest.mark.parametrize(
+    ("valeurs", "a_arbitrer", "attendu"),
+    [
+        ([], [], "liste vide"),
+        (False, [], "False (type bool) au lieu de"),
+        (["A"], {"B": 1}, "une liste est attendue"),
+    ],
+)
+def test_regle_valeurs_mal_formee(tmp_path, valeurs, a_arbitrer, attendu):
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, _dictionnaire_fictif(valeurs=valeurs, a_arbitrer=a_arbitrer))
+    with pytest.raises(ValueError) as erreur:
+        charger_dictionnaire(chemin)
+    assert attendu in str(erreur.value)
