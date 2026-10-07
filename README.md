@@ -17,6 +17,8 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | Terminé |
 | 2 | Profilage de chaque fichier | Python, Jupyter | Terminé |
 | 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | Terminé |
+| 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | Terminé |
+| 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | À venir |
 | 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | À venir |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | À venir |
 | 5 | Table des anomalies | Python, Jupyter | À venir |
@@ -55,11 +57,12 @@ python -m venv .venv
 source .venv/Scripts/activate   # Windows avec Git Bash
 # source .venv/bin/activate     # Linux ou macOS
 python -m pip install -r requirements.txt
+python -m pip install -e .
 python -m nbstripout --install
-python -m pytest tests
+python -m pytest tests -q
 ```
 
-La commande `nbstripout --install` retire automatiquement les sorties des notebooks à chaque commit. La commande `pytest` lance les tests automatisés, qui doivent tous réussir avant de traiter des données.
+La commande `nbstripout --install` retire automatiquement les sorties des notebooks à chaque commit. La dernière lance les tests.
 
 ## Données
 
@@ -70,6 +73,7 @@ data/
   raw/2025/         exports annuels 2025
   raw/2026/         exports mensuels 2026
   referentiels/     intervenants, clients, fournisseurs, catalogue, paramètres
+  config/           dictionnaire généré (contient des valeurs observées)
 ```
 
 ## Conventions de travail
