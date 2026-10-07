@@ -100,3 +100,57 @@ def proposer_liste(
         "valeurs": [v for v, _ in principales],
         "a_arbitrer": [{"valeur": v, "effectif": n} for v, n in autres],
     }
+
+# Seuils du critère obligatoire, facultatif, presque toujours vide (validés le
+# 07/10/2026, à confirmer sur le profil réel).
+VIDES_MAX_OBLIGATOIRE = 0.02
+VIDES_MIN_PRESQUE_VIDE = 0.98
+
+
+def _regle_vides(regle: str, motif: str, a_arbitrer: dict) -> dict:
+    return {"regle": regle, "motif": motif, "a_arbitrer": a_arbitrer}
+
+
+def proposer_obligatoire(
+    serie: pd.Series,
+    *,
+    vides_max: float = VIDES_MAX_OBLIGATOIRE,
+    presque_vide_min: float = VIDES_MIN_PRESQUE_VIDE,
+    effectif_min: int = EFFECTIF_MIN,
+) -> dict:
+    """Propose le caractère obligatoire d'une colonne d'après sa part de vides.
+
+    Les trois formes de vide (None ou NaN, chaîne vide, chaîne d'espaces) sont
+    comptées ensemble. Règles rendues, dans cet ordre :
+    « toujours vide » (100 % de vides), « obligatoire » si aucune valeur n'est vide,
+    « à décider » sous `effectif_min` lignes dès qu'il y a un vide, puis
+    « obligatoire » jusqu'à `vides_max` de vides inclus (les vides vont dans
+    `a_arbitrer`), « presque toujours vide » à partir de `presque_vide_min` (les
+    cellules renseignées vont dans `a_arbitrer`) et « facultatif » entre les deux.
+    """
+    total = len(serie)
+    if total == 0:
+        return _regle_vides("à décider", "aucune ligne", {})
+    renseignees = len(_valeurs_renseignees(serie))
+    vides = total - renseignees
+    part = vides / total
+
+    if renseignees == 0:
+        return _regle_vides("toujours vide", "100 % de vides", {})
+    if vides == 0:
+        return _regle_vides("obligatoire", "aucune valeur vide", {"vides": 0})
+    if total < effectif_min:
+        return _regle_vides(
+            "à décider",
+            f"effectif insuffisant ({total} lignes, {effectif_min} requises)",
+            {"vides": vides},
+        )
+
+    motif = f"{100 * part:.2f} % de vides"
+    if part <= vides_max:
+        return _regle_vides("obligatoire", motif, {"vides": vides})
+    if part >= presque_vide_min:
+        return _regle_vides(
+            "presque toujours vide", motif, {"renseignees": renseignees}
+        )
+    return _regle_vides("facultatif", motif, {})

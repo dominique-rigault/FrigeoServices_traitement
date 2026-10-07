@@ -2,7 +2,7 @@
 
 import pandas as pd
 
-from frigeo.dictionnaire import proposer_liste
+from frigeo.dictionnaire import proposer_liste, proposer_obligatoire
 
 
 def _serie(*comptes) -> pd.Series:
@@ -101,3 +101,56 @@ def test_seuils_parametrables():
     colonne = _serie(*[(f"V{i}", 200) for i in range(5)])
     assert proposer_liste(colonne)["liste_fermee"] is True
     assert proposer_liste(colonne, max_valeurs=3)["liste_fermee"] is False
+
+def test_obligatoire_compte_les_trois_formes_de_vide():
+    colonne = _serie(("x", 990), (None, 4), ("", 3), ("  ", 3))
+    resultat = proposer_obligatoire(colonne)
+    assert resultat["regle"] == "obligatoire"
+    assert resultat["a_arbitrer"] == {"vides": 10}
+
+
+def test_obligatoire_sans_aucun_vide():
+    resultat = proposer_obligatoire(_serie(("x", 1000)))
+    assert resultat["regle"] == "obligatoire"
+    assert resultat["a_arbitrer"] == {"vides": 0}
+
+
+def test_limite_de_2_pour_cent_incluse():
+    assert proposer_obligatoire(_serie(("x", 980), ("", 20)))["regle"] == "obligatoire"
+    assert proposer_obligatoire(_serie(("x", 979), ("", 21)))["regle"] == "facultatif"
+
+
+def test_facultatif_entre_les_deux_bornes():
+    resultat = proposer_obligatoire(_serie(("x", 500), (None, 500)))
+    assert resultat["regle"] == "facultatif"
+    assert resultat["a_arbitrer"] == {}
+
+
+def test_presque_toujours_vide_a_partir_de_98_pour_cent():
+    assert proposer_obligatoire(_serie(("x", 21), ("", 979)))["regle"] == "facultatif"
+    limite = proposer_obligatoire(_serie(("x", 20), ("", 980)))
+    assert limite["regle"] == "presque toujours vide"
+    rare = proposer_obligatoire(_serie(("x", 11), (None, 989)))
+    assert rare["regle"] == "presque toujours vide"
+    assert rare["a_arbitrer"] == {"renseignees": 11}
+
+
+def test_toujours_vide_seulement_a_100_pour_cent():
+    colonne = _serie((None, 100), ("", 100), ("  ", 100))
+    assert proposer_obligatoire(colonne)["regle"] == "toujours vide"
+    une_valeur = _serie(("x", 1), (None, 999))
+    assert proposer_obligatoire(une_valeur)["regle"] == "presque toujours vide"
+
+
+def test_petite_table_avec_un_vide_est_a_decider():
+    resultat = proposer_obligatoire(_serie(("x", 17), (None, 1)))
+    assert resultat["regle"] == "à décider"
+    assert resultat["motif"].startswith("effectif insuffisant")
+    assert resultat["a_arbitrer"] == {"vides": 1}
+
+
+def test_petite_table_sans_vide_et_table_vide():
+    assert proposer_obligatoire(_serie(("x", 18)))["regle"] == "obligatoire"
+    vide = proposer_obligatoire(pd.Series([], dtype=object))
+    assert vide["regle"] == "à décider"
+    assert vide["motif"] == "aucune ligne"
