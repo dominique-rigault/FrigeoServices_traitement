@@ -2,7 +2,7 @@
 
 import pandas as pd
 
-from frigeo.dictionnaire import proposer_liste, proposer_obligatoire
+from frigeo.dictionnaire import proposer_liste, proposer_nature, proposer_obligatoire
 
 
 def _serie(*comptes) -> pd.Series:
@@ -154,3 +154,57 @@ def test_petite_table_sans_vide_et_table_vide():
     vide = proposer_obligatoire(pd.Series([], dtype=object))
     assert vide["regle"] == "à décider"
     assert vide["motif"] == "aucune ligne"
+
+def test_nature_texte_libre():
+    resultat = proposer_nature(_serie(("Réalisée", 500), ("Annulée", 500)))
+    assert resultat["regle"] == "texte"
+    assert resultat["a_arbitrer"] == {"hors_nature": 0}
+
+
+def test_nature_specifique_toutes_conformes():
+    resultat = proposer_nature(_serie(("12", 1000)))
+    assert resultat["regle"] not in ("texte", "à décider")
+    assert resultat["a_arbitrer"] == {"hors_nature": 0}
+
+
+def test_nature_hors_nature_a_arbitrer():
+    nature = proposer_nature(_serie(("12", 1000)))["regle"]
+    resultat = proposer_nature(_serie(("12", 990), ("abc", 10)))
+    assert resultat["regle"] == nature
+    assert resultat["a_arbitrer"] == {"hors_nature": 10}
+
+
+def test_nature_a_decider_si_couverture_insuffisante():
+    nature = proposer_nature(_serie(("12", 1000)))["regle"]
+    resultat = proposer_nature(_serie(("12", 800), ("abc", 200)))
+    assert resultat["regle"] == "à décider"
+    assert resultat["a_arbitrer"] == {"nature_dominante": nature, "hors_nature": 200}
+
+
+def test_nature_negligeable_devient_texte():
+    colonne = _serie(("abc", 600), ("def", 396), ("12", 4))
+    resultat = proposer_nature(colonne)
+    assert resultat["regle"] == "texte"
+    assert resultat["a_arbitrer"] == {"hors_nature": 0}
+
+
+def test_nature_petite_table():
+    nature = proposer_nature(_serie(("12", 1000)))["regle"]
+    assert proposer_nature(_serie(("12", 18)))["regle"] == nature
+    resultat = proposer_nature(_serie(("12", 17), ("abc", 1)))
+    assert resultat["regle"] == "à décider"
+    assert resultat["motif"].startswith("effectif insuffisant")
+
+
+def test_nature_sans_aucune_valeur():
+    resultat = proposer_nature(_serie((None, 10), ("", 5)))
+    assert resultat["regle"] == "à décider"
+    assert resultat["motif"] == "aucune valeur renseignée"
+
+
+def test_liste_fermee_malgre_quelques_valeurs_ressemblant_a_des_nombres():
+    statut = _serie(("Réalisée", 700), ("Annulée", 296), ("12", 4))
+    resultat = proposer_liste(statut)
+    assert resultat["liste_fermee"] is True
+    assert resultat["valeurs"] == ["Réalisée", "Annulée"]
+    assert resultat["a_arbitrer"] == [{"valeur": "12", "effectif": 4}]

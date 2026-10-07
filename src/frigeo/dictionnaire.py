@@ -68,7 +68,7 @@ def proposer_liste(
             f"effectif insuffisant ({total} valeurs renseignées, {effectif_min} requises)"
         )
 
-    nature = profiler_colonne(serie)["nature_dominante"]
+    nature = proposer_nature(serie)["regle"]
     if nature != "texte":
         return _refus(f"nature dominante {nature}")
 
@@ -107,7 +107,7 @@ VIDES_MAX_OBLIGATOIRE = 0.02
 VIDES_MIN_PRESQUE_VIDE = 0.98
 
 
-def _regle_vides(regle: str, motif: str, a_arbitrer: dict) -> dict:
+def _regle(regle: str, motif: str, a_arbitrer: dict) -> dict:
     return {"regle": regle, "motif": motif, "a_arbitrer": a_arbitrer}
 
 
@@ -130,17 +130,17 @@ def proposer_obligatoire(
     """
     total = len(serie)
     if total == 0:
-        return _regle_vides("à décider", "aucune ligne", {})
+        return _regle("à décider", "aucune ligne", {})
     renseignees = len(_valeurs_renseignees(serie))
     vides = total - renseignees
     part = vides / total
 
     if renseignees == 0:
-        return _regle_vides("toujours vide", "100 % de vides", {})
+        return _regle("toujours vide", "100 % de vides", {})
     if vides == 0:
-        return _regle_vides("obligatoire", "aucune valeur vide", {"vides": 0})
+        return _regle("obligatoire", "aucune valeur vide", {"vides": 0})
     if total < effectif_min:
-        return _regle_vides(
+        return _regle(
             "à décider",
             f"effectif insuffisant ({total} lignes, {effectif_min} requises)",
             {"vides": vides},
@@ -148,9 +148,67 @@ def proposer_obligatoire(
 
     motif = f"{100 * part:.2f} % de vides"
     if part <= vides_max:
-        return _regle_vides("obligatoire", motif, {"vides": vides})
+        return _regle("obligatoire", motif, {"vides": vides})
     if part >= presque_vide_min:
-        return _regle_vides(
+        return _regle(
             "presque toujours vide", motif, {"renseignees": renseignees}
         )
-    return _regle_vides("facultatif", motif, {})
+    return _regle("facultatif", motif, {})
+
+def proposer_nature(
+    serie: pd.Series,
+    profil: dict | None = None,
+    *,
+    couverture_min: float = COUVERTURE_MIN,
+    part_min: float = PART_MIN,
+    effectif_min: int = EFFECTIF_MIN,
+) -> dict:
+    """Propose la nature d'une colonne d'après la nature dominante du profil.
+
+    Règles rendues :
+    la nature dominante si elle couvre au moins `couverture_min` des valeurs
+    renseignées (les valeurs hors nature vont dans `a_arbitrer`), « à décider » entre
+    `part_min` et `couverture_min`, et « texte » si aucune nature spécifique ne couvre
+    `part_min` (les valeurs conformes à une nature sont alors des coïncidences).
+    Sous `effectif_min` valeurs renseignées, « à décider » dès qu'une valeur est hors
+    nature. `profil` évite de recalculer `profiler_colonne`.
+    """
+    if profil is None:
+        profil = profiler_colonne(serie)
+    nature = profil["nature_dominante"]
+    if nature == "aucune valeur":
+        return _regle("à décider", "aucune valeur renseignée", {})
+
+    renseignees = (
+        profil["nb_lignes"]
+        - profil["nb_none_nan"]
+        - profil["nb_chaine_vide"]
+        - profil["nb_espaces_seuls"]
+    )
+    hors = profil["nb_hors_nature"]
+    couverture = (renseignees - hors) / renseignees
+    if nature != "texte" and couverture < part_min:
+        nature, hors, couverture = "texte", 0, 1.0
+
+    if hors == 0:
+        return _regle(nature, "toutes les valeurs renseignées sont de cette nature", {"hors_nature": 0})
+
+    detail = {"nature_dominante": nature, "hors_nature": hors}
+    if renseignees < effectif_min:
+        return _regle(
+            "à décider",
+            f"effectif insuffisant ({renseignees} valeurs renseignées, {effectif_min} requises)",
+            detail,
+        )
+    if couverture >= couverture_min:
+        return _regle(
+            nature,
+            f"{100 * couverture:.2f} % des valeurs renseignées",
+            {"hors_nature": hors},
+        )
+    return _regle(
+        "à décider",
+        f"nature dominante {nature} sur {100 * couverture:.1f} % des valeurs "
+        f"renseignées (minimum {100 * couverture_min:.0f} %)",
+        detail,
+    )
