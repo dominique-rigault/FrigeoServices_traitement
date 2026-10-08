@@ -23,6 +23,7 @@ from frigeo.revue import (
     importer_revue,
     lignes_regles,
     lignes_valeurs,
+    reste_a_traiter,
 )
 
 PIEGES = ["076", "27", "2026-03-01", "=1+1", "Non", "Gisors  ", "a b"]
@@ -759,3 +760,81 @@ def test_deux_revues_ecrites_puis_regeneration_refusee(tmp_path):
     assert "clients.statut, valeur 'actif' : statut 'invalide' devenu 'observé'" in message
     assert "clients.type_commerce, valeur 'Boulangerie' : décision (documenté) absente" in message
     assert charger_dictionnaire(fichier) == final
+
+
+def test_mode_emploi_decrit_les_cas_particuliers(tmp_path):
+    classeur = load_workbook(_exporter(tmp_path))
+    cellules = [c for c in classeur["mode_emploi"]["A"] if c.value]
+    textes = [c.value for c in cellules]
+    debut = textes.index("Cas particuliers")
+    fin = next(i for i, t in enumerate(textes) if t.startswith("Règles à respecter"))
+    assert cellules[debut].font.bold
+    cas = textes[debut + 1 : fin]
+    assert [t.split(" :")[0] for t in cas] == [
+        "Annuler une décision (règle ou valeur)",
+        "Retirer une valeur ajoutée (origine « ajoutée »)",
+        "Écarter toute une liste",
+        "Statut invalide sur une règle",
+        "Changer une règle déjà validée quand la proposition a changé",
+        "Déclarer correcte une valeur absente des données",
+        "Remplacer une valeur erronée",
+        "Modifier seulement un commentaire",
+        "Reprendre une revue",
+        "Avant l'import",
+    ]
+    # Chaque consigne n'est donnée qu'une fois dans la feuille.
+    assert sum("ne s'applique qu'une fois" in t for t in textes) == 1
+    assert sum("Retirer une valeur ajoutée" in t or "retirer une valeur ajoutée" in t for t in textes) == 1
+
+
+def test_mode_emploi_compte_ce_qui_reste_a_traiter(tmp_path):
+    def reste(chemin):
+        textes = [c.value for c in load_workbook(chemin)["mode_emploi"]["A"] if c.value]
+        debut = textes.index("Ce qui reste à traiter")
+        return " ".join(textes[debut + 1 : debut + 5])
+
+    # Avant toute revue : tout est à « observé ».
+    notice = reste(_exporter(tmp_path))
+    assert "« regles » : 10 lignes à « observé » sur 10" in notice
+    assert "2 ont une proposition « à décider »" in notice
+    assert "4 ont des écarts à arbitrer" in notice
+    assert "« valeurs » : 10 lignes à « observé » sur 10, dont 1 d'origine « à arbitrer »" in notice
+    assert "S'y ajoutent 0 valeurs de listes écartées" in notice
+
+    # Après la première revue : quatre règles décidées, dont une liste écartée.
+    resultat, _, _ = _apres_premiere_revue(tmp_path / "premiere")
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    notice = reste(chemin)
+    assert "« regles » : 6 lignes à « observé » sur 10" in notice
+    assert "1 ont une proposition « à décider »" in notice
+    assert "2 ont des écarts à arbitrer" in notice
+    # Les sept valeurs de la liste écartée ne sont plus à revoir.
+    assert "« valeurs » : 1 lignes à « observé » sur 12, dont 0 d'origine « à arbitrer »" in notice
+    assert "S'y ajoutent 7 valeurs de listes écartées" in notice
+
+
+def test_reste_a_traiter_sans_exporter(tmp_path):
+    assert reste_a_traiter(_dictionnaire()) == {
+        "regles": 10,
+        "regles_a_traiter": 10,
+        "regles_a_decider": 2,
+        "regles_avec_ecarts": 4,
+        "valeurs": 10,
+        "valeurs_a_traiter": 10,
+        "valeurs_a_arbitrer": 1,
+        "valeurs_listes_ecartees": 0,
+        "complet": False,
+    }
+    resultat, _, _ = _apres_premiere_revue(tmp_path)
+    reste = reste_a_traiter(resultat)
+    assert (reste["regles_a_traiter"], reste["valeurs_a_traiter"]) == (6, 1)
+    assert (reste["valeurs_listes_ecartees"], reste["complet"]) == (7, False)
+    # Tout décider : la revue est complète, les valeurs de la liste écartée mises à part.
+    for colonnes in resultat.values():
+        for regles in colonnes.values():
+            for nom, regle in regles.items():
+                if regle["statut"] == "observé":
+                    regle.update(statut="invalide", regle="aucune", revu_le=JOUR)
+    reste = reste_a_traiter(resultat)
+    assert (reste["regles_a_traiter"], reste["valeurs_a_traiter"], reste["complet"]) == (0, 0, True)
+    assert reste["valeurs_listes_ecartees"] == 8

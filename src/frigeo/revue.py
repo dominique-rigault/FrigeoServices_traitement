@@ -189,13 +189,82 @@ def lignes_valeurs(dictionnaire: dict) -> list[dict]:
     ]
 
 
-def _mode_emploi(periode_fin: str, nb_regles: int, nb_valeurs: int) -> list[str]:
+def _compter_reste(regles: list[dict], valeurs: list[dict]) -> dict:
+    attente = [ligne for ligne in regles if ligne["statut"] == STATUT_INITIAL]
+    ecartees = {
+        (ligne["table"], ligne["colonne"])
+        for ligne in regles
+        if ligne["regle"] == "valeurs" and ligne["statut"] == "invalide"
+    }
+    observees = [ligne for ligne in valeurs if ligne["statut"] == STATUT_INITIAL]
+    restantes = [
+        ligne for ligne in observees if (ligne["table"], ligne["colonne"]) not in ecartees
+    ]
+    return {
+        "regles": len(regles),
+        "regles_a_traiter": len(attente),
+        "regles_a_decider": sum(ligne["proposition"] == A_DECIDER for ligne in attente),
+        "regles_avec_ecarts": sum(ligne["nb_a_arbitrer"] > 0 for ligne in attente),
+        "valeurs": len(valeurs),
+        "valeurs_a_traiter": len(restantes),
+        "valeurs_a_arbitrer": sum(
+            ligne["origine"] == ORIGINE_A_ARBITRER for ligne in restantes
+        ),
+        "valeurs_listes_ecartees": len(observees) - len(restantes),
+        "complet": not attente and not restantes,
+    }
+
+
+def reste_a_traiter(dictionnaire: dict) -> dict:
+    """Décompte des lignes du classeur que le métier n'a pas encore revues.
+
+    Une ligne reste à traiter tant que son statut est « observé ». Les nombres sont
+    ceux qu'afficherait le mode d'emploi d'un classeur exporté de ce dictionnaire :
+    `regles` et `valeurs` (nombres de lignes des deux feuilles), `regles_a_traiter`,
+    dont `regles_a_decider` (proposition « à décider ») et `regles_avec_ecarts`
+    (écarts à arbitrer), `valeurs_a_traiter`, dont `valeurs_a_arbitrer` (valeurs
+    rares). Les valeurs non revues d'une liste écartée sont comptées à part, dans
+    `valeurs_listes_ecartees` : elles n'ont pas à être revues. `complet` est vrai
+    quand il ne reste ni règle ni valeur à traiter.
+    """
+    return _compter_reste(lignes_regles(dictionnaire), lignes_valeurs(dictionnaire))
+
+
+def _reste_a_traiter(regles: list[dict], valeurs: list[dict]) -> list[str]:
+    """Rubrique du mode d'emploi qui dit, à l'export, ce qui reste à revoir."""
+    reste = _compter_reste(regles, valeurs)
+    return [
+        "Ce qui reste à traiter",
+        "Une ligne reste à traiter tant que son statut est « observé » : le filtre de "
+        "la colonne statut les isole. Les nombres ci-dessous sont ceux du jour de "
+        "l'export.",
+        f"Feuille « {FEUILLE_REGLES} » : {reste['regles_a_traiter']} lignes à "
+        f"« observé » sur {reste['regles']}. Parmi elles, {reste['regles_a_decider']} "
+        f"ont une proposition « {A_DECIDER} » (les données ne permettent pas de "
+        "proposer une règle : la donner par le statut documenté) et "
+        f"{reste['regles_avec_ecarts']} ont des écarts à arbitrer (colonne "
+        "nb_a_arbitrer supérieure à 0). Ce sont les lignes à regarder en premier.",
+        f"Feuille « {FEUILLE_VALEURS} » : {reste['valeurs_a_traiter']} lignes à "
+        f"« observé » sur {reste['valeurs']}, dont {reste['valeurs_a_arbitrer']} "
+        f"d'origine « {ORIGINE_A_ARBITRER} » (valeurs rares, souvent des variantes ou "
+        f"des erreurs), à regarder en premier. S'y ajoutent "
+        f"{reste['valeurs_listes_ecartees']} valeurs de listes écartées, qui n'ont pas "
+        "à être revues.",
+        "La revue est complète quand plus aucune ligne n'est à « observé », hors "
+        "valeurs des listes écartées. Une revue partielle est possible : les lignes "
+        "laissées à « observé » se retrouvent telles quelles dans le classeur suivant.",
+    ]
+
+
+def _mode_emploi(periode_fin: str, regles: list[dict], valeurs: list[dict]) -> list[str]:
     return [
         "Revue du dictionnaire des données",
         f"Période de fin : {periode_fin}. Classeur généré le {date.today():%d/%m/%Y}.",
-        f"À revoir : {nb_regles} lignes dans la feuille « {FEUILLE_REGLES} », "
-        f"{nb_valeurs} lignes dans la feuille « {FEUILLE_VALEURS} ».",
+        f"À revoir : {len(regles)} lignes dans la feuille « {FEUILLE_REGLES} », "
+        f"{len(valeurs)} lignes dans la feuille « {FEUILLE_VALEURS} ».",
         REPERE_REVUES,
+        "",
+        *_reste_a_traiter(regles, valeurs),
         "",
         "Ce qui est attendu",
         "Pour chaque ligne, choisir un statut dans le menu déroulant et, si besoin, "
@@ -230,8 +299,31 @@ def _mode_emploi(periode_fin: str, nb_regles: int, nb_valeurs: int) -> list[str]
         "Pour ajouter une valeur légitime absente de la liste : remplir table, "
         "colonne et valeur sur une ligne vide en bas de la feuille, avec le statut "
         "documenté.",
-        "Pour retirer une valeur ajoutée (origine « ajoutée ») : la remettre à "
-        "« observé ».",
+        "",
+        "Cas particuliers",
+        "Annuler une décision (règle ou valeur) : remettre son statut à « observé ». "
+        "La décision et sa date de revue sont effacées.",
+        "Retirer une valeur ajoutée (origine « ajoutée ») : remettre son statut à "
+        "« observé ». La valeur disparaît de la liste si elle n'est pas observée "
+        "dans les données; sinon elle redevient une valeur à arbitrer.",
+        f"Écarter toute une liste : statut invalide sur la ligne « valeurs » de la "
+        f"feuille « {FEUILLE_REGLES} », avec un commentaire. Les valeurs et leurs "
+        "statuts sont conservés, sans effet tant que la liste est écartée.",
+        "Statut invalide sur une règle : plus aucun contrôle de ce type ne portera "
+        "sur la colonne.",
+        "Changer une règle déjà validée quand la proposition a changé : choisir "
+        "documenté et donner la règle dans regle_retenue. Laisser valide conserve "
+        "l'ancienne règle, celle de la colonne regle_en_vigueur.",
+        "Déclarer correcte une valeur absente des données : l'ajouter en bas de la "
+        f"feuille « {FEUILLE_VALEURS} », au statut documenté.",
+        "Remplacer une valeur erronée : statut invalide, puis la valeur correcte dans "
+        "la colonne remplacement. Une valeur qui sert de remplacement ne peut être "
+        "ni invalidée ni retirée tant que d'autres lignes la visent.",
+        "Modifier seulement un commentaire : il est enregistré sans changer la date "
+        "de la décision.",
+        "Reprendre une revue : un classeur ne s'applique qu'une fois. Après son "
+        "application, ou celle d'un autre classeur, il est à réexporter.",
+        "Avant l'import : enregistrer puis fermer le classeur dans Excel.",
         "",
         "Règles à respecter pour que le classeur puisse être réimporté",
         "Ne modifier que les colonnes statut, regle_retenue, remplacement et "
@@ -242,8 +334,6 @@ def _mode_emploi(periode_fin: str, nb_regles: int, nb_valeurs: int) -> list[str]
         "Choisir les statuts dans le menu déroulant, sans les saisir autrement.",
         "Enregistrer au format .xlsx, sans changer le nom du fichier.",
         "Le filtre de la ligne d'en-tête peut être utilisé librement.",
-        "Un classeur ne s'applique qu'une fois : après son application, ou après "
-        "celle d'un autre classeur, il est à réexporter.",
     ]
 
 
@@ -330,14 +420,14 @@ def exporter_revue(
     notice.title = FEUILLE_MODE_EMPLOI
     notice.column_dimensions["A"].width = 120
     for numero, texte in enumerate(
-        _mode_emploi(periode_fin, len(regles), len(valeurs)), start=1
+        _mode_emploi(periode_fin, regles, valeurs), start=1
     ):
         cellule = notice.cell(row=numero, column=1)
         _ecrire_texte(cellule, texte)
         cellule.alignment = Alignment(wrap_text=True, vertical="top")
         if texte == REPERE_REVUES:
             notice.cell(row=numero, column=2, value=nb_revues)
-        if numero == 1 or texte.startswith(("Ce qui", "Feuille", "Règles à")):
+        if numero == 1 or texte.startswith(("Ce qui", "Feuille", "Cas particuliers", "Règles à")):
             cellule.font = Font(bold=True)
     notice.protection.sheet = True
 
