@@ -1,0 +1,343 @@
+"""Classeur Excel de revue du dictionnaire par le métier (étape 2d).
+
+Le dictionnaire généré n'est ni ouvert dans Excel ni modifié à la main : il est
+exporté dans un classeur où le métier choisit un statut par règle et par valeur.
+Ce module ne contient rien de propre à un client.
+"""
+
+from __future__ import annotations
+
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Font, Protection
+from openpyxl.worksheet.datavalidation import DataValidation
+
+from . import racine_projet
+from .dictionnaire import STATUTS, _valeurs_renseignees
+from .profilage import _NATURES_TEXTE
+
+FEUILLE_MODE_EMPLOI = "mode_emploi"
+FEUILLE_REGLES = "regles"
+FEUILLE_VALEURS = "valeurs"
+
+COLONNES_REGLES = (
+    "table",
+    "colonne",
+    "regle",
+    "proposition",
+    "motif",
+    "nb_a_arbitrer",
+    "statut",
+    "regle_retenue",
+    "commentaire",
+)
+COLONNES_VALEURS = (
+    "table",
+    "colonne",
+    "valeur",
+    "effectif",
+    "origine",
+    "remarque",
+    "statut",
+    "commentaire",
+)
+# Colonnes que le métier peut modifier; les autres cellules sont verrouillées.
+MODIFIABLES_REGLES = ("statut", "regle_retenue", "commentaire")
+MODIFIABLES_VALEURS = ("statut", "commentaire")
+# Colonnes à saisir sur une ligne ajoutée en bas de la feuille des valeurs.
+SAISIE_AJOUT = ("table", "colonne", "valeur", "statut", "commentaire")
+
+ORIGINE_LISTE = "liste proposée"
+ORIGINE_A_ARBITRER = "à arbitrer"
+ORIGINE_AJOUT = "ajoutée"
+
+# Règles que le métier peut donner lui-même, avec le statut « documenté ».
+REGLES_RETENUES = {
+    "obligatoire": ("obligatoire", "facultatif", "toujours vide"),
+    "nature": ("texte", "nombre natif", "date native", *_NATURES_TEXTE),
+}
+LIGNES_AJOUT = 200
+LARGEURS = {
+    "table": 22,
+    "colonne": 26,
+    "regle": 12,
+    "proposition": 26,
+    "motif": 55,
+    "nb_a_arbitrer": 14,
+    "statut": 13,
+    "regle_retenue": 24,
+    "commentaire": 50,
+    "valeur": 34,
+    "effectif": 10,
+    "origine": 16,
+    "remarque": 24,
+}
+
+
+def chemin_revue(periode_fin: str) -> Path:
+    """Emplacement par défaut du classeur : data/revue/, hors du dépôt."""
+    return racine_projet() / "data" / "revue" / f"dictionnaire_revue_{periode_fin}.xlsx"
+
+
+def lignes_regles(dictionnaire: dict) -> list[dict]:
+    """Lignes de la feuille des règles, dans l'ordre du dictionnaire.
+
+    Deux lignes par colonne (`obligatoire`, `nature`), plus une ligne `valeurs`
+    quand une liste fermée est proposée : elle porte la question « cette colonne
+    est-elle bien une liste fermée ? ».
+    """
+    lignes = []
+    for table, colonnes in dictionnaire.items():
+        for colonne, regles in colonnes.items():
+            for nom in ("obligatoire", "nature"):
+                regle = regles[nom]
+                ecarts = sum(
+                    valeur
+                    for valeur in regle["a_arbitrer"].values()
+                    if isinstance(valeur, int) and not isinstance(valeur, bool)
+                )
+                lignes.append(
+                    {
+                        "table": table,
+                        "colonne": colonne,
+                        "regle": nom,
+                        "proposition": regle["regle"],
+                        "motif": regle["motif"],
+                        "nb_a_arbitrer": ecarts,
+                        "statut": regle["statut"],
+                    }
+                )
+            valeurs = regles["valeurs"]
+            if isinstance(valeurs["regle"], list):
+                lignes.append(
+                    {
+                        "table": table,
+                        "colonne": colonne,
+                        "regle": "valeurs",
+                        "proposition": f"liste de {len(valeurs['regle'])} valeurs",
+                        "motif": valeurs["motif"],
+                        "nb_a_arbitrer": len(valeurs["a_arbitrer"]),
+                        "statut": valeurs["statut"],
+                    }
+                )
+    return lignes
+
+
+def _remarque(valeur: str) -> str:
+    """Signale ce qui ne se voit pas à l'écran dans une valeur."""
+    remarques = []
+    if valeur != valeur.strip(" \t"):
+        remarques.append("espaces en bord")
+    if " " in valeur or " " in valeur:
+        remarques.append("espace insécable")
+    return ", ".join(remarques)
+
+
+def lignes_valeurs(
+    dictionnaire: dict, tables: dict[str, pd.DataFrame] | None = None
+) -> list[dict]:
+    """Lignes de la feuille des valeurs : une ligne par valeur des listes proposées.
+
+    Les valeurs à arbitrer portent l'effectif enregistré dans le dictionnaire. Pour
+    celles de la liste proposée, l'effectif est compté dans `tables` si elles sont
+    fournies, et laissé vide sinon. Une colonne sans liste (dont toute colonne
+    sensible) ne donne aucune ligne.
+    """
+    lignes = []
+    for table, colonnes in dictionnaire.items():
+        for colonne, regles in colonnes.items():
+            valeurs = regles["valeurs"]
+            if not isinstance(valeurs["regle"], list):
+                continue
+            effectifs = {}
+            if tables is not None and table in tables and colonne in tables[table]:
+                presentes = _valeurs_renseignees(tables[table][colonne])
+                effectifs = presentes.astype(str).value_counts().to_dict()
+            for valeur in valeurs["regle"]:
+                effectif = effectifs.get(valeur)
+                lignes.append(
+                    {
+                        "table": table,
+                        "colonne": colonne,
+                        "valeur": valeur,
+                        "effectif": None if effectif is None else int(effectif),
+                        "origine": ORIGINE_LISTE,
+                        "remarque": _remarque(valeur),
+                        "statut": valeurs["statut"],
+                    }
+                )
+            for element in valeurs["a_arbitrer"]:
+                lignes.append(
+                    {
+                        "table": table,
+                        "colonne": colonne,
+                        "valeur": element["valeur"],
+                        "effectif": element["effectif"],
+                        "origine": ORIGINE_A_ARBITRER,
+                        "remarque": _remarque(element["valeur"]),
+                        "statut": valeurs["statut"],
+                    }
+                )
+    return lignes
+
+
+def _mode_emploi(periode_fin: str, nb_regles: int, nb_valeurs: int) -> list[str]:
+    return [
+        "Revue du dictionnaire des données",
+        f"Période de fin : {periode_fin}. Classeur généré le {date.today():%d/%m/%Y}.",
+        f"À revoir : {nb_regles} lignes dans la feuille « {FEUILLE_REGLES} », "
+        f"{nb_valeurs} lignes dans la feuille « {FEUILLE_VALEURS} ».",
+        "",
+        "Ce qui est attendu",
+        "Pour chaque ligne, choisir un statut dans le menu déroulant et, si besoin, "
+        "écrire un commentaire. Une ligne laissée à « observé » n'est pas revue : "
+        "elle pourra l'être plus tard.",
+        "",
+        f"Feuille « {FEUILLE_REGLES} » : les règles proposées pour chaque colonne",
+        "valide : la proposition est la règle. Impossible si la proposition est "
+        "« à décider ».",
+        "invalide : la proposition est écartée et rien ne la remplace. Dire pourquoi "
+        "en commentaire.",
+        "documenté : vous donnez vous-même la règle, dans la colonne regle_retenue "
+        "(à remplir avec ce statut, à laisser vide avec les autres).",
+        "Sur une ligne « valeurs », la question est : cette colonne n'accepte-t-elle "
+        "qu'une liste fermée de valeurs ? Le statut invalide écarte toute la liste, "
+        f"sans avoir à revoir ses valeurs dans la feuille « {FEUILLE_VALEURS} ».",
+        "",
+        f"Feuille « {FEUILLE_VALEURS} » : les valeurs des listes proposées",
+        "valide : la valeur est légitime.",
+        "invalide : la valeur est une erreur, elle sera signalée en anomalie.",
+        "La colonne remarque signale ce qui ne se voit pas à l'écran (espaces en "
+        "bord, espace insécable).",
+        "Pour ajouter une valeur légitime absente de la liste : remplir table, "
+        "colonne et valeur sur une ligne vide en bas de la feuille, avec le statut "
+        "documenté.",
+        "",
+        "Règles à respecter pour que le classeur puisse être réimporté",
+        "Ne modifier que les colonnes statut, regle_retenue et commentaire (les "
+        "autres cellules sont verrouillées).",
+        "Ne pas renommer, déplacer ni supprimer de feuilles, de colonnes ou de lignes.",
+        "Ne pas ajouter de lignes, sauf en bas de la feuille des valeurs comme "
+        "indiqué ci-dessus.",
+        "Choisir les statuts dans le menu déroulant, sans les saisir autrement.",
+        "Enregistrer au format .xlsx, sans changer le nom du fichier.",
+        "Le filtre de la ligne d'en-tête peut être utilisé librement.",
+    ]
+
+
+def _ecrire_texte(cellule, valeur) -> None:
+    """Écrit une valeur comme texte, pour qu'Excel ne la transforme pas.
+
+    Sans cela, « 076 » deviendrait 76, « 2026-03-01 » une date et « =1+1 » une formule.
+    """
+    cellule.value = valeur
+    cellule.number_format = "@"
+    if isinstance(valeur, str):
+        cellule.data_type = "s"
+
+
+def _menu(feuille, choix) -> DataValidation:
+    menu = DataValidation(
+        type="list", formula1='"' + ",".join(choix) + '"', allow_blank=True
+    )
+    menu.error = "Choisir une valeur dans le menu déroulant."
+    menu.errorTitle = "Valeur non prévue"
+    feuille.add_data_validation(menu)
+    return menu
+
+
+def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0) -> None:
+    """Écrit l'en-tête et les lignes, puis protège la feuille hors colonnes modifiables."""
+    for indice, nom in enumerate(colonnes, start=1):
+        cellule = feuille.cell(row=1, column=indice, value=nom)
+        cellule.font = Font(bold=True)
+        feuille.column_dimensions[cellule.column_letter].width = LARGEURS[nom]
+    for numero, ligne in enumerate(lignes, start=2):
+        for indice, nom in enumerate(colonnes, start=1):
+            cellule = feuille.cell(row=numero, column=indice)
+            valeur = ligne.get(nom)
+            if isinstance(valeur, int):
+                cellule.value = valeur
+            else:
+                _ecrire_texte(cellule, valeur)
+            if nom in modifiables:
+                cellule.protection = Protection(locked=False)
+    fin = len(lignes) + 1
+    for numero in range(fin + 1, fin + lignes_ajout + 1):
+        for indice, nom in enumerate(colonnes, start=1):
+            if nom in SAISIE_AJOUT:
+                cellule = feuille.cell(row=numero, column=indice)
+                cellule.number_format = "@"
+                cellule.protection = Protection(locked=False)
+    derniere = feuille.cell(row=1, column=len(colonnes)).column_letter
+    feuille.freeze_panes = "A2"
+    feuille.auto_filter.ref = f"A1:{derniere}{max(fin + lignes_ajout, 2)}"
+    feuille.protection.sheet = True
+    feuille.protection.autoFilter = False
+    feuille.protection.formatColumns = False
+
+
+def exporter_revue(
+    dictionnaire: dict,
+    periode_fin: str,
+    chemin: str | Path | None = None,
+    *,
+    tables: dict[str, pd.DataFrame] | None = None,
+    ecraser: bool = False,
+) -> Path:
+    """Écrit le classeur de revue du dictionnaire et rend son chemin.
+
+    Sans `ecraser=True`, refuse de remplacer un classeur existant : une revue y est
+    peut-être en cours. `tables` (les tables chargées) sert seulement à compter
+    l'effectif des valeurs des listes proposées.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_revue(periode_fin)
+    if chemin.exists() and not ecraser:
+        raise FileExistsError(
+            f"{chemin} existe déjà : export refusé (ecraser=True pour forcer)"
+        )
+    regles = lignes_regles(dictionnaire)
+    valeurs = lignes_valeurs(dictionnaire, tables)
+
+    classeur = Workbook()
+    notice = classeur.active
+    notice.title = FEUILLE_MODE_EMPLOI
+    notice.column_dimensions["A"].width = 120
+    for numero, texte in enumerate(
+        _mode_emploi(periode_fin, len(regles), len(valeurs)), start=1
+    ):
+        cellule = notice.cell(row=numero, column=1)
+        _ecrire_texte(cellule, texte)
+        cellule.alignment = Alignment(wrap_text=True, vertical="top")
+        if numero == 1 or texte.startswith(("Ce qui", "Feuille", "Règles à")):
+            cellule.font = Font(bold=True)
+    notice.protection.sheet = True
+
+    feuille = classeur.create_sheet(FEUILLE_REGLES)
+    _remplir(feuille, COLONNES_REGLES, regles, MODIFIABLES_REGLES)
+    statut = COLONNES_REGLES.index("statut") + 1
+    retenue = COLONNES_REGLES.index("regle_retenue") + 1
+    menu_statut = _menu(feuille, STATUTS)
+    menus_retenue = {nom: _menu(feuille, choix) for nom, choix in REGLES_RETENUES.items()}
+    for numero, ligne in enumerate(regles, start=2):
+        menu_statut.add(feuille.cell(row=numero, column=statut))
+        cellule = feuille.cell(row=numero, column=retenue)
+        if ligne["regle"] in menus_retenue:
+            menus_retenue[ligne["regle"]].add(cellule)
+        else:
+            # Une liste de valeurs se revoit dans la feuille des valeurs.
+            cellule.protection = Protection(locked=True)
+
+    feuille = classeur.create_sheet(FEUILLE_VALEURS)
+    _remplir(feuille, COLONNES_VALEURS, valeurs, MODIFIABLES_VALEURS, LIGNES_AJOUT)
+    statut = COLONNES_VALEURS.index("statut") + 1
+    menu_statut = _menu(feuille, STATUTS)
+    for numero in range(2, len(valeurs) + LIGNES_AJOUT + 2):
+        menu_statut.add(feuille.cell(row=numero, column=statut))
+
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    classeur.save(chemin)
+    return chemin
