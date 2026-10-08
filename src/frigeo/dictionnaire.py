@@ -13,6 +13,7 @@ from __future__ import annotations
 import numbers
 import os
 import unicodedata
+from copy import deepcopy
 from datetime import date
 from pathlib import Path
 
@@ -21,7 +22,7 @@ import yaml
 
 from . import racine_projet
 from .confidentialite import charger_sensibilite, est_sensible, verifier_sensibilite
-from .profilage import COLONNES_LIGNAGE, profiler_colonne
+from .profilage import COLONNES_LIGNAGE, _NATURES_TEXTE, profiler_colonne
 
 # Seuils par défaut du critère de liste fermée (validés le 05/10/2026, à
 # confirmer sur le profil réel).
@@ -238,6 +239,16 @@ STATUT_INITIAL = "observé"
 STATUTS = ("observé", "valide", "invalide", "documenté")
 REGLES = ("obligatoire", "nature", "valeurs")
 
+A_DECIDER = "à décider"
+# Règle en vigueur d'une proposition écartée par le métier (statut « invalide ») :
+# aucun contrôle de ce type ne portera sur la colonne.
+REGLE_ECARTEE = "aucune"
+# Règles que le métier peut donner lui-même, avec le statut « documenté ».
+REGLES_RETENUES = {
+    "obligatoire": ("obligatoire", "facultatif", "toujours vide"),
+    "nature": ("texte", "nombre natif", "date native", *_NATURES_TEXTE),
+}
+
 # Règle `valeurs` : la colonne n'accepte qu'une liste fermée de valeurs, ou non.
 LISTE_FERMEE = "liste fermée"
 AUCUNE_LISTE = "aucune"
@@ -428,6 +439,17 @@ def _natif(valeur):
     raise TypeError(f"Type non pris en charge dans le dictionnaire : {type(valeur).__name__}")
 
 
+# Journal des revues, dans le bloc `meta` : une entrée par classeur appliqué.
+CHAMPS_REVUE = (
+    "date",
+    "classeur",
+    "regles_changees",
+    "valeurs_changees",
+    "valeurs_ajoutees",
+    "commentaires_changes",
+)
+
+
 def _meta(periode_fin: str) -> dict:
     return {
         "structure": STRUCTURE,
@@ -441,6 +463,7 @@ def _meta(periode_fin: str) -> dict:
             "vides_max_obligatoire": VIDES_MAX_OBLIGATOIRE,
             "vides_min_presque_vide": VIDES_MIN_PRESQUE_VIDE,
         },
+        "revues": [],
     }
 
 
@@ -450,6 +473,40 @@ def _decrire(valeur) -> str:
 
 def _statut_normalise(statut):
     return unicodedata.normalize("NFC", statut) if isinstance(statut, str) else statut
+
+
+def _est_date_iso(valeur) -> bool:
+    """Vrai pour un texte 'AAAA-MM-JJ' qui désigne une date réelle."""
+    try:
+        return date.fromisoformat(valeur).isoformat() == valeur
+    except (TypeError, ValueError):
+        return False
+
+
+def _problemes_journal(revues) -> list[str]:
+    """Problèmes du journal des revues (clé `revues` du bloc `meta`)."""
+    if not isinstance(revues, list):
+        return ["journal des revues : une liste est attendue"]
+    problemes = []
+    for rang, entree in enumerate(revues, start=1):
+        ou = f"journal des revues, entrée {rang}"
+        if not isinstance(entree, dict) or set(entree) != set(CHAMPS_REVUE):
+            problemes.append(f"{ou} : champs attendus {', '.join(CHAMPS_REVUE)}")
+            continue
+        if not _est_date_iso(entree["date"]):
+            problemes.append(
+                f"{ou} : date {_decrire(entree['date'])}, une date 'AAAA-MM-JJ' entre "
+                "guillemets est attendue"
+            )
+        if not isinstance(entree["classeur"], str) or entree["classeur"].strip() == "":
+            problemes.append(f"{ou} : nom de classeur {_decrire(entree['classeur'])}")
+        for champ in CHAMPS_REVUE[2:]:
+            nombre = entree[champ]
+            if isinstance(nombre, bool) or not isinstance(nombre, int) or nombre < 0:
+                problemes.append(
+                    f"{ou} : {champ} {_decrire(nombre)}, un entier positif ou nul est attendu"
+                )
+    return problemes
 
 
 def _problemes_decision(ou: str, element: dict) -> list[str]:
@@ -465,16 +522,11 @@ def _problemes_decision(ou: str, element: dict) -> list[str]:
             problemes.append(
                 f"{ou} : statut {element['statut']} sans date de revue (revu_le)"
             )
-    else:
-        try:
-            valide = date.fromisoformat(revu_le).isoformat() == revu_le
-        except (TypeError, ValueError):
-            valide = False
-        if not valide:
-            problemes.append(
-                f"{ou} : revu_le {_decrire(revu_le)}, une date 'AAAA-MM-JJ' entre "
-                "guillemets est attendue"
-            )
+    elif not _est_date_iso(revu_le):
+        problemes.append(
+            f"{ou} : revu_le {_decrire(revu_le)}, une date 'AAAA-MM-JJ' entre "
+            "guillemets est attendue"
+        )
     return problemes
 
 
@@ -559,6 +611,31 @@ def _problemes_liste(ou: str, regle: dict) -> list[str]:
     return problemes
 
 
+def _probleme_regle_en_vigueur(nom: str, regle: dict) -> str | None:
+    """Incohérence entre le statut d'une règle revue et sa règle en vigueur.
+
+    Une proposition validée est une vraie règle, une proposition écartée ne laisse
+    aucune règle, et une règle donnée par le métier fait partie de `REGLES_RETENUES`.
+    """
+    statut, en_vigueur = regle["statut"], regle["regle"]
+    if statut == "invalide" and en_vigueur != REGLE_ECARTEE:
+        return (
+            f"au statut invalide, la règle ({en_vigueur!r}) doit être "
+            f"« {REGLE_ECARTEE} »"
+        )
+    if statut == "valide" and en_vigueur in (A_DECIDER, REGLE_ECARTEE):
+        return f"au statut valide, la règle ne peut pas être « {en_vigueur} »"
+    if statut == "documenté":
+        if nom not in REGLES_RETENUES:
+            return f"statut documenté impossible sur la règle {nom}"
+        if en_vigueur not in REGLES_RETENUES[nom]:
+            return (
+                f"au statut documenté, la règle ({en_vigueur!r}) doit être parmi "
+                f"{', '.join(REGLES_RETENUES[nom])}"
+            )
+    return None
+
+
 def _verifier_et_normaliser(contenu) -> list[str]:
     """Liste tous les problèmes de structure et normalise les statuts (NFC)."""
     if not isinstance(contenu, dict) or not isinstance(contenu.get("tables"), dict):
@@ -591,19 +668,26 @@ def _verifier_et_normaliser(contenu) -> list[str]:
                         f"({regle['regle']!r}) doit être la proposition "
                         f"({regle['proposition']!r})"
                     )
+                else:
+                    probleme = _probleme_regle_en_vigueur(nom, regle)
+                    if probleme:
+                        problemes.append(f"{ici} : {probleme}")
                 problemes.extend(_problemes_decision(ici, regle))
                 if nom == "valeurs":
                     problemes.extend(_problemes_liste(ou, regle))
     return problemes
 
 
-def charger_dictionnaire(chemin: str | Path | None = None) -> dict:
-    """Charge le dictionnaire et rend ses tables, après contrôle de la structure.
+def problemes_dictionnaire(tables: dict) -> list[str]:
+    """Problèmes de structure et de cohérence de tables déjà en mémoire.
 
-    Tous les problèmes sont listés en une fois. Un statut hors de `STATUTS` est rejeté.
-    Un fichier écrit avant la refonte de la structure est refusé d'emblée.
+    Mêmes contrôles qu'au chargement du fichier. `tables` n'est pas modifié.
     """
-    chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
+    return _verifier_et_normaliser({"tables": deepcopy(tables)})
+
+
+def _lire_fichier(chemin: Path) -> dict:
+    """Contenu du fichier, après contrôle de la version de la structure."""
     with open(chemin, encoding="utf-8") as flux:
         contenu = yaml.safe_load(flux)
     meta = contenu.get("meta") if isinstance(contenu, dict) else None
@@ -613,10 +697,36 @@ def charger_dictionnaire(chemin: str | Path | None = None) -> dict:
             f"Dictionnaire à une autre structure ({chemin}) : structure "
             f"{structure!r}, attendue {STRUCTURE}. Le fichier est à régénérer."
         )
+    return contenu
+
+
+def charger_dictionnaire(chemin: str | Path | None = None) -> dict:
+    """Charge le dictionnaire et rend ses tables, après contrôle de la structure.
+
+    Tous les problèmes sont listés en une fois. Un statut hors de `STATUTS` est rejeté.
+    Un fichier écrit avant la refonte de la structure est refusé d'emblée.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
+    contenu = _lire_fichier(chemin)
     problemes = _verifier_et_normaliser(contenu)
     if problemes:
         raise ValueError(f"Dictionnaire invalide ({chemin})\n  " + "\n  ".join(problemes))
     return contenu["tables"]
+
+
+def charger_meta(chemin: str | Path | None = None) -> dict:
+    """Rend le bloc `meta` du dictionnaire, dont le journal des revues.
+
+    La clé `revues` est toujours présente : une liste vide si aucun classeur n'a
+    encore été appliqué (y compris pour un fichier écrit avant ce journal).
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
+    meta = dict(_lire_fichier(chemin)["meta"])
+    meta.setdefault("revues", [])
+    problemes = _problemes_journal(meta["revues"])
+    if problemes:
+        raise ValueError(f"Dictionnaire invalide ({chemin})\n  " + "\n  ".join(problemes))
+    return meta
 
 
 def ecrire_dictionnaire(
@@ -625,12 +735,18 @@ def ecrire_dictionnaire(
     chemin: str | Path | None = None,
     *,
     ecraser: bool = False,
+    revue: dict | None = None,
 ) -> Path:
     """Écrit le dictionnaire en YAML et vérifie l'écriture par une relecture.
 
     Sans `ecraser=True`, refuse de remplacer un fichier illisible ou qui porte au
     moins une décision de revue (règle ou valeur à un statut autre que « observé »). Le
     fichier n'est remplacé qu'une fois la relecture identique au dictionnaire fourni.
+
+    Le journal des revues du fichier en place est toujours conservé. `revue` est
+    l'entrée rendue par `appliquer_revue` : elle est ajoutée au journal, et le reste
+    du bloc `meta` (période, date de génération, seuils) est alors repris du fichier
+    en place, puisque l'application d'un classeur ne régénère rien.
     """
     chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
     tables = _natif(dictionnaire)
@@ -649,19 +765,46 @@ def ecrire_dictionnaire(
                 "(ecraser=True pour forcer)"
             )
 
+    en_place = None
+    if chemin.exists():
+        try:
+            en_place = charger_meta(chemin)
+        except (ValueError, yaml.YAMLError):
+            # Fichier illisible, remplacé avec ecraser=True : son journal est perdu.
+            en_place = None
+    meta = _meta(periode_fin)
+    if revue is not None:
+        if en_place is None:
+            raise ValueError(
+                f"{chemin} : aucun dictionnaire lisible en place, une revue ne peut "
+                "s'appliquer qu'à un dictionnaire existant"
+            )
+        if en_place.get("periode_fin") != periode_fin:
+            raise ValueError(
+                f"{chemin} : dictionnaire de la période {en_place.get('periode_fin')}, "
+                f"revue appliquée pour la période {periode_fin}"
+            )
+        meta = en_place
+    meta["revues"] = _natif(
+        (en_place["revues"] if en_place else []) + ([revue] if revue is not None else [])
+    )
+    problemes = _problemes_journal(meta["revues"])
+    if problemes:
+        raise ValueError("Journal des revues invalide\n  " + "\n  ".join(problemes))
+
     chemin.parent.mkdir(parents=True, exist_ok=True)
     provisoire = chemin.with_name(chemin.name + ".tmp")
     try:
         with open(provisoire, "w", encoding="utf-8", newline="\n") as flux:
             yaml.safe_dump(
-                {"meta": _meta(periode_fin), "tables": tables},
+                {"meta": meta, "tables": tables},
                 flux,
                 allow_unicode=True,
                 sort_keys=False,
                 default_flow_style=False,
                 width=1000,
             )
-        if charger_dictionnaire(provisoire) != tables:
+        if charger_dictionnaire(provisoire) != tables or charger_meta(provisoire) != meta:
             raise RuntimeError("La relecture du dictionnaire écrit diffère de l'original")
         os.replace(provisoire, chemin)
     finally:

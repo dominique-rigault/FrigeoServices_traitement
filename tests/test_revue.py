@@ -1,12 +1,18 @@
-"""Tests de l'export et de l'import du classeur de revue (frigeo.revue)."""
+"""Tests de l'export, de l'import et de l'application du classeur de revue (frigeo.revue)."""
+
+from copy import deepcopy
 
 import pytest
 from openpyxl import load_workbook
 
+from frigeo.dictionnaire import charger_dictionnaire, charger_meta, ecrire_dictionnaire
 from frigeo.revue import (
+    COLONNES_RAPPORT_REVUE,
     COLONNES_REGLES,
     COLONNES_VALEURS,
     LIGNES_AJOUT,
+    REPERE_REVUES,
+    appliquer_revue,
     exporter_revue,
     importer_revue,
     lignes_regles,
@@ -115,7 +121,7 @@ def test_statut_propre_a_chaque_valeur():
 
 
 def test_classeur_ecrit_et_relu(tmp_path):
-    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue" / "revue.xlsx")
+    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue" / "revue.xlsx", nb_revues=0)
     classeur = load_workbook(chemin)
     assert classeur.sheetnames == ["mode_emploi", "regles", "valeurs"]
     regles, valeurs = classeur["regles"], classeur["valeurs"]
@@ -130,14 +136,14 @@ def test_classeur_ecrit_et_relu(tmp_path):
 
 
 def test_valeurs_conservees_comme_texte(tmp_path):
-    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx")
+    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
     lues = [l for l in _lire(load_workbook(chemin)["valeurs"]) if l["colonne"] == "code"]
     assert [l["valeur"] for l in lues] == PIEGES
     assert all(isinstance(l["valeur"], str) for l in lues)
 
 
 def test_protection_et_menus(tmp_path):
-    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx")
+    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
     classeur = load_workbook(chemin)
     regles, valeurs = classeur["regles"], classeur["valeurs"]
     assert regles.protection.sheet and valeurs.protection.sheet
@@ -149,8 +155,8 @@ def test_protection_et_menus(tmp_path):
     ligne = next(l for l in regles.iter_rows(min_row=2) if l[2].value == "valeurs")
     assert ligne[COLONNES_REGLES.index("regle_retenue")].protection.locked
     libres = {c.value for c, d in zip(valeurs[1], valeurs[2]) if not d.protection.locked}
-    assert libres == {"statut", "commentaire"}
-    # Lignes d'ajout en bas de la feuille des valeurs.
+    assert libres == {"statut", "remplacement", "commentaire"}
+    # Lignes d'ajout en bas de la feuille des valeurs : pas de remplacement à saisir.
     ajout = valeurs[3 + len(PIEGES) + 2]
     libres = {c.value for c, d in zip(valeurs[1], ajout) if not d.protection.locked}
     assert libres == {"table", "colonne", "valeur", "statut", "commentaire"}
@@ -163,20 +169,20 @@ def test_protection_et_menus(tmp_path):
 
 
 def test_colonne_sans_liste_absente_de_la_feuille_des_valeurs(tmp_path):
-    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx")
+    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
     colonnes = {l["colonne"] for l in _lire(load_workbook(chemin)["valeurs"])}
     assert "type_commerce" not in colonnes
 
 
 def test_export_refuse_d_ecraser_un_classeur_existant(tmp_path):
-    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx")
+    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
     with pytest.raises(FileExistsError, match="existe déjà"):
-        exporter_revue(_dictionnaire(), "2026-03", chemin)
-    exporter_revue(_dictionnaire(), "2026-03", chemin, ecraser=True)
+        exporter_revue(_dictionnaire(), "2026-03", chemin, nb_revues=0)
+    exporter_revue(_dictionnaire(), "2026-03", chemin, nb_revues=0, ecraser=True)
 
 
 def _exporter(tmp_path):
-    return exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx")
+    return exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
 
 
 def _ligne(feuille, **cles):
@@ -200,12 +206,12 @@ def _modifier(chemin, nom_feuille, ligne, **valeurs):
 
 def _erreur_import(chemin):
     with pytest.raises(ValueError) as erreur:
-        importer_revue(chemin, _dictionnaire())
+        importer_revue(chemin, _dictionnaire(), nb_revues=0)
     return str(erreur.value)
 
 
 def test_import_sans_modification(tmp_path):
-    revue = importer_revue(_exporter(tmp_path), _dictionnaire())
+    revue = importer_revue(_exporter(tmp_path), _dictionnaire(), nb_revues=0)
     assert len(revue.regles) == 10
     assert len(revue.valeurs) == 3 + len(PIEGES)
     assert set(revue.regles["statut"]) == set(revue.valeurs["statut"]) == {"observé"}
@@ -230,7 +236,7 @@ def test_import_des_decisions_du_metier(tmp_path):
     _modifier(chemin, "valeurs", fin + 5, table="clients", colonne="type_commerce",
               valeur="Boulangerie", statut="documenté", commentaire="chapitre 4")
 
-    revue = importer_revue(chemin, _dictionnaire())
+    revue = importer_revue(chemin, _dictionnaire(), nb_revues=0)
     regles = revue.regles.set_index(["colonne", "regle"])
     assert regles.loc[("statut", "obligatoire"), "statut"] == "valide"
     assert regles.loc[("statut", "nature"), "statut"] == "documenté"
@@ -289,7 +295,7 @@ def test_classeur_perime_refuse(tmp_path):
         _valeur("Radié", "à arbitrer", 1)
     )
     with pytest.raises(ValueError) as erreur:
-        importer_revue(chemin, dictionnaire)
+        importer_revue(chemin, dictionnaire, nb_revues=0)
     message = str(erreur.value)
     assert "classeur périmé, à réexporter" in message
     assert "('clients', 'statut', 'Radié') absente du classeur" in message
@@ -335,3 +341,358 @@ def test_structure_modifiee_refusee(tmp_path, cas):
         attendu = "en-tête modifié"
     classeur.save(chemin)
     assert attendu in _erreur_import(chemin)
+
+
+# Décisions enregistrées, remplacements, classeur périmé et application (morceau 4c).
+
+JOUR = "2026-10-09"
+STATUT = dict(table="clients", colonne="statut")
+FIN = 1 + 3 + len(PIEGES)  # dernière ligne exportée de la feuille des valeurs
+
+
+def _importer(chemin, dictionnaire=None, nb_revues=0):
+    return importer_revue(chemin, dictionnaire or _dictionnaire(), nb_revues=nb_revues)
+
+
+def _decisions(chemin):
+    """Saisit dans le classeur un jeu de décisions couvrant tous les statuts."""
+    _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), statut="valide")
+    _modifier(chemin, "regles", dict(STATUT, regle="nature"), statut="documenté",
+              regle_retenue="entier (texte)", commentaire="code numérique")
+    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="valeurs"),
+              statut="invalide", commentaire="identifiant libre")
+    _modifier(chemin, "regles", dict(table="interventions", colonne="duree", regle="obligatoire"),
+              statut="documenté", regle_retenue="facultatif")
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="Actif"), statut="valide")
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), statut="invalide",
+              remplacement="Actif", commentaire="casse")
+    _modifier(chemin, "valeurs", FIN + 1, table="clients", colonne="statut",
+              valeur="En sommeil", statut="documenté", commentaire="chapitre 4")
+    _modifier(chemin, "valeurs", FIN + 2, table="clients", colonne="type_commerce",
+              valeur="Boulangerie", statut="documenté")
+
+
+def _apres_premiere_revue(tmp_path):
+    """Dictionnaire obtenu en appliquant le jeu de décisions, et l'entrée de journal."""
+    chemin = _exporter(tmp_path)
+    _decisions(chemin)
+    resultat, rapport, entree = appliquer_revue(_dictionnaire(), _importer(chemin), chemin, JOUR)
+    return resultat, rapport, entree
+
+
+def _element(dictionnaire, valeur, colonne="statut"):
+    liste = dictionnaire["clients"][colonne]["valeurs"]["liste"]
+    return next(e for e in liste if e["valeur"] == valeur)
+
+
+def test_repere_des_revues(tmp_path):
+    chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=2)
+    assert len(_importer(chemin, nb_revues=2).regles) == 10
+    # Une revue a été appliquée depuis l'export : le classeur annulerait ses décisions.
+    with pytest.raises(ValueError, match="exporté après 2 revues, le dictionnaire en compte 3"):
+        _importer(chemin, nb_revues=3)
+    classeur = load_workbook(chemin)
+    notice = classeur["mode_emploi"]
+    ligne = next(c.row for c in notice["A"] if c.value == REPERE_REVUES)
+    assert notice.cell(row=ligne, column=2).value == 2
+    notice.cell(row=ligne, column=2).value = "deux"
+    classeur.save(chemin)
+    with pytest.raises(ValueError, match="repère des revues absent ou modifié"):
+        _importer(chemin, nb_revues=2)
+    with pytest.raises(ValueError, match="nb_revues"):
+        exporter_revue(_dictionnaire(), "2026-03", tmp_path / "autre.xlsx", nb_revues=-1)
+
+
+def test_application_sans_decision_ne_change_rien(tmp_path):
+    chemin = _exporter(tmp_path)
+    dictionnaire = _dictionnaire()
+    resultat, rapport, entree = appliquer_revue(dictionnaire, _importer(chemin), chemin, JOUR)
+    assert resultat == dictionnaire
+    assert entree is None
+    assert rapport.empty and tuple(rapport.columns) == COLONNES_RAPPORT_REVUE
+
+
+def test_application_des_decisions(tmp_path):
+    dictionnaire = _dictionnaire()
+    temoin = deepcopy(dictionnaire)
+    chemin = _exporter(tmp_path)
+    _decisions(chemin)
+    revue = _importer(chemin)
+    resultat, rapport, entree = appliquer_revue(dictionnaire, revue, chemin, JOUR)
+    assert dictionnaire == temoin  # l'argument n'est pas modifié
+
+    statut = resultat["clients"]["statut"]
+    # valide : la règle est la proposition du moment.
+    assert (statut["obligatoire"]["statut"], statut["obligatoire"]["regle"]) == ("valide", "obligatoire")
+    assert statut["obligatoire"]["revu_le"] == JOUR
+    # documenté : la règle est la règle retenue, la proposition reste.
+    nature = statut["nature"]
+    assert (nature["statut"], nature["regle"], nature["proposition"]) == (
+        "documenté", "entier (texte)", "texte",
+    )
+    assert nature["commentaire"] == "code numérique"
+    # invalide : plus aucune règle, la liste et ses valeurs sont conservées.
+    code = resultat["clients"]["code"]["valeurs"]
+    assert (code["statut"], code["regle"], code["proposition"]) == (
+        "invalide", "aucune", "liste fermée",
+    )
+    assert [e["valeur"] for e in code["liste"]] == PIEGES
+    duree = resultat["interventions"]["duree"]["obligatoire"]
+    assert (duree["regle"], duree["proposition"]) == ("facultatif", "à décider")
+    # Une ligne laissée à « observé » n'est pas touchée.
+    assert statut["valeurs"] == {**temoin["clients"]["statut"]["valeurs"], "liste": statut["valeurs"]["liste"]}
+
+    assert _element(resultat, "Actif")["statut"] == "valide"
+    assert _element(resultat, "Inactif") == _element(temoin, "Inactif")
+    actif = _element(resultat, "actif")
+    assert (actif["statut"], actif["remplacement"], actif["commentaire"], actif["revu_le"]) == (
+        "invalide", "Actif", "casse", JOUR,
+    )
+    assert _element(resultat, "En sommeil") == {
+        "valeur": "En sommeil",
+        "origine": "ajoutée",
+        "effectif": 0,
+        "statut": "documenté",
+        "commentaire": "chapitre 4",
+        "revu_le": JOUR,
+        "remplacement": None,
+    }
+    # Une valeur peut être ajoutée dans une colonne sans liste proposée.
+    assert _element(resultat, "Boulangerie", "type_commerce")["origine"] == "ajoutée"
+    assert resultat["clients"]["type_commerce"]["valeurs"]["regle"] == "aucune"
+
+    assert entree == {
+        "date": JOUR,
+        "classeur": "revue.xlsx",
+        "regles_changees": 4,
+        "valeurs_changees": 2,
+        "valeurs_ajoutees": 2,
+        "commentaires_changes": 0,
+    }
+    assert len(rapport) == 8
+    ligne = rapport[rapport["valeur"] == "actif"].iloc[0]
+    assert (ligne["evenement"], ligne["avant"], ligne["apres"]) == (
+        "décision changée", "observé", "invalide, remplacée par 'Actif'",
+    )
+    ligne = rapport[(rapport["colonne"] == "statut") & (rapport["regle"] == "nature")].iloc[0]
+    assert (ligne["avant"], ligne["apres"]) == (
+        "observé, règle texte", "documenté, règle entier (texte)",
+    )
+    assert set(rapport.loc[rapport["valeur"].isin(["En sommeil", "Boulangerie"]), "evenement"]) == {
+        "valeur ajoutée"
+    }
+
+
+def test_dictionnaire_revu_ecrit_avec_son_journal(tmp_path):
+    fichier = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire(), "2026-03", fichier)
+    resultat, _, entree = _apres_premiere_revue(tmp_path)
+    ecrire_dictionnaire(resultat, "2026-03", fichier, revue=entree)
+    assert charger_dictionnaire(fichier) == resultat
+    assert charger_meta(fichier)["revues"] == [entree]
+
+
+def test_export_affiche_les_decisions_enregistrees(tmp_path):
+    resultat, _, _ = _apres_premiere_revue(tmp_path)
+    regles = {(l["table"], l["colonne"], l["regle"]): l for l in lignes_regles(resultat)}
+    nature = regles[("clients", "statut", "nature")]
+    assert (nature["statut"], nature["regle_en_vigueur"], nature["regle_retenue"], nature["commentaire"]) == (
+        "documenté", "entier (texte)", "entier (texte)", "code numérique",
+    )
+    valide = regles[("clients", "statut", "obligatoire")]
+    assert (valide["regle_en_vigueur"], valide["regle_retenue"], valide["commentaire"]) == (
+        "obligatoire", None, None,
+    )
+    assert regles[("clients", "code", "valeurs")]["regle_en_vigueur"] == "aucune"
+    valeurs = {(l["colonne"], l["valeur"]): l for l in lignes_valeurs(resultat)}
+    assert valeurs[("statut", "actif")]["remplacement"] == "Actif"
+    assert valeurs[("statut", "actif")]["commentaire"] == "casse"
+    assert valeurs[("statut", "En sommeil")]["origine"] == "ajoutée"
+    assert ("type_commerce", "Boulangerie") in valeurs
+
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    classeur = load_workbook(chemin)
+    lues = {(l["colonne"], l["valeur"]): l for l in _lire(classeur["valeurs"])}
+    assert lues[("statut", "actif")]["remplacement"] == "Actif"
+    assert lues[("statut", "En sommeil")]["statut"] == "documenté"
+    feuille = classeur["regles"]
+    assert feuille.cell(row=2, column=COLONNES_REGLES.index("regle_en_vigueur") + 1).protection.locked
+
+
+def test_liste_ecartee_qui_n_est_plus_proposee_reste_dans_le_classeur():
+    dictionnaire = _dictionnaire()
+    code = dictionnaire["clients"]["code"]["valeurs"]
+    code.update(statut="invalide", regle="aucune", proposition="aucune", revu_le=JOUR,
+                commentaire="identifiant libre")
+    ligne = next(l for l in lignes_regles(dictionnaire) if (l["colonne"], l["regle"]) == ("code", "valeurs"))
+    assert (ligne["proposition"], ligne["statut"]) == ("aucune", "invalide")
+    # Sans décision, une colonne sans liste proposée n'a pas de ligne « valeurs ».
+    cles = [(l["colonne"], l["regle"]) for l in lignes_regles(dictionnaire)]
+    assert ("type_commerce", "valeurs") not in cles
+
+
+def test_classeur_reexporte_sans_modification_ne_change_rien(tmp_path):
+    resultat, _, _ = _apres_premiere_revue(tmp_path)
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    revue = _importer(chemin, resultat, nb_revues=1)
+    encore, rapport, entree = appliquer_revue(resultat, revue, chemin, "2026-11-02")
+    assert encore == resultat
+    assert entree is None and rapport.empty
+
+
+def test_deuxieme_revue_modifie_annule_et_retire(tmp_path):
+    resultat, _, _ = _apres_premiere_revue(tmp_path)
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    # Retour à « observé » : la décision est annulée.
+    _modifier(chemin, "regles", dict(STATUT, regle="nature"), statut="observé",
+              regle_retenue=None, commentaire=None)
+    # Règle retenue changée sans changer de statut.
+    _modifier(chemin, "regles", dict(table="interventions", colonne="duree", regle="obligatoire"),
+              regle_retenue="obligatoire")
+    # Commentaire seul modifié.
+    _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), commentaire="confirmé")
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="Actif"), commentaire="valeur de référence")
+    # Remplacement retiré, valeur ajoutée retirée.
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), remplacement=None)
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="En sommeil"), statut="observé")
+    second = "2026-11-02"
+    revue = _importer(chemin, resultat, nb_revues=1)
+    final, rapport, entree = appliquer_revue(resultat, revue, "C:\\Users\\x\\revue2.xlsx", second)
+
+    nature = final["clients"]["statut"]["nature"]
+    assert (nature["statut"], nature["regle"], nature["revu_le"], nature["commentaire"]) == (
+        "observé", "texte", None, "",
+    )
+    duree = final["interventions"]["duree"]["obligatoire"]
+    assert (duree["statut"], duree["regle"], duree["revu_le"]) == ("documenté", "obligatoire", second)
+    # Un commentaire seul ne déplace pas la date de la décision.
+    obligatoire = final["clients"]["statut"]["obligatoire"]
+    assert (obligatoire["commentaire"], obligatoire["revu_le"]) == ("confirmé", JOUR)
+    assert (_element(final, "Actif")["commentaire"], _element(final, "Actif")["revu_le"]) == (
+        "valeur de référence", JOUR,
+    )
+    actif = _element(final, "actif")
+    assert (actif["statut"], actif["remplacement"], actif["revu_le"]) == ("invalide", None, second)
+    valeurs = [e["valeur"] for e in final["clients"]["statut"]["valeurs"]["liste"]]
+    assert "En sommeil" not in valeurs
+
+    assert entree == {
+        "date": second,
+        "classeur": "revue2.xlsx",
+        "regles_changees": 2,
+        "valeurs_changees": 2,
+        "valeurs_ajoutees": 0,
+        "commentaires_changes": 2,
+    }
+    evenements = sorted(rapport["evenement"])
+    assert evenements == ["commentaire modifié"] * 2 + ["décision changée"] * 3 + ["valeur retirée"]
+    ligne = rapport[rapport["evenement"] == "valeur retirée"].iloc[0]
+    assert (ligne["valeur"], ligne["avant"], ligne["apres"]) == ("En sommeil", "documenté", "")
+
+
+def test_retour_a_observe_selon_l_effectif(tmp_path):
+    dictionnaire = _dictionnaire()
+    liste = dictionnaire["clients"]["statut"]["valeurs"]["liste"]
+    # Valeur ajoutée par le métier, observée depuis dans les données.
+    liste.append({**_valeur("En sommeil", "ajoutée", 4), "statut": "documenté", "revu_le": JOUR})
+    # Valeur revue qui n'est plus observée.
+    liste[2].update(statut="invalide", effectif=0, revu_le=JOUR)
+    chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=1)
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="En sommeil"), statut="observé")
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), statut="observé")
+    revue = _importer(chemin, dictionnaire, nb_revues=1)
+    resultat, rapport, entree = appliquer_revue(dictionnaire, revue, chemin, "2026-11-02")
+    sommeil = _element(resultat, "En sommeil")
+    assert (sommeil["origine"], sommeil["statut"], sommeil["effectif"], sommeil["revu_le"]) == (
+        "à arbitrer", "observé", 4, None,
+    )
+    assert "actif" not in [e["valeur"] for e in resultat["clients"]["statut"]["valeurs"]["liste"]]
+    assert entree["valeurs_changees"] == 2
+
+
+def test_remplacements_refuses(tmp_path):
+    chemin = _exporter(tmp_path)
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="Actif"), statut="valide", remplacement="Inactif")
+    # Cible restée à « observé », visée par deux lignes.
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), statut="invalide", remplacement="Inactif")
+    code = dict(table="clients", colonne="code")
+    _modifier(chemin, "valeurs", dict(code, valeur="076"), statut="invalide", remplacement="076")
+    _modifier(chemin, "valeurs", dict(code, valeur="27"), statut="invalide", remplacement="Actif")
+    _modifier(chemin, "valeurs", dict(code, valeur="Non"), statut="invalide", remplacement=27)
+    _modifier(chemin, "valeurs", FIN + 1, table="clients", colonne="statut",
+              valeur="En sommeil", statut="documenté", remplacement="Actif")
+    _modifier(chemin, "valeurs", FIN + 2, table="clients", colonne="statut",
+              valeur="Actf", statut="documenté")
+    message = _erreur_import(chemin)
+    assert "6 problèmes" in message
+    for attendu in (
+        "remplacement réservé au statut invalide",
+        "une valeur ne peut pas être son propre remplacement",
+        "remplacement 'Actif' absent des valeurs de clients.code",
+        "remplacement 27 lu comme int",
+        "remplacement interdit sur une valeur ajoutée",
+        "valeur 'Inactif' au statut 'observé' alors qu'elle sert de remplacement (lignes 4)",
+    ):
+        assert attendu in message
+
+
+def test_remplacement_vers_une_valeur_ajoutee_dans_le_meme_classeur(tmp_path):
+    chemin = _exporter(tmp_path)
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), statut="invalide",
+              remplacement="En sommeil")
+    _modifier(chemin, "valeurs", FIN + 1, table="clients", colonne="statut",
+              valeur="En sommeil", statut="documenté")
+    resultat, _, _ = appliquer_revue(_dictionnaire(), _importer(chemin), chemin, JOUR)
+    assert _element(resultat, "actif")["remplacement"] == "En sommeil"
+
+
+def test_invalider_ou_retirer_une_cible_bloque_l_import(tmp_path):
+    resultat, _, _ = _apres_premiere_revue(tmp_path)
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="Actif"), statut="invalide")
+    with pytest.raises(ValueError) as erreur:
+        _importer(chemin, resultat, nb_revues=1)
+    message = str(erreur.value)
+    assert "1 problèmes" in message
+    assert "valeur 'Actif' au statut 'invalide' alors qu'elle sert de remplacement" in message
+
+
+def test_statuts_d_une_valeur_ajoutee_deja_enregistree(tmp_path):
+    resultat, _, _ = _apres_premiere_revue(tmp_path)
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    _modifier(chemin, "valeurs", dict(STATUT, valeur="En sommeil"), statut="invalide")
+    with pytest.raises(ValueError, match="impossible sur une valeur ajoutée"):
+        _importer(chemin, resultat, nb_revues=1)
+
+
+def test_regle_validee_conservee_quand_la_proposition_change(tmp_path):
+    resultat, _, _ = _apres_premiere_revue(tmp_path)
+    # Régénération : la proposition ne permet plus de trancher.
+    resultat["clients"]["statut"]["obligatoire"]["proposition"] = "à décider"
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    revue = _importer(chemin, resultat, nb_revues=1)
+    encore, _, entree = appliquer_revue(resultat, revue, chemin, "2026-11-02")
+    assert entree is None
+    assert encore["clients"]["statut"]["obligatoire"]["regle"] == "obligatoire"
+    # Une nouvelle validation de cette proposition reste refusée.
+    _modifier(chemin, "regles", dict(table="interventions", colonne="duree", regle="nature"),
+              statut="valide")
+    with pytest.raises(ValueError, match="ne peut pas être validée"):
+        _importer(chemin, resultat, nb_revues=1)
+
+
+def test_rien_a_valider_sans_liste_proposee(tmp_path):
+    dictionnaire = _dictionnaire()
+    dictionnaire["clients"]["code"]["valeurs"].update(
+        statut="invalide", regle="aucune", proposition="aucune", revu_le=JOUR, commentaire="libre"
+    )
+    chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=1)
+    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="valeurs"), statut="valide")
+    with pytest.raises(ValueError, match="il n'y a rien à valider"):
+        _importer(chemin, dictionnaire, nb_revues=1)
+
+
+def test_regle_en_vigueur_modifiee_dans_le_classeur(tmp_path):
+    chemin = _exporter(tmp_path)
+    _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), regle_en_vigueur="facultatif")
+    assert "regle_en_vigueur 'facultatif' différente du dictionnaire" in _erreur_import(chemin)

@@ -7,7 +7,9 @@ import yaml
 
 from frigeo.dictionnaire import (
     charger_dictionnaire,
+    charger_meta,
     ecrire_dictionnaire,
+    problemes_dictionnaire,
     generer_dictionnaire,
     generer_table,
     proposer_liste,
@@ -660,3 +662,116 @@ def test_regle_valeurs_mal_formee(tmp_path, modification, attendu):
     tables = _dictionnaire_fictif(liste=["A"])
     tables["clients"]["ville"]["valeurs"].update(modification)
     assert attendu in _erreur_chargement(tmp_path, tables)
+
+
+# Cohérence entre statut et règle en vigueur, journal des revues (morceau 4c).
+
+
+@pytest.mark.parametrize(
+    "regle, champs, attendu",
+    [
+        ("obligatoire", dict(statut="invalide"), "au statut invalide, la règle ('obligatoire') doit être « aucune »"),
+        ("obligatoire", dict(statut="valide", regle="à décider"), "au statut valide, la règle ne peut pas être « à décider »"),
+        ("valeurs", dict(statut="valide"), "au statut valide, la règle ne peut pas être « aucune »"),
+        ("nature", dict(statut="documenté", regle="presque texte"), "au statut documenté, la règle ('presque texte') doit être parmi texte, nombre natif"),
+        ("valeurs", dict(statut="documenté"), "statut documenté impossible sur la règle valeurs"),
+    ],
+)
+def test_statut_et_regle_en_vigueur_incoherents(tmp_path, regle, champs, attendu):
+    tables = _dictionnaire_fictif()
+    tables["clients"]["ville"][regle].update(revu_le="2026-10-08", **champs)
+    assert attendu in _erreur_chargement(tmp_path, tables)
+    assert any(attendu in probleme for probleme in problemes_dictionnaire(tables))
+
+
+def test_statut_et_regle_en_vigueur_coherents(tmp_path):
+    tables = _dictionnaire_fictif(liste=["A", "B"])
+    colonne = tables["clients"]["ville"]
+    colonne["obligatoire"].update(statut="invalide", regle="aucune", revu_le="2026-10-08")
+    colonne["nature"].update(statut="documenté", regle="date native", revu_le="2026-10-08")
+    # Liste écartée : la règle ne vaut plus rien, les valeurs restent.
+    colonne["valeurs"].update(statut="invalide", regle="aucune", revu_le="2026-10-08")
+    assert problemes_dictionnaire(tables) == []
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, tables)
+    assert charger_dictionnaire(chemin) == tables
+
+
+def _entree(jour="2026-10-09", classeur="revue.xlsx"):
+    return {
+        "date": jour,
+        "classeur": classeur,
+        "regles_changees": 2,
+        "valeurs_changees": 1,
+        "valeurs_ajoutees": 0,
+        "commentaires_changes": 0,
+    }
+
+
+def test_journal_vide_a_la_generation_et_pour_un_fichier_anterieur(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    meta = charger_meta(chemin)
+    assert (meta["structure"], meta["periode_fin"], meta["revues"]) == (2, "2026-03", [])
+    # Fichier écrit avant le journal : pas de clé « revues ».
+    _ecrire_brut(chemin, _dictionnaire_fictif())
+    assert charger_meta(chemin)["revues"] == []
+
+
+def test_revue_ajoutee_au_journal_sans_toucher_au_reste_de_meta(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    contenu = yaml.safe_load(chemin.read_text(encoding="utf-8"))
+    contenu["meta"]["genere_le"] = "2026-09-30"
+    chemin.write_text(yaml.safe_dump(contenu, allow_unicode=True), encoding="utf-8")
+
+    revu = _dictionnaire_fictif()
+    revu["clients"]["ville"]["obligatoire"].update(statut="valide", revu_le="2026-10-09")
+    ecrire_dictionnaire(revu, "2026-03", chemin, revue=_entree())
+    meta = charger_meta(chemin)
+    # L'application d'un classeur ne régénère rien : la date de génération reste.
+    assert meta["genere_le"] == "2026-09-30"
+    assert meta["revues"] == [_entree()]
+    assert charger_dictionnaire(chemin) == revu
+
+    ecrire_dictionnaire(revu, "2026-03", chemin, ecraser=True, revue=_entree("2026-11-02", "revue2.xlsx"))
+    assert [r["classeur"] for r in charger_meta(chemin)["revues"]] == ["revue.xlsx", "revue2.xlsx"]
+
+
+def test_regeneration_conserve_le_journal(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin, revue=_entree())
+    # Mois suivant : le bloc meta est refait, le journal est repris.
+    ecrire_dictionnaire(_dictionnaire_fictif(liste=["A"]), "2026-04", chemin)
+    meta = charger_meta(chemin)
+    assert meta["periode_fin"] == "2026-04"
+    assert meta["revues"] == [_entree()]
+
+
+def test_revue_refusee_sans_dictionnaire_en_place_ou_pour_une_autre_periode(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    with pytest.raises(ValueError, match="aucun dictionnaire lisible en place"):
+        ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin, revue=_entree())
+    assert not chemin.exists()
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    with pytest.raises(ValueError, match="dictionnaire de la période 2026-03"):
+        ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin, revue=_entree())
+    assert charger_meta(chemin)["revues"] == []
+
+
+def test_journal_mal_forme_refuse(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    mauvaise = {**_entree(jour="09/10/2026"), "valeurs_ajoutees": -1}
+    with pytest.raises(ValueError) as erreur:
+        ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin, revue=mauvaise)
+    assert "date '09/10/2026'" in str(erreur.value)
+    assert "valeurs_ajoutees -1" in str(erreur.value)
+    assert charger_meta(chemin)["revues"] == []
+    # Journal modifié à la main dans le fichier.
+    contenu = yaml.safe_load(chemin.read_text(encoding="utf-8"))
+    contenu["meta"]["revues"] = [{"date": "2026-10-09"}]
+    chemin.write_text(yaml.safe_dump(contenu, allow_unicode=True), encoding="utf-8")
+    with pytest.raises(ValueError, match="journal des revues, entrée 1"):
+        charger_meta(chemin)
