@@ -7,11 +7,13 @@ Ce module ne contient rien de propre à un client.
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import date
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, Protection
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -341,3 +343,240 @@ def exporter_revue(
     chemin.parent.mkdir(parents=True, exist_ok=True)
     classeur.save(chemin)
     return chemin
+
+
+# Statuts admis sur une valeur observée : « documenté » est réservé aux ajouts.
+STATUTS_VALEUR_EXPORTEE = ("observé", "valide", "invalide")
+A_DECIDER = "à décider"
+
+
+class Revue(NamedTuple):
+    """Décisions lues dans un classeur de revue, contrôlées mais pas encore fusionnées."""
+
+    regles: pd.DataFrame
+    valeurs: pd.DataFrame
+    avertissements: list[str]
+
+
+def _choix(valeur) -> str:
+    """Texte d'un statut ou d'une règle retenue, normalisé (NFC, espaces en bord ôtés)."""
+    if valeur is None:
+        return ""
+    return unicodedata.normalize("NFC", str(valeur)).strip()
+
+
+def _commentaire(valeur) -> str:
+    return "" if valeur is None else str(valeur).strip()
+
+
+def _est_vide(valeur) -> bool:
+    return valeur is None or (isinstance(valeur, str) and valeur.strip() == "")
+
+
+def _lire_feuille(classeur, nom: str, colonnes: tuple[str, ...]) -> list[tuple[int, dict]]:
+    """Lignes non vides d'une feuille, avec leur numéro de ligne Excel.
+
+    Lève une ValueError si la feuille manque ou si son en-tête n'est pas celui exporté.
+    """
+    if nom not in classeur.sheetnames:
+        raise ValueError(f"feuille « {nom} » absente")
+    lignes = classeur[nom].iter_rows(values_only=True)
+    entete = tuple(next(lignes, ()))
+    while entete and entete[-1] is None:
+        entete = entete[:-1]
+    if entete != colonnes:
+        raise ValueError(
+            f"feuille « {nom} » : en-tête modifié, attendu {', '.join(colonnes)}"
+        )
+    resultat = []
+    for numero, valeurs in enumerate(lignes, start=2):
+        valeurs = tuple(valeurs[: len(colonnes)]) + (None,) * (len(colonnes) - len(valeurs))
+        if all(_est_vide(valeur) for valeur in valeurs):
+            continue
+        resultat.append((numero, dict(zip(colonnes, valeurs))))
+    return resultat
+
+
+def _controler_regles(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
+    attendues = {
+        (l["table"], l["colonne"], l["regle"]): l["proposition"]
+        for l in lignes_regles(dictionnaire)
+    }
+    decisions, problemes, vues = [], [], set()
+    for numero, ligne in lignes:
+        ou = f"{FEUILLE_REGLES}, ligne {numero}"
+        cle = (ligne["table"], ligne["colonne"], ligne["regle"])
+        if cle not in attendues:
+            problemes.append(f"{ou} : règle inconnue {cle} (classeur périmé ou ligne ajoutée)")
+            continue
+        if cle in vues:
+            problemes.append(f"{ou} : règle {cle} présente plusieurs fois")
+            continue
+        vues.add(cle)
+        proposition = attendues[cle]
+        if ligne["proposition"] != proposition:
+            problemes.append(
+                f"{ou} : proposition {ligne['proposition']!r} différente du dictionnaire "
+                f"({proposition!r}), classeur périmé, à réexporter"
+            )
+        statut = _choix(ligne["statut"])
+        retenue = _choix(ligne["regle_retenue"])
+        commentaire = _commentaire(ligne["commentaire"])
+        regle = ligne["regle"]
+        if statut == "":
+            problemes.append(f"{ou} : statut vide (laisser « observé » si la règle n'est pas revue)")
+        elif statut not in STATUTS:
+            problemes.append(f"{ou} : statut inconnu {statut!r}")
+        elif statut == "valide" and proposition == A_DECIDER:
+            problemes.append(
+                f"{ou} : une proposition « {A_DECIDER} » ne peut pas être validée "
+                "(choisir documenté et une règle retenue)"
+            )
+        elif statut == "invalide" and commentaire == "":
+            problemes.append(f"{ou} : commentaire obligatoire avec le statut invalide")
+        if regle not in REGLES_RETENUES:
+            if statut == "documenté":
+                problemes.append(
+                    f"{ou} : statut documenté impossible sur une liste, ajouter les "
+                    f"valeurs dans la feuille « {FEUILLE_VALEURS} »"
+                )
+            if retenue:
+                problemes.append(f"{ou} : regle_retenue interdite sur une liste")
+        elif statut == "documenté" and retenue == "":
+            problemes.append(f"{ou} : regle_retenue obligatoire avec le statut documenté")
+        elif statut == "documenté" and retenue not in REGLES_RETENUES[regle]:
+            problemes.append(f"{ou} : regle_retenue {retenue!r} hors du menu de la règle {regle}")
+        elif statut != "documenté" and retenue:
+            problemes.append(f"{ou} : regle_retenue réservée au statut documenté")
+        decisions.append(
+            {
+                "table": cle[0],
+                "colonne": cle[1],
+                "regle": regle,
+                "statut": statut,
+                "regle_retenue": retenue or None,
+                "commentaire": commentaire,
+                "ligne_excel": numero,
+            }
+        )
+    for cle in attendues.keys() - vues:
+        problemes.append(f"{FEUILLE_REGLES} : règle {cle} absente du classeur")
+    return decisions, problemes
+
+
+def _controler_valeurs(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
+    exportees = {
+        (l["table"], l["colonne"], l["valeur"]): l["origine"]
+        for l in lignes_valeurs(dictionnaire)
+    }
+    colonnes = {(table, colonne) for table, cols in dictionnaire.items() for colonne in cols}
+    decisions, problemes, vues = [], [], set()
+    for numero, ligne in lignes:
+        ou = f"{FEUILLE_VALEURS}, ligne {numero}"
+        table, colonne, valeur = ligne["table"], ligne["colonne"], ligne["valeur"]
+        statut = _choix(ligne["statut"])
+        ajout = _est_vide(ligne["origine"])
+        cle = (table, colonne, valeur)
+        if ajout:
+            origine = ORIGINE_AJOUT
+            if (table, colonne) not in colonnes:
+                problemes.append(f"{ou} : colonne {table}.{colonne} absente du dictionnaire")
+            if _est_vide(valeur):
+                problemes.append(f"{ou} : valeur vide")
+            elif not isinstance(valeur, str):
+                problemes.append(
+                    f"{ou} : valeur {valeur!r} lue comme {type(valeur).__name__}, "
+                    "la saisir comme texte"
+                )
+            elif cle in exportees or cle in vues:
+                problemes.append(f"{ou} : valeur {valeur!r} déjà présente pour {table}.{colonne}")
+            if statut != "documenté":
+                problemes.append(f"{ou} : une valeur ajoutée doit porter le statut documenté")
+        else:
+            origine = ligne["origine"]
+            if cle not in exportees or exportees[cle] != origine:
+                problemes.append(
+                    f"{ou} : valeur {valeur!r} de {table}.{colonne} inconnue du "
+                    "dictionnaire (classeur périmé ou ligne modifiée)"
+                )
+                continue
+            if cle in vues:
+                problemes.append(f"{ou} : valeur {valeur!r} présente plusieurs fois")
+                continue
+            if statut not in STATUTS_VALEUR_EXPORTEE:
+                problemes.append(
+                    f"{ou} : statut {statut!r} impossible sur une valeur observée "
+                    f"(choisir parmi {', '.join(STATUTS_VALEUR_EXPORTEE)})"
+                )
+        vues.add(cle)
+        decisions.append(
+            {
+                "table": table,
+                "colonne": colonne,
+                "valeur": valeur,
+                "origine": origine,
+                "statut": statut,
+                "commentaire": _commentaire(ligne["commentaire"]),
+                "ligne_excel": numero,
+            }
+        )
+    for cle in exportees.keys() - vues:
+        problemes.append(f"{FEUILLE_VALEURS} : valeur {cle} absente du classeur")
+    return decisions, problemes
+
+
+def _avertissements(regles: list[dict], valeurs: list[dict]) -> list[str]:
+    """Listes écartées dont des valeurs ont pourtant été revues (non bloquant)."""
+    ecartees = {
+        (r["table"], r["colonne"])
+        for r in regles
+        if r["regle"] == "valeurs" and r["statut"] == "invalide"
+    }
+    revues: dict[tuple[str, str], int] = {}
+    for v in valeurs:
+        cle = (v["table"], v["colonne"])
+        if cle in ecartees and v["statut"] in ("valide", "invalide"):
+            revues[cle] = revues.get(cle, 0) + 1
+    return [
+        f"{table}.{colonne} : liste écartée, mais {n} valeurs revues "
+        "(statuts conservés, sans effet tant que la liste est écartée)"
+        for (table, colonne), n in sorted(revues.items())
+    ]
+
+
+def importer_revue(chemin: str | Path, dictionnaire: dict) -> Revue:
+    """Lit un classeur de revue et contrôle chaque décision, sans modifier le dictionnaire.
+
+    `dictionnaire` est le dictionnaire courant : un classeur exporté avant une
+    régénération qui a changé une proposition est refusé (classeur périmé). Tous les
+    problèmes bloquants sont listés en une fois dans une ValueError, avec la feuille et
+    le numéro de ligne Excel. Les avertissements ne bloquent pas l'import.
+    """
+    chemin = Path(chemin)
+    classeur = load_workbook(chemin, read_only=True, data_only=True)
+    try:
+        try:
+            lignes_r = _lire_feuille(classeur, FEUILLE_REGLES, COLONNES_REGLES)
+            lignes_v = _lire_feuille(classeur, FEUILLE_VALEURS, COLONNES_VALEURS)
+        except ValueError as erreur:
+            raise ValueError(f"Classeur de revue invalide ({chemin})\n  {erreur}") from None
+    finally:
+        classeur.close()
+
+    regles, problemes_r = _controler_regles(lignes_r, dictionnaire)
+    valeurs, problemes_v = _controler_valeurs(lignes_v, dictionnaire)
+    problemes = problemes_r + problemes_v
+    if problemes:
+        raise ValueError(
+            f"Classeur de revue invalide ({chemin}), {len(problemes)} problèmes\n  "
+            + "\n  ".join(problemes)
+        )
+    return Revue(
+        pd.DataFrame(regles, columns=[
+            "table", "colonne", "regle", "statut", "regle_retenue", "commentaire", "ligne_excel",
+        ]),
+        pd.DataFrame(valeurs, columns=[
+            "table", "colonne", "valeur", "origine", "statut", "commentaire", "ligne_excel",
+        ]),
+        _avertissements(regles, valeurs),
+    )

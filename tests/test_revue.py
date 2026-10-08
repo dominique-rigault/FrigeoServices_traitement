@@ -9,6 +9,7 @@ from frigeo.revue import (
     COLONNES_VALEURS,
     LIGNES_AJOUT,
     exporter_revue,
+    importer_revue,
     lignes_regles,
     lignes_valeurs,
 )
@@ -150,3 +151,163 @@ def test_export_refuse_d_ecraser_un_classeur_existant(tmp_path):
     with pytest.raises(FileExistsError, match="existe déjà"):
         exporter_revue(_dictionnaire(), "2026-03", chemin)
     exporter_revue(_dictionnaire(), "2026-03", chemin, ecraser=True)
+
+
+def _exporter(tmp_path):
+    return exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx")
+
+
+def _ligne(feuille, **cles):
+    """Numéro de la ligne Excel dont les cellules nommées ont les valeurs données."""
+    entete = [c.value for c in feuille[1]]
+    for ligne in feuille.iter_rows(min_row=2):
+        if all(ligne[entete.index(nom)].value == valeur for nom, valeur in cles.items()):
+            return ligne[0].row
+    raise KeyError(cles)
+
+
+def _modifier(chemin, nom_feuille, ligne, **valeurs):
+    classeur = load_workbook(chemin)
+    feuille = classeur[nom_feuille]
+    entete = [c.value for c in feuille[1]]
+    numero = ligne if isinstance(ligne, int) else _ligne(feuille, **ligne)
+    for nom, valeur in valeurs.items():
+        feuille.cell(row=numero, column=entete.index(nom) + 1).value = valeur
+    classeur.save(chemin)
+
+
+def _erreur_import(chemin):
+    with pytest.raises(ValueError) as erreur:
+        importer_revue(chemin, _dictionnaire())
+    return str(erreur.value)
+
+
+def test_import_sans_modification(tmp_path):
+    revue = importer_revue(_exporter(tmp_path), _dictionnaire())
+    assert len(revue.regles) == 10
+    assert len(revue.valeurs) == 3 + len(PIEGES)
+    assert set(revue.regles["statut"]) == set(revue.valeurs["statut"]) == {"observé"}
+    assert list(revue.valeurs.loc[revue.valeurs["colonne"] == "code", "valeur"]) == PIEGES
+    assert revue.avertissements == []
+
+
+def test_import_des_decisions_du_metier(tmp_path):
+    chemin = _exporter(tmp_path)
+    regle = dict(table="clients", colonne="statut")
+    _modifier(chemin, "regles", dict(regle, regle="obligatoire"), statut="valide")
+    # Statut saisi en forme décomposée, avec une espace en trop : il est normalisé.
+    _modifier(chemin, "regles", dict(regle, regle="nature"), statut=" documenté",
+              regle_retenue="entier (texte)")
+    _modifier(chemin, "regles", dict(regle, regle="valeurs"), statut="invalide",
+              commentaire="clé vers un référentiel")
+    _modifier(chemin, "valeurs", dict(regle, valeur="actif"), statut="invalide")
+    # Ajouts : dans une colonne avec liste et dans une colonne sans liste.
+    fin = 1 + 3 + len(PIEGES)
+    _modifier(chemin, "valeurs", fin + 1, table="clients", colonne="statut",
+              valeur="En sommeil", statut="documenté")
+    _modifier(chemin, "valeurs", fin + 5, table="clients", colonne="type_commerce",
+              valeur="Boulangerie", statut="documenté", commentaire="chapitre 4")
+
+    revue = importer_revue(chemin, _dictionnaire())
+    regles = revue.regles.set_index(["colonne", "regle"])
+    assert regles.loc[("statut", "obligatoire"), "statut"] == "valide"
+    assert regles.loc[("statut", "nature"), "statut"] == "documenté"
+    assert regles.loc[("statut", "nature"), "regle_retenue"] == "entier (texte)"
+    ajouts = revue.valeurs[revue.valeurs["origine"] == "ajoutée"]
+    assert list(ajouts["valeur"]) == ["En sommeil", "Boulangerie"]
+    assert list(ajouts["ligne_excel"]) == [fin + 1, fin + 5]
+    assert revue.avertissements == [
+        "clients.statut : liste écartée, mais 1 valeurs revues "
+        "(statuts conservés, sans effet tant que la liste est écartée)"
+    ]
+
+
+def test_problemes_de_la_feuille_regles_listes_en_une_fois(tmp_path):
+    chemin = _exporter(tmp_path)
+    statut = dict(table="clients", colonne="statut")
+    duree = dict(table="interventions", colonne="duree")
+    _modifier(chemin, "regles", dict(statut, regle="obligatoire"), statut=None)
+    _modifier(chemin, "regles", dict(statut, regle="nature"), statut="ok")
+    _modifier(chemin, "regles", dict(duree, regle="obligatoire"), statut="valide")
+    _modifier(chemin, "regles", dict(duree, regle="nature"), statut="documenté")
+    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="obligatoire"),
+              statut="documenté", regle_retenue="presque toujours vide")
+    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="nature"),
+              statut="valide", regle_retenue="texte")
+    _modifier(chemin, "regles", dict(statut, regle="valeurs"), statut="invalide")
+    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="valeurs"),
+              statut="documenté")
+    classeur = load_workbook(chemin)
+    feuille = classeur["regles"]
+    feuille.delete_rows(_ligne(feuille, table="clients", colonne="type_commerce", regle="nature"))
+    classeur.save(chemin)
+
+    message = _erreur_import(chemin)
+    assert "9 problèmes" in message
+    for attendu in (
+        "statut vide",
+        "statut inconnu 'ok'",
+        "ne peut pas être validée",
+        "regle_retenue obligatoire avec le statut documenté",
+        "'presque toujours vide' hors du menu",
+        "regle_retenue réservée au statut documenté",
+        "commentaire obligatoire avec le statut invalide",
+        "statut documenté impossible sur une liste",
+        "('clients', 'type_commerce', 'nature') absente du classeur",
+    ):
+        assert attendu in message
+    assert "regles, ligne " in message
+
+
+def test_classeur_perime_refuse(tmp_path):
+    chemin = _exporter(tmp_path)
+    dictionnaire = _dictionnaire()
+    dictionnaire["clients"]["statut"]["obligatoire"]["regle"] = "facultatif"
+    dictionnaire["clients"]["statut"]["valeurs"]["regle"].append("Radié")
+    with pytest.raises(ValueError) as erreur:
+        importer_revue(chemin, dictionnaire)
+    message = str(erreur.value)
+    assert "classeur périmé, à réexporter" in message
+    assert "('clients', 'statut', 'Radié') absente du classeur" in message
+
+
+def test_problemes_de_la_feuille_valeurs(tmp_path):
+    chemin = _exporter(tmp_path)
+    fin = 1 + 3 + len(PIEGES)
+    _modifier(chemin, "valeurs", dict(table="clients", colonne="statut", valeur="Actif"),
+              statut="documenté")
+    _modifier(chemin, "valeurs", fin + 1, table="clients", colonne="statut",
+              valeur="Archivé", statut="valide")
+    _modifier(chemin, "valeurs", fin + 2, table="clients", colonne="inconnue",
+              valeur="X", statut="documenté")
+    _modifier(chemin, "valeurs", fin + 3, table="clients", colonne="statut",
+              valeur="Inactif", statut="documenté")
+    _modifier(chemin, "valeurs", fin + 4, table="clients", colonne="code",
+              valeur=27, statut="documenté")
+    _modifier(chemin, "valeurs", fin + 5, table="clients", colonne="statut",
+              statut="documenté")
+    message = _erreur_import(chemin)
+    assert "6 problèmes" in message
+    for attendu in (
+        "statut 'documenté' impossible sur une valeur observée",
+        "une valeur ajoutée doit porter le statut documenté",
+        "colonne clients.inconnue absente du dictionnaire",
+        "valeur 'Inactif' déjà présente pour clients.statut",
+        "valeur 27 lue comme int",
+        "valeur vide",
+    ):
+        assert attendu in message
+
+
+@pytest.mark.parametrize("cas", ["feuille", "entete"])
+def test_structure_modifiee_refusee(tmp_path, cas):
+    chemin = _exporter(tmp_path)
+    classeur = load_workbook(chemin)
+    if cas == "feuille":
+        classeur["valeurs"].title = "Valeurs"
+        attendu = "feuille « valeurs » absente"
+    else:
+        classeur["regles"]["D1"] = "proposée"
+        attendu = "en-tête modifié"
+    classeur.save(chemin)
+    assert attendu in _erreur_import(chemin)
