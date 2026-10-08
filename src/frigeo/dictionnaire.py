@@ -14,7 +14,7 @@ import numbers
 import os
 import unicodedata
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 
 import pandas as pd
@@ -475,12 +475,54 @@ def _statut_normalise(statut):
     return unicodedata.normalize("NFC", statut) if isinstance(statut, str) else statut
 
 
-def _est_date_iso(valeur) -> bool:
-    """Vrai pour un texte 'AAAA-MM-JJ' qui désigne une date réelle."""
-    try:
-        return date.fromisoformat(valeur).isoformat() == valeur
-    except (TypeError, ValueError):
-        return False
+# Horodatage d'une décision (`revu_le`) et d'une entrée du journal (`date`), à
+# l'heure locale du poste. Une date seule, écrite avant le morceau 4d, reste lisible
+# et vaut minuit ce jour-là.
+FORMAT_INSTANT = "%Y-%m-%d %H:%M:%S"
+_FORMAT_JOUR = "%Y-%m-%d"
+_ATTENDU_INSTANT = "une date et une heure 'AAAA-MM-JJ HH:MM:SS' entre guillemets sont attendues"
+
+
+def _maintenant() -> datetime:
+    return datetime.now().replace(microsecond=0)
+
+
+def lire_instant(valeur) -> datetime | None:
+    """Instant désigné par un texte 'AAAA-MM-JJ HH:MM:SS' ou 'AAAA-MM-JJ', sinon None.
+
+    Seule l'écriture exacte est admise ('2026-3-1' ou '2026-03-01T10:00:00' sont
+    refusés), pour que l'ordre des textes soit celui des instants.
+    """
+    if not isinstance(valeur, str):
+        return None
+    for forme in (FORMAT_INSTANT, _FORMAT_JOUR):
+        try:
+            instant = datetime.strptime(valeur, forme)
+        except ValueError:
+            continue
+        if instant.strftime(forme) == valeur:
+            return instant
+    return None
+
+
+def horodater(instant: datetime | date | str | None = None) -> str:
+    """Texte 'AAAA-MM-JJ HH:MM:SS' d'un instant, maintenant par défaut.
+
+    `instant` peut être un `datetime`, une `date` (minuit ce jour-là) ou un texte déjà
+    à l'un des deux formats lus par `lire_instant`.
+    """
+    if instant is None:
+        instant = _maintenant()
+    elif isinstance(instant, str):
+        lu = lire_instant(instant)
+        if lu is None:
+            raise ValueError(f"Instant {instant!r} : {_ATTENDU_INSTANT}")
+        instant = lu
+    elif not isinstance(instant, datetime):
+        if not isinstance(instant, date):
+            raise ValueError(f"Instant {_decrire(instant)} : {_ATTENDU_INSTANT}")
+        instant = datetime(instant.year, instant.month, instant.day)
+    return instant.strftime(FORMAT_INSTANT)
 
 
 def _problemes_journal(revues) -> list[str]:
@@ -493,11 +535,8 @@ def _problemes_journal(revues) -> list[str]:
         if not isinstance(entree, dict) or set(entree) != set(CHAMPS_REVUE):
             problemes.append(f"{ou} : champs attendus {', '.join(CHAMPS_REVUE)}")
             continue
-        if not _est_date_iso(entree["date"]):
-            problemes.append(
-                f"{ou} : date {_decrire(entree['date'])}, une date 'AAAA-MM-JJ' entre "
-                "guillemets est attendue"
-            )
+        if lire_instant(entree["date"]) is None:
+            problemes.append(f"{ou} : date {_decrire(entree['date'])}, {_ATTENDU_INSTANT}")
         if not isinstance(entree["classeur"], str) or entree["classeur"].strip() == "":
             problemes.append(f"{ou} : nom de classeur {_decrire(entree['classeur'])}")
         for champ in CHAMPS_REVUE[2:]:
@@ -522,11 +561,8 @@ def _problemes_decision(ou: str, element: dict) -> list[str]:
             problemes.append(
                 f"{ou} : statut {element['statut']} sans date de revue (revu_le)"
             )
-    elif not _est_date_iso(revu_le):
-        problemes.append(
-            f"{ou} : revu_le {_decrire(revu_le)}, une date 'AAAA-MM-JJ' entre "
-            "guillemets est attendue"
-        )
+    elif lire_instant(revu_le) is None:
+        problemes.append(f"{ou} : revu_le {_decrire(revu_le)}, {_ATTENDU_INSTANT}")
     return problemes
 
 
@@ -729,6 +765,127 @@ def charger_meta(chemin: str | Path | None = None) -> dict:
     return meta
 
 
+DOSSIER_SAUVEGARDES = "sauvegardes"
+
+
+def dossier_sauvegardes(chemin: str | Path | None = None) -> Path:
+    """Dossier des copies datées du dictionnaire : `sauvegardes/`, à côté du fichier."""
+    chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
+    return chemin.parent / DOSSIER_SAUVEGARDES
+
+
+def _sauvegarder(chemin: Path, periode: str) -> Path:
+    """Copie le fichier en place, octet pour octet, sous un nom daté à la seconde.
+
+    Une copie n'est jamais écrasée : si le nom existe déjà, rien n'est écrit.
+    """
+    copie = dossier_sauvegardes(chemin) / (
+        f"{chemin.stem}_{periode}_{_maintenant():%Y-%m-%d_%H%M%S}{chemin.suffix}"
+    )
+    copie.parent.mkdir(parents=True, exist_ok=True)
+    contenu = chemin.read_bytes()
+    try:
+        with open(copie, "xb") as flux:
+            flux.write(contenu)
+    except FileExistsError:
+        raise FileExistsError(
+            f"{copie} existe déjà : rien n'est écrit, pour ne pas écraser une copie de "
+            "sauvegarde (relancer l'écriture)"
+        ) from None
+    if copie.read_bytes() != contenu:
+        copie.unlink(missing_ok=True)
+        raise RuntimeError(f"La copie de sauvegarde {copie} diffère de {chemin}")
+    return copie
+
+
+def _elements(tables: dict):
+    """Chaque règle et chaque valeur, avec sa clé (table, colonne, règle, valeur).
+
+    La valeur de la clé est None pour une règle.
+    """
+    for table, colonnes in tables.items():
+        for colonne, regles in colonnes.items():
+            for nom, regle in regles.items():
+                yield (table, colonne, nom, None), regle
+                for element in regle.get("liste", ()):
+                    yield (table, colonne, nom, element["valeur"]), element
+
+
+def _nommer(cle: tuple) -> str:
+    table, colonne, nom, valeur = cle
+    if valeur is None:
+        return f"{table}.{colonne}, règle {nom}"
+    return f"{table}.{colonne}, valeur {valeur!r}"
+
+
+def _ecarts_de_decision(en_place: dict, tables: dict, revue: dict | None) -> list[str]:
+    """Décisions de revue que l'écriture de `tables` ferait perdre ou changer à tort.
+
+    Une ligne par règle ou valeur concernée.
+
+    Une décision est le statut d'une règle ou d'une valeur revue, avec sa règle en
+    vigueur (règle) ou son remplacement (valeur), son commentaire et sa date.
+
+    Sans `revue` (régénération), aucune décision ne bouge : chacune se retrouve à
+    l'identique, et aucune n'apparaît.
+
+    Avec `revue` (entrée de journal d'un classeur appliqué), une décision peut
+    changer ou apparaître si sa date `revu_le` est celle de l'entrée, postérieure à
+    l'ancienne. Une décision peut aussi être annulée (retour à « observé ») et une
+    valeur retirée. Un commentaire peut changer seul, sans toucher à la date.
+    """
+    anciens, nouveaux = dict(_elements(en_place)), dict(_elements(tables))
+    instant = lire_instant(revue["date"]) if revue is not None else None
+    ecarts = []
+    for cle in [*anciens, *(c for c in nouveaux if c not in anciens)]:
+        ancien, nouveau = anciens.get(cle), nouveaux.get(cle)
+        avant = ancien is not None and ancien["statut"] != STATUT_INITIAL
+        apres = nouveau is not None and nouveau["statut"] != STATUT_INITIAL
+        if not avant and not apres:
+            continue
+        ou = _nommer(cle)
+        objet = "regle" if cle[3] is None else "remplacement"
+        if revue is None:
+            if not avant:
+                ecarts.append(
+                    f"{ou} : décision ({nouveau['statut']}) absente du fichier en place"
+                )
+            elif nouveau is None:
+                ecarts.append(f"{ou} : décision ({ancien['statut']}) absente")
+            else:
+                changes = ", ".join(
+                    f"{champ} {ancien[champ]!r} devenu {nouveau[champ]!r}"
+                    for champ in ("statut", objet, "commentaire", "revu_le")
+                    if ancien[champ] != nouveau[champ]
+                )
+                if changes:
+                    ecarts.append(f"{ou} : {changes}")
+            continue
+        if not apres:
+            # Décision annulée ou valeur retirée : admis, tant que la colonne reste.
+            if cle[:3] + (None,) not in nouveaux:
+                ecarts.append(f"{ou} : décision ({ancien['statut']}) absente")
+            continue
+        if avant and all(ancien[champ] == nouveau[champ] for champ in ("statut", objet)):
+            if ancien["revu_le"] != nouveau["revu_le"]:
+                ecarts.append(
+                    f"{ou} : revu_le {ancien['revu_le']!r} devenu {nouveau['revu_le']!r} "
+                    "sans changement de décision"
+                )
+            continue
+        if lire_instant(nouveau["revu_le"]) != instant:
+            ecarts.append(
+                f"{ou} : décision changée, mais sa date ({nouveau['revu_le']}) n'est "
+                f"pas celle de la revue ({revue['date']})"
+            )
+        elif avant and lire_instant(ancien["revu_le"]) >= instant:
+            ecarts.append(
+                f"{ou} : décision du {ancien['revu_le']}, la revue ({revue['date']}) "
+                "doit lui être postérieure"
+            )
+    return ecarts
+
+
 def ecrire_dictionnaire(
     dictionnaire: dict,
     periode_fin: str,
@@ -737,41 +894,65 @@ def ecrire_dictionnaire(
     ecraser: bool = False,
     revue: dict | None = None,
 ) -> Path:
-    """Écrit le dictionnaire en YAML et vérifie l'écriture par une relecture.
+    """Écrit le dictionnaire en YAML, sans jamais perdre une décision de revue.
 
-    Sans `ecraser=True`, refuse de remplacer un fichier illisible ou qui porte au
-    moins une décision de revue (règle ou valeur à un statut autre que « observé »). Le
-    fichier n'est remplacé qu'une fois la relecture identique au dictionnaire fourni.
+    Le dictionnaire fourni est contrôlé avant toute écriture, puis écrit dans un
+    fichier provisoire relu et comparé. Le fichier en place n'est remplacé qu'ensuite.
 
-    Le journal des revues du fichier en place est toujours conservé. `revue` est
-    l'entrée rendue par `appliquer_revue` : elle est ajoutée au journal, et le reste
-    du bloc `meta` (période, date de génération, seuils) est alors repris du fichier
-    en place, puisque l'application d'un classeur ne régénère rien.
+    Protection des décisions du fichier en place (voir `_ecarts_de_decision`). Sans
+    `revue`, l'écriture est refusée si une décision disparaît, change ou apparaît :
+    un dictionnaire fraîchement généré est refusé, le résultat de `fusionner` passe.
+    Avec `revue`, l'entrée rendue par `appliquer_revue`, seules les décisions datées
+    de cette entrée peuvent changer, et l'entrée doit être postérieure à la dernière
+    du journal. Tous les écarts sont listés en une fois.
+
+    Copie datée : un fichier en place qui porte au moins une décision, ou un journal
+    non vide, est d'abord copié à l'identique dans `sauvegardes/`, à côté de lui,
+    sous le nom `<fichier>_<période>_<AAAA-MM-JJ>_<HHMMSS>.yaml`. Si la copie échoue,
+    rien n'est remplacé. Les copies ne sont jamais supprimées par le code.
+
+    `ecraser` ne sert que pour un fichier en place illisible (YAML invalide, autre
+    structure, contrôles en échec), qui porte peut-être des décisions : sans
+    `ecraser=True` il n'est pas remplacé; avec, il est copié puis remplacé, et son
+    journal est perdu.
+
+    Le journal des revues du fichier en place est toujours conservé. Avec `revue`,
+    l'entrée y est ajoutée et le reste du bloc `meta` (période, date de génération,
+    seuils) est repris du fichier en place, puisque l'application d'un classeur ne
+    régénère rien.
     """
     chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
     tables = _natif(dictionnaire)
-
-    if chemin.exists() and not ecraser:
-        revues = sum(
-            element["statut"] != STATUT_INITIAL
-            for colonnes in charger_dictionnaire(chemin).values()
-            for regles in colonnes.values()
-            for regle in regles.values()
-            for element in (regle, *regle.get("liste", ()))
+    problemes = _verifier_et_normaliser({"tables": tables})
+    if problemes:
+        raise ValueError(
+            "Dictionnaire invalide, rien n'est écrit\n  " + "\n  ".join(problemes)
         )
-        if revues:
-            raise FileExistsError(
-                f"{chemin} porte {revues} décisions de revue : écriture refusée "
-                "(ecraser=True pour forcer)"
-            )
 
-    en_place = None
+    en_place = tables_en_place = None
+    a_copier = None
     if chemin.exists():
         try:
+            tables_en_place = charger_dictionnaire(chemin)
             en_place = charger_meta(chemin)
-        except (ValueError, yaml.YAMLError):
-            # Fichier illisible, remplacé avec ecraser=True : son journal est perdu.
-            en_place = None
+        except (ValueError, yaml.YAMLError) as erreur:
+            if not ecraser:
+                raise ValueError(
+                    f"{chemin} est illisible : il n'est pas remplacé, car il porte "
+                    "peut-être des décisions de revue. Avec ecraser=True, il est copié "
+                    f"dans {dossier_sauvegardes(chemin)} puis remplacé.\n  {erreur}"
+                ) from None
+            en_place = tables_en_place = None
+            a_copier = "illisible"
+        else:
+            porte_decision = any(
+                element["statut"] != STATUT_INITIAL
+                for _, element in _elements(tables_en_place)
+            )
+            if porte_decision or en_place["revues"]:
+                periode = en_place.get("periode_fin")
+                a_copier = periode if lire_instant(f"{periode}-01") else "periode_inconnue"
+
     meta = _meta(periode_fin)
     if revue is not None:
         if en_place is None:
@@ -784,13 +965,34 @@ def ecrire_dictionnaire(
                 f"{chemin} : dictionnaire de la période {en_place.get('periode_fin')}, "
                 f"revue appliquée pour la période {periode_fin}"
             )
-        meta = en_place
-    meta["revues"] = _natif(
-        (en_place["revues"] if en_place else []) + ([revue] if revue is not None else [])
-    )
+        meta = dict(en_place)
+    journal = list(en_place["revues"]) if en_place else []
+    meta["revues"] = _natif(journal + ([revue] if revue is not None else []))
     problemes = _problemes_journal(meta["revues"])
     if problemes:
         raise ValueError("Journal des revues invalide\n  " + "\n  ".join(problemes))
+    if revue is not None and journal:
+        derniere = journal[-1]["date"]
+        if lire_instant(revue["date"]) <= lire_instant(derniere):
+            raise ValueError(
+                f"{chemin} : la revue ({revue['date']}) doit être postérieure à la "
+                f"dernière revue du journal ({derniere})"
+            )
+
+    if tables_en_place is not None:
+        ecarts = _ecarts_de_decision(tables_en_place, tables, revue)
+        if ecarts:
+            conseil = (
+                "Seules les décisions datées de la revue peuvent changer."
+                if revue is not None
+                else "Une régénération se fusionne d'abord avec le dictionnaire en "
+                "place (fusionner), et une décision ne change que par un classeur de "
+                "revue (revue=)."
+            )
+            raise ValueError(
+                f"{chemin} : écriture refusée, {len(ecarts)} décisions de revue "
+                f"seraient perdues ou modifiées. {conseil}\n  " + "\n  ".join(ecarts)
+            )
 
     chemin.parent.mkdir(parents=True, exist_ok=True)
     provisoire = chemin.with_name(chemin.name + ".tmp")
@@ -806,6 +1008,8 @@ def ecrire_dictionnaire(
             )
         if charger_dictionnaire(provisoire) != tables or charger_meta(provisoire) != meta:
             raise RuntimeError("La relecture du dictionnaire écrit diffère de l'original")
+        if a_copier is not None:
+            _sauvegarder(chemin, a_copier)
         os.replace(provisoire, chemin)
     finally:
         provisoire.unlink(missing_ok=True)

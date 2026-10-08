@@ -2,7 +2,14 @@
 
 from copy import deepcopy
 
-from frigeo.dictionnaire import charger_dictionnaire, ecrire_dictionnaire
+import pytest
+
+from frigeo.dictionnaire import (
+    charger_dictionnaire,
+    charger_meta,
+    dossier_sauvegardes,
+    ecrire_dictionnaire,
+)
 from frigeo.fusion import fusionner
 
 DATE = "2026-10-08"
@@ -309,3 +316,36 @@ def test_le_dictionnaire_fusionne_passe_les_controles_du_fichier(tmp_path):
     fusion, _ = fusionner(existant, regenere)
     chemin = ecrire_dictionnaire(fusion, "2026-04", tmp_path / "dictionnaire.yaml")
     assert charger_dictionnaire(chemin) == fusion
+
+
+def test_la_fusion_remplace_le_dictionnaire_revu_la_regeneration_seule_non(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    existant, regenere = _genere(), _genere()
+    _decider(_valeurs(existant)["Actif"], "valide")
+    _decider(existant["clients"]["ville"]["obligatoire"], "valide", commentaire="confirmé")
+    ecrire_dictionnaire(existant, "2026-03", chemin)
+    avant = chemin.read_bytes()
+    # Mois suivant : la proposition change et une valeur n'est plus observée.
+    del regenere["clients"]["statut"]["valeurs"]["liste"][0]
+    regenere["clients"]["ville"]["obligatoire"] = _regle("facultatif")
+
+    with pytest.raises(ValueError, match="écriture refusée, 2 décisions") as erreur:
+        ecrire_dictionnaire(regenere, "2026-04", chemin)
+    assert str(erreur.value).splitlines()[1:] == [
+        "  clients.statut, valeur 'Actif' : décision (valide) absente",
+        (
+            "  clients.ville, règle obligatoire : statut 'valide' devenu 'observé', regle "
+            "'obligatoire' devenu 'facultatif', commentaire 'confirmé' devenu '', revu_le "
+            "'2026-10-08' devenu None"
+        ),
+    ]
+    assert chemin.read_bytes() == avant
+    assert not dossier_sauvegardes(chemin).exists()
+
+    fusion, _ = fusionner(existant, regenere)
+    ecrire_dictionnaire(fusion, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == fusion
+    assert charger_meta(chemin)["periode_fin"] == "2026-04"
+    copies = list(dossier_sauvegardes(chemin).iterdir())
+    assert len(copies) == 1 and copies[0].name.startswith("dictionnaire_2026-03_")
+    assert copies[0].read_bytes() == avant

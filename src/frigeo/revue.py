@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import unicodedata
 from copy import deepcopy
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path, PureWindowsPath
 from typing import NamedTuple
 
@@ -32,6 +32,7 @@ from .dictionnaire import (
     STATUTS,
     STATUTS_CIBLE,
     STATUTS_VALEUR_OBSERVEE,
+    horodater,
     problemes_dictionnaire,
 )
 
@@ -714,21 +715,22 @@ def appliquer_revue(
     dictionnaire: dict,
     revue: Revue,
     classeur: str | Path,
-    jour: date | str | None = None,
+    instant: datetime | str | None = None,
 ) -> tuple[dict, pd.DataFrame, dict | None]:
     """Applique au dictionnaire les décisions d'un classeur importé.
 
     `revue` est le résultat de `importer_revue` pour ce même dictionnaire, `classeur`
-    le chemin du classeur (seul son nom est gardé au journal) et `jour` la date de
-    l'application (aujourd'hui par défaut). Rien n'est modifié ni écrit : la
-    fonction rend le dictionnaire mis à jour, le rapport des changements (une ligne
-    par règle ou valeur touchée) et l'entrée à ajouter au journal des revues par
-    `ecrire_dictionnaire(..., revue=entree)`. Sans aucun changement, l'entrée est
-    None et il n'y a rien à écrire.
+    le chemin du classeur (seul son nom est gardé au journal) et `instant` la date et
+    l'heure de l'application (maintenant par défaut, voir `horodater`). Rien n'est
+    modifié ni écrit : la fonction rend le dictionnaire mis à jour, le rapport des
+    changements (une ligne par règle ou valeur touchée) et l'entrée à ajouter au
+    journal des revues par `ecrire_dictionnaire(..., revue=entree)`. Sans aucun
+    changement, l'entrée est None et il n'y a rien à écrire.
 
     Le classeur fait foi pour chacune de ses lignes. Une décision change quand le
     statut, la règle retenue ou le remplacement change : la date `revu_le` prend
-    alors `jour`. Un commentaire modifié seul est enregistré sans toucher à la date.
+    alors `instant`, au format 'AAAA-MM-JJ HH:MM:SS'. Un commentaire modifié seul est
+    enregistré sans toucher à la date.
 
     Règle : « valide » adopte la proposition du moment, « documenté » la règle
     retenue, « invalide » ne laisse aucune règle, et le retour à « observé » rend la
@@ -740,9 +742,7 @@ def appliquer_revue(
     effectif est nul; sinon elle redevient une valeur observée, à arbitrer si elle
     avait été ajoutée.
     """
-    if jour is None:
-        jour = date.today()
-    jour = jour.isoformat() if isinstance(jour, date) else date.fromisoformat(jour).isoformat()
+    jour = horodater(instant)
     resultat = deepcopy(dictionnaire)
     evenements = []
     compte = {

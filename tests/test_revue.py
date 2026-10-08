@@ -5,7 +5,13 @@ from copy import deepcopy
 import pytest
 from openpyxl import load_workbook
 
-from frigeo.dictionnaire import charger_dictionnaire, charger_meta, ecrire_dictionnaire
+from frigeo.dictionnaire import (
+    charger_dictionnaire,
+    charger_meta,
+    dossier_sauvegardes,
+    ecrire_dictionnaire,
+    lire_instant,
+)
 from frigeo.revue import (
     COLONNES_RAPPORT_REVUE,
     COLONNES_REGLES,
@@ -345,7 +351,7 @@ def test_structure_modifiee_refusee(tmp_path, cas):
 
 # Décisions enregistrées, remplacements, classeur périmé et application (morceau 4c).
 
-JOUR = "2026-10-09"
+JOUR = "2026-10-09 10:15:00"
 STATUT = dict(table="clients", colonne="statut")
 FIN = 1 + 3 + len(PIEGES)  # dernière ligne exportée de la feuille des valeurs
 
@@ -535,7 +541,7 @@ def test_classeur_reexporte_sans_modification_ne_change_rien(tmp_path):
     resultat, _, _ = _apres_premiere_revue(tmp_path)
     chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
     revue = _importer(chemin, resultat, nb_revues=1)
-    encore, rapport, entree = appliquer_revue(resultat, revue, chemin, "2026-11-02")
+    encore, rapport, entree = appliquer_revue(resultat, revue, chemin, "2026-11-02 09:00:00")
     assert encore == resultat
     assert entree is None and rapport.empty
 
@@ -555,7 +561,7 @@ def test_deuxieme_revue_modifie_annule_et_retire(tmp_path):
     # Remplacement retiré, valeur ajoutée retirée.
     _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), remplacement=None)
     _modifier(chemin, "valeurs", dict(STATUT, valeur="En sommeil"), statut="observé")
-    second = "2026-11-02"
+    second = "2026-11-02 09:00:00"
     revue = _importer(chemin, resultat, nb_revues=1)
     final, rapport, entree = appliquer_revue(resultat, revue, "C:\\Users\\x\\revue2.xlsx", second)
 
@@ -601,7 +607,7 @@ def test_retour_a_observe_selon_l_effectif(tmp_path):
     _modifier(chemin, "valeurs", dict(STATUT, valeur="En sommeil"), statut="observé")
     _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), statut="observé")
     revue = _importer(chemin, dictionnaire, nb_revues=1)
-    resultat, rapport, entree = appliquer_revue(dictionnaire, revue, chemin, "2026-11-02")
+    resultat, rapport, entree = appliquer_revue(dictionnaire, revue, chemin, "2026-11-02 09:00:00")
     sommeil = _element(resultat, "En sommeil")
     assert (sommeil["origine"], sommeil["statut"], sommeil["effectif"], sommeil["revu_le"]) == (
         "à arbitrer", "observé", 4, None,
@@ -671,7 +677,7 @@ def test_regle_validee_conservee_quand_la_proposition_change(tmp_path):
     resultat["clients"]["statut"]["obligatoire"]["proposition"] = "à décider"
     chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
     revue = _importer(chemin, resultat, nb_revues=1)
-    encore, _, entree = appliquer_revue(resultat, revue, chemin, "2026-11-02")
+    encore, _, entree = appliquer_revue(resultat, revue, chemin, "2026-11-02 09:00:00")
     assert entree is None
     assert encore["clients"]["statut"]["obligatoire"]["regle"] == "obligatoire"
     # Une nouvelle validation de cette proposition reste refusée.
@@ -696,3 +702,60 @@ def test_regle_en_vigueur_modifiee_dans_le_classeur(tmp_path):
     chemin = _exporter(tmp_path)
     _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), regle_en_vigueur="facultatif")
     assert "regle_en_vigueur 'facultatif' différente du dictionnaire" in _erreur_import(chemin)
+
+
+# Horodatage des décisions et protection à l'écriture (morceau 4d).
+
+
+def test_instant_de_l_application(tmp_path):
+    chemin = _exporter(tmp_path)
+    _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), statut="valide")
+    revue = _importer(chemin)
+    # Par défaut, l'instant présent, à la seconde.
+    resultat, _, entree = appliquer_revue(_dictionnaire(), revue, chemin)
+    assert len(entree["date"]) == 19 and lire_instant(entree["date"]) is not None
+    assert resultat["clients"]["statut"]["obligatoire"]["revu_le"] == entree["date"]
+    # Une date seule vaut minuit ce jour-là.
+    _, _, entree = appliquer_revue(_dictionnaire(), revue, chemin, "2026-11-02")
+    assert entree["date"] == "2026-11-02 00:00:00"
+    with pytest.raises(ValueError, match="02/11/2026"):
+        appliquer_revue(_dictionnaire(), revue, chemin, "02/11/2026")
+
+
+def test_deux_revues_ecrites_puis_regeneration_refusee(tmp_path):
+    fichier = tmp_path / "config" / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire(), "2026-03", fichier)
+    resultat, _, entree = _apres_premiere_revue(tmp_path)
+    ecrire_dictionnaire(resultat, "2026-03", fichier, revue=entree)
+    # Rien à protéger avant la première revue : aucune copie.
+    assert not dossier_sauvegardes(fichier).exists()
+    apres_premiere = fichier.read_bytes()
+
+    # Seconde revue : décision annulée, règle retenue changée, valeur ajoutée retirée.
+    classeur = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    _modifier(classeur, "regles", dict(STATUT, regle="nature"), statut="observé",
+              regle_retenue=None, commentaire=None)
+    _modifier(classeur, "regles", dict(table="interventions", colonne="duree", regle="obligatoire"),
+              regle_retenue="obligatoire")
+    _modifier(classeur, "regles", dict(STATUT, regle="obligatoire"), commentaire="confirmé")
+    _modifier(classeur, "valeurs", dict(STATUT, valeur="En sommeil"), statut="observé")
+    revue = _importer(classeur, resultat, nb_revues=1)
+    # Un classeur appliqué à une heure antérieure à la dernière revue est refusé.
+    final, _, ancienne = appliquer_revue(resultat, revue, classeur, "2026-10-09 10:14:59")
+    with pytest.raises(ValueError, match="doit être postérieure à la dernière revue"):
+        ecrire_dictionnaire(final, "2026-03", fichier, revue=ancienne)
+    # Le même jour, une heure plus tard, il passe.
+    final, _, seconde = appliquer_revue(resultat, revue, classeur, "2026-10-09 11:15:00")
+    ecrire_dictionnaire(final, "2026-03", fichier, revue=seconde)
+    assert charger_dictionnaire(fichier) == final
+    assert charger_meta(fichier)["revues"] == [entree, seconde]
+    copies = list(dossier_sauvegardes(fichier).iterdir())
+    assert len(copies) == 1 and copies[0].read_bytes() == apres_premiere
+
+    # Un dictionnaire fraîchement généré ne remplace pas le dictionnaire revu.
+    with pytest.raises(ValueError, match="écriture refusée") as erreur:
+        ecrire_dictionnaire(_dictionnaire(), "2026-04", fichier)
+    message = str(erreur.value)
+    assert "clients.statut, valeur 'actif' : statut 'invalide' devenu 'observé'" in message
+    assert "clients.type_commerce, valeur 'Boulangerie' : décision (documenté) absente" in message
+    assert charger_dictionnaire(fichier) == final

@@ -1,5 +1,8 @@
 """Tests de la génération, du contrôle et de l'écriture du dictionnaire (frigeo.dictionnaire)."""
 
+from copy import deepcopy
+from datetime import date, datetime
+
 import numpy as np
 import pandas as pd
 import pytest
@@ -8,7 +11,10 @@ import yaml
 from frigeo.dictionnaire import (
     charger_dictionnaire,
     charger_meta,
+    dossier_sauvegardes,
     ecrire_dictionnaire,
+    horodater,
+    lire_instant,
     problemes_dictionnaire,
     generer_dictionnaire,
     generer_table,
@@ -424,7 +430,7 @@ def test_aller_retour_des_valeurs_que_yaml_pourrait_deformer(tmp_path):
     dictionnaire = _dictionnaire_fictif(liste=pieges)
     # Une date de revue ressemble à une date pour YAML : elle doit rester un texte.
     dictionnaire["clients"]["ville"]["valeurs"]["liste"][0].update(
-        statut="invalide", revu_le="2026-10-08", commentaire="non: prévu"
+        statut="invalide", revu_le="2026-10-08 21:45:03", commentaire="non: prévu"
     )
     ecrire_dictionnaire(dictionnaire, "2026-03", chemin)
     relu = charger_dictionnaire(chemin)
@@ -432,7 +438,7 @@ def test_aller_retour_des_valeurs_que_yaml_pourrait_deformer(tmp_path):
     liste = relu["clients"]["ville"]["valeurs"]["liste"]
     assert [element["valeur"] for element in liste] == pieges
     assert all(isinstance(element["valeur"], str) for element in liste)
-    assert liste[0]["revu_le"] == "2026-10-08"
+    assert liste[0]["revu_le"] == "2026-10-08 21:45:03"
 
 
 def test_les_types_numpy_sont_convertis_en_types_natifs(tmp_path):
@@ -467,11 +473,20 @@ def test_fichier_a_l_ancienne_structure_refuse(tmp_path):
         charger_dictionnaire(chemin)
     # Un seul message, sans la liste des écarts règle par règle.
     assert "\n" not in str(erreur.value)
-    # L'écriture ne remplace pas ce fichier sans qu'on le demande.
-    with pytest.raises(ValueError, match="à régénérer"):
+    # L'écriture ne remplace pas ce fichier sans qu'on le demande : il porte
+    # peut-être des décisions qu'on ne sait plus lire.
+    illisible = chemin.read_bytes()
+    with pytest.raises(ValueError, match="est illisible") as refus:
         ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    assert "à régénérer" in str(refus.value)
+    assert chemin.read_bytes() == illisible
+    assert not dossier_sauvegardes(chemin).exists()
+    # Avec ecraser=True, il est copié à l'identique avant d'être remplacé.
     ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin, ecraser=True)
     assert charger_dictionnaire(chemin) == _dictionnaire_fictif()
+    copies = list(dossier_sauvegardes(chemin).iterdir())
+    assert len(copies) == 1 and copies[0].name.startswith("dictionnaire_illisible_")
+    assert copies[0].read_bytes() == illisible
 
 
 def test_chargement_liste_tous_les_problemes_en_une_fois(tmp_path):
@@ -517,10 +532,20 @@ def test_decision_sans_date_et_date_mal_formee(tmp_path):
             _valeur("A", statut="valide", revu_le=None),
             _valeur("B", statut="invalide", revu_le="08/10/2026"),
             _valeur("C", revu_le=20261008, commentaire=None),
+            _valeur("D", statut="valide", revu_le="2026-10-08 25:00:00"),
+            _valeur("E", statut="valide", revu_le="2026-10-08T10:00:00"),
+            _valeur("F", statut="valide", revu_le="2026-10-08 10:00"),
+            # Les deux formats admis : date seule (avant la 4d), date et heure.
+            _valeur("G", statut="valide", revu_le="2026-10-08"),
+            _valeur("H", statut="valide", revu_le="2026-10-08 10:00:00"),
         ],
         statut="valide",
     )
     message = _erreur_chargement(tmp_path, tables)
+    for valeur, texte in (("D", "2026-10-08 25:00:00"), ("E", "2026-10-08T10:00:00"),
+                          ("F", "2026-10-08 10:00")):
+        assert f"valeur {valeur!r} : revu_le {texte!r} (type str)" in message
+    assert "valeur 'G'" not in message and "valeur 'H'" not in message
     assert "règle valeurs : statut valide sans date de revue" in message
     assert "valeur 'A' : statut valide sans date de revue" in message
     assert "valeur 'B' : revu_le '08/10/2026' (type str)" in message
@@ -528,21 +553,168 @@ def test_decision_sans_date_et_date_mal_formee(tmp_path):
     assert "valeur 'C' : commentaire None (type NoneType)" in message
 
 
-def test_ecrasement_refuse_si_une_decision_a_ete_prise(tmp_path):
+def test_regeneration_refusee_si_une_decision_serait_perdue(tmp_path):
     chemin = tmp_path / "dictionnaire.yaml"
     ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
-    # Tant que tout est au statut observé, la régénération est libre.
+    # Tant que tout est au statut observé, la régénération est libre, sans copie.
     ecrire_dictionnaire(_dictionnaire_fictif(liste=["A", "B"]), "2026-03", chemin)
+    assert not dossier_sauvegardes(chemin).exists()
     revu = _dictionnaire_fictif(
         liste=["A", _valeur("B", statut="invalide")], statut="valide", revu_le="2026-10-08"
     )
     _ecrire_brut(chemin, revu)
-    # Une règle et une valeur revues.
-    with pytest.raises(FileExistsError, match="2 décisions de revue"):
-        ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin)
+    avant = chemin.read_bytes()
+    # Une règle et une valeur revues : toutes deux listées, ecraser n'y change rien.
+    for ecraser in (False, True):
+        with pytest.raises(ValueError, match="2 décisions de revue seraient perdues") as refus:
+            ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin, ecraser=ecraser)
+        assert "clients.ville, règle valeurs : statut 'valide' devenu 'observé'" in str(refus.value)
+        assert "clients.ville, valeur 'B' : décision (invalide) absente" in str(refus.value)
+    assert chemin.read_bytes() == avant
+    assert not dossier_sauvegardes(chemin).exists()
+
+
+def _fichier_revu(tmp_path, jour="2026-10-08"):
+    """Fichier en place portant une règle validée, une valeur invalidée et une revue au journal."""
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(liste=["A", "B", "C"]), "2026-03", chemin)
+    revu = _dictionnaire_fictif(liste=["A", "B", "C"])
+    colonne = revu["clients"]["ville"]
+    colonne["obligatoire"].update(statut="valide", revu_le=jour)
+    colonne["valeurs"]["liste"][1].update(statut="invalide", revu_le=jour, commentaire="faute")
+    ecrire_dictionnaire(revu, "2026-03", chemin, revue=_entree(jour))
+    return chemin, revu
+
+
+def test_ecriture_sans_revue_conserve_chaque_decision_a_l_identique(tmp_path):
+    chemin, revu = _fichier_revu(tmp_path)
+    avant = chemin.read_bytes()
+    # Ce que la génération observe peut changer : proposition, motif, effectif, origine.
+    fusionne = deepcopy(revu)
+    colonne = fusionne["clients"]["ville"]
+    colonne["obligatoire"].update(proposition="facultatif", motif="12.00 % de vides")
+    colonne["valeurs"]["liste"][1].update(effectif=0, origine="à arbitrer")
+    colonne["nature"]["commentaire"] = "note sur une règle non revue"
+    ecrire_dictionnaire(fusionne, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == fusionne
+    copies = list(dossier_sauvegardes(chemin).iterdir())
+    assert len(copies) == 1 and copies[0].read_bytes() == avant
+    assert copies[0].name.startswith("dictionnaire_2026-03_") and copies[0].suffix == ".yaml"
+
+    # Chaque composante d'une décision est protégée, et aucune décision n'apparaît.
+    for modification, attendu in (
+        (lambda c: c["obligatoire"].update(commentaire="autre"), "commentaire '' devenu 'autre'"),
+        (lambda c: c["obligatoire"].update(revu_le="2026-10-08 10:00:00"), "revu_le '2026-10-08' devenu"),
+        (lambda c: c["obligatoire"].update(statut="documenté", regle="facultatif"),
+         "statut 'valide' devenu 'documenté', regle 'obligatoire' devenu 'facultatif'"),
+        (lambda c: c["valeurs"]["liste"][0].update(statut="valide", revu_le="2026-10-09"),
+         "valeur 'A' : décision (valide) absente du fichier en place"),
+        (lambda c: c["valeurs"]["liste"].pop(1), "valeur 'B' : décision (invalide) absente"),
+    ):
+        essai = deepcopy(fusionne)
+        modification(essai["clients"]["ville"])
+        with pytest.raises(ValueError, match="1 décisions de revue") as refus:
+            ecrire_dictionnaire(essai, "2026-04", chemin)
+        assert attendu in str(refus.value)
+    assert charger_dictionnaire(chemin) == fusionne
+    assert len(list(dossier_sauvegardes(chemin).iterdir())) == 1
+
+
+def test_ecriture_avec_revue_n_admet_que_les_decisions_datees_de_la_revue(tmp_path):
+    chemin, revu = _fichier_revu(tmp_path)
+    instant = "2026-10-08 21:45:03"
+    # Une date seule, écrite avant l'horodatage, vaut minuit : la revue du soir passe.
+    suivant = deepcopy(revu)
+    colonne = suivant["clients"]["ville"]
+    colonne["obligatoire"].update(statut="documenté", regle="facultatif", revu_le=instant)
+    colonne["nature"].update(statut="valide", revu_le=instant)
+    colonne["valeurs"]["liste"][0].update(statut="valide", revu_le=instant)
+    # Décision annulée, valeur retirée, commentaire seul.
+    colonne["valeurs"]["liste"][1].update(statut="observé", revu_le=None, commentaire="")
+    del colonne["valeurs"]["liste"][2]
+    ecrire_dictionnaire(suivant, "2026-03", chemin, revue=_entree(instant, "revue2.xlsx"))
+    assert charger_dictionnaire(chemin) == suivant
+    assert [r["date"] for r in charger_meta(chemin)["revues"]] == ["2026-10-08", instant]
+    assert len(list(dossier_sauvegardes(chemin).iterdir())) == 1
+
+    plus_tard = "2026-10-09 08:00:00"
+    for modification, attendu in (
+        # Décision changée sans prendre la date de la revue.
+        (lambda c: c["nature"].update(statut="invalide", regle="aucune"),
+         f"règle nature : décision changée, mais sa date ({instant}) n'est pas celle de la revue"),
+        # Décision nouvelle datée d'un autre moment.
+        (lambda c: c["valeurs"]["liste"][1].update(statut="valide", revu_le="2026-10-09 07:00:00"),
+         "valeur 'B' : décision changée, mais sa date (2026-10-09 07:00:00)"),
+        # Date déplacée sans changement de décision.
+        (lambda c: c["nature"].update(revu_le=plus_tard),
+         f"règle nature : revu_le {instant!r} devenu {plus_tard!r} sans changement de décision"),
+        # Colonne disparue avec ses décisions.
+        (lambda c: c.pop("nature"), "règle nature : décision (valide) absente"),
+    ):
+        essai = deepcopy(suivant)
+        modification(essai["clients"]["ville"])
+        if "nature" not in essai["clients"]["ville"]:
+            essai["clients"]["autre"] = essai["clients"].pop("ville")
+            essai["clients"]["autre"]["nature"] = _regle("texte")
+        with pytest.raises(ValueError, match="écriture refusée") as refus:
+            ecrire_dictionnaire(essai, "2026-03", chemin, revue=_entree(plus_tard, "revue3.xlsx"))
+        assert attendu in str(refus.value)
+    assert charger_dictionnaire(chemin) == suivant
+    assert len(charger_meta(chemin)["revues"]) == 2
+
+
+def test_revue_refusee_si_elle_n_est_pas_posterieure_a_la_derniere(tmp_path):
+    chemin, revu = _fichier_revu(tmp_path, "2026-10-08 21:45:03")
+    suivant = deepcopy(revu)
+    for instant in ("2026-10-08 21:45:03", "2026-10-08 21:45:02", "2026-10-08"):
+        suivant["clients"]["ville"]["nature"].update(statut="valide", revu_le=instant)
+        with pytest.raises(ValueError, match="doit être postérieure à la dernière revue"):
+            ecrire_dictionnaire(suivant, "2026-03", chemin, revue=_entree(instant))
     assert charger_dictionnaire(chemin) == revu
-    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin, ecraser=True)
-    assert charger_dictionnaire(chemin) == _dictionnaire_fictif()
+    suivant["clients"]["ville"]["nature"].update(statut="valide", revu_le="2026-10-08 21:45:04")
+    ecrire_dictionnaire(suivant, "2026-03", chemin, revue=_entree("2026-10-08 21:45:04"))
+    assert len(charger_meta(chemin)["revues"]) == 2
+
+
+def test_une_copie_de_sauvegarde_n_est_jamais_ecrasee(tmp_path, monkeypatch):
+    chemin, revu = _fichier_revu(tmp_path)
+    monkeypatch.setattr(
+        "frigeo.dictionnaire._maintenant", lambda: datetime(2026, 10, 8, 21, 45, 3)
+    )
+    ecrire_dictionnaire(revu, "2026-03", chemin)
+    copie = dossier_sauvegardes(chemin) / "dictionnaire_2026-03_2026-10-08_214503.yaml"
+    assert [c.name for c in dossier_sauvegardes(chemin).iterdir()] == [copie.name]
+    contenu, en_place = copie.read_bytes(), chemin.read_bytes()
+    # Seconde écriture dans la même seconde : ni la copie ni le fichier ne bougent.
+    autre = deepcopy(revu)
+    autre["clients"]["ville"]["nature"]["motif"] = "autre motif"
+    with pytest.raises(FileExistsError, match="existe déjà : rien n'est écrit"):
+        ecrire_dictionnaire(autre, "2026-03", chemin)
+    assert copie.read_bytes() == contenu and chemin.read_bytes() == en_place
+    assert [c.name for c in tmp_path.iterdir() if c.is_file()] == ["dictionnaire.yaml"]
+
+
+def test_journal_seul_suffit_a_declencher_la_copie(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin, revue=_entree())
+    assert not dossier_sauvegardes(chemin).exists()
+    # Plus aucune décision, mais un journal : le fichier est copié avant remplacement.
+    ecrire_dictionnaire(_dictionnaire_fictif(liste=["A"]), "2026-04", chemin)
+    assert len(list(dossier_sauvegardes(chemin).iterdir())) == 1
+
+
+def test_lire_instant_et_horodater():
+    assert lire_instant("2026-10-08 21:45:03") == datetime(2026, 10, 8, 21, 45, 3)
+    assert lire_instant("2026-10-08") == datetime(2026, 10, 8)
+    for refuse in ("2026-10-8", "2026-02-30", "08/10/2026", "2026-10-08 21:45", "", None, 20261008,
+                   date(2026, 10, 8)):
+        assert lire_instant(refuse) is None
+    assert horodater(datetime(2026, 10, 8, 21, 45, 3, 999)) == "2026-10-08 21:45:03"
+    assert horodater(date(2026, 10, 8)) == horodater("2026-10-08") == "2026-10-08 00:00:00"
+    assert lire_instant(horodater()) is not None
+    with pytest.raises(ValueError, match="AAAA-MM-JJ HH:MM:SS"):
+        horodater("08/10/2026")
 
 
 def test_valeurs_ecrites_a_la_main_sans_guillemets_rejetees(tmp_path):
@@ -734,7 +906,7 @@ def test_revue_ajoutee_au_journal_sans_toucher_au_reste_de_meta(tmp_path):
     assert meta["revues"] == [_entree()]
     assert charger_dictionnaire(chemin) == revu
 
-    ecrire_dictionnaire(revu, "2026-03", chemin, ecraser=True, revue=_entree("2026-11-02", "revue2.xlsx"))
+    ecrire_dictionnaire(revu, "2026-03", chemin, revue=_entree("2026-11-02", "revue2.xlsx"))
     assert [r["classeur"] for r in charger_meta(chemin)["revues"]] == ["revue.xlsx", "revue2.xlsx"]
 
 
