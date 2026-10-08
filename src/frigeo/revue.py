@@ -18,7 +18,13 @@ from openpyxl.styles import Alignment, Font, Protection
 from openpyxl.worksheet.datavalidation import DataValidation
 
 from . import racine_projet
-from .dictionnaire import STATUTS, _valeurs_renseignees
+from .dictionnaire import (
+    LISTE_FERMEE,
+    ORIGINE_AJOUT,
+    ORIGINE_LISTE,
+    STATUTS,
+    STATUTS_VALEUR_OBSERVEE,
+)
 from .profilage import _NATURES_TEXTE
 
 FEUILLE_MODE_EMPLOI = "mode_emploi"
@@ -51,10 +57,6 @@ MODIFIABLES_REGLES = ("statut", "regle_retenue", "commentaire")
 MODIFIABLES_VALEURS = ("statut", "commentaire")
 # Colonnes à saisir sur une ligne ajoutée en bas de la feuille des valeurs.
 SAISIE_AJOUT = ("table", "colonne", "valeur", "statut", "commentaire")
-
-ORIGINE_LISTE = "liste proposée"
-ORIGINE_A_ARBITRER = "à arbitrer"
-ORIGINE_AJOUT = "ajoutée"
 
 # Règles que le métier peut donner lui-même, avec le statut « documenté ».
 REGLES_RETENUES = {
@@ -94,8 +96,15 @@ def lignes_regles(dictionnaire: dict) -> list[dict]:
     lignes = []
     for table, colonnes in dictionnaire.items():
         for colonne, regles in colonnes.items():
-            for nom in ("obligatoire", "nature"):
-                regle = regles[nom]
+            for nom, regle in regles.items():
+                proposition = regle["proposition"]
+                if nom == "valeurs":
+                    if proposition != LISTE_FERMEE:
+                        continue
+                    proposees = sum(
+                        element["origine"] == ORIGINE_LISTE for element in regle["liste"]
+                    )
+                    proposition = f"liste de {proposees} valeurs"
                 ecarts = sum(
                     valeur
                     for valeur in regle["a_arbitrer"].values()
@@ -106,23 +115,10 @@ def lignes_regles(dictionnaire: dict) -> list[dict]:
                         "table": table,
                         "colonne": colonne,
                         "regle": nom,
-                        "proposition": regle["regle"],
+                        "proposition": proposition,
                         "motif": regle["motif"],
                         "nb_a_arbitrer": ecarts,
                         "statut": regle["statut"],
-                    }
-                )
-            valeurs = regles["valeurs"]
-            if isinstance(valeurs["regle"], list):
-                lignes.append(
-                    {
-                        "table": table,
-                        "colonne": colonne,
-                        "regle": "valeurs",
-                        "proposition": f"liste de {len(valeurs['regle'])} valeurs",
-                        "motif": valeurs["motif"],
-                        "nb_a_arbitrer": len(valeurs["a_arbitrer"]),
-                        "statut": valeurs["statut"],
                     }
                 )
     return lignes
@@ -138,52 +134,27 @@ def _remarque(valeur: str) -> str:
     return ", ".join(remarques)
 
 
-def lignes_valeurs(
-    dictionnaire: dict, tables: dict[str, pd.DataFrame] | None = None
-) -> list[dict]:
-    """Lignes de la feuille des valeurs : une ligne par valeur des listes proposées.
+def lignes_valeurs(dictionnaire: dict) -> list[dict]:
+    """Lignes de la feuille des valeurs : une ligne par valeur des listes du dictionnaire.
 
-    Les valeurs à arbitrer portent l'effectif enregistré dans le dictionnaire. Pour
-    celles de la liste proposée, l'effectif est compté dans `tables` si elles sont
-    fournies, et laissé vide sinon. Une colonne sans liste (dont toute colonne
-    sensible) ne donne aucune ligne.
+    Chaque ligne porte l'effectif, l'origine et le statut enregistrés dans le
+    dictionnaire. Une colonne dont la liste est vide (dont toute colonne sensible)
+    ne donne aucune ligne.
     """
-    lignes = []
-    for table, colonnes in dictionnaire.items():
-        for colonne, regles in colonnes.items():
-            valeurs = regles["valeurs"]
-            if not isinstance(valeurs["regle"], list):
-                continue
-            effectifs = {}
-            if tables is not None and table in tables and colonne in tables[table]:
-                presentes = _valeurs_renseignees(tables[table][colonne])
-                effectifs = presentes.astype(str).value_counts().to_dict()
-            for valeur in valeurs["regle"]:
-                effectif = effectifs.get(valeur)
-                lignes.append(
-                    {
-                        "table": table,
-                        "colonne": colonne,
-                        "valeur": valeur,
-                        "effectif": None if effectif is None else int(effectif),
-                        "origine": ORIGINE_LISTE,
-                        "remarque": _remarque(valeur),
-                        "statut": valeurs["statut"],
-                    }
-                )
-            for element in valeurs["a_arbitrer"]:
-                lignes.append(
-                    {
-                        "table": table,
-                        "colonne": colonne,
-                        "valeur": element["valeur"],
-                        "effectif": element["effectif"],
-                        "origine": ORIGINE_A_ARBITRER,
-                        "remarque": _remarque(element["valeur"]),
-                        "statut": valeurs["statut"],
-                    }
-                )
-    return lignes
+    return [
+        {
+            "table": table,
+            "colonne": colonne,
+            "valeur": element["valeur"],
+            "effectif": element["effectif"],
+            "origine": element["origine"],
+            "remarque": _remarque(element["valeur"]),
+            "statut": element["statut"],
+        }
+        for table, colonnes in dictionnaire.items()
+        for colonne, regles in colonnes.items()
+        for element in regles["valeurs"]["liste"]
+    ]
 
 
 def _mode_emploi(periode_fin: str, nb_regles: int, nb_valeurs: int) -> list[str]:
@@ -287,14 +258,12 @@ def exporter_revue(
     periode_fin: str,
     chemin: str | Path | None = None,
     *,
-    tables: dict[str, pd.DataFrame] | None = None,
     ecraser: bool = False,
 ) -> Path:
     """Écrit le classeur de revue du dictionnaire et rend son chemin.
 
     Sans `ecraser=True`, refuse de remplacer un classeur existant : une revue y est
-    peut-être en cours. `tables` (les tables chargées) sert seulement à compter
-    l'effectif des valeurs des listes proposées.
+    peut-être en cours.
     """
     chemin = Path(chemin) if chemin is not None else chemin_revue(periode_fin)
     if chemin.exists() and not ecraser:
@@ -302,7 +271,7 @@ def exporter_revue(
             f"{chemin} existe déjà : export refusé (ecraser=True pour forcer)"
         )
     regles = lignes_regles(dictionnaire)
-    valeurs = lignes_valeurs(dictionnaire, tables)
+    valeurs = lignes_valeurs(dictionnaire)
 
     classeur = Workbook()
     notice = classeur.active
@@ -345,8 +314,6 @@ def exporter_revue(
     return chemin
 
 
-# Statuts admis sur une valeur observée : « documenté » est réservé aux ajouts.
-STATUTS_VALEUR_EXPORTEE = ("observé", "valide", "invalide")
 A_DECIDER = "à décider"
 
 
@@ -503,10 +470,10 @@ def _controler_valeurs(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
             if cle in vues:
                 problemes.append(f"{ou} : valeur {valeur!r} présente plusieurs fois")
                 continue
-            if statut not in STATUTS_VALEUR_EXPORTEE:
+            if statut not in STATUTS_VALEUR_OBSERVEE:
                 problemes.append(
                     f"{ou} : statut {statut!r} impossible sur une valeur observée "
-                    f"(choisir parmi {', '.join(STATUTS_VALEUR_EXPORTEE)})"
+                    f"(choisir parmi {', '.join(STATUTS_VALEUR_OBSERVEE)})"
                 )
         vues.add(cle)
         decisions.append(

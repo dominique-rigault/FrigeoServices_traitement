@@ -1,6 +1,5 @@
-"""Tests de l'export du classeur de revue (frigeo.revue)."""
+"""Tests de l'export et de l'import du classeur de revue (frigeo.revue)."""
 
-import pandas as pd
 import pytest
 from openpyxl import load_workbook
 
@@ -18,35 +17,59 @@ PIEGES = ["076", "27", "2026-03-01", "=1+1", "Non", "Gisors  ", "a b"]
 
 
 def _regle(regle, a_arbitrer, statut="observé"):
-    return {"regle": regle, "statut": statut, "motif": "motif fictif", "a_arbitrer": a_arbitrer}
+    return {
+        "regle": regle,
+        "proposition": regle,
+        "statut": statut,
+        "motif": "motif fictif",
+        "a_arbitrer": a_arbitrer,
+        "commentaire": "",
+        "revu_le": None,
+    }
 
 
-def _colonne(valeurs="aucune", a_arbitrer=None, vides=0, hors_nature=0):
+def _valeur(valeur, origine, effectif):
+    return {
+        "valeur": valeur,
+        "origine": origine,
+        "effectif": effectif,
+        "statut": "observé",
+        "commentaire": "",
+        "revu_le": None,
+        "remplacement": None,
+    }
+
+
+def _colonne(valeurs=None, a_arbitrer=None, vides=0, hors_nature=0):
+    """Colonne avec une liste fermée si `valeurs` est donnée (effectif 10 par valeur)."""
+    a_arbitrer = a_arbitrer or {}
+    liste = _regle(
+        "liste fermée" if valeurs else "aucune",
+        {"valeurs": len(a_arbitrer)} if valeurs else {},
+    )
+    liste["liste"] = [_valeur(v, "liste proposée", 10) for v in valeurs or []] + [
+        _valeur(v, "à arbitrer", n) for v, n in a_arbitrer.items()
+    ]
     return {
         "obligatoire": _regle("obligatoire", {"vides": vides}),
         "nature": _regle("texte", {"hors_nature": hors_nature}),
-        "valeurs": _regle(valeurs, [] if a_arbitrer is None else a_arbitrer),
+        "valeurs": liste,
     }
 
 
 def _dictionnaire():
+    duree = _colonne()
+    duree["obligatoire"] = _regle("à décider", {"vides": 1})
+    duree["nature"] = _regle(
+        "à décider", {"nature_dominante": "entier (texte)", "hors_nature": 40}
+    )
     return {
         "clients": {
-            "statut": _colonne(
-                ["Actif", "Inactif"], [{"valeur": "actif", "effectif": 3}], vides=5
-            ),
+            "statut": _colonne(["Actif", "Inactif"], {"actif": 3}, vides=5),
             "code": _colonne(PIEGES),
             "type_commerce": _colonne(),
         },
-        "interventions": {
-            "duree": {
-                "obligatoire": _regle("à décider", {"vides": 1}),
-                "nature": _regle(
-                    "à décider", {"nature_dominante": "entier (texte)", "hors_nature": 40}
-                ),
-                "valeurs": _regle("aucune", []),
-            }
-        },
+        "interventions": {"duree": duree},
     }
 
 
@@ -70,26 +93,25 @@ def test_lignes_regles():
     assert par_cle[("interventions", "duree", "nature")]["nb_a_arbitrer"] == 40
 
 
-def test_lignes_valeurs_sans_les_tables():
+def test_lignes_valeurs():
     lignes = lignes_valeurs(_dictionnaire())
     assert len(lignes) == 3 + len(PIEGES)
     assert {l["colonne"] for l in lignes} == {"statut", "code"}
-    assert [l["effectif"] for l in lignes[:3]] == [None, None, 3]
+    # L'effectif et l'origine viennent du dictionnaire.
+    assert [l["effectif"] for l in lignes[:3]] == [10, 10, 3]
     assert [l["origine"] for l in lignes[:3]] == ["liste proposée", "liste proposée", "à arbitrer"]
     remarques = {l["valeur"]: l["remarque"] for l in lignes}
     assert remarques["Gisors  "] == "espaces en bord"
-    assert remarques["a b"] == "espace insécable"
+    assert remarques["a\u00a0b"] == "espace insécable"
     assert remarques["Actif"] == ""
 
 
-def test_effectifs_comptes_dans_les_tables():
-    donnees = pd.DataFrame(
-        {"statut": pd.Series(["Actif"] * 7 + ["Inactif"] * 2 + ["actif", None, "  "], dtype=object)}
-    )
-    lignes = lignes_valeurs(_dictionnaire(), {"clients": donnees})
-    assert [l["effectif"] for l in lignes[:3]] == [7, 2, 3]
-    # Colonne absente des tables fournies : effectif laissé vide.
-    assert lignes[3]["effectif"] is None
+def test_statut_propre_a_chaque_valeur():
+    dictionnaire = _dictionnaire()
+    liste = dictionnaire["clients"]["statut"]["valeurs"]["liste"]
+    liste[2].update(statut="invalide", revu_le="2026-10-08")
+    lignes = lignes_valeurs(dictionnaire)
+    assert [l["statut"] for l in lignes[:3]] == ["observé", "observé", "invalide"]
 
 
 def test_classeur_ecrit_et_relu(tmp_path):
@@ -195,13 +217,13 @@ def test_import_des_decisions_du_metier(tmp_path):
     chemin = _exporter(tmp_path)
     regle = dict(table="clients", colonne="statut")
     _modifier(chemin, "regles", dict(regle, regle="obligatoire"), statut="valide")
-    # Statut saisi en forme décomposée, avec une espace en trop : il est normalisé.
+    # Statut saisi en forme décomposée, avec une espace en trop : il est normalisé.
     _modifier(chemin, "regles", dict(regle, regle="nature"), statut=" documenté",
               regle_retenue="entier (texte)")
     _modifier(chemin, "regles", dict(regle, regle="valeurs"), statut="invalide",
               commentaire="clé vers un référentiel")
     _modifier(chemin, "valeurs", dict(regle, valeur="actif"), statut="invalide")
-    # Ajouts : dans une colonne avec liste et dans une colonne sans liste.
+    # Ajouts : dans une colonne avec liste et dans une colonne sans liste.
     fin = 1 + 3 + len(PIEGES)
     _modifier(chemin, "valeurs", fin + 1, table="clients", colonne="statut",
               valeur="En sommeil", statut="documenté")
@@ -262,8 +284,10 @@ def test_problemes_de_la_feuille_regles_listes_en_une_fois(tmp_path):
 def test_classeur_perime_refuse(tmp_path):
     chemin = _exporter(tmp_path)
     dictionnaire = _dictionnaire()
-    dictionnaire["clients"]["statut"]["obligatoire"]["regle"] = "facultatif"
-    dictionnaire["clients"]["statut"]["valeurs"]["regle"].append("Radié")
+    dictionnaire["clients"]["statut"]["obligatoire"]["proposition"] = "facultatif"
+    dictionnaire["clients"]["statut"]["valeurs"]["liste"].append(
+        _valeur("Radié", "à arbitrer", 1)
+    )
     with pytest.raises(ValueError) as erreur:
         importer_revue(chemin, dictionnaire)
     message = str(erreur.value)

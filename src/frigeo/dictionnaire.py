@@ -1,7 +1,11 @@
 """Génération du dictionnaire des données à partir des données observées.
 
 Ce module ne contient rien de propre à un client. Tout ce qui est généré a le
-statut « observé »; seul le métier peut le faire passer à « validé ».
+statut « observé »; seul le métier peut en décider autrement, par la revue.
+
+Chaque règle distingue la `proposition` (ce que la génération déduit des données)
+de la `regle` en vigueur (ce que les contrôles appliqueront). Les deux sont égales
+tant que la règle n'a pas été revue.
 """
 
 from __future__ import annotations
@@ -37,7 +41,13 @@ def _valeurs_renseignees(serie: pd.Series) -> pd.Series:
 
 
 def _refus(motif: str) -> dict:
-    return {"liste_fermee": False, "motif": motif, "valeurs": [], "a_arbitrer": []}
+    return {
+        "liste_fermee": False,
+        "motif": motif,
+        "valeurs": [],
+        "effectifs": [],
+        "a_arbitrer": [],
+    }
 
 
 def proposer_liste(
@@ -53,14 +63,15 @@ def proposer_liste(
 ) -> dict:
     """Décide si une colonne est proposée avec une liste de valeurs fermée.
 
-    Conditions, vérifiées dans cet ordre (la première qui échoue donne le motif) :
+    Conditions, vérifiées dans cet ordre (la première qui échoue donne le motif) :
     colonne non sensible, au moins `effectif_min` valeurs renseignées, nature
     dominante « texte », au plus `max_valeurs` valeurs principales (une valeur est
     principale si elle pèse au moins `part_min` des valeurs renseignées), et
     valeurs principales couvrant au moins `couverture_min` des valeurs renseignées.
 
-    Les valeurs non principales ne sont jamais déclarées valides : elles sont
-    rendues dans `a_arbitrer` avec leur effectif. Une colonne sensible n'expose
+    Les valeurs non principales ne sont jamais déclarées valides : elles sont
+    rendues dans `a_arbitrer` avec leur effectif. `effectifs` donne l'effectif des
+    valeurs principales, dans le même ordre. Une colonne sensible n'expose
     aucune valeur. Les valeurs sont comparées telles quelles (« Gisors » et
     « Gisors  » sont deux valeurs), converties en texte.
     """
@@ -106,6 +117,7 @@ def proposer_liste(
             f"{100 * couverture:.1f} % des valeurs renseignées"
         ),
         "valeurs": [v for v, _ in principales],
+        "effectifs": [n for _, n in principales],
         "a_arbitrer": [{"valeur": v, "effectif": n} for v, n in autres],
     }
 
@@ -129,7 +141,7 @@ def proposer_obligatoire(
     """Propose le caractère obligatoire d'une colonne d'après sa part de vides.
 
     Les trois formes de vide (None ou NaN, chaîne vide, chaîne d'espaces) sont
-    comptées ensemble. Règles rendues, dans cet ordre :
+    comptées ensemble. Règles rendues, dans cet ordre :
     « toujours vide » (100 % de vides), « obligatoire » si aucune valeur n'est vide,
     « à décider » sous `effectif_min` lignes dès qu'il y a un vide, puis
     « obligatoire » jusqu'à `vides_max` de vides inclus (les vides vont dans
@@ -173,7 +185,7 @@ def proposer_nature(
 ) -> dict:
     """Propose la nature d'une colonne d'après la nature dominante du profil.
 
-    Règles rendues :
+    Règles rendues :
     la nature dominante si elle couvre au moins `couverture_min` des valeurs
     renseignées (les valeurs hors nature vont dans `a_arbitrer`), « à décider » entre
     `part_min` et `couverture_min`, et « texte » si aucune nature spécifique ne couvre
@@ -223,14 +235,42 @@ def proposer_nature(
 
 
 STATUT_INITIAL = "observé"
+STATUTS = ("observé", "valide", "invalide", "documenté")
+REGLES = ("obligatoire", "nature", "valeurs")
+
+# Règle `valeurs` : la colonne n'accepte qu'une liste fermée de valeurs, ou non.
+LISTE_FERMEE = "liste fermée"
+AUCUNE_LISTE = "aucune"
+
+# Origine d'une valeur de la liste d'une colonne.
+ORIGINE_LISTE = "liste proposée"
+ORIGINE_A_ARBITRER = "à arbitrer"
+ORIGINE_AJOUT = "ajoutée"
+ORIGINES = (ORIGINE_LISTE, ORIGINE_A_ARBITRER, ORIGINE_AJOUT)
 
 
-def _regle_observee(regle, motif: str, a_arbitrer) -> dict:
+def _regle_observee(proposition: str, motif: str, a_arbitrer: dict) -> dict:
+    """Règle proposée et pas encore revue : la règle en vigueur est la proposition."""
     return {
-        "regle": regle,
+        "regle": proposition,
+        "proposition": proposition,
         "statut": STATUT_INITIAL,
         "motif": motif,
         "a_arbitrer": a_arbitrer,
+        "commentaire": "",
+        "revu_le": None,
+    }
+
+
+def _valeur_observee(valeur: str, origine: str, effectif: int) -> dict:
+    return {
+        "valeur": valeur,
+        "origine": origine,
+        "effectif": effectif,
+        "statut": STATUT_INITIAL,
+        "commentaire": "",
+        "revu_le": None,
+        "remplacement": None,
     }
 
 
@@ -240,19 +280,33 @@ def generer_colonne(
     colonne: str,
     sensibles: dict[str, frozenset[str]],
 ) -> dict:
-    """Règles proposées pour une colonne, toutes au statut « observe ».
+    """Règles proposées pour une colonne, toutes au statut « observé ».
 
-    Trois règles sont rendues : `obligatoire`, `nature` et `valeurs`. Chacune porte son
-    statut, le motif de la proposition et les écarts à arbitrer. Une colonne sensible
-    n'expose aucune valeur : sa règle `valeurs` est « aucune ».
+    Trois règles sont rendues : `obligatoire`, `nature` et `valeurs`. Chacune porte la
+    proposition, la règle en vigueur (égale à la proposition), son statut, le motif
+    de la proposition et les écarts à arbitrer. La règle `valeurs` vaut « liste
+    fermée » ou « aucune » et porte en plus la `liste` des valeurs observées : les
+    valeurs principales (origine « liste proposée ») puis les valeurs rares (origine
+    « à arbitrer »), chacune avec son effectif et son propre statut. Une colonne
+    sensible n'expose aucune valeur : sa liste est vide.
     """
     obligatoire = proposer_obligatoire(serie)
     nature = proposer_nature(serie)
     liste = proposer_liste(serie, table, colonne, sensibles)
     if liste["liste_fermee"]:
-        valeurs = _regle_observee(liste["valeurs"], liste["motif"], liste["a_arbitrer"])
+        valeurs = _regle_observee(
+            LISTE_FERMEE, liste["motif"], {"valeurs": len(liste["a_arbitrer"])}
+        )
+        valeurs["liste"] = [
+            _valeur_observee(valeur, ORIGINE_LISTE, effectif)
+            for valeur, effectif in zip(liste["valeurs"], liste["effectifs"])
+        ] + [
+            _valeur_observee(element["valeur"], ORIGINE_A_ARBITRER, element["effectif"])
+            for element in liste["a_arbitrer"]
+        ]
     else:
-        valeurs = _regle_observee("aucune", liste["motif"], [])
+        valeurs = _regle_observee(AUCUNE_LISTE, liste["motif"], {})
+        valeurs["liste"] = []
     return {
         "obligatoire": _regle_observee(
             obligatoire["regle"], obligatoire["motif"], obligatoire["a_arbitrer"]
@@ -298,40 +352,62 @@ def generer_dictionnaire(
 def resumer_dictionnaire(dictionnaire: dict) -> pd.DataFrame:
     """Tableau de synthèse du dictionnaire, une ligne par colonne.
 
-    Pour une colonne avec liste fermée, `nb_valeurs` est le nombre de valeurs proposées
-    et `nb_a_arbitrer` le nombre de valeurs à arbitrer. Sans liste, `motif_liste` dit
+    Les colonnes `obligatoire`, `nature` et `liste_fermee` donnent la règle en
+    vigueur. `nb_valeurs` est le nombre de valeurs de la liste proposée et
+    `nb_a_arbitrer` le nombre de valeurs à arbitrer. Sans liste, `motif_liste` dit
     pourquoi aucune n'est proposée.
     """
     lignes = []
     for table, colonnes in dictionnaire.items():
         for colonne, regles in colonnes.items():
             valeurs = regles["valeurs"]
-            fermee = isinstance(valeurs["regle"], list)
+            origines = [element["origine"] for element in valeurs["liste"]]
             lignes.append(
                 {
                     "table": table,
                     "colonne": colonne,
                     "obligatoire": regles["obligatoire"]["regle"],
                     "nature": regles["nature"]["regle"],
-                    "liste_fermee": fermee,
-                    "nb_valeurs": len(valeurs["regle"]) if fermee else 0,
-                    "nb_a_arbitrer": len(valeurs["a_arbitrer"]),
+                    "liste_fermee": valeurs["regle"] == LISTE_FERMEE,
+                    "nb_valeurs": origines.count(ORIGINE_LISTE),
+                    "nb_a_arbitrer": origines.count(ORIGINE_A_ARBITRER),
                     "motif_liste": valeurs["motif"],
                 }
             )
     return pd.DataFrame(lignes)
 
 
-
-STATUTS = ("observé", "valide", "invalide", "documenté")
-REGLES = ("obligatoire", "nature", "valeurs")
-CHAMPS_REGLE = ("regle", "statut", "motif", "a_arbitrer")
+# Version de la structure du fichier : 2 depuis la refonte de l'étape 2d (règle en
+# vigueur distincte de la proposition, liste unique de valeurs).
+STRUCTURE = 2
+CHAMPS_REGLE = (
+    "regle",
+    "proposition",
+    "statut",
+    "motif",
+    "a_arbitrer",
+    "commentaire",
+    "revu_le",
+)
+CHAMPS_VALEUR = (
+    "valeur",
+    "origine",
+    "effectif",
+    "statut",
+    "commentaire",
+    "revu_le",
+    "remplacement",
+)
+# Statuts admis sur une valeur observée : « documenté » est réservé aux ajouts.
+STATUTS_VALEUR_OBSERVEE = ("observé", "valide", "invalide")
+# Statuts d'une valeur qui peut servir de remplacement à une valeur invalide.
+STATUTS_CIBLE = ("valide", "documenté")
 
 
 def chemin_dictionnaire() -> Path:
-    """Emplacement par défaut du dictionnaire : data/config/dictionnaire.yaml.
+    """Emplacement par défaut du dictionnaire : data/config/dictionnaire.yaml.
 
-    Le dictionnaire contient des valeurs observées dans les données : il est rangé
+    Le dictionnaire contient des valeurs observées dans les données : il est rangé
     avec elles, hors du dépôt.
     """
     return racine_projet() / "data" / "config" / "dictionnaire.yaml"
@@ -349,11 +425,12 @@ def _natif(valeur):
         return int(valeur)
     if isinstance(valeur, numbers.Real):
         return float(valeur)
-    raise TypeError(f"Type non pris en charge dans le dictionnaire : {type(valeur).__name__}")
+    raise TypeError(f"Type non pris en charge dans le dictionnaire : {type(valeur).__name__}")
 
 
 def _meta(periode_fin: str) -> dict:
     return {
+        "structure": STRUCTURE,
         "periode_fin": periode_fin,
         "genere_le": date.today().isoformat(),
         "seuils": {
@@ -371,56 +448,116 @@ def _decrire(valeur) -> str:
     return f"{valeur!r} (type {type(valeur).__name__})"
 
 
-def _problemes_valeurs(ou: str, regle: dict) -> list[str]:
-    """Problèmes de type, de vide et de doublon dans une règle `valeurs`.
+def _statut_normalise(statut):
+    return unicodedata.normalize("NFC", statut) if isinstance(statut, str) else statut
 
-    Une valeur écrite à la main sans guillemets (No, 27, 2026-03-01) est lue par
-    YAML comme un booléen, un nombre ou une date : elle est rejetée ici. Une même
-    valeur ne peut figurer qu'une fois, liste et valeurs à arbitrer confondues.
-    """
+
+def _problemes_decision(ou: str, element: dict) -> list[str]:
+    """Problèmes de commentaire et de date de revue, communs aux règles et aux valeurs."""
     problemes = []
-    vues = set()
-
-    def controler(valeur, origine):
-        if not isinstance(valeur, str):
-            problemes.append(
-                f"{ou}, {origine} : {_decrire(valeur)} n'est pas un texte, "
-                "mettre la valeur entre guillemets"
-            )
-        elif valeur.strip() == "":
-            problemes.append(f"{ou}, {origine} : valeur vide ou composée d'espaces")
-        elif valeur in vues:
-            problemes.append(f"{ou}, {origine} : valeur {valeur!r} présente plusieurs fois")
-        else:
-            vues.add(valeur)
-
-    liste = regle["regle"]
-    if isinstance(liste, list):
-        if not liste:
-            problemes.append(f"{ou}, liste de valeurs : liste vide (écrire « aucune »)")
-        for valeur in liste:
-            controler(valeur, "liste de valeurs")
-    elif liste != "aucune":
+    if not isinstance(element["commentaire"], str):
         problemes.append(
-            f"{ou}, liste de valeurs : {_decrire(liste)} au lieu de « aucune » ou d'une liste"
+            f"{ou} : commentaire {_decrire(element['commentaire'])}, un texte est attendu"
         )
-
-    a_arbitrer = regle["a_arbitrer"]
-    if not isinstance(a_arbitrer, list):
-        problemes.append(f"{ou}, valeurs à arbitrer : une liste est attendue")
-        return problemes
-    for element in a_arbitrer:
-        if not isinstance(element, dict) or set(element) != {"valeur", "effectif"}:
-            problemes.append(f"{ou}, valeurs à arbitrer : champs attendus valeur, effectif")
-            continue
-        controler(element["valeur"], "valeurs à arbitrer")
-        effectif = element["effectif"]
-        if isinstance(effectif, bool) or not isinstance(effectif, int) or effectif < 1:
+    revu_le = element["revu_le"]
+    if revu_le is None:
+        if element["statut"] in STATUTS and element["statut"] != STATUT_INITIAL:
             problemes.append(
-                f"{ou}, valeurs à arbitrer : effectif {_decrire(effectif)} "
-                f"pour {element['valeur']!r}, un entier d'au moins 1 est attendu"
+                f"{ou} : statut {element['statut']} sans date de revue (revu_le)"
+            )
+    else:
+        try:
+            valide = date.fromisoformat(revu_le).isoformat() == revu_le
+        except (TypeError, ValueError):
+            valide = False
+        if not valide:
+            problemes.append(
+                f"{ou} : revu_le {_decrire(revu_le)}, une date 'AAAA-MM-JJ' entre "
+                "guillemets est attendue"
             )
     return problemes
+
+
+def _problemes_liste(ou: str, regle: dict) -> list[str]:
+    """Problèmes de la règle `valeurs` et de sa liste de valeurs.
+
+    Une valeur écrite à la main sans guillemets (No, 27, 2026-03-01) est lue par
+    YAML comme un booléen, un nombre ou une date : elle est rejetée ici. Une même
+    valeur ne figure qu'une fois dans la liste d'une colonne. Un remplacement n'est
+    admis que sur une valeur invalide et vise une valeur valide ou documentée de la
+    même liste.
+    """
+    problemes = []
+    for champ in ("regle", "proposition"):
+        if regle[champ] not in (LISTE_FERMEE, AUCUNE_LISTE):
+            problemes.append(
+                f"{ou}, règle valeurs : {champ} {_decrire(regle[champ])} au lieu de "
+                f"« {LISTE_FERMEE} » ou « {AUCUNE_LISTE} »"
+            )
+    liste = regle["liste"]
+    if not isinstance(liste, list):
+        problemes.append(f"{ou}, liste de valeurs : une liste est attendue")
+        return problemes
+    if regle["regle"] == LISTE_FERMEE and not liste:
+        problemes.append(f"{ou}, liste de valeurs : liste fermée sans aucune valeur")
+
+    statuts = {}
+    remplacements = []
+    for element in liste:
+        if not isinstance(element, dict) or set(element) != set(CHAMPS_VALEUR):
+            problemes.append(
+                f"{ou}, liste de valeurs : champs attendus {', '.join(CHAMPS_VALEUR)}"
+            )
+            continue
+        valeur = element["valeur"]
+        if not isinstance(valeur, str):
+            problemes.append(
+                f"{ou}, liste de valeurs : {_decrire(valeur)} n'est pas un texte, "
+                "mettre la valeur entre guillemets"
+            )
+            continue
+        if valeur.strip() == "":
+            problemes.append(f"{ou}, liste de valeurs : valeur vide ou composée d'espaces")
+            continue
+        if valeur in statuts:
+            problemes.append(
+                f"{ou}, liste de valeurs : valeur {valeur!r} présente plusieurs fois"
+            )
+            continue
+        ici = f"{ou}, valeur {valeur!r}"
+        statut = element["statut"] = _statut_normalise(element["statut"])
+        statuts[valeur] = statut
+        origine = element["origine"]
+        if origine not in ORIGINES:
+            problemes.append(f"{ici} : origine inconnue {origine!r}")
+        elif origine == ORIGINE_AJOUT and statut != "documenté":
+            problemes.append(f"{ici} : une valeur ajoutée doit porter le statut documenté")
+        elif origine != ORIGINE_AJOUT and statut not in STATUTS_VALEUR_OBSERVEE:
+            problemes.append(
+                f"{ici} : statut {statut!r} impossible sur une valeur observée "
+                f"(attendu {', '.join(STATUTS_VALEUR_OBSERVEE)})"
+            )
+        effectif = element["effectif"]
+        minimum = 1 if statut == STATUT_INITIAL else 0
+        if isinstance(effectif, bool) or not isinstance(effectif, int) or effectif < minimum:
+            problemes.append(
+                f"{ici} : effectif {_decrire(effectif)}, un entier d'au moins "
+                f"{minimum} est attendu"
+            )
+        problemes.extend(_problemes_decision(ici, element))
+        if element["remplacement"] is not None:
+            remplacements.append((ici, statut, element["remplacement"]))
+
+    for ici, statut, cible in remplacements:
+        if statut != "invalide":
+            problemes.append(f"{ici} : remplacement réservé au statut invalide")
+        elif not isinstance(cible, str) or statuts.get(cible) not in STATUTS_CIBLE:
+            problemes.append(
+                f"{ici} : remplacement {_decrire(cible)} absent des valeurs valides "
+                "ou documentées de la colonne"
+            )
+    return problemes
+
 
 def _verifier_et_normaliser(contenu) -> list[str]:
     """Liste tous les problèmes de structure et normalise les statuts (NFC)."""
@@ -429,29 +566,34 @@ def _verifier_et_normaliser(contenu) -> list[str]:
     problemes = []
     for table, colonnes in contenu["tables"].items():
         if not isinstance(colonnes, dict):
-            problemes.append(f"{table} : liste de colonnes mal formée")
+            problemes.append(f"{table} : liste de colonnes mal formée")
             continue
         for colonne, regles in colonnes.items():
             ou = f"{table}.{colonne}"
             if not isinstance(regles, dict) or set(regles) != set(REGLES):
-                problemes.append(f"{ou} : règles attendues {', '.join(REGLES)}")
+                problemes.append(f"{ou} : règles attendues {', '.join(REGLES)}")
                 continue
             for nom in REGLES:
                 regle = regles[nom]
-                if not isinstance(regle, dict) or set(regle) != set(CHAMPS_REGLE):
+                champs = CHAMPS_REGLE + (("liste",) if nom == "valeurs" else ())
+                if not isinstance(regle, dict) or set(regle) != set(champs):
                     problemes.append(
-                        f"{ou}, règle {nom} : champs attendus {', '.join(CHAMPS_REGLE)}"
+                        f"{ou}, règle {nom} : champs attendus {', '.join(champs)}"
                     )
                     continue
-                statut = regle["statut"]
-                if isinstance(statut, str):
-                    statut = unicodedata.normalize("NFC", statut)
+                ici = f"{ou}, règle {nom}"
+                statut = regle["statut"] = _statut_normalise(regle["statut"])
                 if statut not in STATUTS:
-                    problemes.append(f"{ou}, règle {nom} : statut inconnu {statut!r}")
-                else:
-                    regle["statut"] = statut
+                    problemes.append(f"{ici} : statut inconnu {statut!r}")
+                elif statut == STATUT_INITIAL and regle["regle"] != regle["proposition"]:
+                    problemes.append(
+                        f"{ici} : au statut {STATUT_INITIAL}, la règle "
+                        f"({regle['regle']!r}) doit être la proposition "
+                        f"({regle['proposition']!r})"
+                    )
+                problemes.extend(_problemes_decision(ici, regle))
                 if nom == "valeurs":
-                    problemes.extend(_problemes_valeurs(ou, regle))
+                    problemes.extend(_problemes_liste(ou, regle))
     return problemes
 
 
@@ -459,10 +601,18 @@ def charger_dictionnaire(chemin: str | Path | None = None) -> dict:
     """Charge le dictionnaire et rend ses tables, après contrôle de la structure.
 
     Tous les problèmes sont listés en une fois. Un statut hors de `STATUTS` est rejeté.
+    Un fichier écrit avant la refonte de la structure est refusé d'emblée.
     """
     chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
     with open(chemin, encoding="utf-8") as flux:
         contenu = yaml.safe_load(flux)
+    meta = contenu.get("meta") if isinstance(contenu, dict) else None
+    structure = meta.get("structure") if isinstance(meta, dict) else None
+    if structure != STRUCTURE:
+        raise ValueError(
+            f"Dictionnaire à une autre structure ({chemin}) : structure "
+            f"{structure!r}, attendue {STRUCTURE}. Le fichier est à régénérer."
+        )
     problemes = _verifier_et_normaliser(contenu)
     if problemes:
         raise ValueError(f"Dictionnaire invalide ({chemin})\n  " + "\n  ".join(problemes))
@@ -479,7 +629,7 @@ def ecrire_dictionnaire(
     """Écrit le dictionnaire en YAML et vérifie l'écriture par une relecture.
 
     Sans `ecraser=True`, refuse de remplacer un fichier illisible ou qui porte au
-    moins un statut autre que « observé » (travail de revue à ne pas perdre). Le
+    moins une décision de revue (règle ou valeur à un statut autre que « observé »). Le
     fichier n'est remplacé qu'une fois la relecture identique au dictionnaire fourni.
     """
     chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
@@ -487,14 +637,15 @@ def ecrire_dictionnaire(
 
     if chemin.exists() and not ecraser:
         revues = sum(
-            regle["statut"] != STATUT_INITIAL
+            element["statut"] != STATUT_INITIAL
             for colonnes in charger_dictionnaire(chemin).values()
             for regles in colonnes.values()
             for regle in regles.values()
+            for element in (regle, *regle.get("liste", ()))
         )
         if revues:
             raise FileExistsError(
-                f"{chemin} porte {revues} règles déjà revues : écriture refusée "
+                f"{chemin} porte {revues} décisions de revue : écriture refusée "
                 "(ecraser=True pour forcer)"
             )
 

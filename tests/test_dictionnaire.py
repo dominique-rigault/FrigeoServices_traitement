@@ -1,4 +1,4 @@
-"""Tests de la décision de liste fermée (frigeo.dictionnaire)."""
+"""Tests de la génération, du contrôle et de l'écriture du dictionnaire (frigeo.dictionnaire)."""
 
 import numpy as np
 import pandas as pd
@@ -35,6 +35,7 @@ def test_liste_fermee_variantes_a_arbitrer_et_vides_exclus():
     resultat = proposer_liste(statut)
     assert resultat["liste_fermee"] is True
     assert resultat["valeurs"] == ["Réalisée", "Annulée", "Reportée"]
+    assert resultat["effectifs"] == [700, 250, 40]
     assert resultat["a_arbitrer"] == [
         {"valeur": "OK", "effectif": 3},
         {"valeur": "Fait", "effectif": 2},
@@ -253,20 +254,37 @@ def test_generer_table_exclut_les_colonnes_de_lignage():
 def test_generer_colonne_avec_liste_fermee():
     colonne = generer_table(_table_fictive(), "clients", SENSIBLES)["statut"]
     assert colonne["obligatoire"]["regle"] == "obligatoire"
+    assert colonne["obligatoire"]["proposition"] == "obligatoire"
     assert colonne["obligatoire"]["a_arbitrer"] == {"vides": 5}
     assert colonne["nature"]["regle"] == "texte"
-    assert colonne["valeurs"]["regle"] == ["Réalisée", "Annulée", "Reportée"]
-    assert colonne["valeurs"]["a_arbitrer"] == [
-        {"valeur": "OK", "effectif": 3},
-        {"valeur": "Fait", "effectif": 2},
+    valeurs = colonne["valeurs"]
+    assert valeurs["regle"] == valeurs["proposition"] == "liste fermée"
+    assert valeurs["a_arbitrer"] == {"valeurs": 2}
+    # Valeurs principales puis valeurs rares, chacune avec son effectif.
+    assert [(v["valeur"], v["origine"], v["effectif"]) for v in valeurs["liste"]] == [
+        ("Réalisée", "liste proposée", 700),
+        ("Annulée", "liste proposée", 250),
+        ("Reportée", "liste proposée", 40),
+        ("OK", "à arbitrer", 3),
+        ("Fait", "à arbitrer", 2),
     ]
+    assert valeurs["liste"][0] == {
+        "valeur": "Réalisée",
+        "origine": "liste proposée",
+        "effectif": 700,
+        "statut": "observé",
+        "commentaire": "",
+        "revu_le": None,
+        "remplacement": None,
+    }
 
 
 def test_generer_colonne_sans_liste_fermee():
     colonne = generer_table(_table_fictive(), "clients", SENSIBLES)["commentaire"]
     assert colonne["obligatoire"]["regle"] == "facultatif"
-    assert colonne["valeurs"]["regle"] == "aucune"
-    assert colonne["valeurs"]["a_arbitrer"] == []
+    assert colonne["valeurs"]["regle"] == colonne["valeurs"]["proposition"] == "aucune"
+    assert colonne["valeurs"]["a_arbitrer"] == {}
+    assert colonne["valeurs"]["liste"] == []
 
 
 def test_colonne_sensible_ne_laisse_fuiter_aucune_valeur():
@@ -274,11 +292,12 @@ def test_colonne_sensible_ne_laisse_fuiter_aucune_valeur():
     colonne = dictionnaire["clients"]["type_commerce"]
     assert colonne["valeurs"]["regle"] == "aucune"
     assert colonne["valeurs"]["motif"] == "colonne sensible"
+    assert colonne["valeurs"]["liste"] == []
     assert "Boulangerie" not in repr(colonne)
     assert "Restaurant" not in repr(colonne)
 
 
-def test_toutes_les_regles_sont_au_statut_observe():
+def test_tout_est_au_statut_observe_et_la_regle_est_la_proposition():
     dictionnaire = generer_dictionnaire({"clients": _table_fictive()}, SENSIBLES)
     regles = [
         regle
@@ -287,7 +306,14 @@ def test_toutes_les_regles_sont_au_statut_observe():
         for regle in colonne.values()
     ]
     assert len(regles) == 9
-    assert {regle["statut"] for regle in regles} == {"observé"}
+    valeurs = [valeur for regle in regles for valeur in regle.get("liste", [])]
+    assert len(valeurs) == 5
+    for element in regles + valeurs:
+        assert element["statut"] == "observé"
+        assert element["commentaire"] == ""
+        assert element["revu_le"] is None
+    assert all(regle["regle"] == regle["proposition"] for regle in regles)
+    assert all(valeur["remplacement"] is None for valeur in valeurs)
 
 
 def test_incoherence_de_sensibilite_arrete_la_generation():
@@ -317,31 +343,62 @@ def test_resumer_dictionnaire():
 
 
 
-def _regle(regle, statut="observé", a_arbitrer=None):
+def _regle(regle, statut="observé", a_arbitrer=None, revu_le=None):
     return {
         "regle": regle,
+        "proposition": regle,
         "statut": statut,
         "motif": "motif fictif",
         "a_arbitrer": {} if a_arbitrer is None else a_arbitrer,
+        "commentaire": "",
+        "revu_le": revu_le,
     }
 
 
-def _dictionnaire_fictif(valeurs="aucune", statut="observé", a_arbitrer=None):
+def _valeur(valeur, origine="liste proposée", effectif=1, statut="observé", **champs):
+    element = {
+        "valeur": valeur,
+        "origine": origine,
+        "effectif": effectif,
+        "statut": statut,
+        "commentaire": "",
+        "revu_le": None if statut == "observé" else "2026-10-08",
+        "remplacement": None,
+    }
+    element.update(champs)
+    return element
+
+
+def _dictionnaire_fictif(liste=None, statut="observé", revu_le=None):
+    """Une colonne, avec une liste fermée si `liste` (des valeurs ou des textes) est donnée."""
+    liste = [v if isinstance(v, dict) else _valeur(v) for v in liste or []]
+    valeurs = _regle("liste fermée" if liste else "aucune", statut, revu_le=revu_le)
+    valeurs["liste"] = liste
     return {
         "clients": {
             "ville": {
                 "obligatoire": _regle("obligatoire", a_arbitrer={"vides": 0}),
                 "nature": _regle("texte", a_arbitrer={"hors_nature": 0}),
-                "valeurs": _regle(valeurs, statut, [] if a_arbitrer is None else a_arbitrer),
+                "valeurs": valeurs,
             }
         }
     }
 
 
-def _ecrire_brut(chemin, tables):
+def _ecrire_brut(chemin, tables, structure=2):
     """Écrit un fichier sans passer par `ecrire_dictionnaire` (cas d'un fichier modifié à la main)."""
-    texte = yaml.safe_dump({"meta": {}, "tables": tables}, allow_unicode=True)
+    texte = yaml.safe_dump(
+        {"meta": {"structure": structure}, "tables": tables}, allow_unicode=True
+    )
     chemin.write_text(texte, encoding="utf-8")
+
+
+def _erreur_chargement(tmp_path, tables) -> str:
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, tables)
+    with pytest.raises(ValueError) as erreur:
+        charger_dictionnaire(chemin)
+    return str(erreur.value)
 
 
 def test_aller_retour_du_dictionnaire_genere(tmp_path):
@@ -349,6 +406,7 @@ def test_aller_retour_du_dictionnaire_genere(tmp_path):
     chemin = ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "config" / "dictionnaire.yaml")
     assert charger_dictionnaire(chemin) == dictionnaire
     contenu = yaml.safe_load(chemin.read_text(encoding="utf-8"))
+    assert contenu["meta"]["structure"] == 2
     assert contenu["meta"]["periode_fin"] == "2026-03"
     assert contenu["meta"]["seuils"]["effectif_min"] == 200
     assert "Boulangerie" not in chemin.read_text(encoding="utf-8")
@@ -358,22 +416,21 @@ def test_aller_retour_des_valeurs_que_yaml_pourrait_deformer(tmp_path):
     pieges = [
         "O", "N", "Oui", "Non", "yes", "no", "on", "off", "true", "null", "~",
         "27", "076", "1e3", "46.80", "2026-03-01", "Gisors  ", "  Gisors",
-        "a\u00a0b", "Réalisée", "30 j fin de mois", "clé: valeur", "# note", "- tiret",
+        "a b", "Réalisée", "30 j fin de mois", "clé: valeur", "# note", "- tiret",
     ]
     chemin = tmp_path / "dictionnaire.yaml"
-
-    ecrire_dictionnaire(_dictionnaire_fictif(valeurs=pieges), "2026-03", chemin)
-    relu = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]
-    assert relu["regle"] == pieges
-    assert all(isinstance(valeur, str) for valeur in relu["regle"])
-
-    a_arbitrer = [{"valeur": valeur, "effectif": 1} for valeur in pieges]
-    ecrire_dictionnaire(
-        _dictionnaire_fictif(valeurs=["A"], a_arbitrer=a_arbitrer), "2026-03", chemin
+    dictionnaire = _dictionnaire_fictif(liste=pieges)
+    # Une date de revue ressemble à une date pour YAML : elle doit rester un texte.
+    dictionnaire["clients"]["ville"]["valeurs"]["liste"][0].update(
+        statut="invalide", revu_le="2026-10-08", commentaire="non: prévu"
     )
-    relu = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]
-    assert [element["valeur"] for element in relu["a_arbitrer"]] == pieges
-    assert all(isinstance(element["valeur"], str) for element in relu["a_arbitrer"])
+    ecrire_dictionnaire(dictionnaire, "2026-03", chemin)
+    relu = charger_dictionnaire(chemin)
+    assert relu == dictionnaire
+    liste = relu["clients"]["ville"]["valeurs"]["liste"]
+    assert [element["valeur"] for element in liste] == pieges
+    assert all(isinstance(element["valeur"], str) for element in liste)
+    assert liste[0]["revu_le"] == "2026-10-08"
 
 
 def test_les_types_numpy_sont_convertis_en_types_natifs(tmp_path):
@@ -400,40 +457,88 @@ def test_statut_inconnu_refuse_a_l_ecriture_sans_laisser_de_fichier(tmp_path):
     assert list(tmp_path.iterdir()) == []
 
 
+def test_fichier_a_l_ancienne_structure_refuse(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    ancien = {"clients": {"ville": {"valeurs": {"regle": ["A"], "statut": "observé"}}}}
+    chemin.write_text(yaml.safe_dump({"meta": {}, "tables": ancien}), encoding="utf-8")
+    with pytest.raises(ValueError, match="structure None, attendue 2") as erreur:
+        charger_dictionnaire(chemin)
+    # Un seul message, sans la liste des écarts règle par règle.
+    assert "\n" not in str(erreur.value)
+    # L'écriture ne remplace pas ce fichier sans qu'on le demande.
+    with pytest.raises(ValueError, match="à régénérer"):
+        ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin, ecraser=True)
+    assert charger_dictionnaire(chemin) == _dictionnaire_fictif()
+
+
 def test_chargement_liste_tous_les_problemes_en_une_fois(tmp_path):
     tables = _dictionnaire_fictif(statut="à voir")
     tables["clients"]["ville"]["nature"]["statut"] = "ok"
     tables["clients"]["code"] = {"obligatoire": _regle("obligatoire")}
     del tables["clients"]["ville"]["obligatoire"]["motif"]
-    chemin = tmp_path / "dictionnaire.yaml"
-    _ecrire_brut(chemin, tables)
-    with pytest.raises(ValueError) as erreur:
-        charger_dictionnaire(chemin)
-    message = str(erreur.value)
-    assert "clients.ville, règle valeurs : statut inconnu 'à voir'" in message
-    assert "clients.ville, règle nature : statut inconnu 'ok'" in message
-    assert "clients.ville, règle obligatoire : champs attendus" in message
-    assert "clients.code : règles attendues" in message
+    message = _erreur_chargement(tmp_path, tables)
+    assert "clients.ville, règle valeurs : statut inconnu 'à voir'" in message
+    assert "clients.ville, règle nature : statut inconnu 'ok'" in message
+    assert "clients.ville, règle obligatoire : champs attendus" in message
+    assert "clients.code : règles attendues" in message
 
 
 def test_statut_en_forme_decomposee_est_normalise(tmp_path):
-    decompose = "observe\u0301"
-    assert decompose != "observ\u00e9"
+    decompose = "observé"
+    assert decompose != "observé"
     chemin = tmp_path / "dictionnaire.yaml"
-    _ecrire_brut(chemin, _dictionnaire_fictif(statut=decompose))
-    statut = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]["statut"]
-    assert statut == "observ\u00e9"
+    tables = _dictionnaire_fictif(liste=[_valeur("A", statut=decompose)], statut=decompose)
+    _ecrire_brut(chemin, tables)
+    valeurs = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]
+    assert valeurs["statut"] == "observé"
+    assert valeurs["liste"][0]["statut"] == "observé"
 
 
-def test_ecrasement_refuse_si_une_regle_a_ete_revue(tmp_path):
+def test_regle_en_vigueur_et_proposition(tmp_path):
+    # Non revue, la règle est la proposition.
+    tables = _dictionnaire_fictif()
+    tables["clients"]["ville"]["obligatoire"]["regle"] = "facultatif"
+    message = _erreur_chargement(tmp_path, tables)
+    assert "au statut observé, la règle ('facultatif') doit être la proposition" in message
+    # Revue, elle peut s'en écarter : le métier a donné sa règle.
+    tables["clients"]["ville"]["obligatoire"].update(statut="documenté", revu_le="2026-10-08")
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, tables)
+    relu = charger_dictionnaire(chemin)["clients"]["ville"]["obligatoire"]
+    assert (relu["regle"], relu["proposition"]) == ("facultatif", "obligatoire")
+
+
+def test_decision_sans_date_et_date_mal_formee(tmp_path):
+    tables = _dictionnaire_fictif(
+        liste=[
+            _valeur("A", statut="valide", revu_le=None),
+            _valeur("B", statut="invalide", revu_le="08/10/2026"),
+            _valeur("C", revu_le=20261008, commentaire=None),
+        ],
+        statut="valide",
+    )
+    message = _erreur_chargement(tmp_path, tables)
+    assert "règle valeurs : statut valide sans date de revue" in message
+    assert "valeur 'A' : statut valide sans date de revue" in message
+    assert "valeur 'B' : revu_le '08/10/2026' (type str)" in message
+    assert "valeur 'C' : revu_le 20261008 (type int)" in message
+    assert "valeur 'C' : commentaire None (type NoneType)" in message
+
+
+def test_ecrasement_refuse_si_une_decision_a_ete_prise(tmp_path):
     chemin = tmp_path / "dictionnaire.yaml"
     ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
     # Tant que tout est au statut observé, la régénération est libre.
-    ecrire_dictionnaire(_dictionnaire_fictif(valeurs=["A", "B"]), "2026-03", chemin)
-    _ecrire_brut(chemin, _dictionnaire_fictif(valeurs=["A", "B"], statut="valide"))
-    with pytest.raises(FileExistsError, match="1 règles déjà revues"):
+    ecrire_dictionnaire(_dictionnaire_fictif(liste=["A", "B"]), "2026-03", chemin)
+    revu = _dictionnaire_fictif(
+        liste=["A", _valeur("B", statut="invalide")], statut="valide", revu_le="2026-10-08"
+    )
+    _ecrire_brut(chemin, revu)
+    # Une règle et une valeur revues.
+    with pytest.raises(FileExistsError, match="2 décisions de revue"):
         ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin)
-    assert charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]["statut"] == "valide"
+    assert charger_dictionnaire(chemin) == revu
     ecrire_dictionnaire(_dictionnaire_fictif(), "2026-04", chemin, ecraser=True)
     assert charger_dictionnaire(chemin) == _dictionnaire_fictif()
 
@@ -441,8 +546,7 @@ def test_ecrasement_refuse_si_une_regle_a_ete_revue(tmp_path):
 def test_valeurs_ecrites_a_la_main_sans_guillemets_rejetees(tmp_path):
     chemin = tmp_path / "dictionnaire.yaml"
     dictionnaire = _dictionnaire_fictif(
-        valeurs=["Oui", "PIEGE1", "PIEGE2", "PIEGE3", "PIEGE4"],
-        a_arbitrer=[{"valeur": "PIEGE5", "effectif": 3}],
+        liste=["Oui", "PIEGE1", "PIEGE2", "PIEGE3", "PIEGE4", _valeur("PIEGE5", "à arbitrer", 3)]
     )
     ecrire_dictionnaire(dictionnaire, "2026-03", chemin)
     # Saisie à la main, sans guillemets, de valeurs que YAML ne lit pas comme du texte.
@@ -471,37 +575,88 @@ def test_valeurs_ecrites_a_la_main_sans_guillemets_rejetees(tmp_path):
 
 def test_valeurs_vides_doublons_et_effectifs_rejetes(tmp_path):
     tables = _dictionnaire_fictif(
-        valeurs=["A", "A", "  "],
-        a_arbitrer=[
-            {"valeur": "A", "effectif": 2},
-            {"valeur": "B", "effectif": 0},
-            {"valeur": "C", "effectif": True},
-            {"valeur": "D"},
-        ],
+        liste=[
+            "A",
+            "A",
+            "  ",
+            _valeur("A", "à arbitrer", 2),
+            _valeur("B", "à arbitrer", 0),
+            _valeur("C", "à arbitrer", True),
+            _valeur("D", "à arbitrer", 0, statut="invalide"),
+            _valeur("E", "inventée"),
+            {"valeur": "F", "effectif": 1},
+        ]
     )
-    chemin = tmp_path / "dictionnaire.yaml"
-    _ecrire_brut(chemin, tables)
-    with pytest.raises(ValueError) as erreur:
-        charger_dictionnaire(chemin)
-    message = str(erreur.value)
+    message = _erreur_chargement(tmp_path, tables)
     assert message.count("valeur 'A' présente plusieurs fois") == 2
     assert "valeur vide ou composée d'espaces" in message
-    assert "effectif 0 (type int) pour 'B'" in message
-    assert "effectif True (type bool) pour 'C'" in message
-    assert "champs attendus valeur, effectif" in message
+    assert "valeur 'B' : effectif 0 (type int), un entier d'au moins 1" in message
+    assert "valeur 'C' : effectif True (type bool)" in message
+    # Une valeur revue qui n'est plus observée garde sa décision, avec un effectif nul.
+    assert "valeur 'D'" not in message
+    assert "valeur 'E' : origine inconnue 'inventée'" in message
+    assert "champs attendus valeur, origine, effectif" in message
+
+
+def test_statut_d_une_valeur_selon_son_origine(tmp_path):
+    tables = _dictionnaire_fictif(
+        liste=[
+            _valeur("A", statut="documenté"),
+            _valeur("B", "ajoutée", 0, statut="valide"),
+            _valeur("C", "ajoutée", 0, statut="documenté"),
+        ]
+    )
+    message = _erreur_chargement(tmp_path, tables)
+    assert "valeur 'A' : statut 'documenté' impossible sur une valeur observée" in message
+    assert "valeur 'B' : une valeur ajoutée doit porter le statut documenté" in message
+    assert "valeur 'C'" not in message
+
+
+def test_remplacement_d_une_valeur_invalide(tmp_path):
+    liste = [
+        _valeur("Réalisée", statut="valide"),
+        _valeur("Terminée", "ajoutée", 0, statut="documenté"),
+        _valeur("OK", "à arbitrer", 3, statut="invalide", remplacement="Réalisée"),
+        _valeur("Fini", "à arbitrer", 2, statut="invalide", remplacement="Terminée"),
+        _valeur("???", "à arbitrer", 1, statut="invalide"),
+    ]
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(liste=liste), "2026-03", chemin)
+    relu = charger_dictionnaire(chemin)["clients"]["ville"]["valeurs"]["liste"]
+    assert [v["remplacement"] for v in relu] == [None, None, "Réalisée", "Terminée", None]
+
+
+def test_remplacements_refuses(tmp_path):
+    tables = _dictionnaire_fictif(
+        liste=[
+            _valeur("Réalisée", statut="valide", remplacement="Annulée"),
+            _valeur("Annulée"),
+            _valeur("OK", "à arbitrer", 3, statut="invalide", remplacement="Annulée"),
+            _valeur("Fait", "à arbitrer", 2, statut="invalide", remplacement="OK"),
+            _valeur("Fini", "à arbitrer", 2, statut="invalide", remplacement="Inconnue"),
+            _valeur("Vu", "à arbitrer", 1, statut="invalide", remplacement="Vu"),
+            _valeur("27", "à arbitrer", 1, statut="invalide", remplacement=27),
+        ]
+    )
+    message = _erreur_chargement(tmp_path, tables)
+    assert "valeur 'Réalisée' : remplacement réservé au statut invalide" in message
+    # La cible doit être valide ou documentée : ni non revue, ni invalide (pas de chaîne).
+    for valeur, cible in (("OK", "'Annulée'"), ("Fait", "'OK'"), ("Fini", "'Inconnue'"),
+                          ("Vu", "'Vu'"), ("27", "27")):
+        assert f"valeur {valeur!r} : remplacement {cible} (type" in message
+    assert len(message.splitlines()) == 1 + 6
 
 
 @pytest.mark.parametrize(
-    ("valeurs", "a_arbitrer", "attendu"),
+    ("modification", "attendu"),
     [
-        ([], [], "liste vide"),
-        (False, [], "False (type bool) au lieu de"),
-        (["A"], {"B": 1}, "une liste est attendue"),
+        ({"liste": []}, "liste fermée sans aucune valeur"),
+        ({"regle": ["A"], "proposition": ["A"]}, "regle ['A'] (type list) au lieu de"),
+        ({"regle": False, "proposition": False}, "proposition False (type bool) au lieu de"),
+        ({"liste": {"A": 1}}, "une liste est attendue"),
     ],
 )
-def test_regle_valeurs_mal_formee(tmp_path, valeurs, a_arbitrer, attendu):
-    chemin = tmp_path / "dictionnaire.yaml"
-    _ecrire_brut(chemin, _dictionnaire_fictif(valeurs=valeurs, a_arbitrer=a_arbitrer))
-    with pytest.raises(ValueError) as erreur:
-        charger_dictionnaire(chemin)
-    assert attendu in str(erreur.value)
+def test_regle_valeurs_mal_formee(tmp_path, modification, attendu):
+    tables = _dictionnaire_fictif(liste=["A"])
+    tables["clients"]["ville"]["valeurs"].update(modification)
+    assert attendu in _erreur_chargement(tmp_path, tables)
