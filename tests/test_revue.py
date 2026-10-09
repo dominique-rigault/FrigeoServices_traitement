@@ -67,6 +67,8 @@ def _colonne(valeurs=None, a_arbitrer=None, vides=0, hors_nature=0):
         "obligatoire": _regle("obligatoire", {"vides": vides}),
         "nature": _regle("texte", {"hors_nature": hors_nature}),
         "valeurs": liste,
+        # Règle présente dans le dictionnaire, pas encore revue dans le classeur.
+        "format": {**_regle("aucune", {}), "liste": []},
     }
 
 
@@ -94,8 +96,10 @@ def _lire(feuille):
 def test_lignes_regles():
     lignes = lignes_regles(_dictionnaire())
     cles = [(l["table"], l["colonne"], l["regle"]) for l in lignes]
-    # Trois lignes par colonne, y compris sans liste proposée.
+    # Trois lignes par colonne, y compris sans liste proposée. La règle « format » du
+    # dictionnaire n'est pas encore revue dans le classeur.
     assert len(lignes) == 4 * 3
+    assert {l["regle"] for l in lignes} == {"obligatoire", "nature", "valeurs"}
     assert ("clients", "statut", "valeurs") in cles
     par_cle = dict(zip(cles, lignes))
     sans_liste = par_cle[("clients", "type_commerce", "valeurs")]

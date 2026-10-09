@@ -18,6 +18,7 @@ from frigeo.dictionnaire import (
     problemes_dictionnaire,
     generer_dictionnaire,
     generer_table,
+    proposer_format,
     proposer_liste,
     proposer_nature,
     proposer_obligatoire,
@@ -313,15 +314,28 @@ def test_tout_est_au_statut_observe_et_la_regle_est_la_proposition():
         for colonne in colonnes.values()
         for regle in colonne.values()
     ]
-    assert len(regles) == 9
-    valeurs = [valeur for regle in regles for valeur in regle.get("liste", [])]
+    assert len(regles) == 12
+    valeurs = [
+        valeur
+        for colonne in dictionnaire["clients"].values()
+        for valeur in colonne["valeurs"]["liste"]
+    ]
     assert len(valeurs) == 5
-    for element in regles + valeurs:
+    formes = [
+        forme
+        for colonne in dictionnaire["clients"].values()
+        for forme in colonne["format"]["liste"]
+    ]
+    assert len(formes) == 3
+    for element in regles + valeurs + formes:
         assert element["statut"] == "observé"
         assert element["commentaire"] == ""
         assert element["revu_le"] is None
     assert all(regle["regle"] == regle["proposition"] for regle in regles)
     assert all(valeur["remplacement"] is None for valeur in valeurs)
+    # Ni la colonne à liste proposée ni la colonne sensible n'ont de forme.
+    assert dictionnaire["clients"]["statut"]["format"]["liste"] == []
+    assert dictionnaire["clients"]["type_commerce"]["format"]["liste"] == []
 
 
 def test_incoherence_de_sensibilite_arrete_la_generation():
@@ -343,7 +357,17 @@ def test_resumer_dictionnaire():
         "nb_a_arbitrer",
         "nb_observees",
         "motif_liste",
+        "formes_fermees",
+        "nb_formes",
+        "nb_formes_a_arbitrer",
+        "nb_formes_observees",
+        "motif_format",
     ]
+    assert list(resume["formes_fermees"]) == [False, False, True]
+    assert resume.loc["statut", "motif_format"] == "liste de valeurs proposée"
+    assert resume.loc["type_commerce", "motif_format"] == "colonne sensible"
+    assert resume.loc["commentaire", "nb_formes"] == 3
+    assert resume.loc["commentaire", "nb_formes_a_arbitrer"] == 0
     assert resume.loc["statut", "liste_fermee"]
     assert resume.loc["statut", "nb_valeurs"] == 3
     assert resume.loc["statut", "nb_a_arbitrer"] == 2
@@ -378,23 +402,35 @@ def _valeur(valeur, origine="liste proposée", effectif=1, statut="observé", **
     return element
 
 
-def _dictionnaire_fictif(liste=None, statut="observé", revu_le=None):
-    """Une colonne, avec une liste fermée si `liste` (des valeurs ou des textes) est donnée."""
+def _forme(forme, origine="liste proposée", effectif=1, statut="observé", **champs):
+    element = _valeur(forme, origine, effectif, statut, **champs)
+    del element["valeur"], element["remplacement"]
+    return {"forme": forme, **element}
+
+
+def _dictionnaire_fictif(liste=None, statut="observé", revu_le=None, formes=None):
+    """Une colonne, avec une liste fermée si `liste` (des valeurs ou des textes) est donnée.
+
+    De même, avec des formes fermées si `formes` (des formes ou des textes) est donnée.
+    """
     liste = [v if isinstance(v, dict) else _valeur(v) for v in liste or []]
     valeurs = _regle("liste fermée" if liste else "aucune", statut, revu_le=revu_le)
     valeurs["liste"] = liste
+    regle_format = _regle("formes fermées" if formes else "aucune")
+    regle_format["liste"] = [f if isinstance(f, dict) else _forme(f) for f in formes or []]
     return {
         "clients": {
             "ville": {
                 "obligatoire": _regle("obligatoire", a_arbitrer={"vides": 0}),
                 "nature": _regle("texte", a_arbitrer={"hors_nature": 0}),
                 "valeurs": valeurs,
+                "format": regle_format,
             }
         }
     }
 
 
-def _ecrire_brut(chemin, tables, structure=2):
+def _ecrire_brut(chemin, tables, structure=3):
     """Écrit un fichier sans passer par `ecrire_dictionnaire` (cas d'un fichier modifié à la main)."""
     texte = yaml.safe_dump(
         {"meta": {"structure": structure}, "tables": tables}, allow_unicode=True
@@ -415,7 +451,7 @@ def test_aller_retour_du_dictionnaire_genere(tmp_path):
     chemin = ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "config" / "dictionnaire.yaml")
     assert charger_dictionnaire(chemin) == dictionnaire
     contenu = yaml.safe_load(chemin.read_text(encoding="utf-8"))
-    assert contenu["meta"]["structure"] == 2
+    assert contenu["meta"]["structure"] == 3
     assert contenu["meta"]["periode_fin"] == "2026-03"
     assert contenu["meta"]["seuils"]["effectif_min"] == 200
     assert "Boulangerie" not in chemin.read_text(encoding="utf-8")
@@ -470,7 +506,7 @@ def test_fichier_a_l_ancienne_structure_refuse(tmp_path):
     chemin = tmp_path / "dictionnaire.yaml"
     ancien = {"clients": {"ville": {"valeurs": {"regle": ["A"], "statut": "observé"}}}}
     chemin.write_text(yaml.safe_dump({"meta": {}, "tables": ancien}), encoding="utf-8")
-    with pytest.raises(ValueError, match="structure None, attendue 2") as erreur:
+    with pytest.raises(ValueError, match="structure None, attendue 3") as erreur:
         charger_dictionnaire(chemin)
     # Un seul message, sans la liste des écarts règle par règle.
     assert "\n" not in str(erreur.value)
@@ -885,7 +921,7 @@ def test_journal_vide_a_la_generation_et_pour_un_fichier_anterieur(tmp_path):
     chemin = tmp_path / "dictionnaire.yaml"
     ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
     meta = charger_meta(chemin)
-    assert (meta["structure"], meta["periode_fin"], meta["revues"]) == (2, "2026-03", [])
+    assert (meta["structure"], meta["periode_fin"], meta["revues"]) == (3, "2026-03", [])
     # Fichier écrit avant le journal : pas de clé « revues ».
     _ecrire_brut(chemin, _dictionnaire_fictif())
     assert charger_meta(chemin)["revues"] == []
@@ -1062,3 +1098,385 @@ def test_effectif_masque_reserve_aux_colonnes_sensibles(tmp_path):
 )
 def test_nature_d_une_colonne_candidate(valeurs, candidate):
     assert bool(proposer_liste(_serie(*valeurs))["observees"]) is candidate
+
+
+# Règle de format : formes fermées, colonnes candidates et structure 3 (morceau 6a).
+
+
+def _codes(*modeles) -> pd.Series:
+    """Série de codes tous distincts, à partir de couples (modèle, effectif).
+
+    Des valeurs distinctes écartent la liste de valeurs : seule la forme se répète.
+    """
+    return pd.Series(
+        [modele.format(i) for modele, n in modeles for i in range(n)], dtype=object
+    )
+
+
+def test_format_propose_avec_formes_rares_a_arbitrer():
+    codes = pd.concat(
+        [
+            _codes(("CL-{:04d}", 993), ("CL{:04d}", 4), ("cl-{:04d}", 3)),
+            pd.Series([None, "", "  ", None, ""], dtype=object),
+        ],
+        ignore_index=True,
+    )
+    resultat = proposer_format(codes)
+    assert resultat["formes_fermees"] is True
+    assert resultat["motif"] == "1 formes principales couvrant 99.3 % des valeurs renseignées"
+    assert (resultat["formes"], resultat["effectifs"]) == (["AA-9999"], [993])
+    # Jamais déclarées valides : à arbitrer, par effectif décroissant.
+    assert resultat["a_arbitrer"] == [
+        {"forme": "AA9999", "effectif": 4},
+        {"forme": "aa-9999", "effectif": 3},
+    ]
+    assert resultat["observees"] == []
+
+
+def test_format_jusqu_a_trois_formes_principales_pour_un_texte():
+    trois = _codes(("AB-{:03d}", 400), ("ABC-{:03d}", 300), ("A-{:03d}", 300))
+    # À effectif égal, l'ordre alphabétique des formes départage.
+    assert proposer_format(trois)["formes"] == ["AA-999", "A-999", "AAA-999"]
+    quatre = _codes(
+        ("AB-{:03d}", 400), ("ABC-{:03d}", 300), ("A-{:03d}", 200), ("ABCD-{:03d}", 100)
+    )
+    resultat = proposer_format(quatre)
+    assert resultat["formes_fermees"] is False
+    assert resultat["motif"] == "4 formes principales (maximum 3)"
+    assert resultat["formes"] == resultat["a_arbitrer"] == resultat["observees"] == []
+
+
+def test_format_une_seule_forme_pour_un_entier():
+    # Un code postal a une longueur fixe, une durée non.
+    codes_postaux = _codes(("27{:03d}", 600), ("76{:03d}", 398), ("27{:02d}", 2))
+    resultat = proposer_format(codes_postaux)
+    assert resultat["formes"] == ["99999"]
+    assert resultat["a_arbitrer"] == [{"forme": "9999", "effectif": 2}]
+    durees = pd.Series(
+        [str(10 + i % 90) for i in range(600)] + [str(100 + i % 300) for i in range(400)],
+        dtype=object,
+    )
+    assert proposer_format(durees)["motif"] == "2 formes principales (maximum 1)"
+
+
+def test_format_couverture_insuffisante():
+    serie = pd.Series(
+        [f"AB-{i:03d}" for i in range(900)] + [f"X{'y' * i}" for i in range(100)], dtype=object
+    )
+    resultat = proposer_format(serie)
+    assert resultat["formes_fermees"] is False
+    assert resultat["motif"] == (
+        "formes principales couvrant 90.0 % des valeurs renseignées (minimum 95 %)"
+    )
+
+
+def test_format_ecarte_par_la_liste_de_valeurs_la_nature_ou_la_sensibilite():
+    statut = _serie(("Actif", 700), ("Inactif", 300))
+    assert proposer_format(statut)["motif"] == "liste de valeurs proposée"
+    petite_liste = _serie(("CDI", 12), ("CDD", 6))
+    assert proposer_format(petite_liste)["motif"] == "colonne candidate à une liste de valeurs"
+    dates = pd.Series([f"{j:02d}/03/2025" for j in range(1, 29)] * 10, dtype=object)
+    assert proposer_format(dates)["motif"] == "nature date JJ/MM/AAAA"
+    montants = pd.Series([f"{i},50" for i in range(300)], dtype=object)
+    assert proposer_format(montants)["motif"] == "nature décimal virgule (texte)"
+    natifs = pd.Series(range(1000, 1300), dtype=object)
+    assert proposer_format(natifs)["motif"] == "nature nombre natif"
+    assert proposer_format(pd.Series([None, " "], dtype=object))["motif"] == (
+        "aucune valeur renseignée"
+    )
+    codes = pd.Series([f"CL-{i:04d}" for i in range(300)], dtype=object)
+    sensible = proposer_format(codes, "clients", "code", {"clients": frozenset({"code"})})
+    assert sensible == {
+        "formes_fermees": False,
+        "motif": "colonne sensible",
+        "formes": [],
+        "effectifs": [],
+        "a_arbitrer": [],
+        "observees": [],
+    }
+    assert proposer_format(codes, "clients", "code", {"clients": frozenset()})["formes"] == [
+        "AA-9999"
+    ]
+
+
+def test_format_colonne_candidate_sous_le_seuil_d_effectif():
+    matricules = pd.Series([f"M{i:03d}" for i in range(18)], dtype=object)
+    resultat = proposer_format(matricules)
+    assert resultat["formes_fermees"] is False
+    assert resultat["motif"] == "effectif insuffisant (18 valeurs renseignées, 200 requises)"
+    assert resultat["observees"] == [{"forme": "A999", "effectif": 18}]
+    # Trop de formes distinctes : rien n'est rendu.
+    libres = _codes(("Ab{:02d}", 5), ("Abc{:02d}", 5), ("Abcd{:02d}", 5), ("Abcde{:02d}", 5))
+    assert proposer_format(libres)["motif"].startswith("effectif insuffisant")
+    assert proposer_format(libres)["observees"] == []
+    # Un entier n'admet qu'une forme, même sous le seuil.
+    codes = _codes(("27{:03d}", 20), ("27{:02d}", 6))
+    assert proposer_format(codes)["motif"].startswith("effectif insuffisant")
+    assert proposer_format(codes)["observees"] == []
+    assert proposer_format(_codes(("27{:03d}", 26)))["observees"] == [
+        {"forme": "99999", "effectif": 26}
+    ]
+    # Une date ou un nombre natif ne sont pas des codes.
+    dates = pd.Series([f"{j:02d}/03/2025" for j in range(1, 21)], dtype=object)
+    assert proposer_format(dates)["motif"] == "nature date JJ/MM/AAAA"
+    assert proposer_format(pd.Series(range(100, 120), dtype=object))["motif"] == (
+        "nature nombre natif"
+    )
+
+
+def test_format_seuils_parametrables():
+    codes = _codes(("AB-{:02d}", 30), ("ABC-{:02d}", 20))
+    assert proposer_format(codes)["formes_fermees"] is False
+    resultat = proposer_format(codes, effectif_min=50)
+    assert resultat["formes"] == ["AA-99", "AAA-99"]
+    assert proposer_format(codes, effectif_min=50, max_formes=1)["formes_fermees"] is False
+    rare = _codes(("AB-{:03d}", 97), ("ab-{:03d}", 3))
+    assert proposer_format(rare, effectif_min=50)["formes"] == ["AA-999", "aa-999"]
+    assert proposer_format(rare, effectif_min=50, part_min=0.05)["a_arbitrer"] == [
+        {"forme": "aa-999", "effectif": 3}
+    ]
+    assert proposer_format(rare, effectif_min=50, part_min=0.05, couverture_min=0.99)[
+        "formes_fermees"
+    ] is False
+
+
+def _table_de_codes() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "code_client": pd.Series(
+                [f"CL-{i:04d}" for i in range(996)] + ["CL0996", "cl-0997", "", None],
+                dtype=object,
+            ),
+            "matricule": pd.Series([f"M{i % 18:03d}" for i in range(1000)], dtype=object),
+            "salaire": pd.Series([f"S-{i:04d}" for i in range(1000)], dtype=object),
+        }
+    )
+
+
+def test_generer_colonne_avec_format():
+    table = generer_table(_table_de_codes(), "paie", {"paie": frozenset({"salaire"})})
+    assert list(table["code_client"]) == ["obligatoire", "nature", "valeurs", "format"]
+    regle = table["code_client"]["format"]
+    assert regle["regle"] == regle["proposition"] == "formes fermées"
+    assert regle["statut"] == "observé"
+    assert regle["a_arbitrer"] == {"formes": 2}
+    assert [(f["forme"], f["origine"], f["effectif"]) for f in regle["liste"]] == [
+        ("AA-9999", "liste proposée", 996),
+        ("AA9999", "à arbitrer", 1),
+        ("aa-9999", "à arbitrer", 1),
+    ]
+    assert regle["liste"][0] == {
+        "forme": "AA-9999",
+        "origine": "liste proposée",
+        "effectif": 996,
+        "statut": "observé",
+        "commentaire": "",
+        "revu_le": None,
+    }
+    # 18 valeurs distinctes pour 1000 lignes : ni liste (trop de valeurs), ni colonne
+    # candidate à une liste, mais une seule forme.
+    assert table["matricule"]["valeurs"]["liste"] == []
+    assert [f["forme"] for f in table["matricule"]["format"]["liste"]] == ["A999"]
+    # Colonne sensible : aucune forme observée, et le motif qui masque les effectifs.
+    sensible = table["salaire"]["format"]
+    assert (sensible["regle"], sensible["motif"], sensible["liste"]) == (
+        "aucune", "colonne sensible", [],
+    )
+    assert "A-9999" not in repr(table["salaire"])
+
+
+def test_generer_colonne_candidate_a_un_format():
+    donnees = pd.DataFrame({"matricule": pd.Series([f"M{i:03d}" for i in range(18)], dtype=object)})
+    regle = generer_table(donnees, "intervenants", {})["matricule"]["format"]
+    assert (regle["regle"], regle["proposition"], regle["a_arbitrer"]) == ("aucune", "aucune", {})
+    assert [(f["forme"], f["origine"], f["effectif"]) for f in regle["liste"]] == [
+        ("A999", "observée", 18)
+    ]
+
+
+def test_aller_retour_d_un_dictionnaire_avec_formats(tmp_path):
+    dictionnaire = generer_dictionnaire(
+        {"paie": _table_de_codes()}, {"paie": frozenset({"salaire"})}
+    )
+    chemin = ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "dictionnaire.yaml")
+    assert charger_dictionnaire(chemin) == dictionnaire
+    assert charger_meta(chemin)["structure"] == 3
+
+
+def test_fichier_de_structure_2_complete_a_la_lecture(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    tables = _dictionnaire_fictif(liste=[_valeur("A", statut="valide")], statut="valide",
+                                  revu_le="2026-10-08")
+    tables["clients"]["salaire"] = deepcopy(_dictionnaire_fictif()["clients"]["ville"])
+    tables["clients"]["salaire"]["valeurs"]["motif"] = "colonne sensible"
+    attendu = deepcopy(tables)
+    for colonne in tables["clients"].values():
+        del colonne["format"]
+    _ecrire_brut(chemin, tables, structure=2)
+    avant = chemin.read_bytes()
+
+    relu = charger_dictionnaire(chemin)
+    regle = relu["clients"]["ville"]["format"]
+    assert set(relu["clients"]["ville"]) == {"obligatoire", "nature", "valeurs", "format"}
+    assert (regle["regle"], regle["proposition"], regle["statut"], regle["liste"]) == (
+        "aucune", "aucune", "observé", [],
+    )
+    assert regle["motif"] == "règle absente du fichier (structure 2), à régénérer puis fusionner"
+    assert relu["clients"]["salaire"]["format"]["motif"] == "colonne sensible"
+    # Les décisions sont lues telles quelles, et la lecture ne modifie pas le fichier.
+    assert relu["clients"]["ville"]["valeurs"] == attendu["clients"]["ville"]["valeurs"]
+    assert charger_meta(chemin)["structure"] == 3
+    assert chemin.read_bytes() == avant
+
+    # L'écriture passe à la structure 3, après copie du fichier qui porte des décisions.
+    ecrire_dictionnaire(relu, "2026-03", chemin)
+    assert yaml.safe_load(chemin.read_text(encoding="utf-8"))["meta"]["structure"] == 3
+    assert charger_dictionnaire(chemin) == relu
+    copies = list(dossier_sauvegardes(chemin).iterdir())
+    assert len(copies) == 1 and copies[0].read_bytes() == avant
+    # Une régénération brute reste refusée : elle perdrait les décisions.
+    with pytest.raises(ValueError, match="écriture refusée, 2 décisions"):
+        ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+
+
+def test_fichier_de_structure_inconnue_refuse(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    for structure in (1, 4, "3"):
+        _ecrire_brut(chemin, _dictionnaire_fictif(), structure=structure)
+        with pytest.raises(ValueError, match="attendue 3. Le fichier est à régénérer"):
+            charger_dictionnaire(chemin)
+
+
+def test_structure_3_exige_la_regle_format(tmp_path):
+    tables = _dictionnaire_fictif()
+    del tables["clients"]["ville"]["format"]
+    message = _erreur_chargement(tmp_path, tables)
+    assert "clients.ville : règles attendues obligatoire, nature, valeurs, format" in message
+
+
+def test_liste_de_formes_controlee_au_chargement(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    correct = _dictionnaire_fictif(
+        formes=[
+            _forme("AA-9999", effectif=990),
+            _forme("AA9999", "à arbitrer", 6, statut="invalide"),
+            _forme("AA-99999", "ajoutée", 0, statut="documenté"),
+        ]
+    )
+    _ecrire_brut(chemin, correct)
+    assert charger_dictionnaire(chemin) == correct
+
+    tables = _dictionnaire_fictif(
+        formes=[
+            _forme("AA-9999"),
+            _forme("AA-9999"),
+            _forme("CL-0001"),
+            _forme(9999),
+            _forme(" "),
+            _forme("AA", "ajoutée", 0),
+            _forme("A9", statut="documenté"),
+            _forme("A99", effectif=0),
+            _forme("A999", origine="inventée"),
+            {**_forme("A9999"), "remplacement": None},
+        ]
+    )
+    message = _erreur_chargement(tmp_path, tables)
+    ou = "clients.ville"
+    for attendu in (
+        f"{ou}, liste de formes : forme 'AA-9999' présente plusieurs fois",
+        f"{ou}, forme 'CL-0001' : ce n'est pas une forme (9 pour un chiffre",
+        f"{ou}, liste de formes : 9999 (type int) n'est pas un texte, mettre la forme entre",
+        f"{ou}, liste de formes : forme vide ou composée d'espaces",
+        f"{ou}, forme 'AA' : une forme ajoutée doit porter le statut documenté",
+        f"{ou}, forme 'A9' : statut 'documenté' impossible sur une forme observée",
+        f"{ou}, forme 'A99' : effectif 0 (type int), un entier d'au moins 1 est attendu",
+        f"{ou}, forme 'A999' : origine inconnue 'inventée'",
+        f"{ou}, liste de formes : champs attendus forme, origine, effectif, statut",
+    ):
+        assert attendu in message, attendu
+
+
+def test_regle_format_mal_formee_ou_incoherente(tmp_path):
+    tables = _dictionnaire_fictif()
+    tables["clients"]["ville"]["format"].update(
+        regle="formes fermées", proposition="formes fermées"
+    )
+    message = _erreur_chargement(tmp_path, tables)
+    assert "liste de formes : formes fermées sans aucune forme" in message
+
+    tables = _dictionnaire_fictif()
+    tables["clients"]["ville"]["format"].update(regle="liste fermée", proposition="liste fermée")
+    message = _erreur_chargement(tmp_path, tables)
+    assert (
+        "règle format : regle 'liste fermée' (type str) au lieu de « formes fermées » ou « aucune »"
+        in message
+    )
+
+    # Format déclaré par le métier : au moins une forme valide ou documentée.
+    tables = _dictionnaire_fictif(formes=[_forme("A999", "observée", 18)])
+    tables["clients"]["ville"]["format"].update(
+        regle="formes fermées", proposition="aucune", statut="documenté", revu_le="2026-10-09"
+    )
+    message = _erreur_chargement(tmp_path, tables)
+    assert "liste de formes : format déclaré sans aucune forme valide ou documentée" in message
+    tables["clients"]["ville"]["format"]["liste"][0].update(statut="valide", revu_le="2026-10-09")
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, tables)
+    assert charger_dictionnaire(chemin) == tables
+
+
+def test_forme_d_une_colonne_sensible_sans_effectif(tmp_path):
+    tables = _dictionnaire_fictif(
+        formes=[_forme("A-9999", "ajoutée", None, statut="documenté")]
+    )
+    regle = tables["clients"]["ville"]["format"]
+    regle.update(
+        regle="formes fermées", proposition="aucune", statut="documenté",
+        revu_le="2026-10-09", motif="colonne sensible",
+    )
+    chemin = tmp_path / "dictionnaire.yaml"
+    _ecrire_brut(chemin, tables)
+    assert charger_dictionnaire(chemin) == tables
+    regle["liste"][0]["effectif"] = 0
+    regle["liste"].append(_forme("A-999", "observée", 3))
+    message = _erreur_chargement(tmp_path, tables)
+    assert "forme 'A-9999' : effectif 0 (type int) dans une colonne sensible" in message
+    assert "forme 'A-999' : forme non revue dans une colonne sensible" in message
+
+
+def test_decisions_sur_les_formes_protegees_a_l_ecriture(tmp_path):
+    chemin = tmp_path / "dictionnaire.yaml"
+    revu = _dictionnaire_fictif(
+        formes=[
+            _forme("AA-9999", effectif=990, statut="valide"),
+            _forme("AA9999", "à arbitrer", 6, statut="invalide", commentaire="tiret oublié"),
+        ]
+    )
+    revu["clients"]["ville"]["format"].update(statut="valide", revu_le="2026-10-08")
+    ecrire_dictionnaire(revu, "2026-03", chemin)
+    # Une régénération brute perdrait les trois décisions.
+    brut = _dictionnaire_fictif(
+        formes=[_forme("AA-9999", effectif=995), _forme("AA9999", "à arbitrer", 7)]
+    )
+    with pytest.raises(ValueError, match="écriture refusée, 3 décisions") as erreur:
+        ecrire_dictionnaire(brut, "2026-04", chemin)
+    assert str(erreur.value).splitlines()[1:] == [
+        (
+            "  clients.ville, règle format : statut 'valide' devenu 'observé', revu_le "
+            "'2026-10-08' devenu None"
+        ),
+        (
+            "  clients.ville, forme 'AA-9999' : statut 'valide' devenu 'observé', revu_le "
+            "'2026-10-08' devenu None"
+        ),
+        (
+            "  clients.ville, forme 'AA9999' : statut 'invalide' devenu 'observé', "
+            "commentaire 'tiret oublié' devenu '', revu_le '2026-10-08' devenu None"
+        ),
+    ]
+    # Seuls les effectifs changent : l'écriture passe.
+    mis_a_jour = deepcopy(revu)
+    mis_a_jour["clients"]["ville"]["format"]["liste"][0]["effectif"] = 995
+    ecrire_dictionnaire(mis_a_jour, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == mis_a_jour
+

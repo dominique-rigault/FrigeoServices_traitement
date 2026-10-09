@@ -22,7 +22,7 @@ import yaml
 
 from . import racine_projet
 from .confidentialite import charger_sensibilite, est_sensible, verifier_sensibilite
-from .profilage import COLONNES_LIGNAGE, _NATURES_TEXTE, profiler_colonne
+from .profilage import COLONNES_LIGNAGE, _NATURES_TEXTE, profiler_colonne, signature
 
 # Seuils par défaut du critère de liste fermée (validés le 05/10/2026, à
 # confirmer sur le profil réel).
@@ -64,6 +64,19 @@ NATURES_CANDIDATES = ("texte", "entier (texte)", "nombre natif")
 PART_NATURE_CANDIDATE = 0.5
 
 
+def _nature_sous_effectif(profil: dict, renseignees: int) -> str:
+    """Nature d'une colonne trop peu renseignée pour que `proposer_nature` tranche.
+
+    C'est la nature dominante du profil quand elle couvre au moins la moitié des
+    valeurs renseignées, « texte » sinon.
+    """
+    nature = profil["nature_dominante"]
+    conformes = renseignees - profil["nb_hors_nature"]
+    if nature != "texte" and conformes < PART_NATURE_CANDIDATE * renseignees:
+        nature = "texte"
+    return nature
+
+
 def _nature_candidate(serie: pd.Series, presentes: pd.Series) -> bool:
     """Vrai si la nature de la colonne admet une liste de valeurs.
 
@@ -71,11 +84,7 @@ def _nature_candidate(serie: pd.Series, presentes: pd.Series) -> bool:
     des valeurs renseignées, « texte » sinon. Un nombre natif n'est admis que si
     toutes les valeurs numériques sont entières (un code, pas une mesure).
     """
-    profil = profiler_colonne(serie)
-    nature = profil["nature_dominante"]
-    conformes = len(presentes) - profil["nb_hors_nature"]
-    if nature != "texte" and conformes < PART_NATURE_CANDIDATE * len(presentes):
-        nature = "texte"
+    nature = _nature_sous_effectif(profiler_colonne(serie), len(presentes))
     if nature == "nombre natif":
         nombres = pd.to_numeric(presentes, errors="coerce").dropna()
         return bool((nombres % 1 == 0).all())
@@ -281,9 +290,144 @@ def proposer_nature(
     )
 
 
+# Seuils du critère de format (validés le 09/10/2026 sur le profil réel) : nombre
+# maximal de formes principales, et natures d'un code ou d'un identifiant.
+MAX_FORMES = 3
+NATURES_FORMAT = ("texte", "entier (texte)")
+# Un code numérique a une longueur fixe, une quantité non : une seule forme admise.
+NATURE_FORME_UNIQUE = "entier (texte)"
+
+
+def _refus_format(motif: str, observees: list | None = None) -> dict:
+    return {
+        "formes_fermees": False,
+        "motif": motif,
+        "formes": [],
+        "effectifs": [],
+        "a_arbitrer": [],
+        "observees": observees or [],
+    }
+
+
+def proposer_format(
+    serie: pd.Series,
+    table: str | None = None,
+    colonne: str | None = None,
+    sensibles: dict[str, frozenset[str]] | None = None,
+    *,
+    liste: dict | None = None,
+    profil: dict | None = None,
+    max_formes: int = MAX_FORMES,
+    part_min: float = PART_MIN,
+    couverture_min: float = COUVERTURE_MIN,
+    effectif_min: int = EFFECTIF_MIN,
+) -> dict:
+    """Décide si une colonne est proposée avec un format, c'est-à-dire des formes fermées.
+
+    La forme d'une valeur est sa signature (voir `profilage.signature`) : un chiffre
+    devient 9, une majuscule A, une minuscule a, les autres caractères sont gardés.
+    La règle ne sert que pour des codes et des identifiants : deux longueurs sont
+    deux formes.
+
+    Conditions, vérifiées dans cet ordre (la première qui échoue donne le motif) :
+    colonne non sensible, ni liste de valeurs proposée ni colonne candidate à une
+    liste (une liste est déjà plus stricte qu'un format), nature texte ou entier (une
+    date, une heure ou un décimal relèvent de la règle `nature`), au moins
+    `effectif_min` valeurs renseignées, au plus `max_formes` formes principales (une
+    seule pour une colonne de nature entier; une forme est principale si elle pèse
+    au moins `part_min` des valeurs renseignées), et formes principales couvrant au
+    moins `couverture_min` des valeurs renseignées.
+
+    Colonne candidate : sous `effectif_min`, les données ne permettent pas de
+    proposer un format. Les formes sont quand même rendues dans `observees`, avec
+    leur effectif, si la colonne respecte les trois premières conditions et ne
+    compte pas plus de formes distinctes que le maximum admis. Le métier pourra
+    déclarer le format sans les ressaisir.
+
+    Les formes non principales ne sont jamais déclarées valides : elles sont rendues
+    dans `a_arbitrer` avec leur effectif. `effectifs` donne l'effectif des formes
+    principales, dans le même ordre. Une colonne sensible n'expose aucune forme.
+    `liste` (résultat de `proposer_liste`) et `profil` (résultat de
+    `profiler_colonne`) évitent de les recalculer.
+    """
+    if sensibles is not None and est_sensible(sensibles, table, colonne):
+        return _refus_format(MOTIF_SENSIBLE)
+    if liste is None:
+        liste = proposer_liste(
+            serie,
+            table,
+            colonne,
+            sensibles,
+            part_min=part_min,
+            couverture_min=couverture_min,
+            effectif_min=effectif_min,
+        )
+    if liste["liste_fermee"]:
+        return _refus_format("liste de valeurs proposée")
+    if liste["observees"]:
+        return _refus_format("colonne candidate à une liste de valeurs")
+
+    presentes = _valeurs_renseignees(serie)
+    total = len(presentes)
+    if total == 0:
+        return _refus_format("aucune valeur renseignée")
+    if profil is None:
+        profil = profiler_colonne(serie)
+    if total < effectif_min:
+        nature = _nature_sous_effectif(profil, total)
+    else:
+        nature = proposer_nature(
+            serie,
+            profil,
+            couverture_min=couverture_min,
+            part_min=part_min,
+            effectif_min=effectif_min,
+        )["regle"]
+    if nature not in NATURES_FORMAT:
+        return _refus_format(f"nature {nature}")
+
+    par_forme: dict[str, int] = {}
+    for valeur, effectif in presentes.astype(str).value_counts().items():
+        forme = signature(valeur)
+        par_forme[forme] = par_forme.get(forme, 0) + int(effectif)
+    comptes = sorted(par_forme.items(), key=lambda element: (-element[1], element[0]))
+    maximum = 1 if nature == NATURE_FORME_UNIQUE else max_formes
+    if total < effectif_min:
+        candidate = len(comptes) <= maximum
+        return _refus_format(
+            f"effectif insuffisant ({total} valeurs renseignées, {effectif_min} requises)",
+            [{"forme": f, "effectif": n} for f, n in comptes] if candidate else [],
+        )
+
+    seuil = part_min * total
+    principales = [(f, n) for f, n in comptes if n >= seuil]
+    autres = [(f, n) for f, n in comptes if n < seuil]
+    if len(principales) > maximum:
+        return _refus_format(
+            f"{len(principales)} formes principales (maximum {maximum})"
+        )
+    couverture = sum(n for _, n in principales) / total
+    if couverture < couverture_min:
+        return _refus_format(
+            f"formes principales couvrant {100 * couverture:.1f} % des valeurs "
+            f"renseignées (minimum {100 * couverture_min:.0f} %)"
+        )
+    return {
+        "formes_fermees": True,
+        "motif": (
+            f"{len(principales)} formes principales couvrant "
+            f"{100 * couverture:.1f} % des valeurs renseignées"
+        ),
+        "formes": [f for f, _ in principales],
+        "effectifs": [n for _, n in principales],
+        "a_arbitrer": [{"forme": f, "effectif": n} for f, n in autres],
+        "observees": [],
+    }
+
+
 STATUT_INITIAL = "observé"
 STATUTS = ("observé", "valide", "invalide", "documenté")
-REGLES = ("obligatoire", "nature", "valeurs")
+REGLES = ("obligatoire", "nature", "valeurs", "format")
 
 A_DECIDER = "à décider"
 # Règle en vigueur d'une proposition écartée par le métier (statut « invalide ») :
@@ -292,17 +436,26 @@ REGLE_ECARTEE = "aucune"
 # Règle `valeurs` : la colonne n'accepte qu'une liste fermée de valeurs, ou non.
 LISTE_FERMEE = "liste fermée"
 AUCUNE_LISTE = "aucune"
+# Règle `format` : la colonne n'accepte que des formes fermées (signatures), ou non.
+FORMES_FERMEES = "formes fermées"
+AUCUN_FORMAT = "aucune"
+# Les deux règles qui portent une liste : le champ qui identifie un élément de la
+# liste, et la règle qui ferme la liste.
+CLES_LISTE = {"valeurs": "valeur", "format": "forme"}
+REGLES_FERMEES = {"valeurs": LISTE_FERMEE, "format": FORMES_FERMEES}
 
 # Règles que le métier peut donner lui-même, avec le statut « documenté ». Pour la
 # règle `valeurs`, il déclare une liste fermée que la génération ne propose pas : ses
-# valeurs sont alors celles qu'il ajoute lui-même à la liste de la colonne.
+# valeurs sont alors celles qu'il ajoute lui-même à la liste de la colonne. Il en va
+# de même des formes de la règle `format`.
 REGLES_RETENUES = {
     "obligatoire": ("obligatoire", "facultatif", "toujours vide"),
     "nature": ("texte", "nombre natif", "date native", *_NATURES_TEXTE),
     "valeurs": (LISTE_FERMEE,),
+    "format": (FORMES_FERMEES,),
 }
 
-# Origine d'une valeur de la liste d'une colonne.
+# Origine d'une valeur, ou d'une forme, de la liste d'une colonne.
 ORIGINE_LISTE = "liste proposée"
 ORIGINE_A_ARBITRER = "à arbitrer"
 ORIGINE_AJOUT = "ajoutée"
@@ -312,10 +465,10 @@ ORIGINES = (ORIGINE_LISTE, ORIGINE_A_ARBITRER, ORIGINE_AJOUT, ORIGINE_OBSERVEE)
 
 
 def est_masquee(regle_valeurs: dict) -> bool:
-    """Vrai pour la règle `valeurs` d'une colonne sensible.
+    """Vrai pour la règle `valeurs` ou `format` d'une colonne sensible.
 
     Les effectifs y sont masqués (`None`) : le dictionnaire ne dit pas si une valeur
-    déclarée par le métier est présente dans les données.
+    ou une forme déclarée par le métier est présente dans les données.
     """
     return regle_valeurs["motif"] == MOTIF_SENSIBLE
 
@@ -345,6 +498,17 @@ def _valeur_observee(valeur: str, origine: str, effectif: int) -> dict:
     }
 
 
+def _forme_observee(forme: str, origine: str, effectif: int) -> dict:
+    return {
+        "forme": forme,
+        "origine": origine,
+        "effectif": effectif,
+        "statut": STATUT_INITIAL,
+        "commentaire": "",
+        "revu_le": None,
+    }
+
+
 def generer_colonne(
     serie: pd.Series,
     table: str,
@@ -353,7 +517,7 @@ def generer_colonne(
 ) -> dict:
     """Règles proposées pour une colonne, toutes au statut « observé ».
 
-    Trois règles sont rendues : `obligatoire`, `nature` et `valeurs`. Chacune porte la
+    Quatre règles sont rendues : `obligatoire`, `nature`, `valeurs` et `format`. Chacune porte la
     proposition, la règle en vigueur (égale à la proposition), son statut, le motif
     de la proposition et les écarts à arbitrer. La règle `valeurs` vaut « liste
     fermée » ou « aucune » et porte en plus la `liste` des valeurs observées : les
@@ -362,10 +526,34 @@ def generer_colonne(
     proposée, une colonne candidate (voir `proposer_liste`) porte quand même ses
     valeurs, d'origine « observée ». Une colonne sensible n'expose aucune valeur :
     sa liste est vide.
+
+    La règle `format` suit le même modèle (voir `proposer_format`) : elle vaut
+    « formes fermées » ou « aucune », et sa `liste` porte les formes observées,
+    principales puis rares, ou celles d'une colonne candidate. Une colonne sensible
+    n'expose aucune forme.
     """
+    profil = profiler_colonne(serie)
     obligatoire = proposer_obligatoire(serie)
-    nature = proposer_nature(serie)
+    nature = proposer_nature(serie, profil)
     liste = proposer_liste(serie, table, colonne, sensibles)
+    formes = proposer_format(serie, table, colonne, sensibles, liste=liste, profil=profil)
+    if formes["formes_fermees"]:
+        regle_format = _regle_observee(
+            FORMES_FERMEES, formes["motif"], {"formes": len(formes["a_arbitrer"])}
+        )
+        regle_format["liste"] = [
+            _forme_observee(forme, ORIGINE_LISTE, effectif)
+            for forme, effectif in zip(formes["formes"], formes["effectifs"])
+        ] + [
+            _forme_observee(element["forme"], ORIGINE_A_ARBITRER, element["effectif"])
+            for element in formes["a_arbitrer"]
+        ]
+    else:
+        regle_format = _regle_observee(AUCUN_FORMAT, formes["motif"], {})
+        regle_format["liste"] = [
+            _forme_observee(element["forme"], ORIGINE_OBSERVEE, element["effectif"])
+            for element in formes["observees"]
+        ]
     if liste["liste_fermee"]:
         valeurs = _regle_observee(
             LISTE_FERMEE, liste["motif"], {"valeurs": len(liste["a_arbitrer"])}
@@ -389,6 +577,7 @@ def generer_colonne(
         ),
         "nature": _regle_observee(nature["regle"], nature["motif"], nature["a_arbitrer"]),
         "valeurs": valeurs,
+        "format": regle_format,
     }
 
 
@@ -432,13 +621,17 @@ def resumer_dictionnaire(dictionnaire: dict) -> pd.DataFrame:
     vigueur. `nb_valeurs` est le nombre de valeurs de la liste proposée,
     `nb_a_arbitrer` le nombre de valeurs à arbitrer et `nb_observees` le nombre de
     valeurs d'une colonne candidate. Sans liste, `motif_liste` dit pourquoi aucune
-    n'est proposée.
+    n'est proposée. Les colonnes `formes_fermees`, `nb_formes`,
+    `nb_formes_a_arbitrer`, `nb_formes_observees` et `motif_format` donnent la même
+    chose pour la règle `format`.
     """
     lignes = []
     for table, colonnes in dictionnaire.items():
         for colonne, regles in colonnes.items():
             valeurs = regles["valeurs"]
             origines = [element["origine"] for element in valeurs["liste"]]
+            formes = regles["format"]
+            origines_formes = [element["origine"] for element in formes["liste"]]
             lignes.append(
                 {
                     "table": table,
@@ -450,14 +643,23 @@ def resumer_dictionnaire(dictionnaire: dict) -> pd.DataFrame:
                     "nb_a_arbitrer": origines.count(ORIGINE_A_ARBITRER),
                     "nb_observees": origines.count(ORIGINE_OBSERVEE),
                     "motif_liste": valeurs["motif"],
+                    "formes_fermees": formes["regle"] == FORMES_FERMEES,
+                    "nb_formes": origines_formes.count(ORIGINE_LISTE),
+                    "nb_formes_a_arbitrer": origines_formes.count(ORIGINE_A_ARBITRER),
+                    "nb_formes_observees": origines_formes.count(ORIGINE_OBSERVEE),
+                    "motif_format": formes["motif"],
                 }
             )
     return pd.DataFrame(lignes)
 
 
 # Version de la structure du fichier : 2 depuis la refonte de l'étape 2d (règle en
-# vigueur distincte de la proposition, liste unique de valeurs).
-STRUCTURE = 2
+# vigueur distincte de la proposition, liste unique de valeurs), 3 depuis la règle
+# `format`. Un fichier de structure 2 reste lisible : il porte peut-être des décisions.
+STRUCTURE = 3
+STRUCTURES_LISIBLES = (2, 3)
+# Motif de la règle `format` ajoutée à la lecture d'un fichier de structure 2.
+MOTIF_STRUCTURE_2 = "règle absente du fichier (structure 2), à régénérer puis fusionner"
 CHAMPS_REGLE = (
     "regle",
     "proposition",
@@ -476,6 +678,8 @@ CHAMPS_VALEUR = (
     "revu_le",
     "remplacement",
 )
+CHAMPS_FORME = ("forme", "origine", "effectif", "statut", "commentaire", "revu_le")
+CHAMPS_LISTE = {"valeurs": CHAMPS_VALEUR, "format": CHAMPS_FORME}
 # Statuts admis sur une valeur observée : « documenté » est réservé aux ajouts.
 STATUTS_VALEUR_OBSERVEE = ("observé", "valide", "invalide")
 # Statuts d'une valeur qui peut servir de remplacement à une valeur invalide.
@@ -633,8 +837,8 @@ def _problemes_decision(ou: str, element: dict) -> list[str]:
     return problemes
 
 
-def _problemes_liste(ou: str, regle: dict) -> list[str]:
-    """Problèmes de la règle `valeurs` et de sa liste de valeurs.
+def _problemes_liste(ou: str, regle: dict, nom: str = "valeurs") -> list[str]:
+    """Problèmes d'une règle qui porte une liste (`valeurs` ou `format`) et de sa liste.
 
     Une valeur écrite à la main sans guillemets (No, 27, 2026-03-01) est lue par
     YAML comme un booléen, un nombre ou une date : elle est rejetée ici. Une même
@@ -643,56 +847,67 @@ def _problemes_liste(ou: str, regle: dict) -> list[str]:
     même liste. Dans une colonne sensible, toute valeur est revue et son effectif
     est masqué (`None`). Une liste déclarée par le métier (statut « documenté ») contient au
     moins une valeur valide ou documentée.
+
+    Les mêmes contrôles portent sur les formes de la règle `format`, qui n'ont pas
+    de remplacement. Une forme est en plus une signature : 9 pour un chiffre, A pour
+    une majuscule, a pour une minuscule, les autres caractères tels quels.
     """
+    cle, mot, champs = CLES_LISTE[nom], CLES_LISTE[nom], CHAMPS_LISTE[nom]
+    fermee = REGLES_FERMEES[nom]
     problemes = []
     for champ in ("regle", "proposition"):
-        if regle[champ] not in (LISTE_FERMEE, AUCUNE_LISTE):
+        if regle[champ] not in (fermee, REGLE_ECARTEE):
             problemes.append(
-                f"{ou}, règle valeurs : {champ} {_decrire(regle[champ])} au lieu de "
-                f"« {LISTE_FERMEE} » ou « {AUCUNE_LISTE} »"
+                f"{ou}, règle {nom} : {champ} {_decrire(regle[champ])} au lieu de "
+                f"« {fermee} » ou « {REGLE_ECARTEE} »"
             )
     liste = regle["liste"]
     if not isinstance(liste, list):
-        problemes.append(f"{ou}, liste de valeurs : une liste est attendue")
+        problemes.append(f"{ou}, liste de {mot}s : une liste est attendue")
         return problemes
-    if regle["regle"] == LISTE_FERMEE and not liste:
-        problemes.append(f"{ou}, liste de valeurs : liste fermée sans aucune valeur")
+    if regle["regle"] == fermee and not liste:
+        problemes.append(f"{ou}, liste de {mot}s : {fermee} sans aucune {mot}")
 
     masquee = est_masquee(regle)
     statuts = {}
     remplacements = []
     for element in liste:
-        if not isinstance(element, dict) or set(element) != set(CHAMPS_VALEUR):
+        if not isinstance(element, dict) or set(element) != set(champs):
             problemes.append(
-                f"{ou}, liste de valeurs : champs attendus {', '.join(CHAMPS_VALEUR)}"
+                f"{ou}, liste de {mot}s : champs attendus {', '.join(champs)}"
             )
             continue
-        valeur = element["valeur"]
+        valeur = element[cle]
         if not isinstance(valeur, str):
             problemes.append(
-                f"{ou}, liste de valeurs : {_decrire(valeur)} n'est pas un texte, "
-                "mettre la valeur entre guillemets"
+                f"{ou}, liste de {mot}s : {_decrire(valeur)} n'est pas un texte, "
+                f"mettre la {mot} entre guillemets"
             )
             continue
         if valeur.strip() == "":
-            problemes.append(f"{ou}, liste de valeurs : valeur vide ou composée d'espaces")
+            problemes.append(f"{ou}, liste de {mot}s : {mot} vide ou composée d'espaces")
             continue
         if valeur in statuts:
             problemes.append(
-                f"{ou}, liste de valeurs : valeur {valeur!r} présente plusieurs fois"
+                f"{ou}, liste de {mot}s : {mot} {valeur!r} présente plusieurs fois"
             )
             continue
-        ici = f"{ou}, valeur {valeur!r}"
+        ici = f"{ou}, {mot} {valeur!r}"
         statut = element["statut"] = _statut_normalise(element["statut"])
         statuts[valeur] = statut
+        if nom == "format" and signature(valeur) != valeur:
+            problemes.append(
+                f"{ici} : ce n'est pas une forme (9 pour un chiffre, A pour une "
+                "majuscule, a pour une minuscule, les autres caractères tels quels)"
+            )
         origine = element["origine"]
         if origine not in ORIGINES:
             problemes.append(f"{ici} : origine inconnue {origine!r}")
         elif origine == ORIGINE_AJOUT and statut != "documenté":
-            problemes.append(f"{ici} : une valeur ajoutée doit porter le statut documenté")
+            problemes.append(f"{ici} : une {mot} ajoutée doit porter le statut documenté")
         elif origine != ORIGINE_AJOUT and statut not in STATUTS_VALEUR_OBSERVEE:
             problemes.append(
-                f"{ici} : statut {statut!r} impossible sur une valeur observée "
+                f"{ici} : statut {statut!r} impossible sur une {mot} observée "
                 f"(attendu {', '.join(STATUTS_VALEUR_OBSERVEE)})"
             )
         effectif = element["effectif"]
@@ -700,8 +915,8 @@ def _problemes_liste(ou: str, regle: dict) -> list[str]:
         if masquee:
             if statut == STATUT_INITIAL:
                 problemes.append(
-                    f"{ici} : valeur non revue dans une colonne sensible, qui "
-                    "n'expose aucune valeur observée"
+                    f"{ici} : {mot} non revue dans une colonne sensible, qui "
+                    f"n'expose aucune {mot} observée"
                 )
             if effectif is not None:
                 problemes.append(
@@ -714,16 +929,17 @@ def _problemes_liste(ou: str, regle: dict) -> list[str]:
                 f"{minimum} est attendu"
             )
         problemes.extend(_problemes_decision(ici, element))
-        if element["remplacement"] is not None:
+        if element.get("remplacement") is not None:
             remplacements.append((ici, statut, element["remplacement"]))
 
     if (
         regle["statut"] == "documenté"
-        and regle["regle"] == LISTE_FERMEE
+        and regle["regle"] == fermee
         and not any(statut in STATUTS_CIBLE for statut in statuts.values())
     ):
+        declaree = "liste déclarée" if nom == "valeurs" else "format déclaré"
         problemes.append(
-            f"{ou}, liste de valeurs : liste déclarée sans aucune valeur valide ou "
+            f"{ou}, liste de {mot}s : {declaree} sans aucune {mot} valide ou "
             "documentée"
         )
 
@@ -779,7 +995,7 @@ def _verifier_et_normaliser(contenu) -> list[str]:
                 continue
             for nom in REGLES:
                 regle = regles[nom]
-                champs = CHAMPS_REGLE + (("liste",) if nom == "valeurs" else ())
+                champs = CHAMPS_REGLE + (("liste",) if nom in CLES_LISTE else ())
                 if not isinstance(regle, dict) or set(regle) != set(champs):
                     problemes.append(
                         f"{ou}, règle {nom} : champs attendus {', '.join(champs)}"
@@ -800,8 +1016,8 @@ def _verifier_et_normaliser(contenu) -> list[str]:
                     if probleme:
                         problemes.append(f"{ici} : {probleme}")
                 problemes.extend(_problemes_decision(ici, regle))
-                if nom == "valeurs":
-                    problemes.extend(_problemes_liste(ou, regle))
+                if nom in CLES_LISTE:
+                    problemes.extend(_problemes_liste(ou, regle, nom))
     return problemes
 
 
@@ -813,17 +1029,49 @@ def problemes_dictionnaire(tables: dict) -> list[str]:
     return _verifier_et_normaliser({"tables": deepcopy(tables)})
 
 
+def _completer_structure_2(contenu: dict) -> None:
+    """Ajoute à un contenu de structure 2 la règle `format`, qu'il n'avait pas.
+
+    La règle ajoutée est au statut « observé », sans proposition ni forme : aucune
+    décision n'est touchée, et la fusion avec une régénération la remplit ensuite.
+    Dans une colonne sensible, elle en porte le motif, pour que l'effectif d'une
+    forme déclarée par le métier y soit masqué.
+    """
+    contenu["meta"] = {**contenu["meta"], "structure": STRUCTURE}
+    tables = contenu.get("tables")
+    if not isinstance(tables, dict):
+        return
+    for colonnes in tables.values():
+        if not isinstance(colonnes, dict):
+            continue
+        for regles in colonnes.values():
+            if not isinstance(regles, dict) or set(regles) != set(REGLES) - {"format"}:
+                continue
+            valeurs = regles["valeurs"]
+            sensible = isinstance(valeurs, dict) and valeurs.get("motif") == MOTIF_SENSIBLE
+            regles["format"] = _regle_observee(
+                AUCUN_FORMAT, MOTIF_SENSIBLE if sensible else MOTIF_STRUCTURE_2, {}
+            )
+            regles["format"]["liste"] = []
+
+
 def _lire_fichier(chemin: Path) -> dict:
-    """Contenu du fichier, après contrôle de la version de la structure."""
+    """Contenu du fichier, après contrôle de la version de la structure.
+
+    Un fichier de structure 2 est complété en mémoire (voir `_completer_structure_2`) :
+    il sera écrit à la structure courante.
+    """
     with open(chemin, encoding="utf-8") as flux:
         contenu = yaml.safe_load(flux)
     meta = contenu.get("meta") if isinstance(contenu, dict) else None
     structure = meta.get("structure") if isinstance(meta, dict) else None
-    if structure != STRUCTURE:
+    if structure not in STRUCTURES_LISIBLES:
         raise ValueError(
             f"Dictionnaire à une autre structure ({chemin}) : structure "
             f"{structure!r}, attendue {STRUCTURE}. Le fichier est à régénérer."
         )
+    if structure != STRUCTURE:
+        _completer_structure_2(contenu)
     return contenu
 
 
@@ -831,7 +1079,8 @@ def charger_dictionnaire(chemin: str | Path | None = None) -> dict:
     """Charge le dictionnaire et rend ses tables, après contrôle de la structure.
 
     Tous les problèmes sont listés en une fois. Un statut hors de `STATUTS` est rejeté.
-    Un fichier écrit avant la refonte de la structure est refusé d'emblée.
+    Un fichier écrit avant la refonte de la structure est refusé d'emblée. Un fichier
+    de structure 2 est rendu avec une règle `format` vide pour chaque colonne.
     """
     chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
     contenu = _lire_fichier(chemin)
@@ -890,32 +1139,33 @@ def _sauvegarder(chemin: Path, periode: str) -> Path:
 
 
 def _elements(tables: dict):
-    """Chaque règle et chaque valeur, avec sa clé (table, colonne, règle, valeur).
+    """Chaque règle, valeur et forme, avec sa clé (table, colonne, règle, valeur).
 
-    La valeur de la clé est None pour une règle.
+    La valeur de la clé est None pour une règle, et la forme pour une forme de la
+    règle `format`.
     """
     for table, colonnes in tables.items():
         for colonne, regles in colonnes.items():
             for nom, regle in regles.items():
                 yield (table, colonne, nom, None), regle
                 for element in regle.get("liste", ()):
-                    yield (table, colonne, nom, element["valeur"]), element
+                    yield (table, colonne, nom, element[CLES_LISTE[nom]]), element
 
 
 def _nommer(cle: tuple) -> str:
     table, colonne, nom, valeur = cle
     if valeur is None:
         return f"{table}.{colonne}, règle {nom}"
-    return f"{table}.{colonne}, valeur {valeur!r}"
+    return f"{table}.{colonne}, {CLES_LISTE[nom]} {valeur!r}"
 
 
 def _ecarts_de_decision(en_place: dict, tables: dict, revue: dict | None) -> list[str]:
     """Décisions de revue que l'écriture de `tables` ferait perdre ou changer à tort.
 
-    Une ligne par règle ou valeur concernée.
+    Une ligne par règle, valeur ou forme concernée.
 
-    Une décision est le statut d'une règle ou d'une valeur revue, avec sa règle en
-    vigueur (règle) ou son remplacement (valeur), son commentaire et sa date.
+    Une décision est le statut d'une règle, d'une valeur ou d'une forme revue, avec sa
+    règle en vigueur (règle) ou son remplacement (valeur), son commentaire et sa date.
 
     Sans `revue` (régénération), aucune décision ne bouge : chacune se retrouve à
     l'identique, et aucune n'apparaît.
@@ -935,7 +1185,12 @@ def _ecarts_de_decision(en_place: dict, tables: dict, revue: dict | None) -> lis
         if not avant and not apres:
             continue
         ou = _nommer(cle)
-        objet = "regle" if cle[3] is None else "remplacement"
+        # Ce qui fait la décision : le statut, et la règle en vigueur d'une règle ou le
+        # remplacement d'une valeur (une forme n'a pas de remplacement).
+        if cle[3] is None:
+            decision = ("statut", "regle")
+        else:
+            decision = ("statut", "remplacement") if cle[2] == "valeurs" else ("statut",)
         if revue is None:
             if not avant:
                 ecarts.append(
@@ -946,7 +1201,7 @@ def _ecarts_de_decision(en_place: dict, tables: dict, revue: dict | None) -> lis
             else:
                 changes = ", ".join(
                     f"{champ} {ancien[champ]!r} devenu {nouveau[champ]!r}"
-                    for champ in ("statut", objet, "commentaire", "revu_le")
+                    for champ in (*decision, "commentaire", "revu_le")
                     if ancien[champ] != nouveau[champ]
                 )
                 if changes:
@@ -957,7 +1212,7 @@ def _ecarts_de_decision(en_place: dict, tables: dict, revue: dict | None) -> lis
             if cle[:3] + (None,) not in nouveaux:
                 ecarts.append(f"{ou} : décision ({ancien['statut']}) absente")
             continue
-        if avant and all(ancien[champ] == nouveau[champ] for champ in ("statut", objet)):
+        if avant and all(ancien[champ] == nouveau[champ] for champ in decision):
             if ancien["revu_le"] != nouveau["revu_le"]:
                 ecarts.append(
                     f"{ou} : revu_le {ancien['revu_le']!r} devenu {nouveau['revu_le']!r} "

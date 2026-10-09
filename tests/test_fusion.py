@@ -49,6 +49,7 @@ def _colonne(obligatoire="obligatoire", liste=None):
         "obligatoire": _regle(obligatoire, {"vides": 0}),
         "nature": _regle("texte", {"hors_nature": 0}),
         "valeurs": valeurs,
+        "format": {**_regle("aucune"), "liste": []},
     }
 
 
@@ -467,3 +468,187 @@ def test_colonne_sensible_garde_l_effectif_masque(tmp_path):
     ecrire_dictionnaire(existant, "2026-03", chemin)
     ecrire_dictionnaire(fusion, "2026-04", chemin)
     assert charger_dictionnaire(chemin) == existant
+
+
+# Règle de format : les formes se fusionnent comme les valeurs (morceau 6a).
+
+
+def _forme(forme, origine="liste proposée", effectif=10):
+    element = _valeur(forme, origine, effectif)
+    del element["valeur"], element["remplacement"]
+    return {"forme": forme, **element}
+
+
+def _avec_format(*formes, proposee=True, motif="motif fictif"):
+    """Dictionnaire généré dont clients.ville porte les formes données.
+
+    Avec `proposee=False`, la colonne est seulement candidate : pas de format proposé.
+    """
+    dictionnaire = _genere()
+    rares = sum(f["origine"] == "à arbitrer" for f in formes)
+    regle = _regle(
+        "formes fermées" if proposee else "aucune", {"formes": rares} if proposee else {}, motif
+    )
+    regle["liste"] = list(formes)
+    dictionnaire["clients"]["ville"]["format"] = regle
+    return dictionnaire
+
+
+def _formes(dictionnaire):
+    return {f["forme"]: f for f in dictionnaire["clients"]["ville"]["format"]["liste"]}
+
+
+def test_premiere_generation_des_formats_sur_un_dictionnaire_qui_n_en_avait_pas(tmp_path):
+    # Dictionnaire lu d'un fichier de structure 2 : règle format vide, décisions ailleurs.
+    existant = _genere()
+    existant["clients"]["ville"]["format"]["motif"] = "règle absente du fichier (structure 2)"
+    _decider(existant["clients"]["ville"]["obligatoire"], "valide")
+    regenere = _avec_format(_forme("AA-999", effectif=990), _forme("AA999", "à arbitrer", 3))
+    fusion, rapport = fusionner(existant, regenere)
+    assert fusion["clients"]["ville"]["format"] == regenere["clients"]["ville"]["format"]
+    assert fusion["clients"]["ville"]["obligatoire"] == existant["clients"]["ville"]["obligatoire"]
+    # Une ligne pour la proposition, aucune par forme.
+    assert _evenements(rapport) == [("ville", "format", "", "proposition changée", "information")]
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(existant, "2026-03", chemin)
+    ecrire_dictionnaire(fusion, "2026-03", chemin)
+    assert charger_dictionnaire(chemin) == fusion
+
+
+def test_formes_revues_conservees_et_formes_non_revues_suivent_la_generation(tmp_path):
+    existant = _avec_format(
+        _forme("AA-999", effectif=990),
+        _forme("AA999", "à arbitrer", 3),
+        _forme("aa-999", "à arbitrer", 2),
+        _forme("A-999", "à arbitrer", 1),
+    )
+    anciennes = _formes(existant)
+    _decider(existant["clients"]["ville"]["format"], "valide")
+    _decider(anciennes["AA-999"], "valide")
+    _decider(anciennes["AA999"], "invalide", commentaire="tiret oublié")
+    # Mois suivant : deux formes ne sont plus observées, une nouvelle apparaît.
+    regenere = _avec_format(
+        _forme("AA-999", effectif=1200),
+        _forme("aa-999", "à arbitrer", 4),
+        _forme("AA-9999", "à arbitrer", 5),
+    )
+    fusion, rapport = fusionner(existant, regenere)
+    regle = fusion["clients"]["ville"]["format"]
+    assert (regle["regle"], regle["statut"], regle["revu_le"]) == ("formes fermées", "valide", DATE)
+    assert regle["a_arbitrer"] == {"formes": 2}
+    assert [(f["forme"], f["statut"], f["effectif"]) for f in regle["liste"]] == [
+        ("AA-999", "valide", 1200),
+        ("aa-999", "observé", 4),
+        ("AA-9999", "observé", 5),
+        ("AA999", "invalide", 0),
+    ]
+    assert _formes(fusion)["AA999"]["commentaire"] == "tiret oublié"
+    assert _evenements(rapport) == [
+        ("ville", "format", "AA999", "forme revue qui n'est plus observée", "à regarder"),
+        ("ville", "format", "AA-9999", "forme nouvelle", "information"),
+        ("ville", "format", "A-999", "forme non revue supprimée", "information"),
+    ]
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(existant, "2026-03", chemin)
+    ecrire_dictionnaire(fusion, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == fusion
+
+
+def test_format_valide_qui_n_est_plus_propose_garde_ses_formes():
+    existant = _avec_format(_forme("AA-999", effectif=990), _forme("AA999", "à arbitrer", 3))
+    _decider(existant["clients"]["ville"]["format"], "valide")
+    _decider(_formes(existant)["AA-999"], "valide")
+    fusion, rapport = fusionner(existant, _genere())
+    regle = fusion["clients"]["ville"]["format"]
+    assert (regle["regle"], regle["proposition"], regle["statut"]) == (
+        "formes fermées", "aucune", "valide",
+    )
+    # La génération ne compte plus les formes : dernier effectif connu conservé.
+    assert [(f["forme"], f["effectif"]) for f in regle["liste"]] == [("AA-999", 990), ("AA999", 3)]
+    assert _evenements(rapport) == [
+        (
+            "ville", "format", "",
+            "nouvelle proposition différente de la règle en vigueur", "à regarder",
+        ),
+        (
+            "ville", "format", "",
+            "format qui n'est plus proposé : 2 formes conservées, effectif non mis à jour",
+            "information",
+        ),
+    ]
+
+
+def test_format_non_revu_qui_n_est_plus_propose_perd_ses_formes():
+    existant = _avec_format(_forme("AA-999", effectif=990), _forme("AA999", "à arbitrer", 3))
+    fusion, rapport = fusionner(existant, _genere())
+    assert fusion == _genere()
+    assert [e[3] for e in _evenements(rapport)] == [
+        "proposition changée", "forme non revue supprimée", "forme non revue supprimée",
+    ]
+
+
+def test_format_declare_sur_une_colonne_candidate(tmp_path):
+    existant = _avec_format(_forme("A999", "observée", 18), proposee=False)
+    _decider(existant["clients"]["ville"]["format"], "documenté", regle="formes fermées")
+    _decider(_formes(existant)["A999"], "valide")
+    ajout = _forme("A9999", "ajoutée", 0)
+    _decider(ajout, "documenté")
+    existant["clients"]["ville"]["format"]["liste"].append(ajout)
+    regenere = _avec_format(
+        _forme("A999", "observée", 19), _forme("a999", "observée", 1), proposee=False
+    )
+    fusion, rapport = fusionner(existant, regenere)
+    regle = fusion["clients"]["ville"]["format"]
+    assert (regle["regle"], regle["proposition"], regle["statut"]) == (
+        "formes fermées", "aucune", "documenté",
+    )
+    assert [(f["forme"], f["origine"], f["statut"], f["effectif"]) for f in regle["liste"]] == [
+        ("A999", "observée", "valide", 19),
+        ("a999", "observée", "observé", 1),
+        ("A9999", "ajoutée", "documenté", 0),
+    ]
+    # Un format est en vigueur : la forme nouvelle est signalée.
+    assert _evenements(rapport) == [("ville", "format", "a999", "forme nouvelle", "information")]
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(existant, "2026-03", chemin)
+    ecrire_dictionnaire(fusion, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == fusion
+
+
+def test_formes_candidates_ajoutees_sans_evenement():
+    regenere = _avec_format(_forme("A999", "observée", 18), proposee=False)
+    fusion, rapport = fusionner(_genere(), regenere)
+    assert fusion == regenere
+    assert rapport.empty
+
+
+def test_format_d_une_colonne_sensible_garde_l_effectif_masque(tmp_path):
+    existant = _avec_format(proposee=False, motif="colonne sensible")
+    regle = existant["clients"]["ville"]["format"]
+    _decider(regle, "documenté", regle="formes fermées")
+    ajout = _forme("A-9999", "ajoutée", None)
+    _decider(ajout, "documenté")
+    regle["liste"].append(ajout)
+    fusion, rapport = fusionner(existant, _avec_format(proposee=False, motif="colonne sensible"))
+    assert fusion == existant
+    assert rapport.empty
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(existant, "2026-03", chemin)
+    ecrire_dictionnaire(fusion, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == existant
+
+
+def test_colonne_conservee_pour_une_decision_sur_une_forme():
+    existant = _avec_format(_forme("AA-999", effectif=990))
+    _decider(_formes(existant)["AA-999"], "valide")
+    regenere = _genere()
+    del regenere["clients"]["ville"]
+    fusion, rapport = fusionner(existant, regenere)
+    assert fusion["clients"]["ville"] == existant["clients"]["ville"]
+    assert _evenements(rapport) == [
+        (
+            "ville", "", "",
+            "colonne absente de la régénération, conservée avec ses décisions", "à regarder",
+        )
+    ]
+

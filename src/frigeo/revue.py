@@ -46,6 +46,10 @@ FEUILLE_VALEURS = "valeurs"
 # Feuille technique, masquée : une colonne par table, pour les menus des lignes d'ajout.
 FEUILLE_LISTES = "listes"
 
+# Règles revues dans le classeur. La règle `format` du dictionnaire n'y figure pas
+# encore : elle reste telle que la génération et la fusion la donnent.
+REGLES_REVUES = ("obligatoire", "nature", "valeurs")
+
 COLONNES_REGLES = (
     "table",
     "colonne",
@@ -119,7 +123,8 @@ def chemin_revue(periode_fin: str) -> Path:
 def lignes_regles(dictionnaire: dict) -> list[dict]:
     """Lignes de la feuille des règles, dans l'ordre du dictionnaire.
 
-    Trois lignes par colonne : `obligatoire`, `nature` et `valeurs`. La ligne
+    Trois lignes par colonne : `obligatoire`, `nature` et `valeurs` (les règles de
+    `REGLES_REVUES`, sans la règle `format`). La ligne
     `valeurs` porte la question « cette colonne est-elle une liste fermée ? » : sa
     proposition s'affiche « liste de N valeurs », ou « aucune » quand la génération
     ne propose pas de liste (le métier peut alors en déclarer une). Chaque ligne
@@ -129,7 +134,8 @@ def lignes_regles(dictionnaire: dict) -> list[dict]:
     lignes = []
     for table, colonnes in dictionnaire.items():
         for colonne, regles in colonnes.items():
-            for nom, regle in regles.items():
+            for nom in REGLES_REVUES:
+                regle = regles[nom]
                 proposition = regle["proposition"]
                 if nom == "valeurs" and proposition == LISTE_FERMEE:
                     proposees = sum(
