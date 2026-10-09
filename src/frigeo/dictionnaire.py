@@ -41,14 +41,45 @@ def _valeurs_renseignees(serie: pd.Series) -> pd.Series:
     return serie[~(est_none | est_texte_vide)]
 
 
-def _refus(motif: str) -> dict:
+# Motif d'une colonne sensible : il sert aussi de repère dans le dictionnaire, où
+# une colonne sensible n'expose ni valeur observée ni effectif.
+MOTIF_SENSIBLE = "colonne sensible"
+
+
+def _refus(motif: str, observees: list | None = None) -> dict:
     return {
         "liste_fermee": False,
         "motif": motif,
         "valeurs": [],
         "effectifs": [],
         "a_arbitrer": [],
+        "observees": observees or [],
     }
+
+
+# Natures d'une colonne qui peut être candidate : un libellé ou un code, jamais une
+# date, une heure ou une mesure décimale.
+NATURES_CANDIDATES = ("texte", "entier (texte)", "nombre natif")
+# Part minimale des valeurs renseignées pour qu'une nature soit celle de la colonne.
+PART_NATURE_CANDIDATE = 0.5
+
+
+def _nature_candidate(serie: pd.Series, presentes: pd.Series) -> bool:
+    """Vrai si la nature de la colonne admet une liste de valeurs.
+
+    La nature est la nature dominante du profil quand elle couvre au moins la moitié
+    des valeurs renseignées, « texte » sinon. Un nombre natif n'est admis que si
+    toutes les valeurs numériques sont entières (un code, pas une mesure).
+    """
+    profil = profiler_colonne(serie)
+    nature = profil["nature_dominante"]
+    conformes = len(presentes) - profil["nb_hors_nature"]
+    if nature != "texte" and conformes < PART_NATURE_CANDIDATE * len(presentes):
+        nature = "texte"
+    if nature == "nombre natif":
+        nombres = pd.to_numeric(presentes, errors="coerce").dropna()
+        return bool((nombres % 1 == 0).all())
+    return nature in NATURES_CANDIDATES
 
 
 def proposer_liste(
@@ -70,6 +101,13 @@ def proposer_liste(
     principale si elle pèse au moins `part_min` des valeurs renseignées), et
     valeurs principales couvrant au moins `couverture_min` des valeurs renseignées.
 
+    Colonne candidate : sous `effectif_min`, les données ne permettent pas de
+    proposer une liste. Les valeurs sont quand même rendues dans `observees`, avec
+    leur effectif, si la colonne est de nature texte ou entier (ni date, ni heure,
+    ni décimal) et compte au plus `max_valeurs` valeurs distinctes, à raison d'une
+    valeur distincte au plus pour deux valeurs renseignées. Le métier pourra
+    déclarer la liste sans les ressaisir.
+
     Les valeurs non principales ne sont jamais déclarées valides : elles sont
     rendues dans `a_arbitrer` avec leur effectif. `effectifs` donne l'effectif des
     valeurs principales, dans le même ordre. Une colonne sensible n'expose
@@ -77,25 +115,32 @@ def proposer_liste(
     « Gisors  » sont deux valeurs), converties en texte.
     """
     if sensibles is not None and est_sensible(sensibles, table, colonne):
-        return _refus("colonne sensible")
+        return _refus(MOTIF_SENSIBLE)
 
     presentes = _valeurs_renseignees(serie)
     total = len(presentes)
     if total == 0:
         return _refus("aucune valeur renseignée")
+    comptes = sorted(
+        ((str(valeur), int(effectif)) for valeur, effectif
+         in presentes.astype(str).value_counts().items()),
+        key=lambda element: (-element[1], element[0]),
+    )
     if total < effectif_min:
+        candidate = (
+            len(comptes) <= max_valeurs
+            and 2 * len(comptes) <= total
+            and _nature_candidate(serie, presentes)
+        )
         return _refus(
-            f"effectif insuffisant ({total} valeurs renseignées, {effectif_min} requises)"
+            f"effectif insuffisant ({total} valeurs renseignées, {effectif_min} requises)",
+            [{"valeur": v, "effectif": n} for v, n in comptes] if candidate else [],
         )
 
     nature = proposer_nature(serie)["regle"]
     if nature != "texte":
         return _refus(f"nature dominante {nature}")
 
-    comptes = sorted(
-        presentes.astype(str).value_counts().items(),
-        key=lambda element: (-element[1], element[0]),
-    )
     seuil = part_min * total
     principales = [(v, n) for v, n in comptes if n >= seuil]
     autres = [(v, n) for v, n in comptes if n < seuil]
@@ -120,6 +165,7 @@ def proposer_liste(
         "valeurs": [v for v, _ in principales],
         "effectifs": [n for _, n in principales],
         "a_arbitrer": [{"valeur": v, "effectif": n} for v, n in autres],
+        "observees": [],
     }
 
 # Seuils du critère obligatoire, facultatif, presque toujours vide (validés le
@@ -243,21 +289,35 @@ A_DECIDER = "à décider"
 # Règle en vigueur d'une proposition écartée par le métier (statut « invalide ») :
 # aucun contrôle de ce type ne portera sur la colonne.
 REGLE_ECARTEE = "aucune"
-# Règles que le métier peut donner lui-même, avec le statut « documenté ».
-REGLES_RETENUES = {
-    "obligatoire": ("obligatoire", "facultatif", "toujours vide"),
-    "nature": ("texte", "nombre natif", "date native", *_NATURES_TEXTE),
-}
-
 # Règle `valeurs` : la colonne n'accepte qu'une liste fermée de valeurs, ou non.
 LISTE_FERMEE = "liste fermée"
 AUCUNE_LISTE = "aucune"
+
+# Règles que le métier peut donner lui-même, avec le statut « documenté ». Pour la
+# règle `valeurs`, il déclare une liste fermée que la génération ne propose pas : ses
+# valeurs sont alors celles qu'il ajoute lui-même à la liste de la colonne.
+REGLES_RETENUES = {
+    "obligatoire": ("obligatoire", "facultatif", "toujours vide"),
+    "nature": ("texte", "nombre natif", "date native", *_NATURES_TEXTE),
+    "valeurs": (LISTE_FERMEE,),
+}
 
 # Origine d'une valeur de la liste d'une colonne.
 ORIGINE_LISTE = "liste proposée"
 ORIGINE_A_ARBITRER = "à arbitrer"
 ORIGINE_AJOUT = "ajoutée"
-ORIGINES = (ORIGINE_LISTE, ORIGINE_A_ARBITRER, ORIGINE_AJOUT)
+# Valeur d'une colonne candidate : observée, sans que la génération propose une liste.
+ORIGINE_OBSERVEE = "observée"
+ORIGINES = (ORIGINE_LISTE, ORIGINE_A_ARBITRER, ORIGINE_AJOUT, ORIGINE_OBSERVEE)
+
+
+def est_masquee(regle_valeurs: dict) -> bool:
+    """Vrai pour la règle `valeurs` d'une colonne sensible.
+
+    Les effectifs y sont masqués (`None`) : le dictionnaire ne dit pas si une valeur
+    déclarée par le métier est présente dans les données.
+    """
+    return regle_valeurs["motif"] == MOTIF_SENSIBLE
 
 
 def _regle_observee(proposition: str, motif: str, a_arbitrer: dict) -> dict:
@@ -298,8 +358,10 @@ def generer_colonne(
     de la proposition et les écarts à arbitrer. La règle `valeurs` vaut « liste
     fermée » ou « aucune » et porte en plus la `liste` des valeurs observées : les
     valeurs principales (origine « liste proposée ») puis les valeurs rares (origine
-    « à arbitrer »), chacune avec son effectif et son propre statut. Une colonne
-    sensible n'expose aucune valeur : sa liste est vide.
+    « à arbitrer »), chacune avec son effectif et son propre statut. Sans liste
+    proposée, une colonne candidate (voir `proposer_liste`) porte quand même ses
+    valeurs, d'origine « observée ». Une colonne sensible n'expose aucune valeur :
+    sa liste est vide.
     """
     obligatoire = proposer_obligatoire(serie)
     nature = proposer_nature(serie)
@@ -317,7 +379,10 @@ def generer_colonne(
         ]
     else:
         valeurs = _regle_observee(AUCUNE_LISTE, liste["motif"], {})
-        valeurs["liste"] = []
+        valeurs["liste"] = [
+            _valeur_observee(element["valeur"], ORIGINE_OBSERVEE, element["effectif"])
+            for element in liste["observees"]
+        ]
     return {
         "obligatoire": _regle_observee(
             obligatoire["regle"], obligatoire["motif"], obligatoire["a_arbitrer"]
@@ -364,9 +429,10 @@ def resumer_dictionnaire(dictionnaire: dict) -> pd.DataFrame:
     """Tableau de synthèse du dictionnaire, une ligne par colonne.
 
     Les colonnes `obligatoire`, `nature` et `liste_fermee` donnent la règle en
-    vigueur. `nb_valeurs` est le nombre de valeurs de la liste proposée et
-    `nb_a_arbitrer` le nombre de valeurs à arbitrer. Sans liste, `motif_liste` dit
-    pourquoi aucune n'est proposée.
+    vigueur. `nb_valeurs` est le nombre de valeurs de la liste proposée,
+    `nb_a_arbitrer` le nombre de valeurs à arbitrer et `nb_observees` le nombre de
+    valeurs d'une colonne candidate. Sans liste, `motif_liste` dit pourquoi aucune
+    n'est proposée.
     """
     lignes = []
     for table, colonnes in dictionnaire.items():
@@ -382,6 +448,7 @@ def resumer_dictionnaire(dictionnaire: dict) -> pd.DataFrame:
                     "liste_fermee": valeurs["regle"] == LISTE_FERMEE,
                     "nb_valeurs": origines.count(ORIGINE_LISTE),
                     "nb_a_arbitrer": origines.count(ORIGINE_A_ARBITRER),
+                    "nb_observees": origines.count(ORIGINE_OBSERVEE),
                     "motif_liste": valeurs["motif"],
                 }
             )
@@ -573,7 +640,9 @@ def _problemes_liste(ou: str, regle: dict) -> list[str]:
     YAML comme un booléen, un nombre ou une date : elle est rejetée ici. Une même
     valeur ne figure qu'une fois dans la liste d'une colonne. Un remplacement n'est
     admis que sur une valeur invalide et vise une valeur valide ou documentée de la
-    même liste.
+    même liste. Dans une colonne sensible, toute valeur est revue et son effectif
+    est masqué (`None`). Une liste déclarée par le métier (statut « documenté ») contient au
+    moins une valeur valide ou documentée.
     """
     problemes = []
     for champ in ("regle", "proposition"):
@@ -589,6 +658,7 @@ def _problemes_liste(ou: str, regle: dict) -> list[str]:
     if regle["regle"] == LISTE_FERMEE and not liste:
         problemes.append(f"{ou}, liste de valeurs : liste fermée sans aucune valeur")
 
+    masquee = est_masquee(regle)
     statuts = {}
     remplacements = []
     for element in liste:
@@ -627,7 +697,18 @@ def _problemes_liste(ou: str, regle: dict) -> list[str]:
             )
         effectif = element["effectif"]
         minimum = 1 if statut == STATUT_INITIAL else 0
-        if isinstance(effectif, bool) or not isinstance(effectif, int) or effectif < minimum:
+        if masquee:
+            if statut == STATUT_INITIAL:
+                problemes.append(
+                    f"{ici} : valeur non revue dans une colonne sensible, qui "
+                    "n'expose aucune valeur observée"
+                )
+            if effectif is not None:
+                problemes.append(
+                    f"{ici} : effectif {_decrire(effectif)} dans une colonne "
+                    "sensible, où l'effectif est masqué (null)"
+                )
+        elif isinstance(effectif, bool) or not isinstance(effectif, int) or effectif < minimum:
             problemes.append(
                 f"{ici} : effectif {_decrire(effectif)}, un entier d'au moins "
                 f"{minimum} est attendu"
@@ -635,6 +716,16 @@ def _problemes_liste(ou: str, regle: dict) -> list[str]:
         problemes.extend(_problemes_decision(ici, element))
         if element["remplacement"] is not None:
             remplacements.append((ici, statut, element["remplacement"]))
+
+    if (
+        regle["statut"] == "documenté"
+        and regle["regle"] == LISTE_FERMEE
+        and not any(statut in STATUTS_CIBLE for statut in statuts.values())
+    ):
+        problemes.append(
+            f"{ou}, liste de valeurs : liste déclarée sans aucune valeur valide ou "
+            "documentée"
+        )
 
     for ici, statut, cible in remplacements:
         if statut != "invalide":

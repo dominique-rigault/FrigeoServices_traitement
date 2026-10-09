@@ -341,6 +341,7 @@ def test_resumer_dictionnaire():
         "liste_fermee",
         "nb_valeurs",
         "nb_a_arbitrer",
+        "nb_observees",
         "motif_liste",
     ]
     assert resume.loc["statut", "liste_fermee"]
@@ -846,7 +847,7 @@ def test_regle_valeurs_mal_formee(tmp_path, modification, attendu):
         ("obligatoire", dict(statut="valide", regle="à décider"), "au statut valide, la règle ne peut pas être « à décider »"),
         ("valeurs", dict(statut="valide"), "au statut valide, la règle ne peut pas être « aucune »"),
         ("nature", dict(statut="documenté", regle="presque texte"), "au statut documenté, la règle ('presque texte') doit être parmi texte, nombre natif"),
-        ("valeurs", dict(statut="documenté"), "statut documenté impossible sur la règle valeurs"),
+        ("valeurs", dict(statut="documenté"), "au statut documenté, la règle ('aucune') doit être parmi liste fermée"),
     ],
 )
 def test_statut_et_regle_en_vigueur_incoherents(tmp_path, regle, champs, attendu):
@@ -947,3 +948,117 @@ def test_journal_mal_forme_refuse(tmp_path):
     chemin.write_text(yaml.safe_dump(contenu, allow_unicode=True), encoding="utf-8")
     with pytest.raises(ValueError, match="journal des revues, entrée 1"):
         charger_meta(chemin)
+
+
+# Liste fermée déclarée par le métier (morceau 5a).
+
+
+def test_liste_declaree_par_le_metier(tmp_path):
+    tables = _dictionnaire_fictif()
+    regle = tables["clients"]["ville"]["valeurs"]
+    regle.update(statut="documenté", regle="liste fermée", revu_le="2026-10-09 10:00:00")
+    # Sans valeur du tout, puis avec une seule valeur observée et non revue.
+    assert "liste fermée sans aucune valeur" in _erreur_chargement(tmp_path, tables)
+    regle["liste"] = [_valeur("Gisors", "à arbitrer", 3)]
+    attendu = "clients.ville, liste de valeurs : liste déclarée sans aucune valeur valide ou documentée"
+    assert attendu in _erreur_chargement(tmp_path, tables)
+    assert attendu in problemes_dictionnaire(tables)
+    # Une valeur ajoutée par le métier suffit; la proposition reste « aucune ».
+    regle["liste"].append(_valeur("Vernon", "ajoutée", 0, statut="documenté"))
+    assert problemes_dictionnaire(tables) == []
+    chemin = tmp_path / "declaree.yaml"
+    _ecrire_brut(chemin, tables)
+    assert charger_dictionnaire(chemin) == tables
+
+
+# Colonnes candidates et effectif masqué des colonnes sensibles (morceau 5b).
+
+
+def test_colonne_candidate_rend_ses_valeurs_observees():
+    # Sous le seuil d'effectif : pas de liste proposée, mais les valeurs sont rendues.
+    petite = _serie(("Actif", 20), ("Inactif", 5), ("actif", 1), (None, 2))
+    resultat = proposer_liste(petite)
+    assert not resultat["liste_fermee"]
+    assert resultat["motif"] == "effectif insuffisant (26 valeurs renseignées, 200 requises)"
+    assert resultat["observees"] == [
+        {"valeur": "Actif", "effectif": 20},
+        {"valeur": "Inactif", "effectif": 5},
+        {"valeur": "actif", "effectif": 1},
+    ]
+    assert all(type(v["effectif"]) is int for v in resultat["observees"])
+    # Une nature non textuelle n'empêche pas d'être candidate (codes de secteur).
+    assert len(proposer_liste(_serie(("27", 10), ("76", 8)))["observees"]) == 2
+    # Aucune valeur répétée (identifiant), ou trop de valeurs distinctes : rien.
+    assert proposer_liste(_serie(*((f"C{i}", 1) for i in range(10))))["observees"] == []
+    assert proposer_liste(_serie(*((f"V{i}", 2) for i in range(13))))["observees"] == []
+    # Plus d'une valeur distincte pour deux valeurs renseignées : presque individuel.
+    presque = _serie(("Dupont", 2), *((f"Nom{i}", 1) for i in range(7)))
+    assert proposer_liste(presque)["observees"] == []
+    assert len(proposer_liste(_serie(("A", 1), ("B", 1), ("C", 4)))["observees"]) == 3
+    # Colonne sensible : aucune valeur, même candidate.
+    sensible = proposer_liste(petite, "clients", "type_commerce", SENSIBLES)
+    assert (sensible["motif"], sensible["observees"]) == ("colonne sensible", [])
+    # Au-dessus du seuil, une colonne sans liste proposée ne rend rien.
+    grande = _serie(*((f"V{i}", 20) for i in range(13)))
+    assert proposer_liste(grande)["observees"] == []
+
+
+def test_generer_colonne_candidate():
+    table = pd.DataFrame({"statut": ["Actif"] * 20 + ["Inactif"] * 5 + ["actif"]}, dtype=object)
+    regle = generer_table(table, "fournisseurs", {})["statut"]["valeurs"]
+    assert (regle["regle"], regle["proposition"], regle["a_arbitrer"]) == ("aucune", "aucune", {})
+    assert [(v["valeur"], v["origine"], v["effectif"], v["statut"]) for v in regle["liste"]] == [
+        ("Actif", "observée", 20, "observé"),
+        ("Inactif", "observée", 5, "observé"),
+        ("actif", "observée", 1, "observé"),
+    ]
+    dictionnaire = {"fournisseurs": generer_table(table, "fournisseurs", {})}
+    assert problemes_dictionnaire(dictionnaire) == []
+    assert resumer_dictionnaire(dictionnaire).loc[0, "nb_observees"] == 3
+
+
+def test_effectif_masque_reserve_aux_colonnes_sensibles(tmp_path):
+    tables = _dictionnaire_fictif()
+    regle = tables["clients"]["ville"]["valeurs"]
+    regle.update(motif="colonne sensible", statut="documenté", regle="liste fermée",
+                 revu_le="2026-10-09 10:00:00")
+    regle["liste"] = [_valeur("Retraite", "ajoutée", None, statut="documenté")]
+    assert problemes_dictionnaire(tables) == []
+    chemin = ecrire_dictionnaire(tables, "2026-03", tmp_path / "dictionnaire.yaml")
+    assert charger_dictionnaire(chemin) == tables
+    assert "effectif: null" in chemin.read_text(encoding="utf-8")
+    # Colonne sensible : ni effectif, même nul, ni valeur non revue.
+    regle["liste"] = [
+        _valeur("Retraite", "ajoutée", 0, statut="documenté"),
+        _valeur("Démission", "observée", None),
+    ]
+    problemes = problemes_dictionnaire(tables)
+    assert any("valeur 'Retraite' : effectif 0 (type int) dans une colonne sensible" in p
+               for p in problemes)
+    assert any("valeur 'Démission' : valeur non revue dans une colonne sensible" in p
+               for p in problemes)
+    # Ailleurs, un effectif masqué est refusé.
+    tables = _dictionnaire_fictif(liste=[_valeur("Gisors", effectif=None)])
+    assert any("effectif None (type NoneType), un entier d'au moins 1" in p
+               for p in problemes_dictionnaire(tables))
+
+
+@pytest.mark.parametrize(
+    ("valeurs", "candidate"),
+    [
+        ([("31/01/2026", 5), ("28/02/2026", 4)], False),
+        ([("2026-01-31", 5), ("2026-02-28", 4)], False),
+        ([(datetime(2026, 1, 31), 5), (datetime(2026, 2, 28), 4)], False),
+        ([("08:00", 5), ("14:00", 4)], False),
+        ([("2100,50", 5), ("1850,00", 4)], False),
+        ([("0.8", 5), ("1.0", 4)], False),
+        ([(0.8, 5), (1.0, 4)], False),
+        ([(27, 5), (76, 4)], True),
+        ([(27.0, 5), (76.0, 4)], True),
+        ([("27", 5), ("76", 4)], True),
+        # Quelques valeurs ressemblant à des dates ne changent pas la nature d'un libellé.
+        ([("Actif", 6), ("Inactif", 3), ("31/01/2026", 2)], True),
+    ],
+)
+def test_nature_d_une_colonne_candidate(valeurs, candidate):
+    assert bool(proposer_liste(_serie(*valeurs))["observees"]) is candidate

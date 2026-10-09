@@ -13,7 +13,7 @@ from copy import deepcopy
 
 import pandas as pd
 
-from .dictionnaire import LISTE_FERMEE, ORIGINE_AJOUT, REGLES, STATUT_INITIAL
+from .dictionnaire import LISTE_FERMEE, ORIGINE_AJOUT, REGLES, STATUT_INITIAL, est_masquee
 
 A_REGARDER = "à regarder"
 INFORMATION = "information"
@@ -55,7 +55,8 @@ def _fusionner_regle(ancienne: dict, nouvelle: dict, noter) -> dict:
 def _fusionner_liste(ancienne: dict, nouvelle: dict, regle_en_vigueur: str, noter) -> list:
     """Liste des valeurs après fusion : l'ordre de la génération, puis les valeurs conservées."""
     anciennes = {element["valeur"]: element for element in ancienne["liste"]}
-    etait_proposee = ancienne["proposition"] == LISTE_FERMEE
+    # Une valeur nouvelle se signale si une liste était proposée ou en vigueur.
+    etait_proposee = LISTE_FERMEE in (ancienne["proposition"], ancienne["regle"])
     liste = []
     for observee in nouvelle["liste"]:
         valeur = observee["valeur"]
@@ -74,17 +75,22 @@ def _fusionner_liste(ancienne: dict, nouvelle: dict, regle_en_vigueur: str, note
         liste.append(element)
 
     # Valeurs que la génération ne connaît pas.
-    if nouvelle["proposition"] != LISTE_FERMEE:
-        # Sans liste proposée, la génération ne compte plus les valeurs.
+    if nouvelle["proposition"] != LISTE_FERMEE and not nouvelle["liste"]:
+        # Ni liste proposée ni colonne candidate : la génération ne compte pas les
+        # valeurs. Dans une colonne sensible, leur effectif est masqué.
         garder_tout = regle_en_vigueur == LISTE_FERMEE
+        masquee = est_masquee(nouvelle)
         conservees = 0
         for valeur, connue in anciennes.items():
-            if garder_tout or _revue(connue):
-                liste.append(deepcopy(connue))
+            if _revue(connue) or (garder_tout and not masquee):
+                element = deepcopy(connue)
+                if masquee:
+                    element["effectif"] = None
+                liste.append(element)
                 conservees += 1
             else:
                 noter("valeur non revue supprimée", INFORMATION, valeur)
-        if conservees and etait_proposee:
+        if conservees and ancienne["proposition"] == LISTE_FERMEE:
             noter(
                 f"liste qui n'est plus proposée : {conservees} valeurs conservées, "
                 "effectif non mis à jour",
@@ -96,7 +102,7 @@ def _fusionner_liste(ancienne: dict, nouvelle: dict, regle_en_vigueur: str, note
             noter("valeur non revue supprimée", INFORMATION, valeur)
             continue
         element = deepcopy(connue)
-        if connue["effectif"] > 0 and connue["origine"] != ORIGINE_AJOUT:
+        if connue["effectif"] and connue["origine"] != ORIGINE_AJOUT:
             noter("valeur revue qui n'est plus observée", A_REGARDER, valeur)
         element["effectif"] = 0
         liste.append(element)
@@ -128,9 +134,10 @@ def fusionner(existant: dict, regenere: dict) -> tuple[dict, pd.DataFrame]:
 
     Règle : la proposition, le motif et les écarts à arbitrer viennent de la
     génération; la règle en vigueur ne change que si la règle n'a pas été revue.
-    Valeur : l'effectif et l'origine viennent de la génération; une valeur revue est
+    Valeur : l'effectif et l'origine viennent de la génération, que la liste soit
+    proposée ou que la colonne soit seulement candidate; une valeur revue est
     conservée même si elle n'est plus observée, une valeur non revue qui n'est plus
-    observée est supprimée. Statut, commentaire, remplacement et date de revue ne
+    observée est supprimée. Dans une colonne sensible, l'effectif reste masqué. Statut, commentaire, remplacement et date de revue ne
     sont jamais modifiés. Une colonne absente de la régénération est conservée si
     elle porte une décision, supprimée sinon.
     """

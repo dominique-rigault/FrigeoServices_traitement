@@ -349,3 +349,121 @@ def test_la_fusion_remplace_le_dictionnaire_revu_la_regeneration_seule_non(tmp_p
     copies = list(dossier_sauvegardes(chemin).iterdir())
     assert len(copies) == 1 and copies[0].name.startswith("dictionnaire_2026-03_")
     assert copies[0].read_bytes() == avant
+
+
+# Liste fermée déclarée par le métier, jamais proposée par la génération (morceau 5a).
+
+
+def _declaree():
+    """Dictionnaire en place dont la colonne ville porte une liste déclarée."""
+    existant = _genere()
+    regle = existant["clients"]["ville"]["valeurs"]
+    _decider(regle, "documenté", regle="liste fermée")
+    for valeur in ("Gisors", "Vernon"):
+        ajout = _valeur(valeur, "ajoutée", 0)
+        _decider(ajout, "documenté")
+        regle["liste"].append(ajout)
+    return existant
+
+
+def test_liste_declaree_conservee_tant_que_la_generation_n_en_propose_pas(tmp_path):
+    existant = _declaree()
+    fusion, rapport = fusionner(existant, _genere())
+    assert fusion == existant
+    assert rapport.empty
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(existant, "2026-03", chemin)
+    ecrire_dictionnaire(fusion, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == existant
+
+
+def test_liste_declaree_que_la_generation_finit_par_proposer(tmp_path):
+    existant, regenere = _declaree(), _genere()
+    regenere["clients"]["ville"] = _colonne(
+        liste=[_valeur("Gisors", effectif=300), _valeur("gisors", "à arbitrer", 2)]
+    )
+    fusion, rapport = fusionner(existant, regenere)
+    regle = fusion["clients"]["ville"]["valeurs"]
+    assert (regle["regle"], regle["proposition"], regle["statut"]) == (
+        "liste fermée", "liste fermée", "documenté",
+    )
+    # Les deux sources disent « liste fermée » : rien à regarder.
+    assert _evenements(rapport) == [
+        ("ville", "valeurs", "", "proposition changée", "information"),
+        ("ville", "valeurs", "gisors", "valeur nouvelle", "information"),
+    ]
+    # Valeur déclarée et observée : effectif mis à jour. Valeur observée inconnue de
+    # la liste : non revue, donc à traiter. Valeur déclarée non observée : conservée.
+    assert [(v["valeur"], v["origine"], v["statut"], v["effectif"]) for v in regle["liste"]] == [
+        ("Gisors", "ajoutée", "documenté", 300),
+        ("gisors", "à arbitrer", "observé", 2),
+        ("Vernon", "ajoutée", "documenté", 0),
+    ]
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(existant, "2026-03", chemin)
+    ecrire_dictionnaire(fusion, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == fusion
+
+
+# Colonnes candidates et effectif masqué des colonnes sensibles (morceau 5b).
+
+
+def _candidate(*valeurs):
+    """Colonne sans liste proposée, dont la génération rend les valeurs observées."""
+    colonne = _colonne()
+    colonne["valeurs"]["liste"] = [_valeur(v, "observée", n) for v, n in valeurs]
+    return colonne
+
+
+def test_valeurs_candidates_ajoutees_sans_evenement():
+    regenere = _genere()
+    regenere["clients"]["ville"] = _candidate(("Gisors", 12), ("Vernon", 6))
+    fusion, rapport = fusionner(_genere(), regenere)
+    assert fusion == regenere
+    assert rapport.empty
+
+
+def test_valeurs_candidates_suivent_la_generation():
+    existant, regenere = _genere(), _genere()
+    existant["clients"]["ville"] = _candidate(("Gisors", 12), ("Vernon", 6), ("gisors", 1), ("Eu", 2))
+    anciennes = _valeurs(existant, "ville")
+    _decider(existant["clients"]["ville"]["valeurs"], "documenté", regle="liste fermée")
+    _decider(anciennes["Gisors"], "valide")
+    _decider(anciennes["gisors"], "invalide", remplacement="Gisors")
+    # Mois suivant : deux valeurs ne sont plus observées, une nouvelle apparaît.
+    regenere["clients"]["ville"] = _candidate(("Gisors", 14), ("Vernon", 7), ("Evreux", 1))
+    fusion, rapport = fusionner(existant, regenere)
+    regle = fusion["clients"]["ville"]["valeurs"]
+    assert (regle["regle"], regle["proposition"], regle["statut"]) == (
+        "liste fermée", "aucune", "documenté",
+    )
+    assert [(v["valeur"], v["statut"], v["effectif"]) for v in regle["liste"]] == [
+        ("Gisors", "valide", 14),
+        ("Vernon", "observé", 7),
+        ("Evreux", "observé", 1),
+        ("gisors", "invalide", 0),
+    ]
+    assert _evenements(rapport) == [
+        ("ville", "valeurs", "gisors", "valeur revue qui n'est plus observée", "à regarder"),
+        ("ville", "valeurs", "Evreux", "valeur nouvelle", "information"),
+        ("ville", "valeurs", "Eu", "valeur non revue supprimée", "information"),
+    ]
+
+
+def test_colonne_sensible_garde_l_effectif_masque(tmp_path):
+    existant, regenere = _genere(), _genere()
+    for dictionnaire in (existant, regenere):
+        dictionnaire["clients"]["ville"]["valeurs"]["motif"] = "colonne sensible"
+    regle = existant["clients"]["ville"]["valeurs"]
+    _decider(regle, "documenté", regle="liste fermée")
+    ajout = _valeur("Retraite", "ajoutée", None)
+    _decider(ajout, "documenté")
+    regle["liste"].append(ajout)
+    fusion, rapport = fusionner(existant, regenere)
+    assert fusion == existant
+    assert rapport.empty
+    assert fusion["clients"]["ville"]["valeurs"]["liste"][0]["effectif"] is None
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(existant, "2026-03", chemin)
+    ecrire_dictionnaire(fusion, "2026-04", chemin)
+    assert charger_dictionnaire(chemin) == existant

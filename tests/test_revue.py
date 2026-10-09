@@ -94,11 +94,13 @@ def _lire(feuille):
 def test_lignes_regles():
     lignes = lignes_regles(_dictionnaire())
     cles = [(l["table"], l["colonne"], l["regle"]) for l in lignes]
-    # Deux lignes par colonne, plus une ligne « valeurs » par liste proposée.
-    assert len(lignes) == 4 * 2 + 2
+    # Trois lignes par colonne, y compris sans liste proposée.
+    assert len(lignes) == 4 * 3
     assert ("clients", "statut", "valeurs") in cles
-    assert ("clients", "type_commerce", "valeurs") not in cles
     par_cle = dict(zip(cles, lignes))
+    sans_liste = par_cle[("clients", "type_commerce", "valeurs")]
+    assert (sans_liste["proposition"], sans_liste["regle_en_vigueur"]) == ("aucune", "aucune")
+    assert (sans_liste["statut"], sans_liste["regle_retenue"]) == ("observé", None)
     assert par_cle[("clients", "statut", "obligatoire")]["nb_a_arbitrer"] == 5
     assert par_cle[("clients", "statut", "valeurs")]["proposition"] == "liste de 2 valeurs"
     assert par_cle[("clients", "statut", "valeurs")]["nb_a_arbitrer"] == 1
@@ -130,15 +132,15 @@ def test_statut_propre_a_chaque_valeur():
 def test_classeur_ecrit_et_relu(tmp_path):
     chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue" / "revue.xlsx", nb_revues=0)
     classeur = load_workbook(chemin)
-    assert classeur.sheetnames == ["mode_emploi", "regles", "valeurs"]
+    assert classeur.sheetnames == ["mode_emploi", "regles", "valeurs", "listes"]
     regles, valeurs = classeur["regles"], classeur["valeurs"]
     assert tuple(c.value for c in regles[1]) == COLONNES_REGLES
     assert tuple(c.value for c in valeurs[1]) == COLONNES_VALEURS
-    assert len(_lire(regles)) == 10
+    assert len(_lire(regles)) == 12
     assert {l["statut"] for l in _lire(regles)} == {"observé"}
     notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
     assert "2026-03" in notice
-    assert "10 lignes" in notice
+    assert "12 lignes dans la feuille « regles »" in notice
     assert "réimporté" in notice
 
 
@@ -158,9 +160,9 @@ def test_protection_et_menus(tmp_path):
     # Feuille des règles : seules statut, regle_retenue et commentaire sont libres.
     libres = {c.value for c, d in zip(regles[1], regles[2]) if not d.protection.locked}
     assert libres == {"statut", "regle_retenue", "commentaire"}
-    # Sur une ligne « valeurs », regle_retenue reste verrouillée.
+    # Sur une ligne « valeurs », regle_retenue sert à déclarer une liste fermée.
     ligne = next(l for l in regles.iter_rows(min_row=2) if l[2].value == "valeurs")
-    assert ligne[COLONNES_REGLES.index("regle_retenue")].protection.locked
+    assert not ligne[COLONNES_REGLES.index("regle_retenue")].protection.locked
     libres = {c.value for c, d in zip(valeurs[1], valeurs[2]) if not d.protection.locked}
     assert libres == {"statut", "remplacement", "commentaire"}
     # Lignes d'ajout en bas de la feuille des valeurs : pas de remplacement à saisir.
@@ -171,8 +173,15 @@ def test_protection_et_menus(tmp_path):
     menus = [m.formula1 for m in regles.data_validations.dataValidation]
     assert '"observé,valide,invalide,documenté"' in menus
     assert '"obligatoire,facultatif,toujours vide"' in menus
+    assert '"liste fermée"' in menus
     assert all(len(m) <= 255 for m in menus)
-    assert len(valeurs.data_validations.dataValidation) == 1
+    # Feuille des valeurs : menu des statuts, puis menus table et colonne des ajouts.
+    assert len(valeurs.data_validations.dataValidation) == 3
+    # Excel refuse une valeur saisie hors d'un menu.
+    for feuille in (regles, valeurs):
+        assert all(m.showErrorMessage for m in feuille.data_validations.dataValidation)
+    # La ligne d'en-tête et les colonnes table et colonne restent visibles.
+    assert regles.freeze_panes == valeurs.freeze_panes == "C2"
 
 
 def test_colonne_sans_liste_absente_de_la_feuille_des_valeurs(tmp_path):
@@ -219,7 +228,7 @@ def _erreur_import(chemin):
 
 def test_import_sans_modification(tmp_path):
     revue = importer_revue(_exporter(tmp_path), _dictionnaire(), nb_revues=0)
-    assert len(revue.regles) == 10
+    assert len(revue.regles) == 12
     assert len(revue.valeurs) == 3 + len(PIEGES)
     assert set(revue.regles["statut"]) == set(revue.valeurs["statut"]) == {"observé"}
     assert list(revue.valeurs.loc[revue.valeurs["colonne"] == "code", "valeur"]) == PIEGES
@@ -287,7 +296,7 @@ def test_problemes_de_la_feuille_regles_listes_en_une_fois(tmp_path):
         "'presque toujours vide' hors du menu",
         "regle_retenue réservée au statut documenté",
         "commentaire obligatoire avec le statut invalide",
-        "statut documenté impossible sur une liste",
+        "une liste est déjà proposée, il n'y a rien à déclarer",
         "('clients', 'type_commerce', 'nature') absente du classeur",
     ):
         assert attendu in message
@@ -394,7 +403,7 @@ def _element(dictionnaire, valeur, colonne="statut"):
 
 def test_repere_des_revues(tmp_path):
     chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=2)
-    assert len(_importer(chemin, nb_revues=2).regles) == 10
+    assert len(_importer(chemin, nb_revues=2).regles) == 12
     # Une revue a été appliquée depuis l'export : le classeur annulerait ses décisions.
     with pytest.raises(ValueError, match="exporté après 2 revues, le dictionnaire en compte 3"):
         _importer(chemin, nb_revues=3)
@@ -533,9 +542,9 @@ def test_liste_ecartee_qui_n_est_plus_proposee_reste_dans_le_classeur():
                 commentaire="identifiant libre")
     ligne = next(l for l in lignes_regles(dictionnaire) if (l["colonne"], l["regle"]) == ("code", "valeurs"))
     assert (ligne["proposition"], ligne["statut"]) == ("aucune", "invalide")
-    # Sans décision, une colonne sans liste proposée n'a pas de ligne « valeurs ».
+    # Sans décision, une colonne sans liste proposée garde sa ligne « valeurs ».
     cles = [(l["colonne"], l["regle"]) for l in lignes_regles(dictionnaire)]
-    assert ("type_commerce", "valeurs") not in cles
+    assert ("type_commerce", "valeurs") in cles
 
 
 def test_classeur_reexporte_sans_modification_ne_change_rien(tmp_path):
@@ -777,6 +786,8 @@ def test_mode_emploi_decrit_les_cas_particuliers(tmp_path):
         "Statut invalide sur une règle",
         "Changer une règle déjà validée quand la proposition a changé",
         "Déclarer correcte une valeur absente des données",
+        "Déclarer une liste que l'outil n'a pas proposée (proposition « aucune »)",
+        "Colonne sensible (motif « colonne sensible », effectif « masqué »)",
         "Remplacer une valeur erronée",
         "Modifier seulement un commentaire",
         "Reprendre une revue",
@@ -791,13 +802,15 @@ def test_mode_emploi_compte_ce_qui_reste_a_traiter(tmp_path):
     def reste(chemin):
         textes = [c.value for c in load_workbook(chemin)["mode_emploi"]["A"] if c.value]
         debut = textes.index("Ce qui reste à traiter")
-        return " ".join(textes[debut + 1 : debut + 5])
+        return " ".join(textes[debut + 1 : debut + 6])
 
     # Avant toute revue : tout est à « observé ».
     notice = reste(_exporter(tmp_path))
     assert "« regles » : 10 lignes à « observé » sur 10" in notice
     assert "2 ont une proposition « à décider »" in notice
     assert "4 ont des écarts à arbitrer" in notice
+    # Deux colonnes sans liste proposée : leur ligne « valeurs » n'est pas à revoir.
+    assert "S'y ajoutent 2 lignes « valeurs » à « observé »" in notice
     assert "« valeurs » : 10 lignes à « observé » sur 10, dont 1 d'origine « à arbitrer »" in notice
     assert "S'y ajoutent 0 valeurs de listes écartées" in notice
 
@@ -816,6 +829,7 @@ def test_mode_emploi_compte_ce_qui_reste_a_traiter(tmp_path):
 def test_reste_a_traiter_sans_exporter(tmp_path):
     assert reste_a_traiter(_dictionnaire()) == {
         "regles": 10,
+        "regles_sans_liste": 2,
         "regles_a_traiter": 10,
         "regles_a_decider": 2,
         "regles_avec_ecarts": 4,
@@ -823,6 +837,7 @@ def test_reste_a_traiter_sans_exporter(tmp_path):
         "valeurs_a_traiter": 10,
         "valeurs_a_arbitrer": 1,
         "valeurs_listes_ecartees": 0,
+        "valeurs_non_declarees": 0,
         "complet": False,
     }
     resultat, _, _ = _apres_premiere_revue(tmp_path)
@@ -838,3 +853,219 @@ def test_reste_a_traiter_sans_exporter(tmp_path):
     reste = reste_a_traiter(resultat)
     assert (reste["regles_a_traiter"], reste["valeurs_a_traiter"], reste["complet"]) == (0, 0, True)
     assert reste["valeurs_listes_ecartees"] == 8
+
+
+# Liste fermée déclarée par le métier sur une colonne sans liste proposée (morceau 5a).
+
+COMMERCE = dict(table="clients", colonne="type_commerce")
+
+
+def _declarer(chemin, valeurs=("Boulangerie", "Boucherie"), **champs):
+    """Déclare dans le classeur une liste fermée sur clients.type_commerce."""
+    champs = {"statut": "documenté", "regle_retenue": "liste fermée", **champs}
+    _modifier(chemin, "regles", dict(COMMERCE, regle="valeurs"), **champs)
+    for rang, valeur in enumerate(valeurs, start=1):
+        _modifier(chemin, "valeurs", FIN + rang, **COMMERCE, valeur=valeur, statut="documenté")
+
+
+def _apres_declaration(tmp_path):
+    chemin = _exporter(tmp_path)
+    _declarer(chemin)
+    return appliquer_revue(_dictionnaire(), _importer(chemin), chemin, JOUR)
+
+
+def test_declarer_une_liste_non_proposee(tmp_path):
+    resultat, rapport, entree = _apres_declaration(tmp_path)
+    regle = resultat["clients"]["type_commerce"]["valeurs"]
+    assert (regle["regle"], regle["proposition"]) == ("liste fermée", "aucune")
+    assert (regle["statut"], regle["revu_le"]) == ("documenté", JOUR)
+    assert [(v["valeur"], v["origine"], v["statut"], v["effectif"]) for v in regle["liste"]] == [
+        ("Boulangerie", "ajoutée", "documenté", 0),
+        ("Boucherie", "ajoutée", "documenté", 0),
+    ]
+    assert (entree["regles_changees"], entree["valeurs_ajoutees"]) == (1, 2)
+    ligne = rapport[rapport["regle"].eq("valeurs") & rapport["valeur"].eq("")].iloc[0]
+    assert (ligne["avant"], ligne["apres"]) == (
+        "observé, règle aucune", "documenté, règle liste fermée",
+    )
+    # La liste déclarée compte désormais parmi les lignes revues.
+    reste = reste_a_traiter(resultat)
+    assert (reste["regles"], reste["regles_a_traiter"], reste["regles_sans_liste"]) == (11, 10, 1)
+
+    # Le dictionnaire s'écrit, et le classeur suivant affiche la déclaration.
+    fichier = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire(), "2026-03", fichier)
+    ecrire_dictionnaire(resultat, "2026-03", fichier, revue=entree)
+    assert charger_dictionnaire(fichier) == resultat
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    lue = next(l for l in _lire(load_workbook(chemin)["regles"])
+               if (l["colonne"], l["regle"]) == ("type_commerce", "valeurs"))
+    assert (lue["proposition"], lue["regle_en_vigueur"], lue["regle_retenue"]) == (
+        "aucune", "liste fermée", "liste fermée",
+    )
+    _, rapport, entree = appliquer_revue(resultat, _importer(chemin, resultat, 1), chemin, JOUR)
+    assert entree is None and rapport.empty
+
+
+def test_declarations_refusees(tmp_path):
+    # Sans valeur, sans règle retenue, ou avec une autre règle retenue.
+    chemin = _exporter(tmp_path)
+    _declarer(chemin, valeurs=())
+    assert "liste déclarée sans aucune valeur au statut valide ou documenté pour " \
+        "clients.type_commerce" in _erreur_import(chemin)
+    _declarer(chemin, regle_retenue=None)
+    assert "regle_retenue obligatoire avec le statut documenté" in _erreur_import(chemin)
+    _declarer(chemin, regle_retenue="aucune")
+    assert "regle_retenue 'aucune' hors du menu de la règle valeurs" in _erreur_import(chemin)
+
+    # Une liste déjà proposée se valide, elle ne se déclare pas : un seul problème.
+    chemin = _exporter(tmp_path / "proposee")
+    _modifier(chemin, "regles", dict(STATUT, regle="valeurs"), statut="documenté",
+              regle_retenue="liste fermée")
+    message = _erreur_import(chemin)
+    assert "1 problèmes" in message and "il n'y a rien à déclarer (choisir valide)" in message
+
+    # Rien à écarter sur une colonne sans liste proposée ni valeur.
+    chemin = _exporter(tmp_path / "ecartee")
+    _modifier(chemin, "regles", dict(COMMERCE, regle="valeurs"), statut="invalide",
+              commentaire="texte libre")
+    assert "il n'y a rien à écarter" in _erreur_import(chemin)
+
+
+def test_annuler_ou_vider_une_liste_declaree(tmp_path):
+    declare, _, _ = _apres_declaration(tmp_path)
+    # Retirer toutes les valeurs d'une liste déclarée bloque l'import.
+    chemin = exporter_revue(declare, "2026-03", tmp_path / "vide.xlsx", nb_revues=1)
+    for valeur in ("Boulangerie", "Boucherie"):
+        _modifier(chemin, "valeurs", dict(COMMERCE, valeur=valeur), statut="observé")
+    with pytest.raises(ValueError, match="liste déclarée sans aucune valeur"):
+        _importer(chemin, declare, nb_revues=1)
+
+    # Retour à « observé » : plus de liste en vigueur, les valeurs ajoutées restent.
+    chemin = exporter_revue(declare, "2026-03", tmp_path / "annule.xlsx", nb_revues=1)
+    _modifier(chemin, "regles", dict(COMMERCE, regle="valeurs"), statut="observé",
+              regle_retenue=None)
+    resultat, _, entree = appliquer_revue(declare, _importer(chemin, declare, 1), chemin, JOUR)
+    regle = resultat["clients"]["type_commerce"]["valeurs"]
+    assert (regle["regle"], regle["statut"], regle["revu_le"]) == ("aucune", "observé", None)
+    assert [v["statut"] for v in regle["liste"]] == ["documenté", "documenté"]
+    assert (entree["regles_changees"], entree["valeurs_changees"]) == (1, 0)
+
+    # Écarter une liste déclarée : elle a des valeurs, la décision est admise.
+    chemin = exporter_revue(declare, "2026-03", tmp_path / "ecarte.xlsx", nb_revues=1)
+    _modifier(chemin, "regles", dict(COMMERCE, regle="valeurs"), statut="invalide",
+              regle_retenue=None, commentaire="finalement libre")
+    resultat, _, _ = appliquer_revue(declare, _importer(chemin, declare, 1), chemin, JOUR)
+    assert resultat["clients"]["type_commerce"]["valeurs"]["regle"] == "aucune"
+
+
+# Colonnes candidates et effectif masqué des colonnes sensibles (morceau 5b).
+
+
+def _avec_candidate():
+    """Dictionnaire dont clients.type_commerce porte trois valeurs observées, sans liste proposée."""
+    dictionnaire = _dictionnaire()
+    dictionnaire["clients"]["type_commerce"]["valeurs"]["liste"] = [
+        _valeur("Boulangerie", "observée", 12),
+        _valeur("Boucherie", "observée", 6),
+        _valeur("boulangerie", "observée", 1),
+    ]
+    return dictionnaire
+
+
+def test_valeurs_candidates_hors_du_reste_a_traiter(tmp_path):
+    dictionnaire = _avec_candidate()
+    reste = reste_a_traiter(dictionnaire)
+    assert (reste["valeurs"], reste["valeurs_a_traiter"]) == (13, 10)
+    assert (reste["valeurs_non_declarees"], reste["valeurs_listes_ecartees"]) == (3, 0)
+    chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
+    classeur = load_workbook(chemin)
+    lues = [l for l in _lire(classeur["valeurs"]) if l["colonne"] == "type_commerce"]
+    assert [(l["valeur"], l["effectif"], l["origine"]) for l in lues] == [
+        ("Boulangerie", 12, "observée"), ("Boucherie", 6, "observée"), ("boulangerie", 1, "observée"),
+    ]
+    notice = " ".join(c.value for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "et 3 valeurs d'origine « observée », à revoir seulement si vous déclarez" in notice
+
+
+def test_declarer_une_liste_en_validant_les_valeurs_observees(tmp_path):
+    dictionnaire = _avec_candidate()
+    chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
+    # Revoir des valeurs sans déclarer la liste : admis, avec un avertissement.
+    _modifier(chemin, "valeurs", dict(COMMERCE, valeur="Boulangerie"), statut="valide")
+    assert _importer(chemin, dictionnaire).avertissements == [
+        "clients.type_commerce : 1 valeurs revues, mais liste non déclarée "
+        "(statuts conservés, sans effet tant que la liste n'est pas déclarée)"
+    ]
+    # Déclaration : aucune valeur à ressaisir, seule la valeur absente des données s'ajoute.
+    _declarer(chemin, valeurs=())
+    _modifier(chemin, "valeurs", FIN + 3 + 1, **COMMERCE, valeur="Poissonnerie",
+              statut="documenté")
+    _modifier(chemin, "valeurs", dict(COMMERCE, valeur="Boucherie"), statut="valide")
+    _modifier(chemin, "valeurs", dict(COMMERCE, valeur="boulangerie"), statut="invalide",
+              remplacement="Boulangerie")
+    revue = _importer(chemin, dictionnaire)
+    assert revue.avertissements == []
+    resultat, _, entree = appliquer_revue(dictionnaire, revue, chemin, JOUR)
+    regle = resultat["clients"]["type_commerce"]["valeurs"]
+    assert (regle["regle"], regle["statut"]) == ("liste fermée", "documenté")
+    assert [(v["valeur"], v["origine"], v["statut"], v["effectif"], v["remplacement"])
+            for v in regle["liste"]] == [
+        ("Boulangerie", "observée", "valide", 12, None),
+        ("Boucherie", "observée", "valide", 6, None),
+        ("boulangerie", "observée", "invalide", 1, "Boulangerie"),
+        ("Poissonnerie", "ajoutée", "documenté", 0, None),
+    ]
+    assert (entree["valeurs_changees"], entree["valeurs_ajoutees"]) == (3, 1)
+    reste = reste_a_traiter(resultat)
+    assert (reste["valeurs_non_declarees"], reste["valeurs_a_traiter"]) == (0, 10)
+
+
+def test_valeur_ajoutee_dans_une_colonne_sensible(tmp_path):
+    dictionnaire = _dictionnaire()
+    dictionnaire["clients"]["type_commerce"]["valeurs"]["motif"] = "colonne sensible"
+    chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
+    _declarer(chemin, valeurs=("Retraite", "Démission"))
+    resultat, _, entree = appliquer_revue(dictionnaire, _importer(chemin, dictionnaire), chemin, JOUR)
+    liste = resultat["clients"]["type_commerce"]["valeurs"]["liste"]
+    # L'effectif est masqué : le dictionnaire ne dit pas si la valeur est observée.
+    assert [(v["valeur"], v["effectif"]) for v in liste] == [("Retraite", None), ("Démission", None)]
+    fichier = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(dictionnaire, "2026-03", fichier)
+    ecrire_dictionnaire(resultat, "2026-03", fichier, revue=entree)
+    assert charger_dictionnaire(fichier) == resultat
+
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    lues = [l for l in _lire(load_workbook(chemin)["valeurs"]) if l["colonne"] == "type_commerce"]
+    assert [l["effectif"] for l in lues] == ["masqué", "masqué"]
+    # Remise à « observé » : la valeur est retirée, comme une valeur d'effectif nul.
+    _modifier(chemin, "valeurs", dict(COMMERCE, valeur="Démission"), statut="observé")
+    resultat, rapport, _ = appliquer_revue(resultat, _importer(chemin, resultat, 1), chemin, JOUR)
+    assert [v["valeur"] for v in resultat["clients"]["type_commerce"]["valeurs"]["liste"]] == ["Retraite"]
+    assert list(rapport["evenement"]) == ["valeur retirée"]
+
+
+# Menus des lignes d'ajout et feuille technique des listes (morceau 5c).
+
+
+def test_menus_table_et_colonne_des_lignes_d_ajout(tmp_path):
+    chemin = _exporter(tmp_path)
+    classeur = load_workbook(chemin)
+    listes, valeurs = classeur["listes"], classeur["valeurs"]
+    # Feuille technique masquée et verrouillée : une colonne par table.
+    assert listes.sheet_state == "hidden" and listes.protection.sheet
+    assert [c.value for c in listes[1]] == ["clients", "interventions"]
+    assert [c.value for c in listes["A"]] == ["clients", "statut", "code", "type_commerce"]
+    assert [c.value for c in listes["B"]][:2] == ["interventions", "duree"]
+    # Les menus ne couvrent que les lignes d'ajout, en bas de la feuille.
+    menus = {str(m.sqref): m.formula1 for m in valeurs.data_validations.dataValidation}
+    premiere, derniere = FIN + 1, FIN + LIGNES_AJOUT
+    assert menus[f"A{premiere}:A{derniere}"] == "'listes'!$A$1:$B$1"
+    colonnes = menus[f"B{premiere}:B{derniere}"]
+    # Le menu des colonnes suit la table choisie sur la même ligne.
+    assert f"MATCH($A{premiere},'listes'!$1:$1,0)" in colonnes
+    assert colonnes.startswith("OFFSET('listes'!$A$1,1,")
+    # La feuille technique ne gêne ni l'import ni l'application.
+    _modifier(chemin, "valeurs", premiere, table="clients", colonne="type_commerce",
+              valeur="Boulangerie", statut="documenté")
+    assert list(_importer(chemin).valeurs["valeur"])[-1] == "Boulangerie"
