@@ -1,0 +1,51 @@
+# Règles de contrôle données par le métier, que le dictionnaire des données ne peut
+# pas déduire des fichiers. Une forme fixe (code postal, numéro à longueur fixe) ne
+# se déclare pas ici mais dans le classeur de revue du dictionnaire (règle format).
+#
+# Règles possibles pour une colonne
+#   decimales  nombre maximal de décimales
+#   bornes     minimum et maximum admis, bornes incluses (min, max ou les deux)
+#   motif      expression régulière que la valeur entière doit respecter
+#   cle_luhn   clé de contrôle de Luhn valide (true)
+
+regles:
+  interventions:
+    distance_km: {decimales: 1}
+  pieces_interventions:
+    quantite: {decimales: 2}
+  factures_entetes:
+    total_ht: {decimales: 2}
+    total_tva: {decimales: 2}
+    total_ttc: {decimales: 2}
+  factures_lignes:
+    quantite: {decimales: 2}
+    pu_ht: {decimales: 2}
+    montant_ht: {decimales: 2}
+    remise_pct: {bornes: {min: 0, max: 15}}
+    taux_tva: {bornes: {min: 20, max: 20}}
+  achats_entetes:
+    total_ht: {decimales: 2}
+    total_tva: {decimales: 2}
+    total_ttc: {decimales: 2}
+  achats_lignes:
+    quantite: {decimales: 2}
+    pu_achat_ht: {decimales: 2}
+    montant_ht: {decimales: 2}
+  clients:
+    siret: {cle_luhn: true}
+    email: {motif: '[^@\s]+@[^@\s]+\.[^@\s]+'}
+  fournisseurs:
+    siret: {cle_luhn: true}
+  intervenants:
+    nom: {motif: '[^a-zà-ÿ]+'}
+  remunerations:
+    salaire_brut_mensuel: {decimales: 2}
+    taux_activite: {bornes: {min: 0, max: 1}}
+  catalogue_pieces:
+    prix_vente_ht_2025: {decimales: 2}
+    stock_initial: {decimales: 2}
+    cump_initial: {decimales: 4}
+  parametres_couts:
+    cout_km: {decimales: 2}
+    taux_charges_cdi_cdd: {bornes: {min: 0, max: 1}}
+    taux_charges_apprenti: {bornes: {min: 0, max: 1}}
