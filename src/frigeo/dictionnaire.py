@@ -717,8 +717,31 @@ CHAMPS_REVUE = (
     "regles_changees",
     "valeurs_changees",
     "valeurs_ajoutees",
+    "formes_changees",
+    "formes_ajoutees",
     "commentaires_changes",
 )
+# Compteurs ajoutés avec la revue des formes : une entrée écrite avant eux ne pouvait
+# toucher aucune forme, elle est lue avec ces compteurs à 0.
+CHAMPS_REVUE_FORMES = ("formes_changees", "formes_ajoutees")
+
+
+def _completer_journal(revues):
+    """Journal dont les entrées écrites avant la revue des formes sont complétées.
+
+    Une entrée qui porte tous les champs sauf les compteurs de formes les reçoit à 0,
+    dans l'ordre de `CHAMPS_REVUE`. Toute autre entrée est rendue telle quelle : elle
+    sera contrôlée par `_problemes_journal`.
+    """
+    if not isinstance(revues, list):
+        return revues
+    anciens = set(CHAMPS_REVUE) - set(CHAMPS_REVUE_FORMES)
+    return [
+        {champ: entree.get(champ, 0) for champ in CHAMPS_REVUE}
+        if isinstance(entree, dict) and set(entree) == anciens
+        else entree
+        for entree in revues
+    ]
 
 
 def _meta(periode_fin: str) -> dict:
@@ -1094,11 +1117,13 @@ def charger_meta(chemin: str | Path | None = None) -> dict:
     """Rend le bloc `meta` du dictionnaire, dont le journal des revues.
 
     La clé `revues` est toujours présente : une liste vide si aucun classeur n'a
-    encore été appliqué (y compris pour un fichier écrit avant ce journal).
+    encore été appliqué (y compris pour un fichier écrit avant ce journal). Une
+    entrée écrite avant la revue des formes est rendue avec ses compteurs de formes
+    à 0 : le fichier sera complété à sa prochaine écriture.
     """
     chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
     meta = dict(_lire_fichier(chemin)["meta"])
-    meta.setdefault("revues", [])
+    meta["revues"] = _completer_journal(meta.get("revues", []))
     problemes = _problemes_journal(meta["revues"])
     if problemes:
         raise ValueError(f"Dictionnaire invalide ({chemin})\n  " + "\n  ".join(problemes))

@@ -13,6 +13,7 @@ from frigeo.dictionnaire import (
     lire_instant,
 )
 from frigeo.revue import (
+    COLONNES_FORMES,
     COLONNES_RAPPORT_REVUE,
     COLONNES_REGLES,
     COLONNES_VALEURS,
@@ -21,6 +22,7 @@ from frigeo.revue import (
     appliquer_revue,
     exporter_revue,
     importer_revue,
+    lignes_formes,
     lignes_regles,
     lignes_valeurs,
     reste_a_traiter,
@@ -67,7 +69,7 @@ def _colonne(valeurs=None, a_arbitrer=None, vides=0, hors_nature=0):
         "obligatoire": _regle("obligatoire", {"vides": vides}),
         "nature": _regle("texte", {"hors_nature": hors_nature}),
         "valeurs": liste,
-        # Règle présente dans le dictionnaire, pas encore revue dans le classeur.
+        # Aucun format proposé : voir `_avec_formats` pour les formats et leurs formes.
         "format": {**_regle("aucune", {}), "liste": []},
     }
 
@@ -96,10 +98,9 @@ def _lire(feuille):
 def test_lignes_regles():
     lignes = lignes_regles(_dictionnaire())
     cles = [(l["table"], l["colonne"], l["regle"]) for l in lignes]
-    # Trois lignes par colonne, y compris sans liste proposée. La règle « format » du
-    # dictionnaire n'est pas encore revue dans le classeur.
-    assert len(lignes) == 4 * 3
-    assert {l["regle"] for l in lignes} == {"obligatoire", "nature", "valeurs"}
+    # Quatre lignes par colonne, y compris sans liste ni format proposé.
+    assert len(lignes) == 4 * 4
+    assert {l["regle"] for l in lignes} == {"obligatoire", "nature", "valeurs", "format"}
     assert ("clients", "statut", "valeurs") in cles
     par_cle = dict(zip(cles, lignes))
     sans_liste = par_cle[("clients", "type_commerce", "valeurs")]
@@ -136,15 +137,17 @@ def test_statut_propre_a_chaque_valeur():
 def test_classeur_ecrit_et_relu(tmp_path):
     chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue" / "revue.xlsx", nb_revues=0)
     classeur = load_workbook(chemin)
-    assert classeur.sheetnames == ["mode_emploi", "regles", "valeurs", "listes"]
+    assert classeur.sheetnames == ["mode_emploi", "regles", "valeurs", "formes", "listes"]
     regles, valeurs = classeur["regles"], classeur["valeurs"]
     assert tuple(c.value for c in regles[1]) == COLONNES_REGLES
     assert tuple(c.value for c in valeurs[1]) == COLONNES_VALEURS
-    assert len(_lire(regles)) == 12
+    assert tuple(c.value for c in classeur["formes"][1]) == COLONNES_FORMES
+    assert len(_lire(regles)) == 16
     assert {l["statut"] for l in _lire(regles)} == {"observé"}
     notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
     assert "2026-03" in notice
-    assert "12 lignes dans la feuille « regles »" in notice
+    assert "16 lignes dans la feuille « regles » (quatre par colonne" in notice
+    assert "0 lignes dans la feuille « formes »" in notice
     assert "réimporté" in notice
 
 
@@ -178,6 +181,7 @@ def test_protection_et_menus(tmp_path):
     assert '"observé,valide,invalide,documenté"' in menus
     assert '"obligatoire,facultatif,toujours vide"' in menus
     assert '"liste fermée"' in menus
+    assert '"formes fermées"' in menus
     assert all(len(m) <= 255 for m in menus)
     # Feuille des valeurs : menu des statuts, puis menus table et colonne des ajouts.
     assert len(valeurs.data_validations.dataValidation) == 3
@@ -232,7 +236,8 @@ def _erreur_import(chemin):
 
 def test_import_sans_modification(tmp_path):
     revue = importer_revue(_exporter(tmp_path), _dictionnaire(), nb_revues=0)
-    assert len(revue.regles) == 12
+    assert len(revue.regles) == 16
+    assert revue.formes.empty
     assert len(revue.valeurs) == 3 + len(PIEGES)
     assert set(revue.regles["statut"]) == set(revue.valeurs["statut"]) == {"observé"}
     assert list(revue.valeurs.loc[revue.valeurs["colonne"] == "code", "valeur"]) == PIEGES
@@ -407,7 +412,7 @@ def _element(dictionnaire, valeur, colonne="statut"):
 
 def test_repere_des_revues(tmp_path):
     chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=2)
-    assert len(_importer(chemin, nb_revues=2).regles) == 12
+    assert len(_importer(chemin, nb_revues=2).regles) == 16
     # Une revue a été appliquée depuis l'export : le classeur annulerait ses décisions.
     with pytest.raises(ValueError, match="exporté après 2 revues, le dictionnaire en compte 3"):
         _importer(chemin, nb_revues=3)
@@ -487,6 +492,8 @@ def test_application_des_decisions(tmp_path):
         "regles_changees": 4,
         "valeurs_changees": 2,
         "valeurs_ajoutees": 2,
+        "formes_changees": 0,
+        "formes_ajoutees": 0,
         "commentaires_changes": 0,
     }
     assert len(rapport) == 8
@@ -602,6 +609,8 @@ def test_deuxieme_revue_modifie_annule_et_retire(tmp_path):
         "regles_changees": 2,
         "valeurs_changees": 2,
         "valeurs_ajoutees": 0,
+        "formes_changees": 0,
+        "formes_ajoutees": 0,
         "commentaires_changes": 2,
     }
     evenements = sorted(rapport["evenement"])
@@ -784,37 +793,41 @@ def test_mode_emploi_decrit_les_cas_particuliers(tmp_path):
     assert cellules[debut].font.bold
     cas = textes[debut + 1 : fin]
     assert [t.split(" :")[0] for t in cas] == [
-        "Annuler une décision (règle ou valeur)",
-        "Retirer une valeur ajoutée (origine « ajoutée »)",
-        "Écarter toute une liste",
+        "Annuler une décision (règle, valeur ou forme)",
+        "Retirer une valeur ou une forme ajoutée (origine « ajoutée »)",
+        "Écarter toute une liste ou tout un format",
         "Statut invalide sur une règle",
         "Changer une règle déjà validée quand la proposition a changé",
-        "Déclarer correcte une valeur absente des données",
+        "Déclarer correcte une valeur ou une forme absente des données",
         "Déclarer une liste que l'outil n'a pas proposée (proposition « aucune »)",
+        "Déclarer un format que l'outil n'a pas proposé (proposition « aucune »)",
         "Colonne sensible (motif « colonne sensible », effectif « masqué »)",
         "Remplacer une valeur erronée",
+        "Valeur mal formée",
         "Modifier seulement un commentaire",
         "Reprendre une revue",
         "Avant l'import",
     ]
     # Chaque consigne n'est donnée qu'une fois dans la feuille.
     assert sum("ne s'applique qu'une fois" in t for t in textes) == 1
-    assert sum("Retirer une valeur ajoutée" in t or "retirer une valeur ajoutée" in t for t in textes) == 1
+    assert sum("etirer une valeur ou une forme ajoutée" in t for t in textes) == 1
 
 
 def test_mode_emploi_compte_ce_qui_reste_a_traiter(tmp_path):
     def reste(chemin):
         textes = [c.value for c in load_workbook(chemin)["mode_emploi"]["A"] if c.value]
         debut = textes.index("Ce qui reste à traiter")
-        return " ".join(textes[debut + 1 : debut + 6])
+        return " ".join(textes[debut + 1 : debut + 7])
 
     # Avant toute revue : tout est à « observé ».
     notice = reste(_exporter(tmp_path))
     assert "« regles » : 10 lignes à « observé » sur 10" in notice
     assert "2 ont une proposition « à décider »" in notice
     assert "4 ont des écarts à arbitrer" in notice
-    # Deux colonnes sans liste proposée : leur ligne « valeurs » n'est pas à revoir.
-    assert "S'y ajoutent 2 lignes « valeurs » à « observé »" in notice
+    # Deux colonnes sans liste proposée, quatre sans format proposé : ces lignes ne
+    # sont pas à revoir.
+    assert "S'y ajoutent 2 lignes « valeurs » et 4 lignes « format » à « observé »" in notice
+    assert "« formes » : 0 lignes à « observé » sur 0, dont 0 d'origine « à arbitrer »" in notice
     assert "« valeurs » : 10 lignes à « observé » sur 10, dont 1 d'origine « à arbitrer »" in notice
     assert "S'y ajoutent 0 valeurs de listes écartées" in notice
 
@@ -834,6 +847,7 @@ def test_reste_a_traiter_sans_exporter(tmp_path):
     assert reste_a_traiter(_dictionnaire()) == {
         "regles": 10,
         "regles_sans_liste": 2,
+        "regles_sans_format": 4,
         "regles_a_traiter": 10,
         "regles_a_decider": 2,
         "regles_avec_ecarts": 4,
@@ -842,6 +856,11 @@ def test_reste_a_traiter_sans_exporter(tmp_path):
         "valeurs_a_arbitrer": 1,
         "valeurs_listes_ecartees": 0,
         "valeurs_non_declarees": 0,
+        "formes": 0,
+        "formes_a_traiter": 0,
+        "formes_a_arbitrer": 0,
+        "formes_formats_ecartes": 0,
+        "formes_non_declarees": 0,
         "complet": False,
     }
     resultat, _, _ = _apres_premiere_revue(tmp_path)
@@ -1073,3 +1092,472 @@ def test_menus_table_et_colonne_des_lignes_d_ajout(tmp_path):
     _modifier(chemin, "valeurs", premiere, table="clients", colonne="type_commerce",
               valeur="Boulangerie", statut="documenté")
     assert list(_importer(chemin).valeurs["valeur"])[-1] == "Boulangerie"
+
+
+# La règle de format dans le classeur : ligne « format » et feuille des formes (morceau 6b).
+
+REF = dict(table="clients", colonne="ref")
+FIN_FORMES = 1 + 3  # dernière ligne exportée de la feuille des formes de `_avec_formats`
+
+
+def _forme(forme, origine, effectif):
+    return {
+        "forme": forme,
+        "origine": origine,
+        "effectif": effectif,
+        "statut": "observé",
+        "commentaire": "",
+        "revu_le": None,
+    }
+
+
+def _avec_formats():
+    """Dictionnaire avec un format proposé (clients.ref) et une colonne candidate à un
+    format (clients.type_commerce)."""
+    dictionnaire = _dictionnaire()
+    ref = _colonne()
+    ref["format"] = {
+        **_regle("formes fermées", {"formes": 1}),
+        "liste": [_forme("AA-9999", "liste proposée", 40), _forme("AA9999", "à arbitrer", 2)],
+    }
+    dictionnaire["clients"]["ref"] = ref
+    dictionnaire["clients"]["type_commerce"]["format"]["liste"] = [
+        _forme("Aaaa", "observée", 12)
+    ]
+    return dictionnaire
+
+
+def _exporter_formats(tmp_path, nom="revue.xlsx"):
+    return exporter_revue(_avec_formats(), "2026-03", tmp_path / nom, nb_revues=0)
+
+
+def _formes(dictionnaire, colonne="ref"):
+    return dictionnaire["clients"][colonne]["format"]["liste"]
+
+
+def test_ligne_format_et_lignes_des_formes():
+    dictionnaire = _avec_formats()
+    regles = {(l["colonne"], l["regle"]): l for l in lignes_regles(dictionnaire)}
+    ligne = regles[("ref", "format")]
+    assert (ligne["proposition"], ligne["regle_en_vigueur"], ligne["nb_a_arbitrer"]) == (
+        "1 forme", "formes fermées", 1,
+    )
+    # Colonne candidate : des formes observées, mais aucun format proposé.
+    assert regles[("type_commerce", "format")]["proposition"] == "aucune"
+    _formes(dictionnaire).insert(1, _forme("AA-99999", "liste proposée", 30))
+    regles = {(l["colonne"], l["regle"]): l for l in lignes_regles(dictionnaire)}
+    assert regles[("ref", "format")]["proposition"] == "2 formes"
+
+    lignes = lignes_formes(_avec_formats())
+    assert [(l["colonne"], l["forme"], l["effectif"], l["origine"]) for l in lignes] == [
+        ("type_commerce", "Aaaa", 12, "observée"),
+        ("ref", "AA-9999", 40, "liste proposée"),
+        ("ref", "AA9999", 2, "à arbitrer"),
+    ]
+    # Une forme n'a pas de remplacement.
+    assert all(tuple(l) == COLONNES_FORMES for l in lignes)
+    # Ce qui ne se voit pas à l'écran est signalé, comme pour une valeur.
+    dictionnaire = _avec_formats()
+    _formes(dictionnaire).append(_forme("AA-9999 ", "à arbitrer", 1))
+    assert lignes_formes(dictionnaire)[-1]["remarque"] == "espaces en bord"
+    # Colonne sensible : l'effectif d'une forme déclarée est masqué.
+    dictionnaire["clients"]["statut"]["format"]["motif"] = "colonne sensible"
+    dictionnaire["clients"]["statut"]["format"]["liste"] = [
+        {**_forme("Aaaaa", "ajoutée", None), "statut": "documenté", "revu_le": JOUR}
+    ]
+    assert lignes_formes(dictionnaire)[0]["effectif"] == "masqué"
+
+
+def test_feuille_des_formes_exportee(tmp_path):
+    dictionnaire = _avec_formats()
+    # Une forme faite de chiffres reste un texte dans le classeur.
+    _formes(dictionnaire).append(_forme("99999", "à arbitrer", 1))
+    chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
+    classeur = load_workbook(chemin)
+    formes = classeur["formes"]
+    assert tuple(c.value for c in formes[1]) == COLONNES_FORMES
+    assert [l["forme"] for l in _lire(formes)] == ["Aaaa", "AA-9999", "AA9999", "99999"]
+    assert formes.protection.sheet
+    libres = {c.value for c, d in zip(formes[1], formes[2]) if not d.protection.locked}
+    assert libres == {"statut", "commentaire"}
+    ajout = formes[1 + 4 + 2]
+    libres = {c.value for c, d in zip(formes[1], ajout) if not d.protection.locked}
+    assert libres == {"table", "colonne", "forme", "statut", "commentaire"}
+    assert formes.max_row == 1 + 4 + LIGNES_AJOUT
+    assert formes.freeze_panes == "C2"
+    # Menu des statuts, puis menus table et colonne des lignes d'ajout.
+    menus = {str(m.sqref): m.formula1 for m in formes.data_validations.dataValidation}
+    assert len(menus) == 3 and all(
+        m.showErrorMessage for m in formes.data_validations.dataValidation
+    )
+    assert menus[f"A6:A{5 + LIGNES_AJOUT}"] == "'listes'!$A$1:$B$1"
+    assert "MATCH($A6,'listes'!$1:$1,0)" in menus[f"B6:B{5 + LIGNES_AJOUT}"]
+    # Sur une ligne « format », regle_retenue sert à déclarer des formes fermées.
+    regles = classeur["regles"]
+    ligne = next(l for l in regles.iter_rows(min_row=2) if l[2].value == "format")
+    assert not ligne[COLONNES_REGLES.index("regle_retenue")].protection.locked
+    notice = [c for c in classeur["mode_emploi"]["A"] if c.value]
+    rubrique = next(c for c in notice if c.value.startswith("Feuille « formes » : les formes"))
+    assert rubrique.font.bold
+    textes = " ".join(c.value for c in notice)
+    assert "9 pour un chiffre, A pour une majuscule, a pour une minuscule" in textes
+    assert "4 lignes dans la feuille « formes »" in textes
+
+
+def _revoir_le_format(chemin):
+    """Valide le format de clients.ref, arbitre ses formes et en ajoute une."""
+    _modifier(chemin, "regles", dict(REF, regle="format"), statut="valide")
+    _modifier(chemin, "formes", dict(REF, forme="AA-9999"), statut="valide")
+    _modifier(chemin, "formes", dict(REF, forme="AA9999"), statut="invalide",
+              commentaire="tiret oublié")
+    _modifier(chemin, "formes", FIN_FORMES + 1, **REF, forme="AA-99999", statut="documenté",
+              commentaire="nouvelle numérotation")
+
+
+def test_revue_des_formes(tmp_path):
+    dictionnaire = _avec_formats()
+    temoin = deepcopy(dictionnaire)
+    chemin = _exporter_formats(tmp_path)
+    # Sans modification : trois formes lues, rien à appliquer.
+    revue = _importer(chemin, dictionnaire)
+    assert list(revue.formes["forme"]) == ["Aaaa", "AA-9999", "AA9999"]
+    assert appliquer_revue(dictionnaire, revue, chemin, JOUR)[2] is None
+
+    _revoir_le_format(chemin)
+    revue = _importer(chemin, dictionnaire)
+    assert revue.avertissements == []
+    assert list(revue.formes["ligne_excel"]) == [2, 3, 4, FIN_FORMES + 1]
+    resultat, rapport, entree = appliquer_revue(dictionnaire, revue, chemin, JOUR)
+    assert dictionnaire == temoin  # l'argument n'est pas modifié
+
+    regle = resultat["clients"]["ref"]["format"]
+    assert (regle["statut"], regle["regle"], regle["revu_le"]) == ("valide", "formes fermées", JOUR)
+    assert _formes(resultat) == [
+        {**_forme("AA-9999", "liste proposée", 40), "statut": "valide", "revu_le": JOUR},
+        {**_forme("AA9999", "à arbitrer", 2), "statut": "invalide", "revu_le": JOUR,
+         "commentaire": "tiret oublié"},
+        # Forme ajoutée : effectif 0, pas de champ de remplacement.
+        {**_forme("AA-99999", "ajoutée", 0), "statut": "documenté", "revu_le": JOUR,
+         "commentaire": "nouvelle numérotation"},
+    ]
+    # Les valeurs et les formes non revues ne sont pas touchées.
+    assert _formes(resultat, "type_commerce") == _formes(temoin, "type_commerce")
+    assert resultat["clients"]["statut"] == temoin["clients"]["statut"]
+    assert entree == {
+        "date": JOUR,
+        "classeur": "revue.xlsx",
+        "regles_changees": 1,
+        "valeurs_changees": 0,
+        "valeurs_ajoutees": 0,
+        "formes_changees": 2,
+        "formes_ajoutees": 1,
+        "commentaires_changes": 0,
+    }
+    # Dans le rapport, la colonne « valeur » porte la forme.
+    assert tuple(rapport.columns) == COLONNES_RAPPORT_REVUE
+    assert set(rapport["regle"]) == {"format"}
+    evenements = dict(zip(rapport["valeur"], rapport["evenement"]))
+    assert evenements == {
+        "": "décision changée",
+        "AA-9999": "décision changée",
+        "AA9999": "décision changée",
+        "AA-99999": "forme ajoutée",
+    }
+    ligne = rapport[rapport["valeur"] == "AA9999"].iloc[0]
+    assert (ligne["avant"], ligne["apres"]) == ("observé", "invalide")
+
+    # Le dictionnaire s'écrit avec son journal, et le classeur suivant affiche la revue.
+    fichier = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(dictionnaire, "2026-03", fichier)
+    ecrire_dictionnaire(resultat, "2026-03", fichier, revue=entree)
+    assert charger_dictionnaire(fichier) == resultat
+    assert charger_meta(fichier)["revues"] == [entree]
+    suivant = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    lues = {l["forme"]: l for l in _lire(load_workbook(suivant)["formes"])}
+    assert (lues["AA9999"]["statut"], lues["AA9999"]["commentaire"]) == ("invalide", "tiret oublié")
+    assert (lues["AA-99999"]["origine"], lues["AA-99999"]["effectif"]) == ("ajoutée", 0)
+    encore, rapport, entree = appliquer_revue(
+        resultat, _importer(suivant, resultat, 1), suivant, "2026-11-02 09:00:00"
+    )
+    assert encore == resultat and entree is None and rapport.empty
+
+    # Seconde revue : forme ajoutée retirée, décision annulée, commentaire seul modifié.
+    _modifier(suivant, "formes", dict(REF, forme="AA-99999"), statut="observé")
+    _modifier(suivant, "formes", dict(REF, forme="AA9999"), statut="observé", commentaire=None)
+    _modifier(suivant, "formes", dict(REF, forme="AA-9999"), commentaire="forme de référence")
+    second = "2026-11-02 09:00:00"
+    final, rapport, entree = appliquer_revue(
+        resultat, _importer(suivant, resultat, 1), suivant, second
+    )
+    assert [f["forme"] for f in _formes(final)] == ["AA-9999", "AA9999"]
+    # Un commentaire seul ne déplace pas la date de la décision.
+    assert (_formes(final)[0]["commentaire"], _formes(final)[0]["revu_le"]) == (
+        "forme de référence", JOUR,
+    )
+    # Une forme observée dans les données redevient une forme à revoir.
+    assert _formes(final)[1] == _forme("AA9999", "à arbitrer", 2)
+    assert (entree["formes_changees"], entree["formes_ajoutees"]) == (2, 0)
+    assert (entree["commentaires_changes"], entree["valeurs_changees"]) == (1, 0)
+    assert sorted(rapport["evenement"]) == [
+        "commentaire modifié", "décision changée", "forme retirée",
+    ]
+    ecrire_dictionnaire(final, "2026-03", fichier, revue=entree)
+    assert charger_dictionnaire(fichier) == final
+
+
+def test_formes_refusees(tmp_path):
+    chemin = _exporter_formats(tmp_path)
+    fin = FIN_FORMES
+    # Une valeur saisie à la place de sa forme.
+    _modifier(chemin, "formes", fin + 1, **REF, forme="CL-00017", statut="documenté")
+    _modifier(chemin, "formes", fin + 2, **REF, forme="AA-999", statut="valide")
+    _modifier(chemin, "formes", fin + 3, table="clients", colonne="inconnue",
+              forme="AAA", statut="documenté")
+    _modifier(chemin, "formes", fin + 4, **REF, forme="AA9999", statut="documenté")
+    _modifier(chemin, "formes", fin + 5, **REF, statut="documenté")
+    _modifier(chemin, "formes", fin + 6, **REF, forme=999, statut="documenté")
+    # Une valeur dont la forme figure déjà dans la feuille : la ligne est à vider.
+    _modifier(chemin, "formes", fin + 7, **REF, forme="CL-0001", statut="documenté")
+    _modifier(chemin, "formes", dict(REF, forme="AA-9999"), statut="documenté")
+    with pytest.raises(ValueError) as erreur:
+        _importer(chemin, _avec_formats())
+    message = str(erreur.value)
+    assert "8 problèmes" in message
+    for attendu in (
+        "formes, ligne 11 : 'CL-0001' n'est pas une forme (9 pour un chiffre, A pour une "
+        "majuscule, a pour une minuscule, les autres caractères tels quels), la forme "
+        "correspondante est 'AA-9999', déjà présente pour cette colonne (vider la ligne)",
+        "formes, ligne 5 : 'CL-00017' n'est pas une forme (9 pour un chiffre, A pour une "
+        "majuscule, a pour une minuscule, les autres caractères tels quels), la forme "
+        "correspondante est 'AA-99999'",
+        "une forme ajoutée doit porter le statut documenté",
+        "colonne clients.inconnue absente du dictionnaire",
+        "forme 'AA9999' déjà présente pour clients.ref",
+        "forme vide",
+        "forme 999 lue comme int",
+        "statut 'documenté' impossible sur une forme observée",
+    ):
+        assert attendu in message
+
+    # Ligne exportée modifiée ou supprimée : le classeur ne correspond plus au dictionnaire.
+    chemin = _exporter_formats(tmp_path, "modifie.xlsx")
+    _modifier(chemin, "formes", dict(REF, forme="AA9999"), forme="AA_9999")
+    with pytest.raises(ValueError) as erreur:
+        _importer(chemin, _avec_formats())
+    message = str(erreur.value)
+    assert "forme 'AA_9999' de clients.ref inconnue du dictionnaire" in message
+    assert "formes : forme ('clients', 'ref', 'AA9999') absente du classeur" in message
+
+    # Une forme ajoutée déjà enregistrée ne se garde ou ne se retire que telle quelle.
+    chemin = _exporter_formats(tmp_path, "premiere.xlsx")
+    _revoir_le_format(chemin)
+    resultat, _, _ = appliquer_revue(
+        _avec_formats(), _importer(chemin, _avec_formats()), chemin, JOUR
+    )
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    _modifier(chemin, "formes", dict(REF, forme="AA-99999"), statut="invalide")
+    with pytest.raises(ValueError, match="impossible sur une forme ajoutée"):
+        _importer(chemin, resultat, nb_revues=1)
+
+
+COMMERCE_FORMAT = dict(table="clients", colonne="type_commerce", regle="format")
+
+
+def test_declarer_un_format_non_propose(tmp_path):
+    dictionnaire = _avec_formats()
+    chemin = _exporter_formats(tmp_path)
+    # Revoir une forme observée sans déclarer le format : admis, avec un avertissement.
+    _modifier(chemin, "formes", dict(COMMERCE, forme="Aaaa"), statut="valide")
+    assert _importer(chemin, dictionnaire).avertissements == [
+        "clients.type_commerce : 1 formes revues, mais format non déclaré "
+        "(statuts conservés, sans effet tant que le format n'est pas déclaré)"
+    ]
+    # Déclaration : la forme observée est validée sans ressaisie, une autre est ajoutée.
+    _modifier(chemin, "regles", COMMERCE_FORMAT, statut="documenté",
+              regle_retenue="formes fermées")
+    _modifier(chemin, "formes", FIN_FORMES + 1, **COMMERCE, forme="Aaaa-aaaa",
+              statut="documenté")
+    revue = _importer(chemin, dictionnaire)
+    assert revue.avertissements == []
+    resultat, rapport, entree = appliquer_revue(dictionnaire, revue, chemin, JOUR)
+    regle = resultat["clients"]["type_commerce"]["format"]
+    assert (regle["regle"], regle["proposition"], regle["statut"]) == (
+        "formes fermées", "aucune", "documenté",
+    )
+    assert [(f["forme"], f["origine"], f["statut"], f["effectif"]) for f in regle["liste"]] == [
+        ("Aaaa", "observée", "valide", 12),
+        ("Aaaa-aaaa", "ajoutée", "documenté", 0),
+    ]
+    assert (entree["regles_changees"], entree["formes_changees"], entree["formes_ajoutees"]) == (
+        1, 1, 1,
+    )
+    ligne = rapport[rapport["regle"].eq("format") & rapport["valeur"].eq("")].iloc[0]
+    assert (ligne["avant"], ligne["apres"]) == (
+        "observé, règle aucune", "documenté, règle formes fermées",
+    )
+    # Le classeur suivant affiche la déclaration et ne change rien.
+    suivant = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    lue = next(l for l in _lire(load_workbook(suivant)["regles"])
+               if (l["colonne"], l["regle"]) == ("type_commerce", "format"))
+    assert (lue["proposition"], lue["regle_en_vigueur"], lue["regle_retenue"]) == (
+        "aucune", "formes fermées", "formes fermées",
+    )
+    assert appliquer_revue(resultat, _importer(suivant, resultat, 1), suivant, JOUR)[2] is None
+
+    # Retirer toutes les formes d'un format déclaré bloque l'import.
+    _modifier(suivant, "formes", dict(COMMERCE, forme="Aaaa"), statut="observé")
+    _modifier(suivant, "formes", dict(COMMERCE, forme="Aaaa-aaaa"), statut="observé")
+    with pytest.raises(ValueError, match="format déclaré sans aucune forme"):
+        _importer(suivant, resultat, nb_revues=1)
+
+    # Écarter le format déclaré : ses formes restent, sans effet, et c'est signalé.
+    ecarte = exporter_revue(resultat, "2026-03", tmp_path / "ecarte.xlsx", nb_revues=1)
+    _modifier(ecarte, "regles", COMMERCE_FORMAT, statut="invalide", regle_retenue=None,
+              commentaire="libellé libre")
+    revue = _importer(ecarte, resultat, nb_revues=1)
+    assert revue.avertissements == [
+        "clients.type_commerce : format écarté, mais 1 formes revues "
+        "(statuts conservés, sans effet tant que le format est écarté)"
+    ]
+    final, _, _ = appliquer_revue(resultat, revue, ecarte, "2026-11-02 09:00:00")
+    regle = final["clients"]["type_commerce"]["format"]
+    assert (regle["regle"], regle["statut"], len(regle["liste"])) == ("aucune", "invalide", 2)
+
+
+def test_declarations_de_format_refusees(tmp_path):
+    def erreur(chemin):
+        with pytest.raises(ValueError) as levee:
+            _importer(chemin, _avec_formats())
+        return str(levee.value)
+
+    # Format déclaré sans aucune forme valide ou documentée, puis avec une autre règle.
+    chemin = _exporter_formats(tmp_path)
+    _modifier(chemin, "regles", COMMERCE_FORMAT, statut="documenté",
+              regle_retenue="formes fermées")
+    assert (
+        "format déclaré sans aucune forme au statut valide ou documenté pour "
+        "clients.type_commerce (ajouter ses formes en bas de la feuille « formes »)"
+    ) in erreur(chemin)
+    _modifier(chemin, "regles", COMMERCE_FORMAT, regle_retenue="liste fermée")
+    assert "regle_retenue 'liste fermée' hors du menu de la règle format" in erreur(chemin)
+
+    # Un format déjà proposé se valide, il ne se déclare pas : un seul problème.
+    chemin = _exporter_formats(tmp_path, "propose.xlsx")
+    _modifier(chemin, "regles", dict(REF, regle="format"), statut="documenté",
+              regle_retenue="formes fermées")
+    message = erreur(chemin)
+    assert "1 problèmes" in message
+    assert "un format est déjà proposé, il n'y a rien à déclarer (choisir valide)" in message
+
+    # Rien à valider sans format proposé, rien à écarter sans aucune forme.
+    chemin = _exporter_formats(tmp_path, "rien.xlsx")
+    _modifier(chemin, "regles", COMMERCE_FORMAT, statut="valide")
+    _modifier(chemin, "regles", dict(STATUT, regle="format"), statut="invalide",
+              commentaire="libellé")
+    message = erreur(chemin)
+    assert "2 problèmes" in message
+    assert "aucun format n'est proposé, il n'y a rien à valider" in message
+    assert "aucun format n'est proposé et la colonne n'a aucune forme, il n'y a rien à écarter" in message
+
+    # Écarter un format proposé reste admis, avec un commentaire.
+    chemin = _exporter_formats(tmp_path, "ecarte.xlsx")
+    _modifier(chemin, "regles", dict(REF, regle="format"), statut="invalide")
+    assert "commentaire obligatoire avec le statut invalide" in erreur(chemin)
+    _modifier(chemin, "regles", dict(REF, regle="format"), commentaire="texte libre régulier")
+    resultat, _, entree = appliquer_revue(
+        _avec_formats(), _importer(chemin, _avec_formats()), chemin, JOUR
+    )
+    regle = resultat["clients"]["ref"]["format"]
+    assert (regle["regle"], regle["proposition"]) == ("aucune", "formes fermées")
+    assert [f["forme"] for f in regle["liste"]] == ["AA-9999", "AA9999"]
+    assert entree["regles_changees"] == 1
+
+
+def test_reste_a_traiter_des_formes(tmp_path):
+    dictionnaire = _avec_formats()
+    reste = reste_a_traiter(dictionnaire)
+    # Cinq colonnes : trois sans liste proposée, quatre sans format proposé.
+    assert (reste["regles"], reste["regles_sans_liste"], reste["regles_sans_format"]) == (13, 3, 4)
+    assert (reste["regles_a_traiter"], reste["regles_avec_ecarts"]) == (13, 5)
+    # La forme de la colonne candidate n'est à revoir que si le format est déclaré.
+    assert (reste["formes"], reste["formes_a_traiter"], reste["formes_a_arbitrer"]) == (3, 2, 1)
+    assert (reste["formes_non_declarees"], reste["formes_formats_ecartes"]) == (1, 0)
+    notice = " ".join(
+        c.value for c in load_workbook(_exporter_formats(tmp_path))["mode_emploi"]["A"] if c.value
+    )
+    assert "« formes » : 2 lignes à « observé » sur 3, dont 1 d'origine « à arbitrer »" in notice
+    assert "S'y ajoutent 0 formes de formats écartés" in notice
+    assert "et 1 formes d'origine « observée », à revoir seulement si vous déclarez le format" in notice
+
+    # Format écarté : ses formes non revues ne sont plus à revoir.
+    ecarte = _avec_formats()
+    ecarte["clients"]["ref"]["format"].update(
+        statut="invalide", regle="aucune", revu_le=JOUR, commentaire="texte libre"
+    )
+    reste = reste_a_traiter(ecarte)
+    assert (reste["formes_a_traiter"], reste["formes_formats_ecartes"]) == (0, 2)
+    assert (reste["regles_a_traiter"], reste["complet"]) == (12, False)
+
+    # Tout revoir : la revue est complète quand il ne reste ni règle, ni valeur, ni forme.
+    complet = _avec_formats()
+    for colonnes in complet.values():
+        for regles in colonnes.values():
+            for regle in regles.values():
+                if regle["statut"] == "observé":
+                    regle.update(statut="invalide", regle="aucune", revu_le=JOUR)
+    complet["clients"]["ref"]["format"].update(statut="valide", regle="formes fermées")
+    reste = reste_a_traiter(complet)
+    assert (reste["regles_a_traiter"], reste["valeurs_a_traiter"]) == (0, 0)
+    assert (reste["formes_a_traiter"], reste["complet"]) == (2, False)
+    for forme in _formes(complet):
+        forme.update(statut="valide", revu_le=JOUR)
+    assert reste_a_traiter(complet)["complet"]
+
+
+def test_forme_ajoutee_dans_une_colonne_sensible(tmp_path):
+    dictionnaire = _dictionnaire()
+    dictionnaire["clients"]["type_commerce"]["format"]["motif"] = "colonne sensible"
+    chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
+    _modifier(chemin, "regles", COMMERCE_FORMAT, statut="documenté",
+              regle_retenue="formes fermées")
+    _modifier(chemin, "formes", 2, **COMMERCE, forme="9 99 99 99 999 999 99",
+              statut="documenté")
+    _modifier(chemin, "formes", 3, **COMMERCE, forme="999999999999999", statut="documenté")
+    resultat, _, entree = appliquer_revue(dictionnaire, _importer(chemin, dictionnaire), chemin, JOUR)
+    liste = resultat["clients"]["type_commerce"]["format"]["liste"]
+    # L'effectif est masqué : le dictionnaire ne dit pas si la forme est observée.
+    assert [(f["forme"], f["effectif"]) for f in liste] == [
+        ("9 99 99 99 999 999 99", None), ("999999999999999", None),
+    ]
+    fichier = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(dictionnaire, "2026-03", fichier)
+    ecrire_dictionnaire(resultat, "2026-03", fichier, revue=entree)
+    assert charger_dictionnaire(fichier) == resultat
+
+    chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
+    lues = _lire(load_workbook(chemin)["formes"])
+    assert [l["effectif"] for l in lues] == ["masqué", "masqué"]
+    # Remise à « observé » : la forme est retirée, comme une forme d'effectif nul.
+    _modifier(chemin, "formes", dict(COMMERCE, forme="999999999999999"), statut="observé")
+    resultat, rapport, _ = appliquer_revue(resultat, _importer(chemin, resultat, 1), chemin, JOUR)
+    assert [f["forme"] for f in resultat["clients"]["type_commerce"]["format"]["liste"]] == [
+        "9 99 99 99 999 999 99"
+    ]
+    assert list(rapport["evenement"]) == ["forme retirée"]
+
+
+def test_classeur_exporte_avant_la_feuille_des_formes_refuse(tmp_path):
+    chemin = _exporter(tmp_path)
+    classeur = load_workbook(chemin)
+    del classeur["formes"]
+    classeur.save(chemin)
+    message = _erreur_import(chemin)
+    assert "feuille « formes » absente" in message
+    assert "à réexporter" in message
+    # Classeur à trois lignes par colonne : la ligne « format » manque.
+    chemin = _exporter(tmp_path / "ancien")
+    classeur = load_workbook(chemin)
+    feuille = classeur["regles"]
+    feuille.delete_rows(_ligne(feuille, table="clients", colonne="code", regle="format"))
+    classeur.save(chemin)
+    assert "('clients', 'code', 'format') absente du classeur" in _erreur_import(chemin)

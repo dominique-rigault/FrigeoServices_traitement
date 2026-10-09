@@ -1,8 +1,8 @@
 """Classeur Excel de revue du dictionnaire par le métier (étape 2d).
 
 Le dictionnaire généré n'est ni ouvert dans Excel ni modifié à la main : il est
-exporté dans un classeur où le métier choisit un statut par règle et par valeur,
-puis le classeur est relu, contrôlé et appliqué au dictionnaire. Ce module ne
+exporté dans un classeur où le métier choisit un statut par règle, par valeur et
+par forme, puis le classeur est relu, contrôlé et appliqué au dictionnaire. Ce module ne
 contient rien de propre à un client et n'écrit que le classeur.
 """
 
@@ -24,12 +24,17 @@ from . import racine_projet
 from .dictionnaire import (
     A_DECIDER,
     AUCUNE_LISTE,
+    CHAMPS_REVUE,
+    CLES_LISTE,
+    FORMES_FERMEES,
     LISTE_FERMEE,
     ORIGINE_A_ARBITRER,
     ORIGINE_AJOUT,
     ORIGINE_LISTE,
     ORIGINE_OBSERVEE,
     REGLE_ECARTEE,
+    REGLES,
+    REGLES_FERMEES,
     REGLES_RETENUES,
     STATUT_INITIAL,
     STATUTS,
@@ -39,16 +44,17 @@ from .dictionnaire import (
     horodater,
     problemes_dictionnaire,
 )
+from .profilage import signature
 
 FEUILLE_MODE_EMPLOI = "mode_emploi"
 FEUILLE_REGLES = "regles"
 FEUILLE_VALEURS = "valeurs"
+FEUILLE_FORMES = "formes"
 # Feuille technique, masquée : une colonne par table, pour les menus des lignes d'ajout.
 FEUILLE_LISTES = "listes"
-
-# Règles revues dans le classeur. La règle `format` du dictionnaire n'y figure pas
-# encore : elle reste telle que la génération et la fusion la donnent.
-REGLES_REVUES = ("obligatoire", "nature", "valeurs")
+# Feuille des éléments de chaque règle qui porte une liste : les valeurs d'une liste
+# fermée, les formes d'un format.
+FEUILLES_LISTE = {"valeurs": FEUILLE_VALEURS, "format": FEUILLE_FORMES}
 
 COLONNES_REGLES = (
     "table",
@@ -73,17 +79,60 @@ COLONNES_VALEURS = (
     "remplacement",
     "commentaire",
 )
+# Une forme n'a pas de remplacement : corriger une valeur mal formée relève d'une règle
+# de nettoyage, pas de la revue du dictionnaire.
+COLONNES_FORMES = (
+    "table",
+    "colonne",
+    "forme",
+    "effectif",
+    "origine",
+    "remarque",
+    "statut",
+    "commentaire",
+)
+COLONNES_LISTE = {"valeurs": COLONNES_VALEURS, "format": COLONNES_FORMES}
 # Colonnes que le métier peut modifier; les autres cellules sont verrouillées.
 MODIFIABLES_REGLES = ("statut", "regle_retenue", "commentaire")
 MODIFIABLES_VALEURS = ("statut", "remplacement", "commentaire")
-# Colonnes à saisir sur une ligne ajoutée en bas de la feuille des valeurs.
-SAISIE_AJOUT = ("table", "colonne", "valeur", "statut", "commentaire")
+MODIFIABLES_FORMES = ("statut", "commentaire")
+MODIFIABLES_LISTE = {"valeurs": MODIFIABLES_VALEURS, "format": MODIFIABLES_FORMES}
+# Colonnes à saisir sur une ligne ajoutée en bas de la feuille des valeurs ou des formes.
+SAISIE_AJOUT = ("table", "colonne", "valeur", "forme", "statut", "commentaire")
 # Statuts admis sur une valeur ajoutée déjà enregistrée : la garder ou la retirer.
 STATUTS_VALEUR_AJOUTEE = ("documenté", STATUT_INITIAL)
 
 LIGNES_AJOUT = 200
-# Affiché à la place de l'effectif d'une valeur d'une colonne sensible.
+# Affiché à la place de l'effectif d'une valeur ou d'une forme d'une colonne sensible.
 EFFECTIF_MASQUE = "masqué"
+# Convention d'écriture d'une forme, rappelée dans le mode d'emploi et les messages.
+CONVENTION_FORME = (
+    "9 pour un chiffre, A pour une majuscule, a pour une minuscule, les autres "
+    "caractères tels quels"
+)
+# Mots des messages et du mode d'emploi, selon la règle qui porte la liste.
+_MOTS = {
+    "valeurs": {
+        "aucun": "aucune liste n'est proposée",
+        "deja": "une liste est déjà proposée",
+        "declare": "liste déclarée",
+        "ecarte": "liste écartée",
+        "non_declare": "liste non déclarée",
+        "tant_ecarte": "tant que la liste est écartée",
+        "tant_non_declare": "tant que la liste n'est pas déclarée",
+        "compteur": "valeurs",
+    },
+    "format": {
+        "aucun": "aucun format n'est proposé",
+        "deja": "un format est déjà proposé",
+        "declare": "format déclaré",
+        "ecarte": "format écarté",
+        "non_declare": "format non déclaré",
+        "tant_ecarte": "tant que le format est écarté",
+        "tant_non_declare": "tant que le format n'est pas déclaré",
+        "compteur": "formes",
+    },
+}
 # Ligne de la feuille du mode d'emploi qui porte, en colonne B, le nombre de revues
 # déjà appliquées au dictionnaire au moment de l'export.
 REPERE_REVUES = "Revues déjà appliquées au dictionnaire (repère technique)"
@@ -112,6 +161,7 @@ LARGEURS = {
     "origine": 16,
     "remarque": 24,
     "remplacement": 34,
+    "forme": 34,
 }
 
 
@@ -120,28 +170,38 @@ def chemin_revue(periode_fin: str) -> Path:
     return racine_projet() / "data" / "revue" / f"dictionnaire_revue_{periode_fin}.xlsx"
 
 
+def _proposition_affichee(nom: str, regle: dict) -> str:
+    """Proposition d'une règle telle que le classeur l'affiche.
+
+    Une liste proposée s'affiche « liste de N valeurs », un format proposé
+    « N formes » : N compte les éléments d'origine « liste proposée ».
+    """
+    proposition = regle["proposition"]
+    if nom not in CLES_LISTE or proposition != REGLES_FERMEES[nom]:
+        return proposition
+    proposees = sum(element["origine"] == ORIGINE_LISTE for element in regle["liste"])
+    if nom == "valeurs":
+        return f"liste de {proposees} valeurs"
+    return f"{proposees} forme" if proposees == 1 else f"{proposees} formes"
+
+
 def lignes_regles(dictionnaire: dict) -> list[dict]:
     """Lignes de la feuille des règles, dans l'ordre du dictionnaire.
 
-    Trois lignes par colonne : `obligatoire`, `nature` et `valeurs` (les règles de
-    `REGLES_REVUES`, sans la règle `format`). La ligne
-    `valeurs` porte la question « cette colonne est-elle une liste fermée ? » : sa
+    Quatre lignes par colonne : `obligatoire`, `nature`, `valeurs` et `format`. La
+    ligne `valeurs` porte la question « cette colonne est-elle une liste fermée ? » : sa
     proposition s'affiche « liste de N valeurs », ou « aucune » quand la génération
-    ne propose pas de liste (le métier peut alors en déclarer une). Chaque ligne
-    affiche la décision enregistrée : statut, règle en vigueur, règle retenue (au
-    statut « documenté ») et commentaire.
+    ne propose pas de liste (le métier peut alors en déclarer une). La ligne `format`
+    porte la question « les valeurs de cette colonne ont-elles une forme prévue ? » :
+    sa proposition s'affiche « N formes », ou « aucune ». Chaque ligne affiche la
+    décision enregistrée : statut, règle en vigueur, règle retenue (au statut
+    « documenté ») et commentaire.
     """
     lignes = []
     for table, colonnes in dictionnaire.items():
         for colonne, regles in colonnes.items():
-            for nom in REGLES_REVUES:
+            for nom in REGLES:
                 regle = regles[nom]
-                proposition = regle["proposition"]
-                if nom == "valeurs" and proposition == LISTE_FERMEE:
-                    proposees = sum(
-                        element["origine"] == ORIGINE_LISTE for element in regle["liste"]
-                    )
-                    proposition = f"liste de {proposees} valeurs"
                 ecarts = sum(
                     valeur
                     for valeur in regle["a_arbitrer"].values()
@@ -152,7 +212,7 @@ def lignes_regles(dictionnaire: dict) -> list[dict]:
                         "table": table,
                         "colonne": colonne,
                         "regle": nom,
-                        "proposition": proposition,
+                        "proposition": _proposition_affichee(nom, regle),
                         "regle_en_vigueur": regle["regle"],
                         "motif": regle["motif"],
                         "nb_a_arbitrer": ecarts,
@@ -176,6 +236,33 @@ def _remarque(valeur: str) -> str:
     return ", ".join(remarques)
 
 
+def _lignes_liste(dictionnaire: dict, nom: str) -> list[dict]:
+    """Lignes de la feuille des valeurs (`valeurs`) ou des formes (`format`)."""
+    champ = CLES_LISTE[nom]
+    lignes = []
+    for table, colonnes in dictionnaire.items():
+        for colonne, regles in colonnes.items():
+            for element in regles[nom]["liste"]:
+                ligne = {
+                    "table": table,
+                    "colonne": colonne,
+                    champ: element[champ],
+                    "effectif": (
+                        EFFECTIF_MASQUE
+                        if element["effectif"] is None
+                        else element["effectif"]
+                    ),
+                    "origine": element["origine"],
+                    "remarque": _remarque(element[champ]),
+                    "statut": element["statut"],
+                }
+                if nom == "valeurs":
+                    ligne["remplacement"] = element["remplacement"]
+                ligne["commentaire"] = element["commentaire"] or None
+                lignes.append(ligne)
+    return lignes
+
+
 def lignes_valeurs(dictionnaire: dict) -> list[dict]:
     """Lignes de la feuille des valeurs : une ligne par valeur des listes du dictionnaire.
 
@@ -185,51 +272,42 @@ def lignes_valeurs(dictionnaire: dict) -> list[dict]:
     sensible) s'affiche « masqué ». Une colonne dont la liste est vide ne donne
     aucune ligne.
     """
-    return [
-        {
-            "table": table,
-            "colonne": colonne,
-            "valeur": element["valeur"],
-            "effectif": (
-                EFFECTIF_MASQUE if element["effectif"] is None else element["effectif"]
-            ),
-            "origine": element["origine"],
-            "remarque": _remarque(element["valeur"]),
-            "statut": element["statut"],
-            "remplacement": element["remplacement"],
-            "commentaire": element["commentaire"] or None,
-        }
-        for table, colonnes in dictionnaire.items()
-        for colonne, regles in colonnes.items()
-        for element in regles["valeurs"]["liste"]
-    ]
+    return _lignes_liste(dictionnaire, "valeurs")
+
+
+def lignes_formes(dictionnaire: dict) -> list[dict]:
+    """Lignes de la feuille des formes : une ligne par forme des formats du dictionnaire.
+
+    Chaque ligne porte l'effectif, l'origine et la décision enregistrés dans le
+    dictionnaire (statut, commentaire), formes ajoutées et formes observées des
+    colonnes candidates comprises. Une forme n'a pas de remplacement. Un effectif
+    masqué (colonne sensible) s'affiche « masqué ». Une colonne sans aucune forme ne
+    donne aucune ligne.
+    """
+    return _lignes_liste(dictionnaire, "format")
 
 
 def _sans_objet(ligne: dict) -> bool:
-    """Ligne `valeurs` sans liste proposée ni décision : il n'y a rien à décider."""
+    """Ligne `valeurs` ou `format` sans proposition ni décision : il n'y a rien à décider."""
     return (
-        ligne["regle"] == "valeurs"
+        ligne["regle"] in CLES_LISTE
         and ligne["statut"] == STATUT_INITIAL
-        and ligne["proposition"] == AUCUNE_LISTE
+        and ligne["proposition"] == REGLE_ECARTEE
     )
 
 
-def _compter_reste(regles: list[dict], valeurs: list[dict]) -> dict:
-    sans_objet = sum(_sans_objet(ligne) for ligne in regles)
-    attente = [
-        ligne
-        for ligne in regles
-        if ligne["statut"] == STATUT_INITIAL and not _sans_objet(ligne)
-    ]
+def _compter_liste(regles: list[dict], lignes: list[dict], nom: str) -> dict:
+    """Décompte des lignes de la feuille des valeurs ou des formes encore à revoir."""
+    de_la_regle = [ligne for ligne in regles if ligne["regle"] == nom]
     ecartees = {
         (ligne["table"], ligne["colonne"])
-        for ligne in regles
-        if ligne["regle"] == "valeurs" and ligne["statut"] == "invalide"
+        for ligne in de_la_regle
+        if ligne["statut"] == "invalide"
     }
     non_declarees = {
-        (ligne["table"], ligne["colonne"]) for ligne in regles if _sans_objet(ligne)
+        (ligne["table"], ligne["colonne"]) for ligne in de_la_regle if _sans_objet(ligne)
     }
-    observees = [ligne for ligne in valeurs if ligne["statut"] == STATUT_INITIAL]
+    observees = [ligne for ligne in lignes if ligne["statut"] == STATUT_INITIAL]
     restantes = [
         ligne
         for ligne in observees
@@ -239,19 +317,42 @@ def _compter_reste(regles: list[dict], valeurs: list[dict]) -> dict:
         (ligne["table"], ligne["colonne"]) in non_declarees for ligne in observees
     )
     return {
-        "regles": len(regles) - sans_objet,
-        "regles_sans_liste": sans_objet,
+        "total": len(lignes),
+        "a_traiter": len(restantes),
+        "a_arbitrer": sum(ligne["origine"] == ORIGINE_A_ARBITRER for ligne in restantes),
+        "ecartees": len(observees) - len(restantes) - candidates,
+        "non_declarees": candidates,
+    }
+
+
+def _compter_reste(regles: list[dict], valeurs: list[dict], formes: list[dict]) -> dict:
+    sans_liste = sum(_sans_objet(ligne) and ligne["regle"] == "valeurs" for ligne in regles)
+    sans_format = sum(_sans_objet(ligne) and ligne["regle"] == "format" for ligne in regles)
+    attente = [
+        ligne
+        for ligne in regles
+        if ligne["statut"] == STATUT_INITIAL and not _sans_objet(ligne)
+    ]
+    val = _compter_liste(regles, valeurs, "valeurs")
+    frm = _compter_liste(regles, formes, "format")
+    return {
+        "regles": len(regles) - sans_liste - sans_format,
+        "regles_sans_liste": sans_liste,
+        "regles_sans_format": sans_format,
         "regles_a_traiter": len(attente),
         "regles_a_decider": sum(ligne["proposition"] == A_DECIDER for ligne in attente),
         "regles_avec_ecarts": sum(ligne["nb_a_arbitrer"] > 0 for ligne in attente),
-        "valeurs": len(valeurs),
-        "valeurs_a_traiter": len(restantes),
-        "valeurs_a_arbitrer": sum(
-            ligne["origine"] == ORIGINE_A_ARBITRER for ligne in restantes
-        ),
-        "valeurs_listes_ecartees": len(observees) - len(restantes) - candidates,
-        "valeurs_non_declarees": candidates,
-        "complet": not attente and not restantes,
+        "valeurs": val["total"],
+        "valeurs_a_traiter": val["a_traiter"],
+        "valeurs_a_arbitrer": val["a_arbitrer"],
+        "valeurs_listes_ecartees": val["ecartees"],
+        "valeurs_non_declarees": val["non_declarees"],
+        "formes": frm["total"],
+        "formes_a_traiter": frm["a_traiter"],
+        "formes_a_arbitrer": frm["a_arbitrer"],
+        "formes_formats_ecartes": frm["ecartees"],
+        "formes_non_declarees": frm["non_declarees"],
+        "complet": not attente and not val["a_traiter"] and not frm["a_traiter"],
     }
 
 
@@ -259,24 +360,35 @@ def reste_a_traiter(dictionnaire: dict) -> dict:
     """Décompte des lignes du classeur que le métier n'a pas encore revues.
 
     Une ligne reste à traiter tant que son statut est « observé ». Les nombres sont
-    ceux qu'afficherait le mode d'emploi d'un classeur exporté de ce dictionnaire :
-    `regles` et `valeurs` (nombres de lignes à revoir dans les deux feuilles),
-    `regles_a_traiter`, dont `regles_a_decider` (proposition « à décider ») et
-    `regles_avec_ecarts` (écarts à arbitrer), `valeurs_a_traiter`, dont
-    `valeurs_a_arbitrer` (valeurs rares). Les valeurs observées d'une colonne dont la liste n'est pas
-    déclarée sont comptées à part, dans `valeurs_non_declarees` : elles ne sont à
-    revoir que si le métier déclare la liste. Les lignes « valeurs » à « observé » dont
-    la proposition est « aucune » sont comptées à part, dans `regles_sans_liste` :
-    aucune liste n'y est proposée, il n'y a donc rien à décider par défaut. Les valeurs non revues d'une liste écartée sont comptées à part, dans
-    `valeurs_listes_ecartees` : elles n'ont pas à être revues. `complet` est vrai
-    quand il ne reste ni règle ni valeur à traiter.
+    ceux qu'afficherait le mode d'emploi d'un classeur exporté de ce dictionnaire.
+
+    Règles : `regles` (nombre de lignes à revoir dans la feuille), `regles_a_traiter`,
+    dont `regles_a_decider` (proposition « à décider ») et `regles_avec_ecarts`
+    (écarts à arbitrer). Les lignes « valeurs » et « format » à « observé » dont la
+    proposition est « aucune » sont comptées à part, dans `regles_sans_liste` et
+    `regles_sans_format` : rien n'y est proposé, il n'y a donc rien à décider par
+    défaut.
+
+    Valeurs : `valeurs` (nombre de lignes de la feuille), `valeurs_a_traiter`, dont
+    `valeurs_a_arbitrer` (valeurs rares). Les valeurs observées d'une colonne dont la
+    liste n'est pas déclarée sont comptées à part, dans `valeurs_non_declarees` :
+    elles ne sont à revoir que si le métier déclare la liste. Les valeurs non revues
+    d'une liste écartée sont comptées à part, dans `valeurs_listes_ecartees` : elles
+    n'ont pas à être revues.
+
+    Formes : les mêmes nombres, `formes`, `formes_a_traiter`, `formes_a_arbitrer`,
+    `formes_non_declarees` et `formes_formats_ecartes`.
+
+    `complet` est vrai quand il ne reste ni règle, ni valeur, ni forme à traiter.
     """
-    return _compter_reste(lignes_regles(dictionnaire), lignes_valeurs(dictionnaire))
+    return _compter_reste(
+        lignes_regles(dictionnaire), lignes_valeurs(dictionnaire), lignes_formes(dictionnaire)
+    )
 
 
-def _reste_a_traiter(regles: list[dict], valeurs: list[dict]) -> list[str]:
+def _reste_a_traiter(regles: list[dict], valeurs: list[dict], formes: list[dict]) -> list[str]:
     """Rubrique du mode d'emploi qui dit, à l'export, ce qui reste à revoir."""
-    reste = _compter_reste(regles, valeurs)
+    reste = _compter_reste(regles, valeurs, formes)
     return [
         "Ce qui reste à traiter",
         "Une ligne reste à traiter tant que son statut est « observé » : le filtre de "
@@ -288,10 +400,11 @@ def _reste_a_traiter(regles: list[dict], valeurs: list[dict]) -> list[str]:
         "proposer une règle : la donner par le statut documenté) et "
         f"{reste['regles_avec_ecarts']} ont des écarts à arbitrer (colonne "
         "nb_a_arbitrer supérieure à 0). Ce sont les lignes à regarder en premier.",
-        f"S'y ajoutent {reste['regles_sans_liste']} lignes « valeurs » à « observé » "
-        f"dont la proposition est « {AUCUNE_LISTE} » : aucune liste n'y est proposée, "
-        "elles n'ont pas à être revues, sauf pour déclarer une liste (voir les cas "
-        "particuliers).",
+        f"S'y ajoutent {reste['regles_sans_liste']} lignes « valeurs » et "
+        f"{reste['regles_sans_format']} lignes « format » à « observé » dont la "
+        f"proposition est « {REGLE_ECARTEE} » : l'outil n'y propose ni liste ni format, "
+        "elles n'ont pas à être revues, sauf pour déclarer une liste ou un format "
+        "(voir les cas particuliers).",
         f"Feuille « {FEUILLE_VALEURS} » : {reste['valeurs_a_traiter']} lignes à "
         f"« observé » sur {reste['valeurs']}, dont {reste['valeurs_a_arbitrer']} "
         f"d'origine « {ORIGINE_A_ARBITRER} » (valeurs rares, souvent des variantes ou "
@@ -300,23 +413,34 @@ def _reste_a_traiter(regles: list[dict], valeurs: list[dict]) -> list[str]:
         f"à être revues, et {reste['valeurs_non_declarees']} valeurs d'origine "
         f"« {ORIGINE_OBSERVEE} », à revoir seulement si vous déclarez la liste de leur "
         "colonne (voir les cas particuliers).",
+        f"Feuille « {FEUILLE_FORMES} » : {reste['formes_a_traiter']} lignes à "
+        f"« observé » sur {reste['formes']}, dont {reste['formes_a_arbitrer']} "
+        f"d'origine « {ORIGINE_A_ARBITRER} » (formes rares, souvent des erreurs de "
+        f"saisie), à regarder en premier. S'y ajoutent "
+        f"{reste['formes_formats_ecartes']} formes de formats écartés, qui n'ont pas "
+        f"à être revues, et {reste['formes_non_declarees']} formes d'origine "
+        f"« {ORIGINE_OBSERVEE} », à revoir seulement si vous déclarez le format de leur "
+        "colonne (voir les cas particuliers).",
         "La revue est complète quand plus aucune ligne n'est à « observé », hors "
-        "lignes sans liste proposée, valeurs des listes écartées et valeurs des listes "
-        "non déclarées. Une revue partielle est possible : les lignes "
+        "lignes sans liste ni format proposé, valeurs et formes des listes et des "
+        "formats écartés ou non déclarés. Une revue partielle est possible : les lignes "
         "laissées à « observé » se retrouvent telles quelles dans le classeur suivant.",
     ]
 
 
-def _mode_emploi(periode_fin: str, regles: list[dict], valeurs: list[dict]) -> list[str]:
+def _mode_emploi(
+    periode_fin: str, regles: list[dict], valeurs: list[dict], formes: list[dict]
+) -> list[str]:
     return [
         "Revue du dictionnaire des données",
         f"Période de fin : {periode_fin}. Classeur généré le {date.today():%d/%m/%Y}.",
-        f"Contenu : {len(regles)} lignes dans la feuille « {FEUILLE_REGLES} » (trois "
+        f"Contenu : {len(regles)} lignes dans la feuille « {FEUILLE_REGLES} » (quatre "
         f"par colonne des données), {len(valeurs)} lignes dans la feuille "
-        f"« {FEUILLE_VALEURS} ».",
+        f"« {FEUILLE_VALEURS} », {len(formes)} lignes dans la feuille "
+        f"« {FEUILLE_FORMES} ».",
         REPERE_REVUES,
         "",
-        *_reste_a_traiter(regles, valeurs),
+        *_reste_a_traiter(regles, valeurs, formes),
         "",
         "Ce qui est attendu",
         "Pour chaque ligne, choisir un statut dans le menu déroulant et, si besoin, "
@@ -341,6 +465,12 @@ def _mode_emploi(periode_fin: str, regles: list[dict], valeurs: list[dict]) -> l
         f"sans avoir à revoir ses valeurs dans la feuille « {FEUILLE_VALEURS} ». Quand "
         f"la proposition est « {AUCUNE_LISTE} », l'outil ne propose pas de liste : la "
         "ligne peut rester à « observé ».",
+        "Sur une ligne « format », la question est : les valeurs de cette colonne "
+        "s'écrivent-elles toutes selon une forme prévue, comme un code ou un "
+        "identifiant ? Le statut invalide écarte tout le format, sans avoir à revoir "
+        f"ses formes dans la feuille « {FEUILLE_FORMES} ». Quand la proposition est "
+        f"« {REGLE_ECARTEE} », l'outil ne propose pas de format : la ligne peut rester "
+        "à « observé ».",
         "",
         f"Feuille « {FEUILLE_VALEURS} » : les valeurs des listes proposées",
         "valide : la valeur est légitime.",
@@ -355,22 +485,41 @@ def _mode_emploi(periode_fin: str, regles: list[dict], valeurs: list[dict]) -> l
         "déroulants (le menu de la colonne dépend de la table choisie), saisir la "
         "valeur et choisir le statut documenté.",
         "",
+        f"Feuille « {FEUILLE_FORMES} » : les formes des formats proposés",
+        "Une forme décrit l'écriture d'une valeur, caractère par caractère : "
+        f"{CONVENTION_FORME}. « AA-9999 » est la forme de tout code fait de deux "
+        "majuscules, d'un tiret et de quatre chiffres. Deux longueurs font deux "
+        "formes, et le séparateur fait partie de la forme.",
+        "valide : la forme est légitime.",
+        "invalide : la forme est une erreur, les valeurs qui s'écrivent ainsi seront "
+        "signalées en anomalie.",
+        "Une forme n'a pas de remplacement (voir « Valeur mal formée » dans les cas "
+        "particuliers).",
+        "La colonne remarque signale ce qui ne se voit pas à l'écran (espaces en "
+        "bord, espace insécable).",
+        "Pour ajouter une forme légitime absente de la liste : sur une ligne vide en "
+        "bas de la feuille, choisir la table puis la colonne dans les menus "
+        "déroulants, saisir la forme (et non un exemple de valeur) et choisir le "
+        "statut documenté.",
+        "",
         "Cas particuliers",
-        "Annuler une décision (règle ou valeur) : remettre son statut à « observé ». "
-        "La décision et sa date de revue sont effacées.",
-        "Retirer une valeur ajoutée (origine « ajoutée ») : remettre son statut à "
-        "« observé ». La valeur disparaît de la liste si elle n'est pas observée "
-        "dans les données; sinon elle redevient une valeur à arbitrer.",
-        f"Écarter toute une liste : statut invalide sur la ligne « valeurs » de la "
-        f"feuille « {FEUILLE_REGLES} », avec un commentaire. Les valeurs et leurs "
-        "statuts sont conservés, sans effet tant que la liste est écartée.",
+        "Annuler une décision (règle, valeur ou forme) : remettre son statut à "
+        "« observé ». La décision et sa date de revue sont effacées.",
+        "Retirer une valeur ou une forme ajoutée (origine « ajoutée ») : remettre son "
+        "statut à « observé ». Elle disparaît de la liste si elle n'est pas observée "
+        "dans les données; sinon elle redevient une ligne à arbitrer.",
+        "Écarter toute une liste ou tout un format : statut invalide sur la ligne "
+        f"« valeurs » ou « format » de la feuille « {FEUILLE_REGLES} », avec un "
+        "commentaire. Les valeurs ou les formes et leurs statuts sont conservés, sans "
+        "effet tant que la liste ou le format est écarté.",
         "Statut invalide sur une règle : plus aucun contrôle de ce type ne portera "
         "sur la colonne.",
         "Changer une règle déjà validée quand la proposition a changé : choisir "
         "documenté et donner la règle dans regle_retenue. Laisser valide conserve "
         "l'ancienne règle, celle de la colonne regle_en_vigueur.",
-        "Déclarer correcte une valeur absente des données : l'ajouter en bas de la "
-        f"feuille « {FEUILLE_VALEURS} », au statut documenté.",
+        "Déclarer correcte une valeur ou une forme absente des données : l'ajouter en "
+        f"bas de la feuille « {FEUILLE_VALEURS} » ou « {FEUILLE_FORMES} », au statut "
+        "documenté.",
         "Déclarer une liste que l'outil n'a pas proposée (proposition "
         f"« {AUCUNE_LISTE} ») : sur la ligne « valeurs » de la feuille "
         f"« {FEUILLE_REGLES} », choisir documenté et « {LISTE_FERMEE} » dans "
@@ -380,13 +529,25 @@ def _mode_emploi(periode_fin: str, regles: list[dict], valeurs: list[dict]) -> l
         "au statut documenté, les valeurs correctes absentes des données. Remettre la "
         "ligne à « observé » annule la déclaration; les valeurs revues et ajoutées "
         "restent tant qu'elles ne sont pas remises à « observé » une à une.",
+        "Déclarer un format que l'outil n'a pas proposé (proposition "
+        f"« {REGLE_ECARTEE} ») : sur la ligne « format » de la feuille "
+        f"« {FEUILLE_REGLES} », choisir documenté et « {FORMES_FERMEES} » dans "
+        f"regle_retenue. Puis, dans la feuille « {FEUILLE_FORMES} », revoir les formes "
+        f"d'origine « {ORIGINE_OBSERVEE} » de la colonne quand il y en a (valide ou "
+        "invalide), et ajouter en bas de la feuille, au statut documenté, les formes "
+        "correctes absentes des données. Remettre la ligne à « observé » annule la "
+        "déclaration, comme pour une liste.",
         f"Colonne sensible (motif « colonne sensible », effectif « {EFFECTIF_MASQUE} ») : "
-        "l'outil n'y propose aucune valeur et n'y affiche aucun effectif. Sa liste "
-        "se déclare en ajoutant les valeurs à la main : n'y saisir que des libellés "
-        "de nomenclature, jamais une information propre à une personne.",
+        "l'outil n'y propose aucune valeur ni aucune forme et n'y affiche aucun "
+        "effectif. Sa liste ou son format se déclare en ajoutant les valeurs ou les "
+        "formes à la main : n'y saisir que des libellés de nomenclature ou des formes, "
+        "jamais une information propre à une personne.",
         "Remplacer une valeur erronée : statut invalide, puis la valeur correcte dans "
         "la colonne remplacement. Une valeur qui sert de remplacement ne peut être "
         "ni invalidée ni retirée tant que d'autres lignes la visent.",
+        "Valeur mal formée : elle ne se corrige pas dans ce classeur. Invalider sa "
+        "forme la fait signaler en anomalie; sa correction relève d'une règle de "
+        "nettoyage, décidée à part.",
         "Modifier seulement un commentaire : il est enregistré sans changer la date "
         "de la décision.",
         "Reprendre une revue : un classeur ne s'applique qu'une fois. Après son "
@@ -399,8 +560,8 @@ def _mode_emploi(periode_fin: str, regles: list[dict], valeurs: list[dict]) -> l
         "Ne pas renommer, déplacer ni supprimer de feuilles, de colonnes ou de lignes "
         f"(la feuille masquée « {FEUILLE_LISTES} » alimente les menus des lignes "
         "ajoutées).",
-        "Ne pas ajouter de lignes, sauf en bas de la feuille des valeurs comme "
-        "indiqué ci-dessus.",
+        f"Ne pas ajouter de lignes, sauf en bas des feuilles « {FEUILLE_VALEURS} » et "
+        f"« {FEUILLE_FORMES} » comme indiqué ci-dessus.",
         "Choisir les statuts dans le menu déroulant : une valeur saisie hors d'un "
         "menu est refusée.",
         "Enregistrer au format .xlsx, sans changer le nom du fichier.",
@@ -435,12 +596,11 @@ def _menu(feuille, choix=None, formule: str | None = None) -> DataValidation:
     return menu
 
 
-def _menus_d_ajout(classeur, feuille, dictionnaire: dict, premiere: int, derniere: int) -> None:
-    """Menus `table` et `colonne` des lignes d'ajout de la feuille des valeurs.
+def _feuille_listes(classeur, dictionnaire: dict) -> None:
+    """Feuille technique masquée qui alimente les menus `table` et `colonne` des ajouts.
 
-    Les choix sont rangés dans une feuille technique masquée, une colonne par table :
-    le nom de la table en première ligne, ses colonnes en dessous. Le menu `colonne`
-    d'une ligne ne propose que les colonnes de la table choisie sur cette ligne.
+    Une colonne par table : le nom de la table en première ligne, ses colonnes en
+    dessous.
     """
     listes = classeur.create_sheet(FEUILLE_LISTES)
     for indice, (table, colonnes) in enumerate(dictionnaire.items(), start=1):
@@ -449,21 +609,29 @@ def _menus_d_ajout(classeur, feuille, dictionnaire: dict, premiere: int, dernier
             _ecrire_texte(listes.cell(row=numero, column=indice), colonne)
     listes.protection.sheet = True
     listes.sheet_state = "hidden"
-    if not dictionnaire or derniere < premiere:
-        return
 
+
+def _menus_d_ajout(feuille, colonnes, nb_tables: int, premiere: int, derniere: int) -> None:
+    """Menus `table` et `colonne` des lignes d'ajout d'une feuille de valeurs ou de formes.
+
+    Les choix sont lus dans la feuille technique (voir `_feuille_listes`). Le menu
+    `colonne` d'une ligne ne propose que les colonnes de la table choisie sur cette
+    ligne.
+    """
+    if not nb_tables or derniere < premiere:
+        return
     nom = quote_sheetname(FEUILLE_LISTES)
-    tables = f"{nom}!$A$1:${get_column_letter(len(dictionnaire))}$1"
-    col_table = get_column_letter(COLONNES_VALEURS.index("table") + 1)
-    col_colonne = get_column_letter(COLONNES_VALEURS.index("colonne") + 1)
+    tables = f"{nom}!$A$1:${get_column_letter(nb_tables)}$1"
+    col_table = get_column_letter(colonnes.index("table") + 1)
+    col_colonne = get_column_letter(colonnes.index("colonne") + 1)
     _menu(feuille, formule=tables).add(f"{col_table}{premiere}:{col_table}{derniere}")
     # La référence à la table est relative à la ligne : elle suit chaque ligne d'ajout.
     rang = f"MATCH(${col_table}{premiere},{nom}!$1:$1,0)-1"
-    colonnes = (
+    choix = (
         f"OFFSET({nom}!$A$1,1,{rang},"
         f"COUNTA(OFFSET({nom}!$A:$A,0,{rang}))-1,1)"
     )
-    _menu(feuille, formule=colonnes).add(f"{col_colonne}{premiere}:{col_colonne}{derniere}")
+    _menu(feuille, formule=choix).add(f"{col_colonne}{premiere}:{col_colonne}{derniere}")
 
 
 def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0) -> None:
@@ -508,7 +676,8 @@ def exporter_revue(
 ) -> Path:
     """Écrit le classeur de revue du dictionnaire et rend son chemin.
 
-    Le classeur affiche les décisions déjà enregistrées dans le dictionnaire.
+    Le classeur affiche les décisions déjà enregistrées dans le dictionnaire, dans
+    trois feuilles : les règles, les valeurs des listes et les formes des formats.
     `nb_revues` est le nombre de revues déjà appliquées au dictionnaire
     (`len(charger_meta()["revues"])`) : il est inscrit dans le classeur, et l'import
     refusera le classeur si une revue a été appliquée depuis. Sans `ecraser=True`,
@@ -522,14 +691,14 @@ def exporter_revue(
             f"{chemin} existe déjà : export refusé (ecraser=True pour forcer)"
         )
     regles = lignes_regles(dictionnaire)
-    valeurs = lignes_valeurs(dictionnaire)
+    elements = {nom: _lignes_liste(dictionnaire, nom) for nom in CLES_LISTE}
 
     classeur = Workbook()
     notice = classeur.active
     notice.title = FEUILLE_MODE_EMPLOI
     notice.column_dimensions["A"].width = 120
     for numero, texte in enumerate(
-        _mode_emploi(periode_fin, regles, valeurs), start=1
+        _mode_emploi(periode_fin, regles, elements["valeurs"], elements["format"]), start=1
     ):
         cellule = notice.cell(row=numero, column=1)
         _ecrire_texte(cellule, texte)
@@ -548,18 +717,23 @@ def exporter_revue(
     menus_retenue = {nom: _menu(feuille, choix) for nom, choix in REGLES_RETENUES.items()}
     for numero, ligne in enumerate(regles, start=2):
         menu_statut.add(feuille.cell(row=numero, column=statut))
-        # Sur une ligne « valeurs », le menu n'a qu'un choix : déclarer une liste fermée.
+        # Sur une ligne « valeurs » ou « format », le menu n'a qu'un choix : déclarer
+        # une liste fermée ou des formes fermées.
         menus_retenue[ligne["regle"]].add(feuille.cell(row=numero, column=retenue))
 
-    feuille = classeur.create_sheet(FEUILLE_VALEURS)
-    _remplir(feuille, COLONNES_VALEURS, valeurs, MODIFIABLES_VALEURS, LIGNES_AJOUT)
-    statut = COLONNES_VALEURS.index("statut") + 1
-    menu_statut = _menu(feuille, STATUTS)
-    for numero in range(2, len(valeurs) + LIGNES_AJOUT + 2):
-        menu_statut.add(feuille.cell(row=numero, column=statut))
-    _menus_d_ajout(
-        classeur, feuille, dictionnaire, len(valeurs) + 2, len(valeurs) + LIGNES_AJOUT + 1
-    )
+    # Feuille des valeurs, puis feuille des formes : même présentation.
+    for nom, lignes in elements.items():
+        colonnes = COLONNES_LISTE[nom]
+        feuille = classeur.create_sheet(FEUILLES_LISTE[nom])
+        _remplir(feuille, colonnes, lignes, MODIFIABLES_LISTE[nom], LIGNES_AJOUT)
+        statut = colonnes.index("statut") + 1
+        menu_statut = _menu(feuille, STATUTS)
+        for numero in range(2, len(lignes) + LIGNES_AJOUT + 2):
+            menu_statut.add(feuille.cell(row=numero, column=statut))
+        _menus_d_ajout(
+            feuille, colonnes, len(dictionnaire), len(lignes) + 2, len(lignes) + LIGNES_AJOUT + 1
+        )
+    _feuille_listes(classeur, dictionnaire)
 
     chemin.parent.mkdir(parents=True, exist_ok=True)
     classeur.save(chemin)
@@ -571,6 +745,7 @@ class Revue(NamedTuple):
 
     regles: pd.DataFrame
     valeurs: pd.DataFrame
+    formes: pd.DataFrame
     avertissements: list[str]
 
 
@@ -595,7 +770,10 @@ def _lire_feuille(classeur, nom: str, colonnes: tuple[str, ...]) -> list[tuple[i
     Lève une ValueError si la feuille manque ou si son en-tête n'est pas celui exporté.
     """
     if nom not in classeur.sheetnames:
-        raise ValueError(f"feuille « {nom} » absente")
+        raise ValueError(
+            f"feuille « {nom} » absente (feuille renommée, ou classeur exporté par une "
+            "version antérieure : à réexporter)"
+        )
     lignes = classeur[nom].iter_rows(values_only=True)
     entete = tuple(next(lignes, ()))
     while entete and entete[-1] is None:
@@ -669,17 +847,19 @@ def _controler_regles(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
             )
         elif validation and en_place["proposition"] == REGLE_ECARTEE:
             problemes.append(
-                f"{ou} : aucune liste n'est proposée, il n'y a rien à valider "
+                f"{ou} : {_MOTS[regle]['aucun']}, il n'y a rien à valider "
                 "(laisser le statut ou remettre « observé »)"
             )
         elif statut == "invalide" and commentaire == "":
             problemes.append(f"{ou} : commentaire obligatoire avec le statut invalide")
         declaration = (
-            regle == "valeurs" and statut == "documenté" and en_place["statut"] != "documenté"
+            regle in CLES_LISTE
+            and statut == "documenté"
+            and en_place["statut"] != "documenté"
         )
-        if declaration and en_place["proposition"] == LISTE_FERMEE:
+        if declaration and en_place["proposition"] == REGLES_FERMEES[regle]:
             problemes.append(
-                f"{ou} : une liste est déjà proposée, il n'y a rien à déclarer "
+                f"{ou} : {_MOTS[regle]['deja']}, il n'y a rien à déclarer "
                 "(choisir valide)"
             )
         elif statut == "documenté" and retenue == "":
@@ -743,18 +923,27 @@ def _controler_remplacements(decisions: list[dict]) -> list[str]:
     return problemes
 
 
-def _controler_valeurs(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
+def _controler_elements(lignes, dictionnaire, nom: str) -> tuple[list[dict], list[str]]:
+    """Contrôle les lignes de la feuille des valeurs (`valeurs`) ou des formes (`format`).
+
+    Une ligne exportée doit être identique au dictionnaire. Une ligne ajoutée vise
+    une colonne du dictionnaire, porte un texte nouveau pour cette colonne et le
+    statut « documenté ». Une forme ajoutée est en plus une signature (voir
+    `CONVENTION_FORME`) : sans cela, aucune valeur ne pourrait s'y conformer.
+    """
+    feuille, champ = FEUILLES_LISTE[nom], CLES_LISTE[nom]
     exportees = {
-        (l["table"], l["colonne"], l["valeur"]): l["origine"]
-        for l in lignes_valeurs(dictionnaire)
+        (l["table"], l["colonne"], l[champ]): l["origine"]
+        for l in _lignes_liste(dictionnaire, nom)
     }
     colonnes = {(table, colonne) for table, cols in dictionnaire.items() for colonne in cols}
     decisions, problemes, vues = [], [], set()
     for numero, ligne in lignes:
-        ou = f"{FEUILLE_VALEURS}, ligne {numero}"
-        table, colonne, valeur = ligne["table"], ligne["colonne"], ligne["valeur"]
+        ou = f"{feuille}, ligne {numero}"
+        table, colonne, valeur = ligne["table"], ligne["colonne"], ligne[champ]
         statut = _choix(ligne["statut"])
-        remplacement = None if _est_vide(ligne["remplacement"]) else ligne["remplacement"]
+        saisi = ligne.get("remplacement")
+        remplacement = None if _est_vide(saisi) else saisi
         ajout = _est_vide(ligne["origine"])
         cle = (table, colonne, valeur)
         if ajout:
@@ -762,38 +951,48 @@ def _controler_valeurs(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
             if (table, colonne) not in colonnes:
                 problemes.append(f"{ou} : colonne {table}.{colonne} absente du dictionnaire")
             if _est_vide(valeur):
-                problemes.append(f"{ou} : valeur vide")
+                problemes.append(f"{ou} : {champ} vide")
             elif not isinstance(valeur, str):
                 problemes.append(
-                    f"{ou} : valeur {valeur!r} lue comme {type(valeur).__name__}, "
+                    f"{ou} : {champ} {valeur!r} lue comme {type(valeur).__name__}, "
                     "la saisir comme texte"
                 )
             elif cle in exportees or cle in vues:
-                problemes.append(f"{ou} : valeur {valeur!r} déjà présente pour {table}.{colonne}")
+                problemes.append(
+                    f"{ou} : {champ} {valeur!r} déjà présente pour {table}.{colonne}"
+                )
+            elif nom == "format" and signature(valeur) != valeur:
+                forme = signature(valeur)
+                connue = (table, colonne, forme) in exportees
+                problemes.append(
+                    f"{ou} : {valeur!r} n'est pas une forme ({CONVENTION_FORME}), la "
+                    f"forme correspondante est {forme!r}"
+                    + (", déjà présente pour cette colonne (vider la ligne)" if connue else "")
+                )
             if statut != "documenté":
-                problemes.append(f"{ou} : une valeur ajoutée doit porter le statut documenté")
+                problemes.append(f"{ou} : une {champ} ajoutée doit porter le statut documenté")
             if remplacement is not None:
                 problemes.append(f"{ou} : remplacement interdit sur une valeur ajoutée")
         else:
             origine = ligne["origine"]
             if cle not in exportees or exportees[cle] != origine:
                 problemes.append(
-                    f"{ou} : valeur {valeur!r} de {table}.{colonne} inconnue du "
+                    f"{ou} : {champ} {valeur!r} de {table}.{colonne} inconnue du "
                     "dictionnaire (classeur périmé ou ligne modifiée)"
                 )
                 continue
             if cle in vues:
-                problemes.append(f"{ou} : valeur {valeur!r} présente plusieurs fois")
+                problemes.append(f"{ou} : {champ} {valeur!r} présente plusieurs fois")
                 continue
             if origine == ORIGINE_AJOUT:
                 if statut not in STATUTS_VALEUR_AJOUTEE:
                     problemes.append(
-                        f"{ou} : statut {statut!r} impossible sur une valeur ajoutée "
+                        f"{ou} : statut {statut!r} impossible sur une {champ} ajoutée "
                         "(documenté pour la garder, observé pour la retirer)"
                     )
             elif statut not in STATUTS_VALEUR_OBSERVEE:
                 problemes.append(
-                    f"{ou} : statut {statut!r} impossible sur une valeur observée "
+                    f"{ou} : statut {statut!r} impossible sur une {champ} observée "
                     f"(choisir parmi {', '.join(STATUTS_VALEUR_OBSERVEE)})"
                 )
             if remplacement is None:
@@ -808,83 +1007,88 @@ def _controler_valeurs(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
             elif remplacement == valeur:
                 problemes.append(f"{ou} : une valeur ne peut pas être son propre remplacement")
         vues.add(cle)
-        decisions.append(
-            {
-                "table": table,
-                "colonne": colonne,
-                "valeur": valeur,
-                "origine": origine,
-                "statut": statut,
-                "remplacement": remplacement,
-                "commentaire": _commentaire(ligne["commentaire"]),
-                "ligne_excel": numero,
-            }
-        )
+        decision = {
+            "table": table,
+            "colonne": colonne,
+            champ: valeur,
+            "origine": origine,
+            "statut": statut,
+        }
+        if nom == "valeurs":
+            decision["remplacement"] = remplacement
+        decision.update(commentaire=_commentaire(ligne["commentaire"]), ligne_excel=numero)
+        decisions.append(decision)
     for cle in exportees.keys() - vues:
-        problemes.append(f"{FEUILLE_VALEURS} : valeur {cle} absente du classeur")
-    problemes.extend(_controler_remplacements(decisions))
+        problemes.append(f"{feuille} : {champ} {cle} absente du classeur")
+    if nom == "valeurs":
+        problemes.extend(_controler_remplacements(decisions))
     return decisions, problemes
 
 
-def _controler_listes(regles: list[dict], valeurs: list[dict], dictionnaire) -> list[str]:
-    """Cohérence entre la ligne `valeurs` d'une colonne et les valeurs du classeur.
+def _controler_listes(
+    regles: list[dict], elements: list[dict], dictionnaire, nom: str = "valeurs"
+) -> list[str]:
+    """Cohérence entre la ligne `valeurs` ou `format` d'une colonne et ses éléments.
 
     Une liste déclarée (statut « documenté ») contient au moins une valeur au statut
     valide ou documenté. Sans liste proposée, il n'y a rien à écarter tant que la
-    colonne n'a aucune valeur.
+    colonne n'a aucune valeur. Il en va de même d'un format et de ses formes.
     """
+    champ, mots = CLES_LISTE[nom], _MOTS[nom]
     par_colonne: dict[tuple, list[str]] = {}
-    for v in valeurs:
-        par_colonne.setdefault((v["table"], v["colonne"]), []).append(v["statut"])
+    for e in elements:
+        par_colonne.setdefault((e["table"], e["colonne"]), []).append(e["statut"])
     problemes = []
     for r in regles:
-        if r["regle"] != "valeurs":
+        if r["regle"] != nom:
             continue
         ou = f"{FEUILLE_REGLES}, ligne {r['ligne_excel']}"
         statuts = par_colonne.get((r["table"], r["colonne"]), [])
-        en_place = dictionnaire[r["table"]][r["colonne"]]["valeurs"]
+        en_place = dictionnaire[r["table"]][r["colonne"]][nom]
         if r["statut"] == "documenté":
             declaree = en_place["statut"] == "documenté"
-            if not declaree and en_place["proposition"] == LISTE_FERMEE:
-                continue  # déjà signalé : une liste proposée se valide
+            if not declaree and en_place["proposition"] == REGLES_FERMEES[nom]:
+                continue  # déjà signalé : une proposition se valide
             if not any(statut in STATUTS_CIBLE for statut in statuts):
                 problemes.append(
-                    f"{ou} : liste déclarée sans aucune valeur au statut "
+                    f"{ou} : {mots['declare']} sans aucune {champ} au statut "
                     f"{' ou '.join(STATUTS_CIBLE)} pour {r['table']}.{r['colonne']} "
-                    f"(ajouter ses valeurs en bas de la feuille « {FEUILLE_VALEURS} »)"
+                    f"(ajouter ses {champ}s en bas de la feuille « {FEUILLES_LISTE[nom]} »)"
                 )
         elif (
             r["statut"] == "invalide"
             and en_place["statut"] != "invalide"
-            and en_place["proposition"] == AUCUNE_LISTE
+            and en_place["proposition"] == REGLE_ECARTEE
             and not statuts
         ):
             problemes.append(
-                f"{ou} : aucune liste n'est proposée et la colonne n'a aucune valeur, "
+                f"{ou} : {mots['aucun']} et la colonne n'a aucune {champ}, "
                 "il n'y a rien à écarter (remettre « observé »)"
             )
     return problemes
 
 
-def _avertissements(regles: list[dict], valeurs: list[dict]) -> list[str]:
-    """Valeurs revues d'une liste écartée ou non déclarée (non bloquant)."""
-    etats = {
-        (r["table"], r["colonne"]): r["statut"] for r in regles if r["regle"] == "valeurs"
-    }
+def _avertissements(regles: list[dict], elements: list[dict], nom: str = "valeurs") -> list[str]:
+    """Valeurs revues d'une liste écartée ou non déclarée (non bloquant).
+
+    De même pour les formes revues d'un format écarté ou non déclaré.
+    """
+    champ, mots = CLES_LISTE[nom], _MOTS[nom]
+    etats = {(r["table"], r["colonne"]): r["statut"] for r in regles if r["regle"] == nom}
     revues: dict[tuple[str, str], int] = {}
-    for v in valeurs:
-        cle = (v["table"], v["colonne"])
+    for e in elements:
+        cle = (e["table"], e["colonne"])
         ecartee = etats.get(cle) == "invalide"
-        non_declaree = etats.get(cle) == STATUT_INITIAL and v["origine"] == ORIGINE_OBSERVEE
-        if (ecartee or non_declaree) and v["statut"] in ("valide", "invalide"):
+        non_declaree = etats.get(cle) == STATUT_INITIAL and e["origine"] == ORIGINE_OBSERVEE
+        if (ecartee or non_declaree) and e["statut"] in ("valide", "invalide"):
             revues[cle] = revues.get(cle, 0) + 1
     return [
         (
-            f"{table}.{colonne} : liste écartée, mais {n} valeurs revues "
-            "(statuts conservés, sans effet tant que la liste est écartée)"
+            f"{table}.{colonne} : {mots['ecarte']}, mais {n} {champ}s revues "
+            f"(statuts conservés, sans effet {mots['tant_ecarte']})"
             if etats[(table, colonne)] == "invalide"
-            else f"{table}.{colonne} : {n} valeurs revues, mais liste non déclarée "
-            "(statuts conservés, sans effet tant que la liste n'est pas déclarée)"
+            else f"{table}.{colonne} : {n} {champ}s revues, mais {mots['non_declare']} "
+            f"(statuts conservés, sans effet {mots['tant_non_declare']})"
         )
         for (table, colonne), n in sorted(revues.items())
     ]
@@ -896,10 +1100,14 @@ def importer_revue(chemin: str | Path, dictionnaire: dict, *, nb_revues: int) ->
     `dictionnaire` est le dictionnaire courant et `nb_revues` le nombre de revues
     qui lui ont déjà été appliquées (`len(charger_meta()["revues"])`). Un classeur
     périmé est refusé : exporté avant la dernière revue appliquée (il annulerait
-    les décisions prises depuis), ou avant une régénération qui a changé une
-    proposition. Tous les problèmes bloquants sont listés en une fois dans une
+    les décisions prises depuis), avant une régénération qui a changé une
+    proposition, ou par une version antérieure du code (feuille ou colonne
+    manquante). Tous les problèmes bloquants sont listés en une fois dans une
     ValueError, avec la feuille et le numéro de ligne Excel. Les avertissements ne
     bloquent pas l'import.
+
+    Le résultat porte trois tableaux, `regles`, `valeurs` et `formes`, avec le numéro
+    de ligne Excel de chaque décision (`ligne_excel`).
     """
     chemin = Path(chemin)
     classeur = load_workbook(chemin, read_only=True, data_only=True)
@@ -907,6 +1115,7 @@ def importer_revue(chemin: str | Path, dictionnaire: dict, *, nb_revues: int) ->
         try:
             lignes_r = _lire_feuille(classeur, FEUILLE_REGLES, COLONNES_REGLES)
             lignes_v = _lire_feuille(classeur, FEUILLE_VALEURS, COLONNES_VALEURS)
+            lignes_f = _lire_feuille(classeur, FEUILLE_FORMES, COLONNES_FORMES)
             repere = _lire_repere(classeur)
         except ValueError as erreur:
             raise ValueError(f"Classeur de revue invalide ({chemin})\n  {erreur}") from None
@@ -920,8 +1129,15 @@ def importer_revue(chemin: str | Path, dictionnaire: dict, *, nb_revues: int) ->
         )
 
     regles, problemes_r = _controler_regles(lignes_r, dictionnaire)
-    valeurs, problemes_v = _controler_valeurs(lignes_v, dictionnaire)
-    problemes = problemes_r + problemes_v + _controler_listes(regles, valeurs, dictionnaire)
+    valeurs, problemes_v = _controler_elements(lignes_v, dictionnaire, "valeurs")
+    formes, problemes_f = _controler_elements(lignes_f, dictionnaire, "format")
+    problemes = (
+        problemes_r
+        + problemes_v
+        + problemes_f
+        + _controler_listes(regles, valeurs, dictionnaire, "valeurs")
+        + _controler_listes(regles, formes, dictionnaire, "format")
+    )
     if problemes:
         raise ValueError(
             f"Classeur de revue invalide ({chemin}), {len(problemes)} problèmes\n  "
@@ -935,7 +1151,10 @@ def importer_revue(chemin: str | Path, dictionnaire: dict, *, nb_revues: int) ->
             "table", "colonne", "valeur", "origine", "statut", "remplacement", "commentaire",
             "ligne_excel",
         ]),
-        _avertissements(regles, valeurs),
+        pd.DataFrame(formes, columns=[
+            "table", "colonne", "forme", "origine", "statut", "commentaire", "ligne_excel",
+        ]),
+        _avertissements(regles, valeurs, "valeurs") + _avertissements(regles, formes, "format"),
     )
 
 
@@ -944,7 +1163,8 @@ def _etat_regle(regle: dict) -> str:
 
 
 def _etat_valeur(element: dict) -> str:
-    if element["remplacement"] is None:
+    """État d'une valeur ou d'une forme dans le rapport (une forme n'a pas de remplacement)."""
+    if element.get("remplacement") is None:
         return element["statut"]
     return f"{element['statut']}, remplacée par {element['remplacement']!r}"
 
@@ -966,7 +1186,8 @@ def appliquer_revue(
     le chemin du classeur (seul son nom est gardé au journal) et `instant` la date et
     l'heure de l'application (maintenant par défaut, voir `horodater`). Rien n'est
     modifié ni écrit : la fonction rend le dictionnaire mis à jour, le rapport des
-    changements (une ligne par règle ou valeur touchée) et l'entrée à ajouter au
+    changements (une ligne par règle, valeur ou forme touchée; la colonne `valeur`
+    du rapport porte la forme pour la règle `format`) et l'entrée à ajouter au
     journal des revues par `ecrire_dictionnaire(..., revue=entree)`. Sans aucun
     changement, l'entrée est None et il n'y a rien à écrire.
 
@@ -976,25 +1197,20 @@ def appliquer_revue(
     enregistré sans toucher à la date.
 
     Règle : « valide » adopte la proposition du moment, « documenté » la règle
-    retenue (sur une ligne `valeurs`, une liste fermée déclarée par le métier),
-    « invalide » ne laisse aucune règle, et le retour à « observé » rend la
-    proposition. Une décision inchangée garde sa règle, même si la proposition a
-    changé depuis.
+    retenue (sur une ligne `valeurs`, une liste fermée déclarée par le métier; sur
+    une ligne `format`, des formes fermées), « invalide » ne laisse aucune règle, et
+    le retour à « observé » rend la proposition. Une décision inchangée garde sa
+    règle, même si la proposition a changé depuis.
 
-    Valeur : une ligne ajoutée entre dans la liste (origine « ajoutée », statut
-    « documenté », effectif 0, ou masqué dans une colonne sensible). Une valeur
-    remise à « observé » est retirée si son effectif est nul ou masqué; sinon elle redevient une valeur observée, à arbitrer si elle
-    avait été ajoutée.
+    Valeur ou forme : une ligne ajoutée entre dans la liste (origine « ajoutée »,
+    statut « documenté », effectif 0, ou masqué dans une colonne sensible). Une valeur
+    ou une forme remise à « observé » est retirée si son effectif est nul ou masqué;
+    sinon elle redevient observée, à arbitrer si elle avait été ajoutée.
     """
     jour = horodater(instant)
     resultat = deepcopy(dictionnaire)
     evenements = []
-    compte = {
-        "regles_changees": 0,
-        "valeurs_changees": 0,
-        "valeurs_ajoutees": 0,
-        "commentaires_changes": 0,
-    }
+    compte = {champ: 0 for champ in CHAMPS_REVUE[2:]}
 
     def commenter(element, commentaire, change, *cle):
         if commentaire == element["commentaire"]:
@@ -1026,43 +1242,52 @@ def appliquer_revue(
             compte["regles_changees"] += 1
         commenter(regle, d.commentaire, change, d.table, d.colonne, d.regle, "")
 
-    for d in revue.valeurs.itertuples(index=False):
-        regle_valeurs = resultat[d.table][d.colonne]["valeurs"]
-        liste = regle_valeurs["liste"]
-        cle = (d.table, d.colonne, "valeurs", d.valeur)
-        element = next((e for e in liste if e["valeur"] == d.valeur), None)
-        if element is None:
-            liste.append(
-                {
-                    "valeur": d.valeur,
+    def appliquer_liste(decisions, nom):
+        """Applique les lignes de la feuille des valeurs (`valeurs`) ou des formes (`format`)."""
+        champ, compteur = CLES_LISTE[nom], _MOTS[nom]["compteur"]
+        for d in decisions.to_dict("records"):
+            regle_liste = resultat[d["table"]][d["colonne"]][nom]
+            liste = regle_liste["liste"]
+            cle = (d["table"], d["colonne"], nom, d[champ])
+            element = next((e for e in liste if e[champ] == d[champ]), None)
+            if element is None:
+                nouveau = {
+                    champ: d[champ],
                     "origine": ORIGINE_AJOUT,
-                    "effectif": None if est_masquee(regle_valeurs) else 0,
+                    "effectif": None if est_masquee(regle_liste) else 0,
                     "statut": "documenté",
-                    "commentaire": d.commentaire,
+                    "commentaire": d["commentaire"],
                     "revu_le": jour,
-                    "remplacement": None,
                 }
-            )
-            evenements.append((*cle, "valeur ajoutée", "", "documenté"))
-            compte["valeurs_ajoutees"] += 1
-            continue
-        remplacement = _texte_ou_rien(d.remplacement)
-        avant = _etat_valeur(element)
-        change = d.statut != element["statut"] or remplacement != element["remplacement"]
-        if change:
-            compte["valeurs_changees"] += 1
-            if d.statut == STATUT_INITIAL and not element["effectif"]:
-                # Plus observée et plus revue : rien ne justifie de la garder.
-                liste.remove(element)
-                evenements.append((*cle, "valeur retirée", avant, ""))
+                if nom == "valeurs":
+                    nouveau["remplacement"] = None
+                liste.append(nouveau)
+                evenements.append((*cle, f"{champ} ajoutée", "", "documenté"))
+                compte[f"{compteur}_ajoutees"] += 1
                 continue
-            element["statut"] = d.statut
-            element["remplacement"] = remplacement
-            element["revu_le"] = None if d.statut == STATUT_INITIAL else jour
-            if d.statut == STATUT_INITIAL and element["origine"] == ORIGINE_AJOUT:
-                element["origine"] = ORIGINE_A_ARBITRER
-            evenements.append((*cle, "décision changée", avant, _etat_valeur(element)))
-        commenter(element, d.commentaire, change, *cle)
+            avant = _etat_valeur(element)
+            change = d["statut"] != element["statut"]
+            if nom == "valeurs":
+                remplacement = _texte_ou_rien(d["remplacement"])
+                change = change or remplacement != element["remplacement"]
+            if change:
+                compte[f"{compteur}_changees"] += 1
+                if d["statut"] == STATUT_INITIAL and not element["effectif"]:
+                    # Plus observée et plus revue : rien ne justifie de la garder.
+                    liste.remove(element)
+                    evenements.append((*cle, f"{champ} retirée", avant, ""))
+                    continue
+                element["statut"] = d["statut"]
+                if nom == "valeurs":
+                    element["remplacement"] = remplacement
+                element["revu_le"] = None if d["statut"] == STATUT_INITIAL else jour
+                if d["statut"] == STATUT_INITIAL and element["origine"] == ORIGINE_AJOUT:
+                    element["origine"] = ORIGINE_A_ARBITRER
+                evenements.append((*cle, "décision changée", avant, _etat_valeur(element)))
+            commenter(element, d["commentaire"], change, *cle)
+
+    appliquer_liste(revue.valeurs, "valeurs")
+    appliquer_liste(revue.formes, "format")
 
     problemes = problemes_dictionnaire(resultat)
     if problemes:

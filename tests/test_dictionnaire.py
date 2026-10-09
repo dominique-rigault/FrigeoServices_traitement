@@ -913,6 +913,8 @@ def _entree(jour="2026-10-09", classeur="revue.xlsx"):
         "regles_changees": 2,
         "valeurs_changees": 1,
         "valeurs_ajoutees": 0,
+        "formes_changees": 0,
+        "formes_ajoutees": 0,
         "commentaires_changes": 0,
     }
 
@@ -1480,3 +1482,46 @@ def test_decisions_sur_les_formes_protegees_a_l_ecriture(tmp_path):
     ecrire_dictionnaire(mis_a_jour, "2026-04", chemin)
     assert charger_dictionnaire(chemin) == mis_a_jour
 
+
+# Journal des revues et compteurs de formes (morceau 6b).
+
+
+def test_journal_ecrit_avant_la_revue_des_formes(tmp_path, monkeypatch):
+    # Une copie de sauvegarde par écriture : chaque écriture a sa propre seconde.
+    secondes = iter(range(60))
+    monkeypatch.setattr(
+        "frigeo.dictionnaire._maintenant", lambda: datetime(2026, 11, 2, 9, 0, next(secondes))
+    )
+    chemin = tmp_path / "dictionnaire.yaml"
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    # Entrée telle qu'elle était écrite avant les compteurs de formes.
+    ancienne = {
+        champ: valeur
+        for champ, valeur in _entree().items()
+        if champ not in ("formes_changees", "formes_ajoutees")
+    }
+    contenu = yaml.safe_load(chemin.read_text(encoding="utf-8"))
+    contenu["meta"]["revues"] = [ancienne]
+    chemin.write_text(yaml.safe_dump(contenu, allow_unicode=True), encoding="utf-8")
+    # Elle est lue avec ses compteurs de formes à 0, dans l'ordre des champs.
+    lue = charger_meta(chemin)["revues"]
+    assert lue == [_entree()]
+    assert list(lue[0]) == list(_entree())
+    # Le fichier est complété à l'écriture suivante, régénération ou revue.
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin)
+    brut = yaml.safe_load(chemin.read_text(encoding="utf-8"))["meta"]["revues"]
+    assert brut == [_entree()]
+    suivante = {**_entree("2026-11-02", "revue2.xlsx"), "formes_changees": 3}
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", chemin, revue=suivante)
+    assert charger_meta(chemin)["revues"] == [_entree(), suivante]
+    # Une entrée à laquelle il manque autre chose reste refusée.
+    del contenu["meta"]["revues"][0]["classeur"]
+    chemin.write_text(yaml.safe_dump(contenu, allow_unicode=True), encoding="utf-8")
+    with pytest.raises(ValueError, match="journal des revues, entrée 1"):
+        charger_meta(chemin)
+    # Une revue se fournit avec tous ses compteurs.
+    ecrire_dictionnaire(_dictionnaire_fictif(), "2026-03", tmp_path / "autre.yaml")
+    with pytest.raises(ValueError, match="champs attendus"):
+        ecrire_dictionnaire(
+            _dictionnaire_fictif(), "2026-03", tmp_path / "autre.yaml", revue=ancienne
+        )
