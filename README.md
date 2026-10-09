@@ -12,21 +12,21 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 
 ## Démarche
 
-| Étape | Contenu | Outil | Avancement |
-| --- | --- | --- | --- |
-| 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | Terminé |
-| 2 | Profilage de chaque fichier | Python, Jupyter | Terminé |
-| 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | Terminé |
-| 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | Terminé |
-| 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | À venir |
-| 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | À venir |
-| 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | À venir |
-| 5 | Table des anomalies | Python, Jupyter | À venir |
-| 6 | Règles de nettoyage explicites et jeu de données nettoyé | Python, Jupyter | À venir |
-| 7 | Modèle en étoile, indicateurs et marge opérationnelle | SQL Server, Azure SQL Database | À venir |
-| 8 | Tableaux de bord direction et qualité | Power BI | À venir |
-| 9 | Documentation de la méthode, des choix et des limites | Markdown | À venir |
-| 10 | Déploiement sur Azure et passation | Azure, Power Automate | À venir |
+| Étape | Contenu | Outil | Notebook | Avancement |
+| --- | --- | --- | --- | --- |
+| 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | 01 | Terminé |
+| 2 | Profilage de chaque fichier | Python, Jupyter | 02 | Terminé |
+| 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | aucun | Terminé |
+| 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 02c | Terminé |
+| 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 02c | Terminé |
+| 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 03 | À venir |
+| 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 04 | À venir |
+| 5 | Table des anomalies | Python, Jupyter | 05 | À venir |
+| 6 | Règles de nettoyage explicites et jeu de données nettoyé | Python, Jupyter | 06 | À venir |
+| 7 | Modèle en étoile, indicateurs et marge opérationnelle | SQL Server, Azure SQL Database | aucun | À venir |
+| 8 | Tableaux de bord direction et qualité | Power BI | aucun | À venir |
+| 9 | Documentation de la méthode, des choix et des limites | Markdown | aucun | À venir |
+| 10 | Déploiement sur Azure et passation | Azure, Power Automate | aucun | À venir |
 
 ## Principes
 
@@ -40,6 +40,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 
 ```
 config/      configuration propre au client (sources, sensibilité)
+revue/            classeur de revue du dictionnaire (étape 2d)
 data/        données locales, ignorées par Git
 docs/        documentation
 notebooks/   un notebook par étape (01 à 06)
