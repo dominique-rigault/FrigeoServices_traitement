@@ -12,7 +12,9 @@ from frigeo.controles import (
     COLONNES_SANS_CONTROLE,
     VALEUR_MASQUEE,
     charger_dictionnaire_enregistre,
+    charger_regles_complementaires,
     controler,
+    problemes_regles_complementaires,
     regles_sans_controle,
 )
 from frigeo.dictionnaire import ecrire_dictionnaire
@@ -83,8 +85,14 @@ def _table(fichier="t.csv", premiere_ligne=2, **colonnes) -> pd.DataFrame:
     return donnees
 
 
-def _controler(donnees, colonnes, sensibles=AUCUNE_SENSIBLE):
-    return controler({"t": donnees}, {"t": colonnes}, sensibles)
+def _controler(donnees, colonnes, sensibles=AUCUNE_SENSIBLE, complementaires=None):
+    """Contrôle d'une table « t », sans règle complémentaire sauf celles de la table."""
+    return controler(
+        {"t": donnees},
+        {"t": colonnes},
+        sensibles,
+        {"t": complementaires} if complementaires else {},
+    )
 
 
 def _lignes(ecarts, *colonnes):
@@ -352,6 +360,7 @@ def test_tables_dans_l_ordre_du_dictionnaire_et_feuille_source():
         {"zebre": premiere, "abeille": seconde},
         {"zebre": colonnes, "abeille": deepcopy(colonnes)},
         AUCUNE_SENSIBLE,
+        {},
     )
     assert _lignes(ecarts, "table", "fichier_source", "feuille_source") == [
         ("zebre", "classeur.xlsx", "Lignes"),
@@ -371,7 +380,10 @@ def test_les_arguments_ne_sont_pas_modifies():
     colonnes = {"ville": _colonne(obligatoire="obligatoire", valeurs=[_valeur("Rouen")])}
     tables, dictionnaire = {"t": donnees}, {"t": colonnes}
     avant_tables, avant_dictionnaire = donnees.copy(deep=True), deepcopy(dictionnaire)
-    controler(tables, dictionnaire, AUCUNE_SENSIBLE)
+    complementaires = {"t": {"ville": {"motif": "[A-Z].*"}}}
+    avant_complementaires = deepcopy(complementaires)
+    controler(tables, dictionnaire, AUCUNE_SENSIBLE, complementaires)
+    assert complementaires == avant_complementaires
     pd.testing.assert_frame_equal(tables["t"], avant_tables)
     assert dictionnaire == avant_dictionnaire
 
@@ -383,7 +395,7 @@ def test_dictionnaire_qui_ne_decrit_pas_les_donnees():
         "absente": {"a": _colonne()},
     }
     with pytest.raises(ValueError) as erreur:
-        controler(tables, dictionnaire, AUCUNE_SENSIBLE)
+        controler(tables, dictionnaire, AUCUNE_SENSIBLE, {})
     message = str(erreur.value)
     assert "02c_dictionnaire" in message
     for attendu in (
@@ -417,3 +429,170 @@ def test_dictionnaire_enregistre_relu(tmp_path):
     dictionnaire = {"t": {"a": _colonne(obligatoire="obligatoire")}}
     chemin = ecrire_dictionnaire(dictionnaire, "2026-03", tmp_path / "dictionnaire.yaml")
     assert charger_dictionnaire_enregistre(chemin) == dictionnaire
+
+
+def test_decimales_sur_des_textes_et_des_nombres_natifs():
+    donnees = _table(
+        montant=["12,50", "12,505", "12.5", "12", "12,500", "abc", None],
+        natif=[12.5, 12.505, 181.45000000000002, 3, "12,505", "abc", None],
+    )
+    ecarts, bilan = _controler(
+        donnees,
+        {"montant": _colonne(), "natif": _colonne()},
+        complementaires={"montant": {"decimales": 2}, "natif": {"decimales": 2}},
+    )
+    assert _lignes(ecarts, "num_ligne_source", "colonne", "regle", "constat", "valeur") == [
+        (3, "montant", "decimales", "trop de décimales", "12,505"),
+        (3, "natif", "decimales", "trop de décimales", "12.505"),
+        (6, "natif", "decimales", "trop de décimales", "12,505"),
+    ]
+    # Une valeur qui n'est pas un nombre n'est pas évaluable : la règle nature la signale.
+    assert _lignes(bilan, "colonne", "regle_en_vigueur", "statut_regle", "controlees") == [
+        ("montant", "2", "documenté", 5),
+        ("natif", "2", "documenté", 5),
+    ]
+    assert list(bilan["anomalies"]) == [1, 2] and bilan["non_revues"].sum() == 0
+
+
+def test_bornes_incluses_et_borne_unique():
+    donnees = _table(remise=[0, 15, 15.5, -1, "7,5", "16", "x"], quantite=[0, 1, -2, 3, 4, 5, 6])
+    ecarts, bilan = _controler(
+        donnees,
+        {"remise": _colonne(), "quantite": _colonne()},
+        complementaires={
+            "remise": {"bornes": {"min": 0, "max": 15}},
+            "quantite": {"bornes": {"min": 0}},
+        },
+    )
+    assert _lignes(ecarts, "num_ligne_source", "colonne", "constat", "valeur") == [
+        (4, "remise", "hors bornes", "15.5"),
+        (4, "quantite", "hors bornes", "-2"),
+        (5, "remise", "hors bornes", "-1"),
+        (7, "remise", "hors bornes", "16"),
+    ]
+    assert _lignes(bilan, "colonne", "regle_en_vigueur", "controlees") == [
+        ("remise", "0 à 15", 6),
+        ("quantite", "min 0", 7),
+    ]
+
+
+def test_motif_sur_la_valeur_entiere():
+    donnees = _table(nom=["LEROUX", "Leroux", "D'ARC", "DE LA TOUR", "", None])
+    ecarts, bilan = _controler(
+        donnees, {"nom": _colonne()}, complementaires={"nom": {"motif": "[^a-zà-ÿ]+"}}
+    )
+    assert _lignes(ecarts, "num_ligne_source", "regle", "constat", "valeur") == [
+        (3, "motif", "hors motif", "Leroux")
+    ]
+    assert bilan.loc[0, "controlees"] == 4 and bilan.loc[0, "regle_en_vigueur"] == "[^a-zà-ÿ]+"
+
+
+def test_cle_de_luhn_sur_toute_valeur_faite_de_chiffres():
+    donnees = _table(
+        siret=["73282932000074", "73282932000075", "7328293200007", "732 829", 79927398713]
+    )
+    ecarts, bilan = _controler(
+        donnees, {"siret": _colonne()}, complementaires={"siret": {"cle_luhn": True}}
+    )
+    # La valeur à espaces n'est pas évaluable : c'est la règle format qui la juge.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (3, "clé invalide", "73282932000075"),
+        (4, "clé invalide", "7328293200007"),
+    ]
+    assert bilan.loc[0, "controlees"] == 4 and bilan.loc[0, "regle_en_vigueur"] == "oui"
+
+
+def test_regles_complementaires_apres_celles_du_dictionnaire_et_masquage():
+    donnees = _table(salaire=["2460,005", None, "abc"])
+    colonnes = {"salaire": _colonne(obligatoire="obligatoire", nature="décimal virgule (texte)")}
+    ecarts, bilan = _controler(
+        donnees,
+        colonnes,
+        {"t": frozenset({"salaire"})},
+        {"salaire": {"cle_luhn": True, "bornes": {"max": 2000}, "decimales": 2}},
+    )
+    assert _lignes(ecarts, "num_ligne_source", "regle", "valeur") == [
+        (2, "decimales", VALEUR_MASQUEE),
+        (2, "bornes", VALEUR_MASQUEE),
+        (3, "obligatoire", VALEUR_MASQUEE),
+        (4, "nature", VALEUR_MASQUEE),
+    ]
+    # Ordre du bilan : règles du dictionnaire, puis décimales, bornes, motif, clé de Luhn.
+    assert list(bilan["regle"]) == ["obligatoire", "nature", "decimales", "bornes", "cle_luhn"]
+    assert list(bilan["controlees"]) == [3, 2, 1, 1, 0]
+
+
+def test_regles_complementaires_sur_une_table_ou_une_colonne_inconnue():
+    with pytest.raises(ValueError) as erreur:
+        controler(
+            {"t": _table(a=["x"])},
+            {"t": {"a": _colonne()}},
+            AUCUNE_SENSIBLE,
+            {"t": {"b": {"decimales": 2}}, "u": {"a": {"decimales": 2}}},
+        )
+    message = str(erreur.value)
+    assert "colonne t.b absente des données chargées" in message
+    assert "table u absente des données chargées" in message
+
+
+def test_problemes_des_regles_complementaires_listes_en_une_fois():
+    regles = {
+        "t": {
+            "a": {"decimales": -1, "arrondi": 2},
+            "b": {"bornes": {"min": 5, "max": 1}},
+            "c": {"bornes": {"entre": 1}},
+            "d": {"motif": "[a-"},
+            "e": {"cle_luhn": False},
+            "f": {"decimales": True},
+            "g": {},
+        },
+        "u": [],
+    }
+    problemes = problemes_regles_complementaires(regles)
+    assert len(problemes) == 9
+    texte = "\n".join(problemes)
+    for attendu in (
+        "t.a, règle decimales",
+        "règle inconnue 'arrondi'",
+        "le minimum dépasse le maximum",
+        "t.c, règle bornes",
+        "expression régulière invalide",
+        "retirer la ligne",
+        "t.f, règle decimales",
+        "t.g : au moins une règle",
+        "u : un dictionnaire de colonnes",
+    ):
+        assert attendu in texte
+    with pytest.raises(ValueError, match="Règles complémentaires invalides"):
+        _controler(_table(a=["x"]), {"a": _colonne()}, complementaires={"a": {"arrondi": 2}})
+
+
+def test_lecture_des_regles_complementaires(tmp_path):
+    chemin = tmp_path / "controles.yaml"
+    assert charger_regles_complementaires(chemin) == {}
+    chemin.write_text(
+        "regles:\n"
+        "  clients:\n"
+        "    siret: {cle_luhn: true}\n"
+        "  factures_lignes:\n"
+        "    remise_pct:\n"
+        "      bornes: {min: 0, max: 15}\n"
+        "    montant_ht:\n"
+        "      decimales: 2\n",
+        encoding="utf-8",
+    )
+    assert charger_regles_complementaires(chemin) == {
+        "clients": {"siret": {"cle_luhn": True}},
+        "factures_lignes": {
+            "remise_pct": {"bornes": {"min": 0, "max": 15}},
+            "montant_ht": {"decimales": 2},
+        },
+    }
+    chemin.write_text("regles:\n", encoding="utf-8")
+    assert charger_regles_complementaires(chemin) == {}
+    chemin.write_text("controles: {}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="seule clé attendue"):
+        charger_regles_complementaires(chemin)
+    chemin.write_text("regles:\n  clients:\n    siret: {luhn: true}\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="règle inconnue 'luhn'"):
+        charger_regles_complementaires(chemin)
