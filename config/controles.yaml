@@ -49,3 +49,48 @@ regles:
     cout_km: {decimales: 2}
     taux_charges_cdi_cdd: {bornes: {min: 0, max: 1}}
     taux_charges_apprenti: {bornes: {min: 0, max: 1}}
+
+
+# Doublons, déclarés d'après ce que dit le métier.
+# cle = identifiant d'une ligne; unique = colonnes qui ne doivent pas se répéter;
+# presume_unique = colonnes en principe uniques, une répétition est à arbitrer;
+# identique_hors_cle false = deux lignes pareilles hors clé sont normales dans cette table.
+doublons:
+  interventions:
+    cle: [id_intervention]
+  pieces_interventions:
+    cle: [id_consommation]
+  factures_entetes:
+    cle: [num_facture]
+  factures_lignes:
+    cle: [num_facture, num_ligne]
+  achats_entetes:
+    cle: [num_piece_achat]
+    unique:
+      - [code_fournisseur, ref_facture_fournisseur]
+  achats_lignes:
+    cle: [num_piece_achat, num_ligne]
+    identique_hors_cle: false
+  clients:
+    cle: [code_client]
+    unique:
+      - [siret]
+    presume_unique:
+      - [raison_sociale, cp]
+  fournisseurs:
+    cle: [code_fournisseur]
+    unique:
+      - [siret]
+    presume_unique:
+      - [raison_sociale]
+  intervenants:
+    cle: [matricule, date_entree]
+  remunerations:
+    cle: [matricule, date_effet]
+    identique_hors_cle: false
+  catalogue_pieces:
+    cle: [ref_piece]
+    presume_unique:
+      - [libelle]
+  parametres_couts:
+    cle: [annee]
