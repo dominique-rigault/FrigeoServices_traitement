@@ -591,8 +591,10 @@ def test_lecture_des_regles_complementaires(tmp_path):
     chemin.write_text("regles:\n", encoding="utf-8")
     assert charger_regles_complementaires(chemin) == {}
     chemin.write_text("controles: {}\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="seule clé attendue"):
+    with pytest.raises(ValueError, match="seules clés attendues.*clé inconnue : controles"):
         charger_regles_complementaires(chemin)
+    chemin.write_text("doublons:\n  clients:\n    cle: [code_client]\n", encoding="utf-8")
+    assert charger_regles_complementaires(chemin) == {}
     chemin.write_text("regles:\n  clients:\n    siret: {luhn: true}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="règle inconnue 'luhn'"):
         charger_regles_complementaires(chemin)

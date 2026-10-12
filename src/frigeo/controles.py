@@ -118,6 +118,10 @@ REGLES_COMPLEMENTAIRES = {
 }
 STATUT_COMPLEMENTAIRE = "documenté"
 CLE_REGLES_COMPLEMENTAIRES = "regles"
+# Le même fichier porte, sous une autre clé, les déclarations de doublons (voir le
+# module doublons).
+CLE_DOUBLONS = "doublons"
+CLES_FICHIER_CONTROLES = (CLE_REGLES_COMPLEMENTAIRES, CLE_DOUBLONS)
 # Tolérance relative pour les décimales d'un nombre natif, dont le calcul par le
 # tableur laisse parfois une imprécision (181.45000000000002).
 TOLERANCE_DECIMALES = 1e-9
@@ -187,6 +191,33 @@ def problemes_regles_complementaires(regles) -> list[str]:
     return problemes
 
 
+def lire_fichier_controles(chemin: str | Path | None = None) -> dict:
+    """Contenu de config/controles.yaml, par clé; vide si le fichier est absent.
+
+    Le fichier porte les règles complémentaires (clé `regles`) et les déclarations
+    de doublons (clé `doublons`), l'une et l'autre facultatives. Une autre clé est
+    refusée (faute de frappe probable).
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_regles_complementaires()
+    if not chemin.is_file():
+        return {}
+    with open(chemin, encoding="utf-8") as flux:
+        contenu = yaml.safe_load(flux)
+    attendues = " et ".join(f"« {cle} »" for cle in CLES_FICHIER_CONTROLES)
+    if not isinstance(contenu, dict):
+        raise ValueError(
+            f"Fichier de contrôles invalide ({chemin}) : les seules clés attendues "
+            f"sont {attendues}"
+        )
+    inconnues = [str(cle) for cle in contenu if cle not in CLES_FICHIER_CONTROLES]
+    if inconnues:
+        raise ValueError(
+            f"Fichier de contrôles invalide ({chemin}) : les seules clés attendues "
+            f"sont {attendues} (clé inconnue : {', '.join(inconnues)})"
+        )
+    return contenu
+
+
 def charger_regles_complementaires(chemin: str | Path | None = None) -> dict:
     """Règles complémentaires de config/controles.yaml, par table puis par colonne.
 
@@ -199,20 +230,11 @@ def charger_regles_complementaires(chemin: str | Path | None = None) -> dict:
     - `motif: "..."` : la valeur entière correspond à l'expression régulière;
     - `cle_luhn: true` : la clé de contrôle de Luhn est valide.
 
-    Un fichier absent ne donne aucune règle. Un fichier mal formé est refusé, tous
-    les problèmes étant listés en une fois.
+    Un fichier absent, ou sans clé `regles`, ne donne aucune règle. Un fichier mal
+    formé est refusé, tous les problèmes étant listés en une fois.
     """
     chemin = Path(chemin) if chemin is not None else chemin_regles_complementaires()
-    if not chemin.is_file():
-        return {}
-    with open(chemin, encoding="utf-8") as flux:
-        contenu = yaml.safe_load(flux)
-    if not isinstance(contenu, dict) or set(contenu) != {CLE_REGLES_COMPLEMENTAIRES}:
-        raise ValueError(
-            f"Règles complémentaires invalides ({chemin}) : la seule clé attendue est "
-            f"« {CLE_REGLES_COMPLEMENTAIRES} »"
-        )
-    regles = contenu[CLE_REGLES_COMPLEMENTAIRES]
+    regles = lire_fichier_controles(chemin).get(CLE_REGLES_COMPLEMENTAIRES)
     if regles is None:
         return {}
     problemes = problemes_regles_complementaires(regles)
