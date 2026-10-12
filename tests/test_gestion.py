@@ -14,6 +14,11 @@ from frigeo.gestion import (
     COLONNES_ECARTS_GESTION,
     CONSTAT_DATE_ANTERIEURE,
     CONSTAT_DATE_POSTERIEURE,
+    CONSTAT_INFERIEURE,
+    CONSTAT_RAPPORT_INFERIEUR,
+    CONSTAT_RAPPORT_NON_CALCULABLE,
+    CONSTAT_RAPPORT_SUPERIEUR,
+    CONSTAT_SUPERIEURE,
     ISSUE_INFORMATION,
     VUE_SANS_SURNOMBRE,
     VUE_TOUTES,
@@ -112,8 +117,10 @@ def test_date_hors_periode_d_un_export_annuel_et_mensuel():
         "table": "t",
         "colonnes": "d",
         "vue": VUE_TOUTES,
+        "filtre": None,
         "lignes": 9,
         "ecartees_doublons": 0,
+        "hors_champ": 0,
         "non_evaluables": 2,
         "controlees": 7,
         "anomalies": 0,
@@ -193,14 +200,14 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "règle n° 1 : un dictionnaire de clés est attendu",
         "règle n° 2 (R1) : clé manquante (type)",
         "règle n° 3 (decoupage) : type inconnu 'date_inconnue' (types possibles : "
-        "date_dans_periode_export)",
+        "date_dans_periode_export, plage, plage_selon_valeur, rapport_dans_plage)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
-        "date_dans_periode_export : ref, libelle, type, table, colonne)",
+        "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
         "règle n° 6 (decoupage), libelle : un texte non vide est attendu",
         "règle n° 7 (decoupage), table : un texte non vide est attendu",
-        "règle n° 9 (R3) : règle en double (même type, même table et mêmes paramètres "
-        "que la règle n° 8 (R2))",
+        "règle n° 9 (R3) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 8 (R2))",
     ]
     assert problemes_regles_gestion({"regles": []}) == [
         "une liste de règles est attendue (chaque règle commence par un tiret)"
@@ -296,10 +303,7 @@ def _toutes_en_information(donnees, parametres, natures):
     """Type d'essai : chaque ligne de la vue donne une information."""
     return Constats(
         pd.Series(True, index=donnees.index, dtype=bool),
-        pd.DataFrame(
-            {"constat": "vue", "issue": ISSUE_INFORMATION, "proposition": None},
-            index=donnees.index,
-        ),
+        pd.DataFrame({"constat": "vue", "proposition": None}, index=donnees.index),
     )
 
 
@@ -311,6 +315,7 @@ def type_sans_surnombre(monkeypatch):
         parametres={"colonne": gestion.GENRE_COLONNE_DATE},
         vue=VUE_SANS_SURNOMBRE,
         controler=_toutes_en_information,
+        issue=ISSUE_INFORMATION,
     )
     monkeypatch.setattr(gestion, "TYPES", types)
 
@@ -388,3 +393,282 @@ def test_catalogue_des_types():
     ligne = catalogue.iloc[0].to_dict()
     assert ligne["parametres"] == "colonne (colonne de date)"
     assert ligne["vue"] == VUE_TOUTES
+    assert ligne["issue"] == "à arbitrer"
+    plage = catalogue.set_index("type").loc["plage"].to_dict()
+    assert plage["parametres"] == (
+        "colonne (colonne de nombre), min (nombre, facultatif), max (nombre, facultatif)"
+    )
+    assert plage["issue"] == "anomalie"
+
+
+# Morceau 4b1 : plages de valeurs, filtre et issue déclarée.
+
+DECIMAL = "décimal virgule (texte)"
+ENTIER = "entier (texte)"
+PLAGES = {"Contrôle": {"min": 30, "max": 90}, "Dépannage": {"min": 30}, "Pose": {"max": 600}}
+
+
+def _instance(type_regle="plage", ref="R22", table="t", **parametres):
+    return {"ref": ref, "libelle": "Plage", "type": type_regle, "table": table, **parametres}
+
+
+def test_plage_bornes_incluses_et_valeurs_non_evaluables():
+    donnees = _table(km=["2,0", "120,0", "1,9", "120,1", "", "18.4", "50,0"])
+    ecarts, bilan = _controler(
+        donnees, {"km": DECIMAL}, regles=[_instance(colonne="km", min=2, max=120)]
+    )
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (4, CONSTAT_INFERIEURE, "anomalie", "km", "1,9"),
+        (5, CONSTAT_SUPERIEURE, "anomalie", "km", "120,1"),
+    ]
+    assert set(ecarts["proposition"].isna()) == {True}
+    resume = _bilan(bilan)
+    assert (resume["non_evaluables"], resume["controlees"], resume["anomalies"]) == (2, 5, 2)
+    assert (resume["colonnes"], resume["filtre"], resume["hors_champ"]) == ("km", None, 0)
+
+
+def test_plage_avec_une_seule_borne():
+    donnees = _table(n=["1", "5", "500"])
+    ecarts, _ = _controler(donnees, {"n": ENTIER}, regles=[_instance(colonne="n", min=5)])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [(2, CONSTAT_INFERIEURE)]
+    ecarts, _ = _controler(donnees, {"n": ENTIER}, regles=[_instance(colonne="n", max=5)])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [(4, CONSTAT_SUPERIEURE)]
+
+
+def test_plage_selon_valeur():
+    donnees = _table(
+        duree=["20", "30", "91", "1000", "10", "20", "20", "", "20"],
+        cat=["Contrôle", "Contrôle", "Contrôle", "Dépannage", "Pose", "Inconnue", None,
+             "Contrôle", "Contrôle "],
+    )
+    regle = _instance("plage_selon_valeur", "R02", colonne="duree", selon="cat", plages=PLAGES)
+    ecarts, bilan = _controler(donnees, {"duree": ENTIER, "cat": "texte"}, regles=[regle])
+    # Dépannage sans maximum, Pose sans minimum; une catégorie inconnue, vide ou
+    # mal saisie n'a pas de plage : la ligne est non évaluable, sans écart.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "colonnes", "valeur") == [
+        (2, CONSTAT_INFERIEURE, "duree, cat", "20 | Contrôle"),
+        (4, CONSTAT_SUPERIEURE, "duree, cat", "91 | Contrôle"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["non_evaluables"], resume["controlees"], resume["anomalies"]) == (4, 5, 2)
+
+
+def test_valeur_masquee_si_la_colonne_de_choix_est_sensible():
+    donnees = _table(duree=["20"], cat=["Contrôle"])
+    regle = _instance("plage_selon_valeur", colonne="duree", selon="cat", plages=PLAGES)
+    ecarts, _ = _controler(donnees, {"duree": ENTIER, "cat": "texte"}, regles=[regle],
+                           sensibles={"t": frozenset({"cat"})})
+    assert _lignes(ecarts, "valeur", "proposition") == [(VALEUR_MASQUEE, None)]
+
+
+def test_rapport_dans_plage():
+    donnees = _table(
+        km=["17,5", "10,0", "40,0", "5,0", "0,0", "", "18,4", "3,0"],
+        mn=["15", "30", "30", "0", "0", "10", "", "6"],
+    )
+    regle = _instance("rapport_dans_plage", numerateur="km", denominateur="mn", facteur=60,
+                      min=30, max=70)
+    ecarts, bilan = _controler(donnees, {"km": DECIMAL, "mn": ENTIER}, regles=[regle])
+    # 17,5 km en 15 min font exactement 70 km/h, dans la plage. Un dénominateur nul
+    # est un écart, même avec un numérateur nul.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (3, CONSTAT_RAPPORT_INFERIEUR, "10,0 | 30"),
+        (4, CONSTAT_RAPPORT_SUPERIEUR, "40,0 | 30"),
+        (5, CONSTAT_RAPPORT_NON_CALCULABLE, "5,0 | 0"),
+        (6, CONSTAT_RAPPORT_NON_CALCULABLE, "0,0 | 0"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["colonnes"], resume["non_evaluables"], resume["controlees"]) == (
+        "km, mn",
+        2,
+        6,
+    )
+    # Sans facteur, le rapport est le simple quotient.
+    regle = _instance("rapport_dans_plage", numerateur="km", denominateur="mn", max=1)
+    ecarts, _ = _controler(donnees, {"km": DECIMAL, "mn": ENTIER}, regles=[regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (2, CONSTAT_RAPPORT_SUPERIEUR),
+        (4, CONSTAT_RAPPORT_SUPERIEUR),
+        (5, CONSTAT_RAPPORT_NON_CALCULABLE),
+        (6, CONSTAT_RAPPORT_NON_CALCULABLE),
+    ]
+    # 0,3 / 0,1 vaut 2,9999999999999996 en virgule flottante : le rapport est arrondi.
+    regle = _instance("rapport_dans_plage", numerateur="a", denominateur="b", min=3)
+    ecarts, _ = _controler(_table(a=["0,3"], b=["0,1"]), {"a": DECIMAL, "b": DECIMAL},
+                           regles=[regle])
+    assert ecarts.empty
+
+
+def test_filtre_hors_champ_et_bilan():
+    donnees = _table(
+        km=["0,0", "0,0", "0,0", "0,0", "0,0", "0,0", "0,0"],
+        statut=["Réalisée", "Annulée", "Reportée", "", "Réalisée ", None, "Réalisée"],
+        type=["A", "A", "A", "A", "A", "A", "B"],
+    )
+    filtre = [{"colonne": "statut", "valeurs": ["Réalisée"]}]
+    regle = _instance(colonne="km", min=2, filtre=filtre)
+    natures = {"km": DECIMAL, "statut": "texte", "type": "texte"}
+    ecarts, bilan = _controler(donnees, natures, regles=[regle])
+    # Valeurs comparées telles quelles : « Réalisée » suivi d'une espace est hors champ.
+    assert _lignes(ecarts, "num_ligne_source") == [(2,), (8,)]
+    resume = _bilan(bilan)
+    assert resume["filtre"] == "statut = Réalisée"
+    assert (resume["lignes"], resume["hors_champ"], resume["non_evaluables"],
+            resume["controlees"]) == (7, 5, 0, 2)
+    # Plusieurs valeurs : l'une ou l'autre; plusieurs conditions : toutes.
+    filtre = [
+        {"colonne": "statut", "valeurs": ["Réalisée", "Annulée"]},
+        {"colonne": "type", "valeurs": ["A"]},
+    ]
+    ecarts, bilan = _controler(donnees, natures, regles=[_instance(colonne="km", min=2,
+                                                                  filtre=filtre)])
+    assert _lignes(ecarts, "num_ligne_source") == [(2,), (3,)]
+    assert _bilan(bilan)["filtre"] == "statut = Réalisée ou Annulée et type = A"
+    assert _bilan(bilan)["hors_champ"] == 5
+
+
+def test_filtre_apres_les_doublons_en_surnombre(type_sans_surnombre):
+    donnees = _table(d=["14/03/2025", "14/03/2025", "15/03/2025"], s=["O", "O", "N"])
+    filtre = [{"colonne": "s", "valeurs": ["O"]}]
+    regles = [_regle(type="essai_vue", filtre=filtre)]
+    _, bilan = _controler(donnees, {"d": "date JJ/MM/AAAA", "s": "texte"}, regles=regles)
+    resume = _bilan(bilan)
+    assert (resume["ecartees_doublons"], resume["hors_champ"], resume["controlees"]) == (1, 1, 1)
+
+
+def test_issue_declaree_par_la_regle():
+    donnees = _table(d=["14/03/2052"], n=["1"])
+    natures = {"d": "date JJ/MM/AAAA", "n": ENTIER}
+    regles = [
+        _regle(issue="anomalie"),
+        _instance(colonne="n", min=2, issue="information"),
+        _instance(colonne="n", min=3, issue="à arbitrer"),
+    ]
+    ecarts, bilan = _controler(donnees, natures, regles=regles)
+    assert list(ecarts["issue"]) == ["anomalie", "information", "à arbitrer"]
+    assert list(bilan["anomalies"]) == [1, 0, 0]
+    assert list(bilan["informations"]) == [0, 1, 0]
+    assert list(bilan["a_arbitrer"]) == [0, 0, 1]
+
+
+def test_structure_des_plages_filtres_et_issues():
+    regles = [
+        _instance(colonne="n", issue="grave"),
+        _instance(colonne="n", min="2", max=True),
+        _instance(colonne="n", min=5, max=2),
+        _instance(colonne="n", min=1, filtre={"colonne": "s"}),
+        _instance(colonne="n", min=1, filtre=[
+            "s", {"colonne": "s", "valeur": ["O"]}, {"colonne": "", "valeurs": []},
+            {"colonne": "s", "valeurs": ["O", 1]},
+        ]),
+        _instance("plage_selon_valeur", colonne="n", selon="c", plages={}),
+        _instance("plage_selon_valeur", colonne="n", selon="c", plages={
+            1: {"min": 1}, "A": 5, "B": {"mini": 1}, "C": {}, "D": {"min": 3, "max": 1},
+        }),
+        _instance("rapport_dans_plage", numerateur="n", denominateur="m", facteur=0, max=1),
+        _instance("rapport_dans_plage", numerateur="n", min=1),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (R22), issue : issue inconnue 'grave' (issues possibles : anomalie, "
+        "à arbitrer, information)",
+        "règle n° 1 (R22) : min ou max attendu",
+        "règle n° 2 (R22), min : un nombre est attendu",
+        "règle n° 2 (R22), max : un nombre est attendu",
+        "règle n° 3 (R22) : min (5) supérieur à max (2)",
+        "règle n° 4 (R22), filtre : une liste de conditions est attendue (chaque condition "
+        "commence par un tiret)",
+        "règle n° 5 (R22), filtre, condition n° 1 : un dictionnaire est attendu (clés "
+        "colonne et valeurs)",
+        "règle n° 5 (R22), filtre, condition n° 2 : clé inconnue valeur (clés possibles : "
+        "colonne, valeurs)",
+        "règle n° 5 (R22), filtre, condition n° 2 : clé manquante (valeurs)",
+        "règle n° 5 (R22), filtre, condition n° 3, colonne : un nom de colonne est attendu",
+        "règle n° 5 (R22), filtre, condition n° 3, valeurs : une liste non vide est attendue",
+        "règle n° 5 (R22), filtre, condition n° 4, valeurs : 1 n'est pas un texte (mettre "
+        "un nombre entre guillemets)",
+        "règle n° 6 (R22), plages : un dictionnaire non vide est attendu (valeur vers min "
+        "et max)",
+        "règle n° 7 (R22), plages : valeur 1 : un texte est attendu (mettre un nombre entre "
+        "guillemets)",
+        "règle n° 7 (R22), plages : valeur 'A' : un dictionnaire min et max est attendu",
+        "règle n° 7 (R22), plages : valeur 'B' : clé inconnue mini (clés possibles : min, "
+        "max)",
+        "règle n° 7 (R22), plages : valeur 'C' : min ou max attendu",
+        "règle n° 7 (R22), plages : valeur 'D' : min (3) supérieur à max (1)",
+        "règle n° 8 (R22) : facteur : un nombre non nul est attendu",
+        "règle n° 9 (R22) : paramètre manquant (denominateur)",
+    ]
+
+
+def test_regle_en_double_selon_les_parametres_et_le_filtre():
+    filtre = [{"colonne": "s", "valeurs": ["O"]}]
+    autre = [{"colonne": "s", "valeurs": ["N"]}]
+    regles = [
+        _instance(colonne="n", min=1, max=2),
+        _instance(colonne="n", max=2.0, min=1, libelle="Autre libellé", issue="information"),
+        _instance(colonne="n", min=1, max=2, filtre=filtre),
+        _instance(colonne="n", min=1, max=2, filtre=autre),
+        _instance("plage_selon_valeur", colonne="n", selon="c", plages=PLAGES),
+        _instance("plage_selon_valeur", colonne="n", selon="c", plages=dict(PLAGES)),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 2 (R22) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 1 (R22))",
+        "règle n° 6 (R22) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 5 (R22))",
+    ]
+
+
+def test_colonnes_de_nombre_et_de_filtre_confrontees_aux_donnees():
+    tables = {"t": _table(n=["1"], m=["x"], c=["A"])}
+    dictionnaire = _dictionnaire(n=ENTIER, m="à décider", c="texte")
+    regles = [
+        _instance(colonne="m", min=1),
+        _instance(colonne="n", min=1, filtre=[{"colonne": "absente", "valeurs": ["O"]}]),
+        _instance("plage_selon_valeur", colonne="n", selon="autre", plages=PLAGES),
+        _instance("rapport_dans_plage", numerateur="n", denominateur="c", max=1),
+    ]
+    with pytest.raises(ValueError) as erreur:
+        controler_gestion(tables, dictionnaire, regles, {}, None, AUCUNE_SENSIBLE)
+    message = str(erreur.value)
+    for attendu in (
+        "règle n° 1 (R22), colonne : la nature en vigueur de t.m est 'à décider', un "
+        "nombre est attendu",
+        "règle n° 2 (R22), filtre : colonne t.absente absente des données chargées",
+        "règle n° 3 (R22), selon : colonne t.autre absente des données chargées",
+        "règle n° 4 (R22), denominateur : la nature en vigueur de t.c est 'texte', un "
+        "nombre est attendu",
+    ):
+        assert attendu in message
+    # Une colonne de choix n'a pas de nature imposée.
+    ecarts, _ = controler_gestion(
+        tables, dictionnaire,
+        [_instance("plage_selon_valeur", colonne="n", selon="c", plages={"A": {"min": 2}})],
+        {}, None, AUCUNE_SENSIBLE,
+    )
+    assert _lignes(ecarts, "constat") == [(CONSTAT_INFERIEURE,)]
+
+
+def test_chargement_d_une_regle_avec_filtre(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: R22\n    libelle: Distance\n    type: plage\n    table: interventions\n"
+        "    colonne: distance_km\n    min: 2\n    max: 120\n"
+        "    filtre:\n      - colonne: statut\n        valeurs: [Réalisée]\n"
+        "    issue: anomalie\n",
+        encoding="utf-8",
+    )
+    assert charger_regles_gestion(chemin) == [
+        {
+            "ref": "R22",
+            "libelle": "Distance",
+            "type": "plage",
+            "table": "interventions",
+            "colonne": "distance_km",
+            "min": 2,
+            "max": 120,
+            "filtre": [{"colonne": "statut", "valeurs": ["Réalisée"]}],
+            "issue": "anomalie",
+        }
+    ]

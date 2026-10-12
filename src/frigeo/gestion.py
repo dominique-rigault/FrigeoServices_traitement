@@ -17,6 +17,11 @@ source. Trois issues sont possibles :
 - information : un cas que le métier tient pour normal, affiché sans être compté
   comme anomalie.
 
+Chaque type a une issue par défaut; une règle peut en déclarer une autre (clé
+`issue`). Une règle peut aussi se limiter aux lignes qui remplissent un filtre
+(clé `filtre`) : les autres lignes sont hors champ, non contrôlées, et comptées au
+bilan.
+
 Une valeur vide ou illisible dans sa nature (voir `typage.lire`) rend la ligne non
 évaluable : elle est comptée au bilan, sans écart, car le contrôle de nature de
 l'étape 3 la signale déjà.
@@ -33,6 +38,7 @@ bilan.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -60,7 +66,7 @@ from .doublons import (
     charger_declarations_doublons,
     detecter_doublons,
 )
-from .typage import NATURES_DATE, ecrire_date, lire
+from .typage import NATURES_DATE, NATURES_NOMBRE, ecrire_date, lire
 
 ISSUE_INFORMATION = "information"
 ISSUES = (ISSUE_ANOMALIE, ISSUE_A_ARBITRER, ISSUE_INFORMATION)
@@ -69,13 +75,30 @@ CLE_REGLES_GESTION = "regles"
 CLES_FICHIER_GESTION = (CLE_REGLES_GESTION,)
 # Clés communes à toutes les instances, en plus des paramètres de leur type.
 CLES_COMMUNES = ("ref", "libelle", "type", "table")
+# Clés communes facultatives : filtre des lignes contrôlées et issue des écarts.
+CLE_FILTRE = "filtre"
+CLE_ISSUE = "issue"
+CLES_FACULTATIVES = (CLE_FILTRE, CLE_ISSUE)
+# Clés d'une condition du filtre.
+CLES_CONDITION = ("colonne", "valeurs")
 
 VUE_TOUTES = "toutes les lignes"
 VUE_SANS_SURNOMBRE = "sans les doublons exacts en surnombre"
 
 # Genre d'un paramètre, qui dit comment il est vérifié.
 GENRE_COLONNE_DATE = "colonne de date"
-GENRES_COLONNE = (GENRE_COLONNE_DATE,)
+GENRE_COLONNE_NOMBRE = "colonne de nombre"
+GENRE_COLONNE = "colonne"
+GENRES_COLONNE = (GENRE_COLONNE_DATE, GENRE_COLONNE_NOMBRE, GENRE_COLONNE)
+GENRE_NOMBRE = "nombre"
+GENRE_PLAGES = "plages"
+# Natures en vigueur admises pour une colonne, selon le genre du paramètre.
+_NATURES_ATTENDUES = {
+    GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
+    GENRE_COLONNE_NOMBRE: (NATURES_NOMBRE, "un nombre est attendu"),
+}
+# Bornes d'une plage, incluses.
+CLES_BORNES = ("min", "max")
 
 # Repère de la période d'un export, ajouté par le chargement : AAAA pour un export
 # annuel, AAAA-MM pour un export mensuel.
@@ -103,15 +126,17 @@ COLONNES_BILAN_GESTION = (
     "table",
     "colonnes",
     "vue",
+    "filtre",
     "lignes",
     "ecartees_doublons",
+    "hors_champ",
     "non_evaluables",
     "controlees",
     "anomalies",
     "a_arbitrer",
     "informations",
 )
-COLONNES_CATALOGUE = ("type", "description", "parametres", "vue")
+COLONNES_CATALOGUE = ("type", "description", "parametres", "vue", "issue")
 
 
 @dataclass(frozen=True)
@@ -119,8 +144,9 @@ class Constats:
     """Résultat d'un type sur sa vue, indexé par la position des lignes.
 
     `evaluables` : vrai pour une ligne que le type a pu juger. `ecarts` : une ligne
-    par écart, avec les colonnes `constat`, `issue` et `proposition` (None quand
-    l'outil ne propose rien), indexée par la position de la ligne en écart.
+    par écart, avec les colonnes `constat` et `proposition` (None quand l'outil ne
+    propose rien), indexée par la position de la ligne en écart. L'issue n'est pas
+    donnée par le type : c'est celle de la règle, ou à défaut celle du type.
     """
 
     evaluables: pd.Series
@@ -131,11 +157,15 @@ class Constats:
 class TypeRegle:
     """Type de règle du catalogue.
 
-    `parametres` : nom et genre de chaque paramètre. `controler(donnees,
-    parametres, natures)` reçoit la vue de la table (index = position des lignes
-    dans la table), les paramètres de l'instance et la nature en vigueur de ses
-    colonnes; il rend des `Constats`. `prerequis(donnees)` rend le problème qui
-    empêche d'appliquer le type à une table, None s'il n'y en a pas.
+    `parametres` : nom et genre de chaque paramètre; ceux de `facultatifs` peuvent
+    manquer. `controler(donnees, parametres, natures)` reçoit la vue de la table
+    (index = position des lignes dans la table), les paramètres présents de
+    l'instance et la nature en vigueur de ses colonnes; il rend des `Constats`.
+    `prerequis(donnees)` rend le problème qui empêche d'appliquer le type à une
+    table, None s'il n'y en a pas. `verifier(parametres)` rend les problèmes
+    propres au type (par exemple un minimum supérieur au maximum), une fois chaque
+    paramètre vérifié selon son genre. `issue` : issue des écarts quand la règle
+    n'en déclare pas.
     """
 
     description: str
@@ -143,10 +173,30 @@ class TypeRegle:
     vue: str
     controler: Callable
     prerequis: Callable | None = None
+    facultatifs: tuple = ()
+    verifier: Callable | None = None
+    issue: str = ISSUE_ANOMALIE
 
 
-def _ecarts(lignes: list[dict], index: list) -> pd.DataFrame:
-    return pd.DataFrame(lignes, index=index, columns=["constat", "issue", "proposition"])
+def _ecarts(constats: pd.Series, propositions: pd.Series | None = None) -> pd.DataFrame:
+    """Écarts d'un type : une ligne par constat renseigné, indexée par la position."""
+    garde = constats.notna()
+    ecarts = pd.DataFrame(
+        {"constat": constats[garde].astype(object), "proposition": None},
+        index=constats.index[garde],
+        columns=["constat", "proposition"],
+    )
+    if propositions is not None:
+        ecarts["proposition"] = propositions[garde].astype(object)
+    return ecarts
+
+
+def _est_nombre(valeur) -> bool:
+    return (
+        isinstance(valeur, (int, float))
+        and not isinstance(valeur, bool)
+        and math.isfinite(valeur)
+    )
 
 
 def _bornes_periode(valeur):
@@ -181,8 +231,8 @@ CONSTAT_DATE_POSTERIEURE = "date postérieure à la période de l'export"
 def _date_dans_periode_export(donnees, parametres, natures) -> Constats:
     """Date de référence de chaque ligne dans la période de son export.
 
-    Une date hors période est à arbitrer. La correction proposée remplace l'année
-    par celle de l'export, quand la date obtenue tombe dans la période.
+    La correction proposée remplace l'année par celle de l'export, quand la date
+    obtenue tombe dans la période.
     """
     colonne = parametres["colonne"]
     nature = natures[colonne]
@@ -191,26 +241,129 @@ def _date_dans_periode_export(donnees, parametres, natures) -> Constats:
     evaluables = dates.notna() & pd.Series(
         [periode is not None for periode in bornes], index=donnees.index, dtype=bool
     )
-    lignes, index = [], []
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    propositions = pd.Series(None, index=donnees.index, dtype=object)
     for position, date, periode in zip(donnees.index, dates, bornes):
         if pd.isna(date) or periode is None:
             continue
         debut, fin = periode
         if debut <= date < fin:
             continue
-        constat = CONSTAT_DATE_ANTERIEURE if date < debut else CONSTAT_DATE_POSTERIEURE
-        proposition = None
+        constats.loc[position] = (
+            CONSTAT_DATE_ANTERIEURE if date < debut else CONSTAT_DATE_POSTERIEURE
+        )
         try:
             corrigee = date.replace(year=debut.year)
         except ValueError:
             corrigee = None
         if corrigee is not None and debut <= corrigee < fin:
-            proposition = ecrire_date(corrigee, nature)
-        lignes.append(
-            {"constat": constat, "issue": ISSUE_A_ARBITRER, "proposition": proposition}
-        )
-        index.append(position)
-    return Constats(evaluables, _ecarts(lignes, index))
+            propositions.loc[position] = ecrire_date(corrigee, nature)
+    return Constats(evaluables, _ecarts(constats, propositions))
+
+
+CONSTAT_INFERIEURE = "inférieure au minimum"
+CONSTAT_SUPERIEURE = "supérieure au maximum"
+CONSTAT_RAPPORT_INFERIEUR = "rapport inférieur au minimum"
+CONSTAT_RAPPORT_SUPERIEUR = "rapport supérieur au maximum"
+CONSTAT_RAPPORT_NON_CALCULABLE = "rapport non calculable (dénominateur nul)"
+# Le rapport est arrondi avant d'être comparé à ses bornes, pour qu'une erreur de
+# calcul en virgule flottante ne fasse pas sortir de la plage une valeur égale à
+# une borne.
+_DECIMALES_RAPPORT = 9
+
+
+def _comparer(valeurs, mini, maxi, sous: str, dessus: str) -> pd.Series:
+    """Constat de chaque valeur face à ses bornes incluses, None dans la plage.
+
+    `mini` et `maxi` sont un nombre, une série alignée sur les valeurs (NaN pour
+    une ligne sans cette borne) ou None. Une valeur NaN n'a pas de constat.
+    """
+    constats = pd.Series(None, index=valeurs.index, dtype=object)
+    if mini is not None:
+        constats[(valeurs < mini).to_numpy(dtype=bool)] = sous
+    if maxi is not None:
+        constats[(valeurs > maxi).to_numpy(dtype=bool)] = dessus
+    return constats
+
+
+def _plage(donnees, parametres, natures) -> Constats:
+    """Valeur d'une colonne de nombres entre un minimum et un maximum inclus."""
+    colonne = parametres["colonne"]
+    valeurs = lire(donnees[colonne], natures[colonne]).valeurs
+    constats = _comparer(
+        valeurs,
+        parametres.get("min"),
+        parametres.get("max"),
+        CONSTAT_INFERIEURE,
+        CONSTAT_SUPERIEURE,
+    )
+    return Constats(valeurs.notna(), _ecarts(constats))
+
+
+def _plage_selon_valeur(donnees, parametres, natures) -> Constats:
+    """Valeur d'une colonne de nombres dans la plage choisie par une autre colonne.
+
+    La valeur de la colonne `selon` est comparée telle quelle aux valeurs de
+    `plages`; une ligne dont la valeur n'a pas de plage déclarée est non évaluable.
+    """
+    colonne, plages = parametres["colonne"], parametres["plages"]
+    valeurs = lire(donnees[colonne], natures[colonne]).valeurs
+    choix = donnees[parametres["selon"]].map(_valeur_constatee)
+    avec_plage = choix.map(lambda valeur: valeur in plages).astype(bool)
+
+    def borne(nom):
+        return choix.map(
+            lambda valeur: plages[valeur].get(nom) if valeur in plages else None
+        ).astype(float)
+
+    constats = _comparer(
+        valeurs, borne("min"), borne("max"), CONSTAT_INFERIEURE, CONSTAT_SUPERIEURE
+    )
+    return Constats(valeurs.notna() & avec_plage, _ecarts(constats))
+
+
+def _rapport_dans_plage(donnees, parametres, natures) -> Constats:
+    """Rapport numérateur × facteur / dénominateur entre un minimum et un maximum.
+
+    Un dénominateur nul est un écart (rapport non calculable), pas une ligne non
+    évaluable.
+    """
+    numerateur, denominateur = parametres["numerateur"], parametres["denominateur"]
+    haut = lire(donnees[numerateur], natures[numerateur]).valeurs
+    bas = lire(donnees[denominateur], natures[denominateur]).valeurs
+    evaluables = haut.notna() & bas.notna()
+    rapport = (haut * parametres.get("facteur", 1) / bas.where(bas != 0)).round(
+        _DECIMALES_RAPPORT
+    )
+    constats = _comparer(
+        rapport,
+        parametres.get("min"),
+        parametres.get("max"),
+        CONSTAT_RAPPORT_INFERIEUR,
+        CONSTAT_RAPPORT_SUPERIEUR,
+    )
+    constats[(evaluables & (bas == 0)).to_numpy(dtype=bool)] = CONSTAT_RAPPORT_NON_CALCULABLE
+    return Constats(evaluables, _ecarts(constats))
+
+
+def _problemes_bornes(bornes: dict) -> list[str]:
+    """Problèmes d'une plage : au moins une borne, des nombres, min au plus max."""
+    presentes = [cle for cle in CLES_BORNES if cle in bornes]
+    if not presentes:
+        return ["min ou max attendu"]
+    problemes = [
+        f"{cle} : un nombre est attendu" for cle in presentes if not _est_nombre(bornes[cle])
+    ]
+    if not problemes and len(presentes) == 2 and bornes["min"] > bornes["max"]:
+        problemes.append(f"min ({bornes['min']}) supérieur à max ({bornes['max']})")
+    return problemes
+
+
+def _verifier_rapport(parametres: dict) -> list[str]:
+    problemes = _problemes_bornes(parametres)
+    if parametres.get("facteur") == 0:
+        problemes.append("facteur : un nombre non nul est attendu")
+    return problemes
 
 
 TYPES = {
@@ -223,22 +376,69 @@ TYPES = {
         vue=VUE_TOUTES,
         controler=_date_dans_periode_export,
         prerequis=_prerequis_export,
+        issue=ISSUE_A_ARBITRER,
+    ),
+    "plage": TypeRegle(
+        description=(
+            "La valeur de la colonne est comprise entre min et max (inclus); l'une "
+            "des deux bornes peut manquer."
+        ),
+        parametres={"colonne": GENRE_COLONNE_NOMBRE, "min": GENRE_NOMBRE, "max": GENRE_NOMBRE},
+        vue=VUE_TOUTES,
+        controler=_plage,
+        facultatifs=("min", "max"),
+        verifier=_problemes_bornes,
+    ),
+    "plage_selon_valeur": TypeRegle(
+        description=(
+            "La valeur de la colonne est comprise dans la plage {min, max} que "
+            "plages associe à la valeur de la colonne selon; une ligne dont la "
+            "valeur de selon n'a pas de plage est non évaluable."
+        ),
+        parametres={
+            "colonne": GENRE_COLONNE_NOMBRE,
+            "selon": GENRE_COLONNE,
+            "plages": GENRE_PLAGES,
+        },
+        vue=VUE_TOUTES,
+        controler=_plage_selon_valeur,
+    ),
+    "rapport_dans_plage": TypeRegle(
+        description=(
+            "Le rapport numerateur × facteur / denominateur est compris entre min et "
+            "max (inclus); facteur vaut 1 par défaut; un dénominateur nul est un "
+            "écart."
+        ),
+        parametres={
+            "numerateur": GENRE_COLONNE_NOMBRE,
+            "denominateur": GENRE_COLONNE_NOMBRE,
+            "facteur": GENRE_NOMBRE,
+            "min": GENRE_NOMBRE,
+            "max": GENRE_NOMBRE,
+        },
+        vue=VUE_TOUTES,
+        controler=_rapport_dans_plage,
+        facultatifs=("facteur", "min", "max"),
+        verifier=_verifier_rapport,
     ),
 }
 
 
 def catalogue_types() -> pd.DataFrame:
-    """Types de règles disponibles, avec leurs paramètres et leur vue."""
+    """Types de règles disponibles, avec leurs paramètres, leur vue et leur issue."""
     return pd.DataFrame(
         [
             {
                 "type": nom,
                 "description": type_regle.description,
                 "parametres": ", ".join(
-                    f"{parametre} ({genre})"
+                    f"{parametre} ({genre}"
+                    + (", facultatif" if parametre in type_regle.facultatifs else "")
+                    + ")"
                     for parametre, genre in type_regle.parametres.items()
                 ),
                 "vue": type_regle.vue,
+                "issue": type_regle.issue,
             }
             for nom, type_regle in TYPES.items()
         ],
@@ -265,8 +465,81 @@ def _colonnes_instance(instance: dict) -> list[str]:
     return [
         instance[parametre]
         for parametre, genre in TYPES[instance["type"]].parametres.items()
-        if genre in GENRES_COLONNE
+        if genre in GENRES_COLONNE and parametre in instance
     ]
+
+
+def _problemes_parametre(genre: str, valeur) -> list[str]:
+    """Problèmes d'un paramètre selon son genre."""
+    if genre in GENRES_COLONNE:
+        return [] if _texte_attendu(valeur) else [f"un nom de colonne est attendu ({genre})"]
+    if genre == GENRE_NOMBRE:
+        return [] if _est_nombre(valeur) else ["un nombre est attendu"]
+    if not isinstance(valeur, dict) or not valeur:
+        return ["un dictionnaire non vide est attendu (valeur vers min et max)"]
+    problemes = []
+    for cle, bornes in valeur.items():
+        if not _texte_attendu(cle):
+            problemes.append(
+                f"valeur {cle!r} : un texte est attendu (mettre un nombre entre guillemets)"
+            )
+            continue
+        if not isinstance(bornes, dict):
+            problemes.append(f"valeur {cle!r} : un dictionnaire min et max est attendu")
+            continue
+        inconnues = [str(nom) for nom in bornes if nom not in CLES_BORNES]
+        if inconnues:
+            problemes.append(
+                f"valeur {cle!r} : clé inconnue {', '.join(inconnues)} (clés possibles : "
+                f"{', '.join(CLES_BORNES)})"
+            )
+            continue
+        problemes.extend(f"valeur {cle!r} : {probleme}" for probleme in _problemes_bornes(bornes))
+    return problemes
+
+
+def _problemes_filtre(filtre) -> list[str]:
+    """Problèmes d'un filtre : liste de conditions {colonne, valeurs}."""
+    if not isinstance(filtre, list) or not filtre:
+        return ["une liste de conditions est attendue (chaque condition commence par un tiret)"]
+    problemes = []
+    for rang, condition in enumerate(filtre, start=1):
+        nom = f"condition n° {rang}"
+        if not isinstance(condition, dict):
+            problemes.append(f"{nom} : un dictionnaire est attendu (clés colonne et valeurs)")
+            continue
+        inconnues = [str(cle) for cle in condition if cle not in CLES_CONDITION]
+        if inconnues:
+            problemes.append(
+                f"{nom} : clé inconnue {', '.join(inconnues)} (clés possibles : "
+                f"{', '.join(CLES_CONDITION)})"
+            )
+        manquantes = [cle for cle in CLES_CONDITION if cle not in condition]
+        if manquantes:
+            problemes.append(f"{nom} : clé manquante ({', '.join(manquantes)})")
+        if "colonne" in condition and not _texte_attendu(condition["colonne"]):
+            problemes.append(f"{nom}, colonne : un nom de colonne est attendu")
+        if "valeurs" in condition:
+            valeurs = condition["valeurs"]
+            if not isinstance(valeurs, list) or not valeurs:
+                problemes.append(f"{nom}, valeurs : une liste non vide est attendue")
+            else:
+                problemes.extend(
+                    f"{nom}, valeurs : {valeur!r} n'est pas un texte (mettre un nombre "
+                    "entre guillemets)"
+                    for valeur in valeurs
+                    if not _texte_attendu(valeur)
+                )
+    return problemes
+
+
+def _figer(valeur):
+    """Valeur d'un paramètre sous une forme comparable et hachable."""
+    if isinstance(valeur, dict):
+        return tuple(sorted((str(cle), _figer(v)) for cle, v in valeur.items()))
+    if isinstance(valeur, list):
+        return tuple(_figer(v) for v in valeur)
+    return valeur
 
 
 def problemes_regles_gestion(regles) -> list[str]:
@@ -286,6 +559,18 @@ def problemes_regles_gestion(regles) -> list[str]:
         for cle in CLES_COMMUNES:
             if cle in instance and not _texte_attendu(instance[cle]):
                 problemes.append(f"{nom}, {cle} : un texte non vide est attendu")
+        if CLE_ISSUE in instance and instance[CLE_ISSUE] not in ISSUES:
+            problemes.append(
+                f"{nom}, issue : issue inconnue {instance[CLE_ISSUE]!r} (issues possibles : "
+                f"{', '.join(ISSUES)})"
+            )
+        if CLE_FILTRE in instance:
+            problemes.extend(
+                f"{nom}, filtre, {probleme}"
+                if probleme.startswith("condition")
+                else f"{nom}, filtre : {probleme}"
+                for probleme in _problemes_filtre(instance[CLE_FILTRE])
+            )
         type_regle = None
         if _texte_attendu(instance.get("type")):
             type_regle = TYPES.get(instance["type"])
@@ -296,30 +581,42 @@ def problemes_regles_gestion(regles) -> list[str]:
                     f"{', '.join(TYPES)})"
                 )
             continue
-        attendues = (*CLES_COMMUNES, *type_regle.parametres)
+        attendues = (*CLES_COMMUNES, *CLES_FACULTATIVES, *type_regle.parametres)
         inconnues = [str(cle) for cle in instance if cle not in attendues]
         if inconnues:
             problemes.append(
                 f"{nom} : clé inconnue {', '.join(inconnues)} (clés possibles pour le "
                 f"type {instance['type']} : {', '.join(attendues)})"
             )
-        absents = [parametre for parametre in type_regle.parametres if parametre not in instance]
+        avant_parametres = len(problemes)
+        absents = [
+            parametre
+            for parametre in type_regle.parametres
+            if parametre not in instance and parametre not in type_regle.facultatifs
+        ]
         if absents:
             problemes.append(f"{nom} : paramètre manquant ({', '.join(absents)})")
         for parametre, genre in type_regle.parametres.items():
-            if parametre in instance and not _texte_attendu(instance[parametre]):
-                problemes.append(f"{nom}, {parametre} : un nom de colonne est attendu ({genre})")
+            if parametre in instance:
+                problemes.extend(
+                    f"{nom}, {parametre} : {probleme}"
+                    for probleme in _problemes_parametre(genre, instance[parametre])
+                )
+        if type_regle.verifier is not None and len(problemes) == avant_parametres:
+            parametres = {p: instance[p] for p in type_regle.parametres if p in instance}
+            problemes.extend(f"{nom} : {probleme}" for probleme in type_regle.verifier(parametres))
         if len(problemes) > deja:
             continue
         repere = (
             instance["type"],
             instance["table"],
-            tuple(instance[parametre] for parametre in type_regle.parametres),
+            _figer({p: instance[p] for p in type_regle.parametres if p in instance}),
+            _figer(instance.get(CLE_FILTRE)),
         )
         if repere in vues:
             problemes.append(
-                f"{nom} : règle en double (même type, même table et mêmes paramètres "
-                f"que la {vues[repere]})"
+                f"{nom} : règle en double (même type, même table, mêmes paramètres et "
+                f"même filtre que la {vues[repere]})"
             )
         else:
             vues[repere] = nom
@@ -330,14 +627,21 @@ def charger_regles_gestion(chemin: str | Path | None = None) -> list:
     """Règles de gestion de config/gestion.yaml, dans l'ordre du fichier.
 
     Le fichier est écrit à la main, d'après ce que dit le métier. Sous la clé
-    `regles`, chaque règle est une instance d'un type du catalogue :
+    `regles`, chaque règle est une instance d'un type du catalogue, avec un filtre
+    et une issue facultatifs :
 
         regles:
-          - ref: decoupage
-            libelle: Date de début dans la période de l'export
-            type: date_dans_periode_export
+          - ref: R22
+            libelle: Distance imputée de 2 à 120 km
+            type: plage
             table: interventions
-            colonne: date_debut
+            colonne: distance_km
+            min: 2
+            max: 120
+            filtre:
+              - colonne: statut
+                valeurs: [Réalisée]
+            issue: anomalie
 
     Un fichier absent, ou sans clé `regles`, ne donne aucune règle. Un fichier mal
     formé est refusé, tous les problèmes étant listés en une fois.
@@ -385,7 +689,7 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
         presentes = _colonnes_de_donnees(donnees)
         type_regle = TYPES[instance["type"]]
         for parametre, genre in type_regle.parametres.items():
-            if genre not in GENRES_COLONNE:
+            if genre not in GENRES_COLONNE or parametre not in instance:
                 continue
             colonne = instance[parametre]
             if colonne not in presentes:
@@ -402,17 +706,49 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
                 )
                 continue
             nature = regles_colonne["nature"]["regle"]
-            if genre == GENRE_COLONNE_DATE and nature not in NATURES_DATE:
+            if genre in _NATURES_ATTENDUES:
+                admises, attendu = _NATURES_ATTENDUES[genre]
+                if nature not in admises:
+                    problemes.append(
+                        f"{nom}, {parametre} : la nature en vigueur de {table}.{colonne} "
+                        f"est {nature!r}, {attendu} (à trancher dans la revue du "
+                        "dictionnaire, notebook 02c_dictionnaire)"
+                    )
+        for condition in instance.get(CLE_FILTRE) or []:
+            if condition["colonne"] not in presentes:
                 problemes.append(
-                    f"{nom}, {parametre} : la nature en vigueur de {table}.{colonne} "
-                    f"est {nature!r}, une date est attendue (à trancher dans la revue "
-                    "du dictionnaire, notebook 02c_dictionnaire)"
+                    f"{nom}, filtre : colonne {table}.{condition['colonne']} absente des "
+                    "données chargées"
                 )
         if type_regle.prerequis is not None:
             probleme = type_regle.prerequis(donnees)
             if probleme:
                 problemes.append(f"{nom} : table {table}, {probleme}")
     return problemes
+
+
+def _dans_le_champ(donnees: pd.DataFrame, filtre) -> pd.Series:
+    """Vrai pour une ligne qui remplit toutes les conditions du filtre.
+
+    La valeur de la ligne est comparée telle quelle aux valeurs de la condition;
+    une cellule vide ne remplit aucune condition.
+    """
+    champ = pd.Series(True, index=donnees.index, dtype=bool)
+    for condition in filtre or []:
+        valeurs = set(condition["valeurs"])
+        champ &= donnees[condition["colonne"]].map(
+            lambda valeur: _valeur_constatee(valeur) in valeurs
+        ).astype(bool)
+    return champ
+
+
+def _texte_filtre(filtre) -> str | None:
+    """Filtre écrit pour le bilan : « statut = Réalisée ou Annulée et ... »."""
+    if not filtre:
+        return None
+    return " et ".join(
+        f"{condition['colonne']} = {' ou '.join(condition['valeurs'])}" for condition in filtre
+    )
 
 
 def _cle_ligne(donnees: pd.DataFrame) -> tuple:
@@ -475,16 +811,21 @@ def controler_gestion(
     règles, puis les tables, les colonnes et leur nature dans les données et le
     dictionnaire (`ValueError`).
 
+    Les lignes en surnombre sont écartées d'abord (selon la vue du type), puis les
+    lignes qui ne remplissent pas le filtre de la règle (hors champ).
+
     Table des écarts (`COLONNES_ECARTS_GESTION`) : une ligne par ligne source et
     par constat, avec le lignage, la référence, le type et le libellé de la règle,
-    l'issue, le constat, les colonnes en cause, la clé de la ligne, la valeur
-    constatée et la correction proposée par l'outil, le cas échéant. Clé, valeur et
-    proposition valent « masqué » dès qu'une de leurs colonnes est sensible. Les
-    écarts suivent l'ordre des règles, puis celui des lignes sources.
+    l'issue (celle de la règle, sinon celle du type), le constat, les colonnes en
+    cause, la clé de la ligne, la valeur constatée et la correction proposée par
+    l'outil, le cas échéant. Clé, valeur et proposition valent « masqué » dès
+    qu'une de leurs colonnes est sensible. Les écarts suivent l'ordre des règles,
+    puis celui des lignes sources.
 
-    Bilan (`COLONNES_BILAN_GESTION`) : une ligne par règle, avec les nombres de
-    lignes de la table, de lignes écartées comme doublons exacts en surnombre, de
-    lignes non évaluables et contrôlées, d'anomalies, d'écarts à arbitrer et
+    Bilan (`COLONNES_BILAN_GESTION`) : une ligne par règle, avec son filtre et les
+    nombres de lignes de la table, de lignes écartées comme doublons exacts en
+    surnombre, de lignes hors champ, de lignes non évaluables et contrôlées (ces
+    quatre nombres font le total), d'anomalies, d'écarts à arbitrer et
     d'informations. Les arguments ne sont pas modifiés.
     """
     if sensibles is None:
@@ -514,33 +855,40 @@ def controler_gestion(
         colonnes = _colonnes_instance(instance)
         regles_colonnes = dictionnaire[table]
         natures = {c: regles_colonnes[c]["nature"]["regle"] for c in colonnes}
+        filtre = instance.get(CLE_FILTRE)
+        issue = instance.get(CLE_ISSUE, type_regle.issue)
 
         ecartees = pd.Index([])
         if type_regle.vue == VUE_SANS_SURNOMBRE:
             ecartees = _positions_en_surnombre(doublons, table, donnees)
         vue = donnees.drop(index=ecartees)
-        parametres = {p: instance[p] for p in type_regle.parametres}
+        dans_champ = _dans_le_champ(vue, filtre)
+        hors_champ = int((~dans_champ).sum())
+        vue = vue[dans_champ]
+        parametres = {p: instance[p] for p in type_regle.parametres if p in instance}
         constats = type_regle.controler(vue, parametres, natures)
         ecarts = constats.ecarts
-        comptes = ecarts["issue"].value_counts()
         commun = {
             "ref": instance["ref"],
             "type": instance["type"],
             "libelle": instance["libelle"],
             "table": table,
         }
+        nombre = len(ecarts)
         bilan.append(
             {
                 **commun,
                 "colonnes": ", ".join(colonnes),
                 "vue": type_regle.vue,
+                "filtre": _texte_filtre(filtre),
                 "lignes": len(donnees),
                 "ecartees_doublons": len(ecartees),
+                "hors_champ": hors_champ,
                 "non_evaluables": int((~constats.evaluables).sum()),
                 "controlees": int(constats.evaluables.sum()),
-                "anomalies": int(comptes.get(ISSUE_ANOMALIE, 0)),
-                "a_arbitrer": int(comptes.get(ISSUE_A_ARBITRER, 0)),
-                "informations": int(comptes.get(ISSUE_INFORMATION, 0)),
+                "anomalies": nombre if issue == ISSUE_ANOMALIE else 0,
+                "a_arbitrer": nombre if issue == ISSUE_A_ARBITRER else 0,
+                "informations": nombre if issue == ISSUE_INFORMATION else 0,
             }
         )
         if ecarts.empty:
@@ -575,7 +923,7 @@ def controler_gestion(
             {
                 "_position": positions,
                 **commun,
-                "issue": ecarts["issue"].to_numpy(),
+                "issue": issue,
                 "constat": ecarts["constat"].to_numpy(),
                 "colonnes": ", ".join(colonnes),
                 "cle": pd.Series(cles, dtype=object).to_numpy(),
