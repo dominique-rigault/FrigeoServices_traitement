@@ -19,7 +19,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | aucun | Terminé |
 | 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 02c | Terminé |
 | 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 02c | Terminé |
-| 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 03 | À venir |
+| 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 03 | Terminé |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 04 | À venir |
 | 5 | Table des anomalies | Python, Jupyter | 05 | À venir |
 | 6 | Règles de nettoyage explicites et jeu de données nettoyé | Python, Jupyter | 06 | À venir |
@@ -39,8 +39,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 ## Structure du dépôt
 
 ```
-config/      configuration propre au client (sources, sensibilité)
-revue/            classeur de revue du dictionnaire (étape 2d)
+config/      configuration propre au client (sources, sensibilité, contrôles et doublons)
 data/        données locales, ignorées par Git
 docs/        documentation
 notebooks/   un notebook par étape (01 à 06)
@@ -75,6 +74,7 @@ data/
   raw/2026/         exports mensuels 2026
   referentiels/     intervenants, clients, fournisseurs, catalogue, paramètres
   config/           dictionnaire généré (contient des valeurs observées)
+  revue/            classeur de revue du dictionnaire (étape 2d)
 ```
 
 ## Conventions de travail
