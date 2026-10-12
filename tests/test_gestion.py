@@ -18,13 +18,17 @@ from frigeo.gestion import (
     CONSTAT_DATE_ANTERIEURE,
     CONSTAT_DATE_AVANT_PRECEDENT,
     CONSTAT_DATE_POSTERIEURE,
+    CONSTAT_DESEQUILIBRE,
+    CONSTAT_ECART_CALCUL,
     CONSTAT_HORS_HORAIRES,
     CONSTAT_INFERIEURE,
     CONSTAT_NUMEROS_MANQUANTS,
     CONSTAT_RAPPORT_INFERIEUR,
     CONSTAT_RAPPORT_NON_CALCULABLE,
     CONSTAT_RAPPORT_SUPERIEUR,
+    CONSTAT_SANS_LIGNE,
     CONSTAT_SUPERIEURE,
+    CONSTAT_TOTAL_DIFFERENT,
     ISSUE_INFORMATION,
     VUE_SANS_SURNOMBRE,
     VUE_TOUTES,
@@ -209,7 +213,7 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "règle n° 3 (decoupage) : type inconnu 'date_inconnue' (types possibles : "
         "date_dans_periode_export, plage, plage_selon_valeur, rapport_dans_plage, "
         "numerotation_continue, numerotation_chronologique, intervalles_sans_chevauchement, "
-        "hors_horaires_selon_valeur)",
+        "hors_horaires_selon_valeur, egalite_calculee, total_des_lignes, equilibre_par_groupe)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -1137,3 +1141,302 @@ def test_chargement_d_une_regle_d_horaires(tmp_path):
     chemin.write_text(texte.replace("FIN", "18:00"), encoding="utf-8")
     with pytest.raises(ValueError, match="lundi, créneau n° 1, fin : une heure HH:MM"):
         charger_regles_gestion(chemin)
+
+
+# Morceau 4c : calculs dans une ligne, totaux des lignes liées, équilibre par groupe.
+
+NATIF = "nombre natif"
+
+
+def _tva(termes=None, **autres):
+    return _instance(
+        "egalite_calculee", ref="R05", cible="tva",
+        termes={"ht": 0.2} if termes is None else termes, **autres,
+    )
+
+
+def test_egalite_calculee_avec_tolerance():
+    donnees = _table(
+        ht=[181.45, 181.45, 10.025, 10.0, -50.0, None, "x", 100.0],
+        tva=[36.29, 36.30, 2.0, 2.006, -10.0, 1.0, 1.0, ""],
+    )
+    natures = {"ht": NATIF, "tva": NATIF}
+    ecarts, bilan = _controler(donnees, natures, regles=[_tva(tolerance=0.005)])
+    # 36,29 est exactement 0,2 x 181,45; 2,005 est à 0,005 de 2 (tolérance incluse).
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (3, CONSTAT_ECART_CALCUL, "anomalie", "tva, ht",
+         "36,3 pour un calcul de 36,29 (écart 0,01)"),
+        (5, CONSTAT_ECART_CALCUL, "anomalie", "tva, ht",
+         "2,006 pour un calcul de 2 (écart 0,006)"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["non_evaluables"], resume["controlees"], resume["anomalies"]) == (3, 5, 2)
+    # Sans tolérance, l'écart d'arrondi de 0,005 en est un.
+    ecarts, _ = _controler(donnees, natures, regles=[_tva()])
+    assert _lignes(ecarts, "num_ligne_source") == [(3,), (4,), (5,)]
+
+
+def test_egalite_calculee_somme_de_plusieurs_termes():
+    donnees = _table(ht=["0,1", "10,00", "10,00"], tva=["0,2", "2,00", "2,00"],
+                     ttc=["0,3", "12,00", "12,01"])
+    ecarts, _ = _controler(
+        donnees,
+        {"ht": DECIMAL, "tva": DECIMAL, "ttc": DECIMAL},
+        regles=[_instance("egalite_calculee", ref="R05", cible="ttc",
+                          termes={"ht": 1, "tva": 1})],
+    )
+    # 0,1 + 0,2 ne fait pas un écart malgré le calcul en virgule flottante.
+    assert _lignes(ecarts, "num_ligne_source", "colonnes", "valeur") == [
+        (4, "ttc, ht, tva", "12,01 pour un calcul de 12 (écart 0,01)")
+    ]
+
+
+def _total(ref="R05", **autres):
+    parametres = {"cle": ["num"], "colonne": "total", "table_lignes": "l",
+                  "colonne_lignes": "montant", **autres}
+    return _instance("total_des_lignes", ref=ref, **parametres)
+
+
+NATURES_TOTAL = {
+    "t": {"num": "texte", "total": NATIF},
+    "l": {"num": "texte", "rang": "texte", "montant": DECIMAL},
+}
+
+
+def _dictionnaire_total(**natures):
+    dictionnaire = {}
+    for table, colonnes in {**NATURES_TOTAL, **natures}.items():
+        dictionnaire.update(_dictionnaire(table, **colonnes))
+    return dictionnaire
+
+
+def _controler_total(entetes, lignes, regles=None, sensibles=AUCUNE_SENSIBLE,
+                     dictionnaire=None, declarations=None):
+    return controler_gestion(
+        {"t": entetes, "l": lignes},
+        _dictionnaire_total() if dictionnaire is None else dictionnaire,
+        [_total()] if regles is None else regles,
+        {} if declarations is None else declarations,
+        None,
+        sensibles,
+    )
+
+
+def _entetes_et_lignes():
+    entetes = _table(
+        "e.xlsx",
+        num=["F1", "F2", "F3", "F4", "F5", "F6", "F6", "", "F1"],
+        total=[30.3, 10.0, 7.0, 5.0, "x", 1.0, 2.0, 3.0, 30.3],
+    )
+    lignes = _table(
+        "l.xlsx",
+        num=["F1", "F1", "F1", "F2", "F4", "F4", "F5", "F6", "", "F1", "G9"],
+        rang=["1", "2", "3", "1", "1", "2", "1", "1", "1", "1", "1"],
+        montant=["10,1", "10,1", "10,1", "9,99", "5,00", "", "1,00", "1,00", "4,00",
+                 "10,1", "1,00"],
+    )
+    # Le dernier en-tête F1 et la dernière ligne F1 sont des doublons exacts.
+    return entetes, lignes
+
+
+def test_total_des_lignes():
+    entetes, lignes = _entetes_et_lignes()
+    lignes = lignes.drop(index=[2])
+    ecarts, bilan = _controler_total(entetes, lignes)
+    # F1 : 10,1 + 10,1 et la copie exacte d'une ligne, écartée; F2 : 0,01 d'écart;
+    # F3 sans ligne; F4 a un montant vide; F5 un total illisible; F6 est répété.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (2, CONSTAT_TOTAL_DIFFERENT, "anomalie", "num, total, l.num, l.montant",
+         "30,3 pour une somme de 20,2 sur 2 lignes liées (écart 10,1)"),
+        (3, CONSTAT_TOTAL_DIFFERENT, "anomalie", "num, total, l.num, l.montant",
+         "10 pour une somme de 9,99 sur 1 ligne liée (écart 0,01)"),
+        (4, CONSTAT_SANS_LIGNE, "anomalie", "num, total, l.num, l.montant", "F3 | 7.0"),
+    ]
+    assert _bilan(bilan) == {
+        "ref": "R05",
+        "type": "total_des_lignes",
+        "libelle": "Plage",
+        "table": "t",
+        "colonnes": "num, total, l.num, l.montant",
+        "vue": VUE_SANS_SURNOMBRE,
+        "filtre": None,
+        "lignes": 9,
+        "ecartees_doublons": 1,
+        "hors_champ": 0,
+        "non_evaluables": 5,
+        "controlees": 3,
+        "anomalies": 3,
+        "a_arbitrer": 0,
+        "informations": 0,
+        "avertissements": None,
+    }
+
+
+def test_total_des_lignes_tolerance_et_somme_exacte():
+    entetes, lignes = _entetes_et_lignes()
+    ecarts, _ = _controler_total(entetes, lignes, regles=[_total(tolerance=0.01)])
+    # 10,1 x 3 fait 30,3 sans écart; l'écart de 0,01 de F2 est toléré.
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [(4, CONSTAT_SANS_LIGNE)]
+
+
+def test_total_des_lignes_masque_si_une_colonne_liee_est_sensible():
+    entetes, lignes = _entetes_et_lignes()
+    for sensibles in ({"l": frozenset({"montant"})}, {"t": frozenset({"total"})}):
+        ecarts, _ = _controler_total(entetes, lignes, sensibles=sensibles)
+        assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+    ecarts, _ = _controler_total(entetes, lignes, declarations={"t": {"cle": ["num"]}})
+    assert _lignes(ecarts, "cle") == [("F2",), ("F3",)]
+
+
+def _equilibre(groupe=("j", "n"), **autres):
+    return _instance(
+        "equilibre_par_groupe", ref="R06", groupe=list(groupe) if isinstance(groupe, tuple)
+        else groupe, debit="d", credit="c", **autres,
+    )
+
+
+NATURES_EQUILIBRE = {"j": "texte", "n": "texte", "d": DECIMAL, "c": DECIMAL}
+
+
+def test_equilibre_par_groupe():
+    donnees = _table(
+        j=["VT", "VT", "VT", "AC", "AC", "AC", "BQ", "BQ", "OD", "VT", "OD"],
+        n=["1", "1", "1", "1", "1", "1", "2", "2", "3", "2", " "],
+        d=["100,00", "0,00", "0,00", "0,00", "50,00", "0,00", "x", "0,00", "1,00", "5,00",
+           "1,00"],
+        c=["0,00", "80,00", "20,00", "40,00", "0,00", "0,00", "1,00", "0,00", "0,00", "0,00",
+           "0,00"],
+    )
+    ecarts, bilan = _controler(donnees, NATURES_EQUILIBRE, regles=[_equilibre()])
+    # VT 1 équilibrée; AC 1 déséquilibrée sur ses trois lignes; BQ 2 a un débit
+    # illisible; VT 2 n'a qu'une ligne au débit; un groupe fait d'espaces est vide.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (5, CONSTAT_DESEQUILIBRE, "anomalie", "j, n, d, c",
+         "AC | 1 : débit 50, crédit 40 (écart 10, 3 lignes)"),
+        (6, CONSTAT_DESEQUILIBRE, "anomalie", "j, n, d, c",
+         "AC | 1 : débit 50, crédit 40 (écart 10, 3 lignes)"),
+        (7, CONSTAT_DESEQUILIBRE, "anomalie", "j, n, d, c",
+         "AC | 1 : débit 50, crédit 40 (écart 10, 3 lignes)"),
+        (10, CONSTAT_DESEQUILIBRE, "anomalie", "j, n, d, c",
+         "OD | 3 : débit 1, crédit 0 (écart 1, 1 ligne)"),
+        (11, CONSTAT_DESEQUILIBRE, "anomalie", "j, n, d, c",
+         "VT | 2 : débit 5, crédit 0 (écart 5, 1 ligne)"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["non_evaluables"], resume["controlees"], resume["anomalies"]) == (3, 8, 5)
+    ecarts, _ = _controler(donnees, NATURES_EQUILIBRE, regles=[_equilibre(tolerance=5)])
+    assert _lignes(ecarts, "num_ligne_source") == [(5,), (6,), (7,)]
+
+
+def test_equilibre_sans_les_doublons_exacts_en_surnombre():
+    donnees = _table(j=["VT", "VT", "VT"], n=["1", "1", "1"], d=["10,00", "0,00", "0,00"],
+                     c=["0,00", "10,00", "10,00"])
+    ecarts, bilan = _controler(donnees, NATURES_EQUILIBRE, regles=[_equilibre()])
+    assert ecarts.empty
+    assert (_bilan(bilan)["ecartees_doublons"], _bilan(bilan)["controlees"]) == (1, 2)
+
+
+def test_structure_des_types_du_4c():
+    regles = [
+        _tva(termes=[]),
+        _tva(termes={"ht": "0,2", "": 1}),
+        _total(cle=[], table_lignes=""),
+        _total(cle=["num", "num"], colonne_lignes=3),
+        _equilibre(groupe="j"),
+        _equilibre(groupe=["j", 1]),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (R05), termes : un dictionnaire non vide est attendu (colonne vers "
+        "coefficient, par exemple {total_ht: 1, total_tva: 1})",
+        "règle n° 2 (R05), termes : ht : un nombre est attendu comme coefficient",
+        "règle n° 2 (R05), termes : '' n'est pas un nom de colonne",
+        "règle n° 3 (R05), cle : une liste non vide de noms de colonnes est attendue "
+        "(colonnes des deux tables)",
+        "règle n° 3 (R05), table_lignes : un nom de table est attendu",
+        "règle n° 4 (R05), cle : colonne citée deux fois",
+        "règle n° 4 (R05), colonne_lignes : un nom de colonne est attendu (colonne de "
+        "nombre de la table liée)",
+        "règle n° 5 (R06), groupe : une liste non vide de noms de colonnes est attendue "
+        "(liste de colonnes)",
+        "règle n° 6 (R06), groupe : 1 n'est pas un nom de colonne",
+    ]
+    assert problemes_regles_gestion(
+        [_tva(tolerance=-0.01), _total(tolerance=-1), _equilibre(tolerance=-1)]
+    ) == [
+        "règle n° 1 (R05) : tolerance : un nombre positif ou nul est attendu",
+        "règle n° 2 (R05) : tolerance : un nombre positif ou nul est attendu",
+        "règle n° 3 (R06) : tolerance : un nombre positif ou nul est attendu",
+    ]
+
+
+def test_table_et_colonnes_liees_confrontees_aux_donnees():
+    entetes, lignes = _entetes_et_lignes()
+    with pytest.raises(ValueError) as erreur:
+        controler_gestion(
+            {"t": entetes}, _dictionnaire_total(), [_total()], {}, None, AUCUNE_SENSIBLE
+        )
+    # La table absente n'est signalée qu'une fois, malgré ses deux colonnes citées.
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R05), table_lignes : table l absente des données chargées"
+    ]
+    with pytest.raises(ValueError) as erreur:
+        _controler_total(
+            entetes,
+            lignes.drop(columns=["num"]),
+            regles=[_total(), _total(ref="R5b", colonne_lignes="autre")],
+            dictionnaire=_dictionnaire_total(l={"num": "texte", "montant": "texte"}),
+        )
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R05), cle : colonne l.num absente des données chargées",
+        "règle n° 1 (R05), colonne_lignes : la nature en vigueur de l.montant est 'texte', "
+        "un nombre est attendu (à trancher dans la revue du dictionnaire, notebook "
+        "02c_dictionnaire)",
+        "règle n° 2 (R5b), cle : colonne l.num absente des données chargées",
+        "règle n° 2 (R5b), colonne_lignes : colonne l.autre absente des données chargées",
+    ]
+    donnees = _table(ht=[1.0], tva=[0.2])
+    with pytest.raises(ValueError) as erreur:
+        _controler(donnees, {"ht": "texte", "tva": NATIF}, regles=[_tva()])
+    assert "règle n° 1 (R05), termes : la nature en vigueur de t.ht est 'texte'" in str(
+        erreur.value
+    )
+
+
+def test_catalogue_des_types_du_4c():
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["egalite_calculee", "parametres"] == (
+        "cible (colonne de nombre), termes (termes), tolerance (nombre, facultatif)"
+    )
+    assert catalogue.loc["total_des_lignes", "parametres"] == (
+        "cle (colonnes des deux tables), colonne (colonne de nombre), table_lignes (table), "
+        "colonne_lignes (colonne de nombre de la table liée), tolerance (nombre, facultatif)"
+    )
+    assert catalogue.loc["equilibre_par_groupe", "parametres"] == (
+        "groupe (liste de colonnes), debit (colonne de nombre), credit (colonne de nombre), "
+        "tolerance (nombre, facultatif)"
+    )
+    assert list(catalogue.loc[["egalite_calculee", "total_des_lignes", "equilibre_par_groupe"],
+                              "vue"]) == [VUE_TOUTES, VUE_SANS_SURNOMBRE, VUE_SANS_SURNOMBRE]
+    assert set(catalogue.loc[["egalite_calculee", "total_des_lignes", "equilibre_par_groupe"],
+                             "issue"]) == {"anomalie"}
+
+
+def test_chargement_des_regles_du_4c(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: R05\n    libelle: TVA\n    type: egalite_calculee\n"
+        "    table: factures_entetes\n    cible: total_tva\n"
+        "    termes: {total_ht: 0.2}\n    tolerance: 0.005\n"
+        "  - ref: R05\n    libelle: Lignes\n    type: total_des_lignes\n"
+        "    table: factures_entetes\n    cle: [num_facture]\n    colonne: total_ht\n"
+        "    table_lignes: factures_lignes\n    colonne_lignes: montant_ht\n"
+        "  - ref: R06\n    libelle: Equilibre\n    type: equilibre_par_groupe\n"
+        "    table: fec\n    groupe: [JournalCode, EcritureNum]\n"
+        "    debit: Debit\n    credit: Credit\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[0]["termes"] == {"total_ht": 0.2}
+    assert regles[1]["cle"] == ["num_facture"]
+    assert regles[2]["groupe"] == ["JournalCode", "EcritureNum"]

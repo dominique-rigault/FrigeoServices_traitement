@@ -32,6 +32,11 @@ lignage), ou les lignes sans les doublons exacts en surnombre, pour un type qui
 compare, cumule ou rapproche des lignes (la première ligne de chaque groupe de
 doublons exacts est gardée).
 
+Un type peut rapprocher la table de la règle d'une autre table, sa table liée (par
+exemple les en-têtes de factures et leurs lignes) : la vue s'applique aux deux
+tables, le filtre à la seule table de la règle, et les écarts sont portés par les
+lignes de la table de la règle.
+
 Rien n'est corrigé ni écrit : `controler_gestion` rend la table des écarts et un
 bilan.
 """
@@ -102,6 +107,19 @@ GENRE_COMPARAISON = "comparaison"
 GENRE_HORAIRES = "horaires"
 GENRE_FERIES = "jours fériés"
 GENRE_VALEURS = "liste de valeurs"
+GENRE_COLONNES = "liste de colonnes"
+GENRE_TERMES = "termes"
+GENRE_TABLE = "table"
+# Colonnes de la table liée (nommée par un paramètre de genre « table »), avec le
+# genre de colonne qui dit leur nature attendue.
+GENRE_COLONNE_LIEE = "colonne de la table liée"
+GENRE_COLONNE_NOMBRE_LIEE = "colonne de nombre de la table liée"
+GENRES_COLONNE_LIEE = {
+    GENRE_COLONNE_LIEE: GENRE_COLONNE,
+    GENRE_COLONNE_NOMBRE_LIEE: GENRE_COLONNE_NOMBRE,
+}
+# Colonnes de même nom dans la table de la règle et dans la table liée.
+GENRE_COLONNES_COMMUNES = "colonnes des deux tables"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
 _NATURES_ATTENDUES = {
     GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
@@ -199,7 +217,9 @@ class TypeRegle:
     table, None s'il n'y en a pas. `verifier(parametres)` rend les problèmes
     propres au type (par exemple un minimum supérieur au maximum), une fois chaque
     paramètre vérifié selon son genre. `issue` : issue des écarts quand la règle
-    n'en déclare pas.
+    n'en déclare pas. `table_liee` : nom du paramètre qui désigne la table liée,
+    pour un type qui rapproche deux tables; `controler` reçoit alors aussi la table
+    liée (`Liee`), prise selon la même vue.
     """
 
     description: str
@@ -210,6 +230,17 @@ class TypeRegle:
     facultatifs: tuple = ()
     verifier: Callable | None = None
     issue: str = ISSUE_ANOMALIE
+    table_liee: str | None = None
+
+
+@dataclass(frozen=True)
+class Liee:
+    """Table liée d'une règle : son nom, sa vue (index = position des lignes dans la
+    table) et la nature en vigueur des colonnes citées par la règle."""
+
+    table: str
+    donnees: pd.DataFrame
+    natures: dict
 
 
 def _ecarts(
@@ -724,6 +755,172 @@ def _hors_horaires_selon_valeur(donnees, parametres, natures) -> Constats:
     return Constats(evaluables, _ecarts(constats, valeurs=valeurs), tuple(avertissements))
 
 
+# Les calculs sont arrondis avant d'être comparés à leur tolérance, pour qu'une
+# erreur de calcul en virgule flottante ne crée pas un écart.
+_DECIMALES_CALCUL = 9
+CONSTAT_ECART_CALCUL = "écart au calcul supérieur à la tolérance"
+CONSTAT_TOTAL_DIFFERENT = "total différent de la somme des lignes liées"
+CONSTAT_SANS_LIGNE = "aucune ligne liée"
+CONSTAT_DESEQUILIBRE = "groupe non équilibré"
+
+
+def _ecrire_nombre(valeur: float) -> str:
+    """Nombre écrit avec une virgule décimale, sans zéro inutile (« 36,3 », « -0,05 »)."""
+    texte = f"{round(valeur, _DECIMALES_CALCUL):.{_DECIMALES_CALCUL}f}".rstrip("0").rstrip(".")
+    return ("0" if texte == "-0" else texte).replace(".", ",")
+
+
+def _cles_lues(donnees: pd.DataFrame, colonnes: list[str]) -> pd.Series:
+    """Clé de chaque ligne (textes de ses colonnes), None si l'une d'elles est vide."""
+
+    def cle(ligne):
+        textes = tuple(_valeur_constatee(valeur) for valeur in ligne)
+        return None if any(t is None or not t.strip() for t in textes) else textes
+
+    return pd.Series(
+        [cle(ligne) for ligne in donnees[colonnes].itertuples(index=False)],
+        index=donnees.index,
+        dtype=object,
+    )
+
+
+def _egalite_calculee(donnees, parametres, natures) -> Constats:
+    """Valeur d'une colonne égale à un calcul sur la même ligne, à la tolérance près.
+
+    Le calcul est la somme des colonnes de `termes`, chacune multipliée par son
+    coefficient. Un écart (valeur moins calcul) dont la valeur absolue dépasse la
+    tolérance est un écart; la valeur affichée donne la valeur, le calcul et
+    l'écart. Une valeur vide ou illisible, dans la cible ou dans un terme, rend la
+    ligne non évaluable.
+    """
+    cible = parametres["cible"]
+    valeurs = lire(donnees[cible], natures[cible]).valeurs
+    calcul = pd.Series(0.0, index=donnees.index)
+    for colonne, coefficient in parametres["termes"].items():
+        calcul = calcul + coefficient * lire(donnees[colonne], natures[colonne]).valeurs
+    evaluables = (valeurs.notna() & calcul.notna()).astype(bool)
+    differences = (valeurs - calcul).round(_DECIMALES_CALCUL)
+    en_ecart = evaluables & (differences.abs() > parametres.get("tolerance", 0))
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position in donnees.index[en_ecart.to_numpy(dtype=bool)]:
+        constats.loc[position] = CONSTAT_ECART_CALCUL
+        affichees.loc[position] = (
+            f"{_ecrire_nombre(valeurs.loc[position])} pour un calcul de "
+            f"{_ecrire_nombre(calcul.loc[position])} (écart "
+            f"{_ecrire_nombre(differences.loc[position])})"
+        )
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees))
+
+
+def _total_des_lignes(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Total de chaque ligne égal à la somme des lignes liées de même clé.
+
+    Les lignes liées sont celles de la table liée qui ont la même clé (comparée
+    telle quelle; une ligne liée à clé vide n'est rattachée à rien). Une ligne sans
+    aucune ligne liée est un écart. Une clé vide ou répétée dans la table, un total
+    vide ou illisible, ou un montant vide ou illisible parmi les lignes liées,
+    rendent la ligne non évaluable. Un écart dont la valeur absolue dépasse la
+    tolérance est un écart; la valeur affichée donne le total, la somme, le nombre
+    de lignes liées et l'écart.
+    """
+    cle, colonne = parametres["cle"], parametres["colonne"]
+    colonne_lignes = parametres["colonne_lignes"]
+    totaux = lire(donnees[colonne], natures[colonne]).valeurs
+    cles = _cles_lues(donnees, cle)
+    montants = lire(liee.donnees[colonne_lignes], liee.natures[colonne_lignes]).valeurs
+    sommes, nombres, illisibles = {}, {}, set()
+    for cle_ligne, montant in zip(_cles_lues(liee.donnees, cle), montants):
+        if cle_ligne is None:
+            continue
+        nombres[cle_ligne] = nombres.get(cle_ligne, 0) + 1
+        if pd.isna(montant):
+            illisibles.add(cle_ligne)
+        else:
+            sommes[cle_ligne] = sommes.get(cle_ligne, 0.0) + montant
+    repetees = cles.notna() & cles.duplicated(keep=False)
+    tolerance = parametres.get("tolerance", 0)
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle_ligne, total, repetee in zip(donnees.index, cles, totaux, repetees):
+        if cle_ligne is None or repetee:
+            continue
+        if cle_ligne not in nombres:
+            evaluables.loc[position] = True
+            constats.loc[position] = CONSTAT_SANS_LIGNE
+            continue
+        if pd.isna(total) or cle_ligne in illisibles:
+            continue
+        evaluables.loc[position] = True
+        somme = sommes[cle_ligne]
+        difference = round(total - somme, _DECIMALES_CALCUL)
+        if abs(difference) > tolerance:
+            constats.loc[position] = CONSTAT_TOTAL_DIFFERENT
+            affichees.loc[position] = (
+                f"{_ecrire_nombre(total)} pour une somme de {_ecrire_nombre(somme)} sur "
+                + _pluriel(nombres[cle_ligne], "ligne liée", "lignes liées")
+                + f" (écart {_ecrire_nombre(difference)})"
+            )
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees))
+
+
+def _equilibre_par_groupe(donnees, parametres, natures) -> Constats:
+    """Somme de debit égale à la somme de credit dans chaque groupe de lignes.
+
+    Un groupe réunit les lignes de même valeur dans les colonnes de `groupe`
+    (comparées telles quelles). Chaque ligne d'un groupe dont l'écart (débit moins
+    crédit) dépasse la tolérance en valeur absolue est un écart; la valeur affichée
+    donne le groupe, ses totaux, l'écart et son nombre de lignes. Une ligne à
+    groupe vide est non évaluable; un débit ou un crédit vide ou illisible rend
+    toutes les lignes de son groupe non évaluables.
+    """
+    colonne_debit, colonne_credit = parametres["debit"], parametres["credit"]
+    debits = lire(donnees[colonne_debit], natures[colonne_debit]).valeurs
+    credits = lire(donnees[colonne_credit], natures[colonne_credit]).valeurs
+    cles = _cles_lues(donnees, parametres["groupe"])
+    groupes = {}
+    for cle_ligne, debit, credit in zip(cles, debits, credits):
+        if cle_ligne is None:
+            continue
+        groupe = groupes.setdefault(cle_ligne, {"debit": 0.0, "credit": 0.0, "lignes": 0,
+                                                 "lisible": True})
+        groupe["lignes"] += 1
+        if pd.isna(debit) or pd.isna(credit):
+            groupe["lisible"] = False
+        else:
+            groupe["debit"] += debit
+            groupe["credit"] += credit
+    tolerance = parametres.get("tolerance", 0)
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle_ligne in zip(donnees.index, cles):
+        if cle_ligne is None or not groupes[cle_ligne]["lisible"]:
+            continue
+        evaluables.loc[position] = True
+        groupe = groupes[cle_ligne]
+        difference = round(groupe["debit"] - groupe["credit"], _DECIMALES_CALCUL)
+        if abs(difference) > tolerance:
+            constats.loc[position] = CONSTAT_DESEQUILIBRE
+            affichees.loc[position] = (
+                f"{SEPARATEUR.join(cle_ligne)} : débit {_ecrire_nombre(groupe['debit'])}, "
+                f"crédit {_ecrire_nombre(groupe['credit'])} (écart "
+                f"{_ecrire_nombre(difference)}, "
+                + _pluriel(groupe["lignes"], "ligne", "lignes")
+                + ")"
+            )
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees))
+
+
+def _verifier_tolerance(parametres: dict) -> list[str]:
+    if parametres.get("tolerance", 0) < 0:
+        return ["tolerance : un nombre positif ou nul est attendu"]
+    return []
+
+
 def _entier_positif(parametres: dict, nom: str) -> list[str]:
     valeur = parametres.get(nom)
     if valeur is not None and (valeur < 0 or not float(valeur).is_integer()):
@@ -884,6 +1081,62 @@ TYPES = {
         facultatifs=("feries_minimum",),
         verifier=_verifier_horaires,
     ),
+    "egalite_calculee": TypeRegle(
+        description=(
+            "La valeur de cible égale, à tolerance près (0 par défaut), la somme des "
+            "colonnes de termes multipliées chacune par son coefficient; par exemple "
+            "total_ttc égale total_ht + total_tva avec termes {total_ht: 1, "
+            "total_tva: 1}."
+        ),
+        parametres={
+            "cible": GENRE_COLONNE_NOMBRE,
+            "termes": GENRE_TERMES,
+            "tolerance": GENRE_NOMBRE,
+        },
+        vue=VUE_TOUTES,
+        controler=_egalite_calculee,
+        facultatifs=("tolerance",),
+        verifier=_verifier_tolerance,
+    ),
+    "total_des_lignes": TypeRegle(
+        description=(
+            "La valeur de colonne égale, à tolerance près (0 par défaut), la somme de "
+            "colonne_lignes sur les lignes de table_lignes de même clé (cle, colonnes de "
+            "même nom dans les deux tables). Une ligne sans aucune ligne liée est un "
+            "écart; une clé répétée, ou un montant illisible parmi les lignes liées, "
+            "rend la ligne non évaluable."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES_COMMUNES,
+            "colonne": GENRE_COLONNE_NOMBRE,
+            "table_lignes": GENRE_TABLE,
+            "colonne_lignes": GENRE_COLONNE_NOMBRE_LIEE,
+            "tolerance": GENRE_NOMBRE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_total_des_lignes,
+        facultatifs=("tolerance",),
+        verifier=_verifier_tolerance,
+        table_liee="table_lignes",
+    ),
+    "equilibre_par_groupe": TypeRegle(
+        description=(
+            "Dans chaque groupe de lignes de même valeur de groupe (une ou plusieurs "
+            "colonnes), la somme de debit égale la somme de credit, à tolerance près (0 "
+            "par défaut). Chaque ligne d'un groupe non équilibré est un écart; un "
+            "montant vide ou illisible rend tout son groupe non évaluable."
+        ),
+        parametres={
+            "groupe": GENRE_COLONNES,
+            "debit": GENRE_COLONNE_NOMBRE,
+            "credit": GENRE_COLONNE_NOMBRE,
+            "tolerance": GENRE_NOMBRE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_equilibre_par_groupe,
+        facultatifs=("tolerance",),
+        verifier=_verifier_tolerance,
+    ),
 }
 
 
@@ -923,13 +1176,50 @@ def _texte_attendu(valeur) -> bool:
     return isinstance(valeur, str) and valeur.strip() != ""
 
 
-def _colonnes_instance(instance: dict) -> list[str]:
-    """Colonnes citées par une instance, dans l'ordre des paramètres de son type."""
-    return [
-        instance[parametre]
-        for parametre, genre in TYPES[instance["type"]].parametres.items()
-        if genre in GENRES_COLONNE and parametre in instance
-    ]
+def _references(instance: dict) -> list[tuple[str, str, str, str]]:
+    """Colonnes citées par une instance : (paramètre, table, colonne, genre de colonne).
+
+    Dans l'ordre des paramètres de son type. Le genre de colonne dit la nature
+    attendue (`GENRE_COLONNE` : aucune). Une colonne de la table liée est rattachée
+    à la table que nomme le paramètre `table_liee` du type.
+    """
+    type_regle = TYPES[instance["type"]]
+    table = instance["table"]
+    liee = instance.get(type_regle.table_liee) if type_regle.table_liee else None
+    references = []
+    for parametre, genre in type_regle.parametres.items():
+        if parametre not in instance:
+            continue
+        valeur = instance[parametre]
+        if genre in GENRES_COLONNE:
+            references.append((parametre, table, valeur, genre))
+        elif genre == GENRE_COLONNES:
+            references.extend((parametre, table, colonne, GENRE_COLONNE) for colonne in valeur)
+        elif genre == GENRE_TERMES:
+            references.extend(
+                (parametre, table, colonne, GENRE_COLONNE_NOMBRE) for colonne in valeur
+            )
+        elif genre == GENRE_COLONNES_COMMUNES:
+            for nom_table in (table, liee):
+                references.extend(
+                    (parametre, nom_table, colonne, GENRE_COLONNE) for colonne in valeur
+                )
+        elif genre in GENRES_COLONNE_LIEE:
+            references.append((parametre, liee, valeur, GENRES_COLONNE_LIEE[genre]))
+    return references
+
+
+def _colonnes_instance(instance: dict, table: str | None = None) -> list[str]:
+    """Colonnes citées par une instance dans une table (la sienne par défaut).
+
+    Dans l'ordre des paramètres de son type, chaque colonne une seule fois.
+    """
+    table = instance["table"] if table is None else table
+    colonnes = []
+    for _, nom_table, colonne, _ in _references(instance):
+        if nom_table == table and colonne not in colonnes:
+            colonnes.append(colonne)
+    return colonnes
 
 
 def _problemes_parametre(genre: str, valeur) -> list[str]:
@@ -966,6 +1256,34 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
             for element in valeur
             if not _texte_attendu(element)
         ]
+    if genre in (GENRE_COLONNES, GENRE_COLONNES_COMMUNES):
+        if not isinstance(valeur, list) or not valeur:
+            return [f"une liste non vide de noms de colonnes est attendue ({genre})"]
+        problemes = [
+            f"{element!r} n'est pas un nom de colonne"
+            for element in valeur
+            if not _texte_attendu(element)
+        ]
+        if not problemes and len(set(valeur)) < len(valeur):
+            problemes.append("colonne citée deux fois")
+        return problemes
+    if genre == GENRE_TABLE:
+        return [] if _texte_attendu(valeur) else ["un nom de table est attendu"]
+    if genre in GENRES_COLONNE_LIEE:
+        return [] if _texte_attendu(valeur) else [f"un nom de colonne est attendu ({genre})"]
+    if genre == GENRE_TERMES:
+        if not isinstance(valeur, dict) or not valeur:
+            return [
+                "un dictionnaire non vide est attendu (colonne vers coefficient, par "
+                "exemple {total_ht: 1, total_tva: 1})"
+            ]
+        problemes = []
+        for colonne, coefficient in valeur.items():
+            if not _texte_attendu(colonne):
+                problemes.append(f"{colonne!r} n'est pas un nom de colonne")
+            elif not _est_nombre(coefficient):
+                problemes.append(f"{colonne} : un nombre est attendu comme coefficient")
+        return problemes
     if genre == GENRE_HORAIRES:
         return _problemes_horaires(valeur)
     if genre == GENRE_FERIES:
@@ -1250,20 +1568,26 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
         donnees = tables[table]
         presentes = _colonnes_de_donnees(donnees)
         type_regle = TYPES[instance["type"]]
-        for parametre, genre in type_regle.parametres.items():
-            if genre not in GENRES_COLONNE or parametre not in instance:
+        absentes = set()
+        for parametre, nom_table, colonne, genre in _references(instance):
+            if nom_table not in tables:
+                if nom_table not in absentes:
+                    problemes.append(
+                        f"{nom}, {type_regle.table_liee} : table {nom_table} absente des "
+                        "données chargées"
+                    )
+                    absentes.add(nom_table)
                 continue
-            colonne = instance[parametre]
-            if colonne not in presentes:
+            if colonne not in _colonnes_de_donnees(tables[nom_table]):
                 problemes.append(
-                    f"{nom}, {parametre} : colonne {table}.{colonne} absente des données "
+                    f"{nom}, {parametre} : colonne {nom_table}.{colonne} absente des données "
                     "chargées"
                 )
                 continue
-            regles_colonne = dictionnaire.get(table, {}).get(colonne)
+            regles_colonne = dictionnaire.get(nom_table, {}).get(colonne)
             if regles_colonne is None:
                 problemes.append(
-                    f"{nom}, {parametre} : colonne {table}.{colonne} absente du "
+                    f"{nom}, {parametre} : colonne {nom_table}.{colonne} absente du "
                     "dictionnaire, à régénérer (notebook 02c_dictionnaire)"
                 )
                 continue
@@ -1272,7 +1596,7 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
                 admises, attendu = _NATURES_ATTENDUES[genre]
                 if nature not in admises:
                     problemes.append(
-                        f"{nom}, {parametre} : la nature en vigueur de {table}.{colonne} "
+                        f"{nom}, {parametre} : la nature en vigueur de {nom_table}.{colonne} "
                         f"est {nature!r}, {attendu} (à trancher dans la revue du "
                         "dictionnaire, notebook 02c_dictionnaire)"
                     )
@@ -1374,7 +1698,9 @@ def controler_gestion(
     dictionnaire (`ValueError`).
 
     Les lignes en surnombre sont écartées d'abord (selon la vue du type), puis les
-    lignes qui ne remplissent pas le filtre de la règle (hors champ).
+    lignes qui ne remplissent pas le filtre de la règle (hors champ). Pour un type
+    qui rapproche deux tables, la table liée est prise selon la même vue, sans
+    filtre; ses colonnes sont écrites « table.colonne » dans la colonne `colonnes`.
 
     Table des écarts (`COLONNES_ECARTS_GESTION`) : une ligne par ligne source et
     par constat, avec le lignage, la référence, le type et le libellé de la règle,
@@ -1431,7 +1757,26 @@ def controler_gestion(
         hors_champ = int((~dans_champ).sum())
         vue = vue[dans_champ]
         parametres = {p: instance[p] for p in type_regle.parametres if p in instance}
-        constats = type_regle.controler(vue, parametres, natures)
+        liee, colonnes_liees = None, []
+        if type_regle.table_liee is not None:
+            nom_liee = instance[type_regle.table_liee]
+            colonnes_liees = _colonnes_instance(instance, nom_liee)
+            donnees_liees = tables[nom_liee].reset_index(drop=True)
+            if type_regle.vue == VUE_SANS_SURNOMBRE:
+                donnees_liees = donnees_liees.drop(
+                    index=_positions_en_surnombre(doublons, nom_liee, donnees_liees)
+                )
+            liee = Liee(
+                nom_liee,
+                donnees_liees,
+                {c: dictionnaire[nom_liee][c]["nature"]["regle"] for c in colonnes_liees},
+            )
+            constats = type_regle.controler(vue, parametres, natures, liee)
+        else:
+            constats = type_regle.controler(vue, parametres, natures)
+        texte_colonnes = ", ".join(
+            [*colonnes, *(f"{liee.table}.{colonne}" for colonne in colonnes_liees)]
+        )
         ecarts = constats.ecarts
         commun = {
             "ref": instance["ref"],
@@ -1443,7 +1788,7 @@ def controler_gestion(
         bilan.append(
             {
                 **commun,
-                "colonnes": ", ".join(colonnes),
+                "colonnes": texte_colonnes,
                 "vue": type_regle.vue,
                 "filtre": _texte_filtre(filtre),
                 "lignes": len(donnees),
@@ -1471,7 +1816,11 @@ def controler_gestion(
                 SEPARATEUR.join(_texte(v) for v in ligne)
                 for ligne in donnees.loc[positions, cle].itertuples(index=False)
             ]
-        if _sensible(sensibles, table, regles_colonnes, colonnes):
+        sensible = _sensible(sensibles, table, regles_colonnes, colonnes) or (
+            liee is not None
+            and _sensible(sensibles, liee.table, dictionnaire[liee.table], colonnes_liees)
+        )
+        if sensible:
             valeurs = [VALEUR_MASQUEE] * len(positions)
             propositions = [
                 None if proposition is None else VALEUR_MASQUEE
@@ -1496,7 +1845,7 @@ def controler_gestion(
                 **commun,
                 "issue": issue,
                 "constat": ecarts["constat"].to_numpy(),
-                "colonnes": ", ".join(colonnes),
+                "colonnes": texte_colonnes,
                 "cle": pd.Series(cles, dtype=object).to_numpy(),
                 "valeur": pd.Series(valeurs, dtype=object).to_numpy(),
                 "proposition": pd.Series(propositions, dtype=object).to_numpy(),
