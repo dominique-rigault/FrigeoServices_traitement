@@ -28,3 +28,45 @@ regles:
     type: date_dans_periode_export
     table: fec
     colonne: EcritureDate
+
+  - ref: R02
+    libelle: Durée sur site dans la plage de sa catégorie
+    type: plage_selon_valeur
+    table: interventions
+    colonne: duree_min
+    selon: categorie
+    plages:
+      Intervention préventive: {min: 45, max: 150}
+      Maintenance: {min: 45, max: 240}
+      Dépannage: {min: 30, max: 300}
+      Contrôle: {min: 30, max: 90}
+      Installation: {min: 120, max: 600}
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+    issue: anomalie
+  - ref: R22
+    libelle: Distance imputée de 2 à 120 km
+    type: plage
+    table: interventions
+    colonne: distance_km
+    min: 2
+    max: 120
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+    issue: anomalie
+  - ref: R22
+    libelle: Vitesse du trajet imputé de 30 à 70 km/h
+    type: rapport_dans_plage
+    table: interventions
+    numerateur: distance_km
+    denominateur: duree_trajet_min
+    facteur: 60
+    min: 30
+    max: 70
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+    issue: anomalie
+
