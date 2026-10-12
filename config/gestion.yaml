@@ -70,3 +70,17 @@ regles:
         valeurs: [Réalisée]
     issue: anomalie
 
+  - ref: R01
+    libelle: Numérotation des interventions sans trou par année
+    type: numerotation_continue
+    table: interventions
+    colonne: id_intervention
+    motif: 'INT-(?P<annee>\d{4})-(?P<numero>\d{6})'
+    debut: 1
+  - ref: R01
+    libelle: Numérotation des interventions dans l'ordre des dates
+    type: numerotation_chronologique
+    table: interventions
+    colonne: id_intervention
+    motif: 'INT-(?P<annee>\d{4})-(?P<numero>\d{6})'
+    date: date_debut
