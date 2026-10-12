@@ -1,0 +1,30 @@
+# Règles de gestion propres au client, écrites à la main d'après ce que dit le métier.
+# Chaque règle est une instance d'un type du catalogue (voir frigeo.gestion.catalogue_types) :
+# ref (référence de la règle), libelle (texte affiché), type, table, puis les paramètres du type.
+# Une règle qui n'entre dans aucun type demande un nouveau type générique dans src/.
+regles:
+  - ref: decoupage
+    libelle: Date de début dans la période de l'export
+    type: date_dans_periode_export
+    table: interventions
+    colonne: date_debut
+  - ref: decoupage
+    libelle: Date de l'intervention dans la période de l'export
+    type: date_dans_periode_export
+    table: pieces_interventions
+    colonne: date_sortie
+  - ref: decoupage
+    libelle: Date de facture dans la période de l'export
+    type: date_dans_periode_export
+    table: factures_entetes
+    colonne: date_facture
+  - ref: decoupage
+    libelle: Date de facture fournisseur dans la période de l'export
+    type: date_dans_periode_export
+    table: achats_entetes
+    colonne: date_facture
+  - ref: decoupage
+    libelle: Date d'écriture dans la période de l'export
+    type: date_dans_periode_export
+    table: fec
+    colonne: EcritureDate
