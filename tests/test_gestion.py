@@ -12,9 +12,12 @@ from frigeo.gestion import (
     COLONNES_BILAN_GESTION,
     COLONNES_CATALOGUE,
     COLONNES_ECARTS_GESTION,
+    CONSTAT_ANNEE_DU_NUMERO,
     CONSTAT_DATE_ANTERIEURE,
+    CONSTAT_DATE_AVANT_PRECEDENT,
     CONSTAT_DATE_POSTERIEURE,
     CONSTAT_INFERIEURE,
+    CONSTAT_NUMEROS_MANQUANTS,
     CONSTAT_RAPPORT_INFERIEUR,
     CONSTAT_RAPPORT_NON_CALCULABLE,
     CONSTAT_RAPPORT_SUPERIEUR,
@@ -200,7 +203,8 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "règle n° 1 : un dictionnaire de clés est attendu",
         "règle n° 2 (R1) : clé manquante (type)",
         "règle n° 3 (decoupage) : type inconnu 'date_inconnue' (types possibles : "
-        "date_dans_periode_export, plage, plage_selon_valeur, rapport_dans_plage)",
+        "date_dans_periode_export, plage, plage_selon_valeur, rapport_dans_plage, "
+        "numerotation_continue, numerotation_chronologique)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -672,3 +676,172 @@ def test_chargement_d_une_regle_avec_filtre(tmp_path):
             "issue": "anomalie",
         }
     ]
+
+
+# Morceau 4b2 : numérotation continue et chronologique.
+
+MOTIF_SERIES = r"(?P<prefixe>[AB])-(?P<annee>\d{4})-(?P<numero>\d{3})"
+MOTIF_INT = r"INT-(?P<annee>\d{4})-(?P<numero>\d{3})"
+DATE = "date JJ/MM/AAAA"
+
+
+def _numeros_a_trous():
+    # La dernière ligne est la copie exacte de la deuxième.
+    return _table(
+        num=["A-2025-001", "A-2025-002", "A-2025-004", "A-2025-007", "A-2025-007",
+             "A-2025-010", "A-2025-009", "B-2025-003", "", "A-2025-0011", "A-2025-002"],
+        x=["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "b"],
+    )
+
+
+def test_numerotation_continue():
+    regle = _instance("numerotation_continue", "R01", colonne="num", motif=MOTIF_SERIES)
+    ecarts, bilan = _controler(_numeros_a_trous(), {"num": "texte"}, regles=[regle])
+    # Un trou est porté par la première ligne du numéro qui le suit, dans l'ordre
+    # des numéros et non dans celui des lignes; un numéro répété ne crée pas de trou.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (4, CONSTAT_NUMEROS_MANQUANTS, "anomalie", "num", "A-2025-003 (1 numéro)"),
+        (5, CONSTAT_NUMEROS_MANQUANTS, "anomalie", "num",
+         "A-2025-005 à A-2025-006 (2 numéros)"),
+        (8, CONSTAT_NUMEROS_MANQUANTS, "anomalie", "num", "A-2025-008 (1 numéro)"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["vue"], resume["lignes"], resume["ecartees_doublons"]) == (
+        VUE_SANS_SURNOMBRE, 11, 1,
+    )
+    # Une valeur vide ou qui ne suit pas le motif sur toute sa longueur est non
+    # évaluable.
+    assert (resume["non_evaluables"], resume["controlees"], resume["anomalies"]) == (2, 8, 3)
+
+
+def test_numerotation_continue_avec_un_debut():
+    regle = _instance("numerotation_continue", "R01", colonne="num", motif=MOTIF_SERIES,
+                      debut=1)
+    ecarts, _ = _controler(_numeros_a_trous(), {"num": "texte"}, regles=[regle])
+    assert _lignes(ecarts, "num_ligne_source", "valeur") == [
+        (4, "A-2025-003 (1 numéro)"),
+        (5, "A-2025-005 à A-2025-006 (2 numéros)"),
+        (8, "A-2025-008 (1 numéro)"),
+        (9, "B-2025-001 à B-2025-002 (2 numéros)"),
+    ]
+    # Un numéro inférieur au début ne fait pas de trou.
+    regle["debut"] = 3
+    ecarts, _ = _controler(_numeros_a_trous(), {"num": "texte"}, regles=[regle])
+    assert _lignes(ecarts, "num_ligne_source") == [(4,), (5,), (8,)]
+
+
+def test_plage_manquante_masquee_si_la_colonne_est_sensible():
+    regle = _instance("numerotation_continue", "R01", colonne="num", motif=MOTIF_SERIES)
+    ecarts, _ = _controler(_numeros_a_trous(), {"num": "texte"}, regles=[regle],
+                           sensibles={"t": frozenset({"num"})})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+
+
+def _numeros_dates():
+    return _table(
+        num=["INT-2025-001", "INT-2025-002", "INT-2025-003", "INT-2025-004", "INT-2025-005",
+             "INT-2025-006", "INT-2025-006", "INT-2025-007", "INT-2025-008", "INT-2026-001",
+             "INT-2026-002", "X"],
+        d=["10/01/2025", "09/01/2025", "14/03/2052", "15/01/2025", "", "16/01/2025",
+           "01/01/2025", "10/01/2025", "10/01/2025", "31/12/2025", "05/01/2025",
+           "01/01/2025"],
+    )
+
+
+def test_numerotation_chronologique():
+    regle = _instance("numerotation_chronologique", "R01", colonne="num", motif=MOTIF_INT,
+                      date="d")
+    ecarts, bilan = _controler(_numeros_dates(), {"num": "texte", "d": DATE}, regles=[regle])
+    # La ligne 6 (numéro 5 sans date) est sautée : le numéro 6 est comparé au 4.
+    # Chaque ligne d'un numéro répété est jugée, mais seule la première représente
+    # ce numéro pour le suivant. Une date égale n'est pas un écart. Une ligne peut
+    # porter deux écarts.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (3, CONSTAT_DATE_AVANT_PRECEDENT, "à arbitrer", "num, d",
+         "09/01/2025 (numéro précédent INT-2025-001 : 10/01/2025)"),
+        (4, CONSTAT_ANNEE_DU_NUMERO, "à arbitrer", "num, d", "INT-2025-003 | 14/03/2052"),
+        (5, CONSTAT_DATE_AVANT_PRECEDENT, "à arbitrer", "num, d",
+         "15/01/2025 (numéro précédent INT-2025-003 : 14/03/2052)"),
+        (8, CONSTAT_DATE_AVANT_PRECEDENT, "à arbitrer", "num, d",
+         "01/01/2025 (numéro précédent INT-2025-004 : 15/01/2025)"),
+        (9, CONSTAT_DATE_AVANT_PRECEDENT, "à arbitrer", "num, d",
+         "10/01/2025 (numéro précédent INT-2025-006 : 16/01/2025)"),
+        (11, CONSTAT_ANNEE_DU_NUMERO, "à arbitrer", "num, d", "INT-2026-001 | 31/12/2025"),
+        (12, CONSTAT_DATE_AVANT_PRECEDENT, "à arbitrer", "num, d",
+         "05/01/2025 (numéro précédent INT-2026-001 : 31/12/2025)"),
+        (12, CONSTAT_ANNEE_DU_NUMERO, "à arbitrer", "num, d", "INT-2026-002 | 05/01/2025"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["non_evaluables"], resume["controlees"], resume["a_arbitrer"]) == (2, 10, 8)
+    assert resume["anomalies"] == 0
+
+
+def test_numerotation_chronologique_sans_groupe_annee():
+    regle = _instance("numerotation_chronologique", "R01", colonne="num",
+                      motif=r"INT-(?P<an>\d{4})-(?P<numero>\d{3})", date="d")
+    ecarts, _ = _controler(_numeros_dates(), {"num": "texte", "d": DATE}, regles=[regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (3, CONSTAT_DATE_AVANT_PRECEDENT),
+        (5, CONSTAT_DATE_AVANT_PRECEDENT),
+        (8, CONSTAT_DATE_AVANT_PRECEDENT),
+        (9, CONSTAT_DATE_AVANT_PRECEDENT),
+        (12, CONSTAT_DATE_AVANT_PRECEDENT),
+    ]
+
+
+def test_numero_qui_n_est_pas_fait_de_chiffres_non_evaluable():
+    donnees = _table(num=["N01", "NAB", "N03"])
+    regle = _instance("numerotation_continue", "R01", colonne="num", motif=r"N(?P<numero>\w{2})")
+    ecarts, bilan = _controler(donnees, {"num": "texte"}, regles=[regle])
+    assert _lignes(ecarts, "num_ligne_source", "valeur") == [(4, "N02 (1 numéro)")]
+    assert (_bilan(bilan)["non_evaluables"], _bilan(bilan)["controlees"]) == (1, 2)
+
+
+def test_structure_des_regles_de_numerotation():
+    regles = [
+        _instance("numerotation_continue", colonne="n", motif=r"INT-(\d+"),
+        _instance("numerotation_continue", colonne="n", motif=r"INT-(?P<annee>\d{4})"),
+        _instance("numerotation_continue", colonne="n", motif=12),
+        _instance("numerotation_continue", colonne="n", motif=r"(?P<numero>\d+)", debut=-1),
+        _instance("numerotation_continue", colonne="n", motif=r"(?P<numero>\d+)", debut=1.5),
+        _instance("numerotation_chronologique", colonne="n", motif=r"(?P<numero>\d+)"),
+    ]
+    problemes = problemes_regles_gestion(regles)
+    assert len(problemes) == 6
+    assert problemes[0].startswith("règle n° 1 (R22), motif : expression régulière invalide (")
+    assert problemes[1:] == [
+        "règle n° 2 (R22), motif : groupe nommé numero attendu, par exemple "
+        r"(?P<numero>\d{6})",
+        "règle n° 3 (R22), motif : une expression régulière est attendue",
+        "règle n° 4 (R22) : debut : un entier positif ou nul est attendu",
+        "règle n° 5 (R22) : debut : un entier positif ou nul est attendu",
+        "règle n° 6 (R22) : paramètre manquant (date)",
+    ]
+
+
+def test_catalogue_des_types_de_numerotation():
+    catalogue = catalogue_types().set_index("type")
+    continue_ = catalogue.loc["numerotation_continue"].to_dict()
+    assert continue_["parametres"] == (
+        "colonne (colonne), motif (motif de numéro), debut (nombre, facultatif)"
+    )
+    assert (continue_["vue"], continue_["issue"]) == (VUE_SANS_SURNOMBRE, "anomalie")
+    chronologique = catalogue.loc["numerotation_chronologique"].to_dict()
+    assert chronologique["parametres"] == (
+        "colonne (colonne), motif (motif de numéro), date (colonne de date)"
+    )
+    assert (chronologique["vue"], chronologique["issue"]) == (VUE_SANS_SURNOMBRE, "à arbitrer")
+
+
+def test_chargement_d_une_regle_de_numerotation(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: R01\n    libelle: Numérotation\n    type: numerotation_continue\n"
+        "    table: interventions\n    colonne: id_intervention\n"
+        "    motif: 'INT-(?P<annee>\\d{4})-(?P<numero>\\d{6})'\n    debut: 1\n",
+        encoding="utf-8",
+    )
+    regle = charger_regles_gestion(chemin)[0]
+    assert regle["motif"] == r"INT-(?P<annee>\d{4})-(?P<numero>\d{6})"
+    assert regle["debut"] == 1

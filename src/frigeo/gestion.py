@@ -92,6 +92,7 @@ GENRE_COLONNE = "colonne"
 GENRES_COLONNE = (GENRE_COLONNE_DATE, GENRE_COLONNE_NOMBRE, GENRE_COLONNE)
 GENRE_NOMBRE = "nombre"
 GENRE_PLAGES = "plages"
+GENRE_MOTIF_NUMERO = "motif de numéro"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
 _NATURES_ATTENDUES = {
     GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
@@ -99,6 +100,12 @@ _NATURES_ATTENDUES = {
 }
 # Bornes d'une plage, incluses.
 CLES_BORNES = ("min", "max")
+# Groupes nommés réservés d'un motif de numéro : le numéro (obligatoire) et
+# l'année (facultative, comparée à l'année de la date par la règle chronologique).
+# Les autres groupes nommés définissent la série.
+GROUPE_NUMERO = "numero"
+GROUPE_ANNEE = "annee"
+_CHIFFRES = re.compile(r"[0-9]+")
 
 # Repère de la période d'un export, ajouté par le chargement : AAAA pour un export
 # annuel, AAAA-MM pour un export mensuel.
@@ -145,8 +152,11 @@ class Constats:
 
     `evaluables` : vrai pour une ligne que le type a pu juger. `ecarts` : une ligne
     par écart, avec les colonnes `constat` et `proposition` (None quand l'outil ne
-    propose rien), indexée par la position de la ligne en écart. L'issue n'est pas
-    donnée par le type : c'est celle de la règle, ou à défaut celle du type.
+    propose rien), indexée par la position de la ligne en écart; une même ligne peut
+    porter plusieurs écarts. Une colonne `valeur`, facultative, remplace la valeur
+    affichée par défaut (les valeurs des colonnes de la règle) quand elle n'est pas
+    vide. L'issue n'est pas donnée par le type : c'est celle de la règle, ou à
+    défaut celle du type.
     """
 
     evaluables: pd.Series
@@ -178,7 +188,11 @@ class TypeRegle:
     issue: str = ISSUE_ANOMALIE
 
 
-def _ecarts(constats: pd.Series, propositions: pd.Series | None = None) -> pd.DataFrame:
+def _ecarts(
+    constats: pd.Series,
+    propositions: pd.Series | None = None,
+    valeurs: pd.Series | None = None,
+) -> pd.DataFrame:
     """Écarts d'un type : une ligne par constat renseigné, indexée par la position."""
     garde = constats.notna()
     ecarts = pd.DataFrame(
@@ -188,7 +202,13 @@ def _ecarts(constats: pd.Series, propositions: pd.Series | None = None) -> pd.Da
     )
     if propositions is not None:
         ecarts["proposition"] = propositions[garde].astype(object)
+    if valeurs is not None:
+        ecarts["valeur"] = valeurs[garde].astype(object)
     return ecarts
+
+
+def _renseignee(valeur) -> bool:
+    return valeur is not None and not (isinstance(valeur, float) and math.isnan(valeur))
 
 
 def _est_nombre(valeur) -> bool:
@@ -359,6 +379,135 @@ def _problemes_bornes(bornes: dict) -> list[str]:
     return problemes
 
 
+CONSTAT_NUMEROS_MANQUANTS = "numéros manquants avant celui-ci"
+CONSTAT_DATE_AVANT_PRECEDENT = "date antérieure à celle du numéro précédent"
+CONSTAT_ANNEE_DU_NUMERO = "année du numéro différente de l'année de la date"
+
+
+def _numeros(donnees: pd.DataFrame, colonne: str, motif: str) -> dict:
+    """Série, numéro et correspondance de chaque ligne dont la valeur suit le motif.
+
+    Le motif doit couvrir la valeur entière, et son groupe `numero` n'être fait que
+    de chiffres; les autres groupes nommés, dans leur ordre, forment la série. Une
+    ligne vide ou qui ne suit pas le motif est absente du résultat. Les lignes sont
+    rendues dans l'ordre de la vue.
+    """
+    expression = re.compile(motif)
+    noms = [nom for nom in expression.groupindex if nom != GROUPE_NUMERO]
+    lues = {}
+    for position, valeur in donnees[colonne].items():
+        texte = _valeur_constatee(valeur)
+        trouve = None if texte is None else expression.fullmatch(texte)
+        if trouve is None or not _CHIFFRES.fullmatch(trouve.group(GROUPE_NUMERO) or ""):
+            continue
+        serie = tuple(trouve.group(nom) for nom in noms)
+        lues[position] = (serie, int(trouve.group(GROUPE_NUMERO)), trouve)
+    return lues
+
+
+def _ecrire_numero(trouve: re.Match, numero: int) -> str:
+    """Valeur de la ligne où le numéro est remplacé par un autre, à la même largeur."""
+    debut, fin = trouve.span(GROUPE_NUMERO)
+    return trouve.string[:debut] + str(numero).zfill(fin - debut) + trouve.string[fin:]
+
+
+def _numeros_manquants(trouve: re.Match, premier: int, dernier: int) -> str:
+    """Plage des numéros manquants : « INT-2025-000004 à INT-2025-000006 (3 numéros) »."""
+    nombre = dernier - premier + 1
+    if nombre == 1:
+        return f"{_ecrire_numero(trouve, premier)} (1 numéro)"
+    return (
+        f"{_ecrire_numero(trouve, premier)} à {_ecrire_numero(trouve, dernier)} "
+        f"({nombre} numéros)"
+    )
+
+
+def _numerotation_continue(donnees, parametres, natures) -> Constats:
+    """Numéros de chaque série sans trou.
+
+    Un trou est porté par la première ligne (dans l'ordre de la vue) du numéro qui le
+    suit; la valeur affichée donne la plage des numéros manquants. Avec `debut`, les
+    numéros manquants entre `debut` et le premier numéro observé forment aussi un
+    trou. Un numéro répété ne crée pas de trou (les valeurs en double relèvent des
+    doublons). Les derniers numéros d'une série, s'ils manquent, ne se voient pas.
+    """
+    lues = _numeros(donnees, parametres["colonne"], parametres["motif"])
+    evaluables = pd.Series(donnees.index.isin(list(lues)), index=donnees.index, dtype=bool)
+    par_serie = {}
+    for position, (serie, numero, trouve) in lues.items():
+        par_serie.setdefault(serie, {}).setdefault(numero, (position, trouve))
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    valeurs = pd.Series(None, index=donnees.index, dtype=object)
+    debut = parametres.get("debut")
+    for numeros in par_serie.values():
+        precedent = None if debut is None else int(debut) - 1
+        for numero in sorted(numeros):
+            if precedent is not None and numero > precedent + 1:
+                position, trouve = numeros[numero]
+                constats.loc[position] = CONSTAT_NUMEROS_MANQUANTS
+                valeurs.loc[position] = _numeros_manquants(trouve, precedent + 1, numero - 1)
+            precedent = numero
+    return Constats(evaluables, _ecarts(constats, valeurs=valeurs))
+
+
+def _numerotation_chronologique(donnees, parametres, natures) -> Constats:
+    """Numéros de chaque série croissants avec la date.
+
+    Une ligne est évaluable si sa valeur suit le motif et si sa date est lisible
+    (et, quand le motif a un groupe `annee`, si l'année n'est faite que de
+    chiffres). Chaque ligne évaluable est comparée au numéro précédent de sa série
+    qui a une date lisible, représenté par sa première ligne dans l'ordre de la vue;
+    une date antérieure est un écart, porté par la ligne au numéro le plus grand, et
+    la valeur affichée donne les deux dates. Quand le motif a un groupe `annee`, une
+    année différente de celle de la date est un autre écart.
+    """
+    colonne, colonne_date = parametres["colonne"], parametres["date"]
+    lues = _numeros(donnees, colonne, parametres["motif"])
+    avec_annee = GROUPE_ANNEE in re.compile(parametres["motif"]).groupindex
+    dates = lire(donnees[colonne_date], natures[colonne_date]).valeurs
+    textes_dates = donnees[colonne_date].map(_valeur_constatee)
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    representants = {}
+    for position, (serie, numero, trouve) in lues.items():
+        if pd.isna(dates.loc[position]):
+            continue
+        if avec_annee and not _CHIFFRES.fullmatch(trouve.group(GROUPE_ANNEE) or ""):
+            continue
+        evaluables.loc[position] = True
+        representants.setdefault(serie, {}).setdefault(numero, position)
+    precedents = {}
+    for serie, numeros in representants.items():
+        ordonnes = sorted(numeros)
+        precedents[serie] = dict(zip(ordonnes[1:], ordonnes[:-1]))
+
+    ruptures = pd.Series(None, index=donnees.index, dtype=object)
+    valeurs = pd.Series(None, index=donnees.index, dtype=object)
+    annees = pd.Series(None, index=donnees.index, dtype=object)
+    for position in evaluables.index[evaluables.to_numpy()]:
+        serie, numero, trouve = lues[position]
+        date = dates.loc[position]
+        precedent = precedents[serie].get(numero)
+        if precedent is not None:
+            ligne_precedente = representants[serie][precedent]
+            if date < dates.loc[ligne_precedente]:
+                ruptures.loc[position] = CONSTAT_DATE_AVANT_PRECEDENT
+                valeurs.loc[position] = (
+                    f"{textes_dates.loc[position]} (numéro précédent "
+                    f"{lues[ligne_precedente][2].string} : {textes_dates.loc[ligne_precedente]})"
+                )
+        if avec_annee and int(trouve.group(GROUPE_ANNEE)) != date.year:
+            annees.loc[position] = CONSTAT_ANNEE_DU_NUMERO
+    ecarts = pd.concat([_ecarts(ruptures, valeurs=valeurs), _ecarts(annees)])
+    return Constats(evaluables, ecarts)
+
+
+def _verifier_debut(parametres: dict) -> list[str]:
+    debut = parametres.get("debut")
+    if debut is not None and (debut < 0 or not float(debut).is_integer()):
+        return ["debut : un entier positif ou nul est attendu"]
+    return []
+
+
 def _verifier_rapport(parametres: dict) -> list[str]:
     problemes = _problemes_bornes(parametres)
     if parametres.get("facteur") == 0:
@@ -421,6 +570,40 @@ TYPES = {
         facultatifs=("facteur", "min", "max"),
         verifier=_verifier_rapport,
     ),
+    "numerotation_continue": TypeRegle(
+        description=(
+            "Les numéros d'une même série se suivent sans trou. motif est une "
+            "expression régulière qui couvre la valeur entière, avec un groupe nommé "
+            "numero (des chiffres); les autres groupes nommés définissent la série "
+            "(par exemple (?P<annee>...) pour une série par année). Un trou est porté "
+            "par la ligne du numéro qui le suit; avec debut, les numéros manquants "
+            "avant le premier numéro observé forment aussi un trou."
+        ),
+        parametres={
+            "colonne": GENRE_COLONNE,
+            "motif": GENRE_MOTIF_NUMERO,
+            "debut": GENRE_NOMBRE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_numerotation_continue,
+        facultatifs=("debut",),
+        verifier=_verifier_debut,
+    ),
+    "numerotation_chronologique": TypeRegle(
+        description=(
+            "Dans une même série (voir numerotation_continue), un numéro n'a pas une "
+            "date antérieure à celle du numéro précédent; si le motif a un groupe "
+            "nommé annee, l'année du numéro est celle de la date."
+        ),
+        parametres={
+            "colonne": GENRE_COLONNE,
+            "motif": GENRE_MOTIF_NUMERO,
+            "date": GENRE_COLONNE_DATE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_numerotation_chronologique,
+        issue=ISSUE_A_ARBITRER,
+    ),
 }
 
 
@@ -475,6 +658,19 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
         return [] if _texte_attendu(valeur) else [f"un nom de colonne est attendu ({genre})"]
     if genre == GENRE_NOMBRE:
         return [] if _est_nombre(valeur) else ["un nombre est attendu"]
+    if genre == GENRE_MOTIF_NUMERO:
+        if not _texte_attendu(valeur):
+            return ["une expression régulière est attendue"]
+        try:
+            expression = re.compile(valeur)
+        except re.error as erreur:
+            return [f"expression régulière invalide ({erreur})"]
+        if GROUPE_NUMERO not in expression.groupindex:
+            return [
+                f"groupe nommé {GROUPE_NUMERO} attendu, par exemple "
+                f"(?P<{GROUPE_NUMERO}>\\d{{6}})"
+            ]
+        return []
     if not isinstance(valeur, dict) or not valeur:
         return ["un dictionnaire non vide est attendu (valeur vers min et max)"]
     problemes = []
@@ -817,8 +1013,9 @@ def controler_gestion(
     Table des écarts (`COLONNES_ECARTS_GESTION`) : une ligne par ligne source et
     par constat, avec le lignage, la référence, le type et le libellé de la règle,
     l'issue (celle de la règle, sinon celle du type), le constat, les colonnes en
-    cause, la clé de la ligne, la valeur constatée et la correction proposée par
-    l'outil, le cas échéant. Clé, valeur et proposition valent « masqué » dès
+    cause, la clé de la ligne, la valeur constatée (ou celle que donne le type, par
+    exemple la plage des numéros manquants) et la correction proposée par l'outil,
+    le cas échéant. Clé, valeur et proposition valent « masqué » dès
     qu'une de leurs colonnes est sensible. Les écarts suivent l'ordre des règles,
     puis celui des lignes sources.
 
@@ -918,6 +1115,11 @@ def controler_gestion(
                 else SEPARATEUR.join(_valeur_constatee(v) or "" for v in ligne)
                 for ligne in donnees.loc[positions, colonnes].itertuples(index=False)
             ]
+            if "valeur" in ecarts.columns:
+                valeurs = [
+                    donnee if _renseignee(donnee) else valeur
+                    for valeur, donnee in zip(valeurs, ecarts["valeur"])
+                ]
             propositions = list(ecarts["proposition"])
         morceau = pd.DataFrame(
             {
