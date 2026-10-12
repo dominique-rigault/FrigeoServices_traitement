@@ -13,9 +13,12 @@ from frigeo.gestion import (
     COLONNES_CATALOGUE,
     COLONNES_ECARTS_GESTION,
     CONSTAT_ANNEE_DU_NUMERO,
+    CONSTAT_BATTEMENT,
+    CONSTAT_CHEVAUCHEMENT,
     CONSTAT_DATE_ANTERIEURE,
     CONSTAT_DATE_AVANT_PRECEDENT,
     CONSTAT_DATE_POSTERIEURE,
+    CONSTAT_HORS_HORAIRES,
     CONSTAT_INFERIEURE,
     CONSTAT_NUMEROS_MANQUANTS,
     CONSTAT_RAPPORT_INFERIEUR,
@@ -129,6 +132,7 @@ def test_date_hors_periode_d_un_export_annuel_et_mensuel():
         "anomalies": 0,
         "a_arbitrer": 5,
         "informations": 0,
+        "avertissements": None,
     }
 
 
@@ -204,7 +208,8 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "règle n° 2 (R1) : clé manquante (type)",
         "règle n° 3 (decoupage) : type inconnu 'date_inconnue' (types possibles : "
         "date_dans_periode_export, plage, plage_selon_valeur, rapport_dans_plage, "
-        "numerotation_continue, numerotation_chronologique)",
+        "numerotation_continue, numerotation_chronologique, intervalles_sans_chevauchement, "
+        "hors_horaires_selon_valeur)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -845,3 +850,290 @@ def test_chargement_d_une_regle_de_numerotation(tmp_path):
     regle = charger_regles_gestion(chemin)[0]
     assert regle["motif"] == r"INT-(?P<annee>\d{4})-(?P<numero>\d{6})"
     assert regle["debut"] == 1
+
+
+# Morceau 4b3 : intervalles sans chevauchement et horaires.
+
+DATE = "date JJ/MM/AAAA"
+HEURE = "heure HH:MM"
+NATURES_INTERVALLES = {"g": "texte", "d": DATE, "h": HEURE, "m": ENTIER}
+
+
+def _intervalles(**autres):
+    return _instance(
+        "intervalles_sans_chevauchement", ref="R03", groupe="g", date="d", heure="h",
+        duree="m", **autres,
+    )
+
+
+def test_intervalles_sans_chevauchement():
+    donnees = _table(
+        g=["A", "A", "A", "A", "A", "A", "B", "B", "B", "", "A", "A", "A"],
+        d=["14/03/2025"] * 7 + ["15/03/2025", "14/03/2025", "14/03/2025", "14/03/2052",
+                                "14/03/2025", "14/03/2025"],
+        h=["08:00", "09:20", "09:55", "10:00", "10:30", "12:00", "23:30", "00:15", "08:00",
+           "08:00", "08:00", "", "13:00"],
+        m=["60", "30", "30", "120", "15", "30", "60", "30", "60", "60", "60", "30", "-5"],
+    )
+    ecarts, bilan = _controler(
+        donnees, NATURES_INTERVALLES, regles=[_intervalles(battement=20)]
+    )
+    # Lignes 2 à 7 : A le 14/03; ligne 3 à 20 minutes exactement de la ligne 2.
+    # La ligne 7 (12:00) suit la ligne 5 (10:00 à 12:00), qui finit le plus tard,
+    # et non la ligne 6 (10:30 à 10:45) qu'elle contient.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "valeur") == [
+        (4, CONSTAT_BATTEMENT, "anomalie",
+         "14/03/2025 09:55 à 10:25, après 14/03/2025 09:20 à 09:50 (t.csv, ligne 3)"),
+        (5, CONSTAT_CHEVAUCHEMENT, "anomalie",
+         "14/03/2025 10:00 à 12:00, après 14/03/2025 09:55 à 10:25 (t.csv, ligne 4)"),
+        (6, CONSTAT_CHEVAUCHEMENT, "anomalie",
+         "14/03/2025 10:30 à 10:45, après 14/03/2025 10:00 à 12:00 (t.csv, ligne 5)"),
+        (7, CONSTAT_BATTEMENT, "anomalie",
+         "14/03/2025 12:00 à 12:30, après 14/03/2025 10:00 à 12:00 (t.csv, ligne 5)"),
+        (9, CONSTAT_CHEVAUCHEMENT, "anomalie",
+         "15/03/2025 00:15 à 00:45, après 14/03/2025 23:30 à 15/03/2025 00:30 "
+         "(t.csv, ligne 8)"),
+    ]
+    assert set(ecarts["colonnes"]) == {"g, d, h, m"}
+    resume = _bilan(bilan)
+    # Non évaluables : groupe vide, heure vide, durée négative.
+    assert (resume["vue"], resume["non_evaluables"], resume["controlees"]) == (
+        VUE_SANS_SURNOMBRE, 3, 10,
+    )
+    assert (resume["anomalies"], resume["avertissements"]) == (5, None)
+    # Sans battement, seuls les chevauchements restent.
+    ecarts, _ = _controler(donnees, NATURES_INTERVALLES, regles=[_intervalles()])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (5, CONSTAT_CHEVAUCHEMENT), (6, CONSTAT_CHEVAUCHEMENT), (9, CONSTAT_CHEVAUCHEMENT),
+    ]
+
+
+def test_intervalles_comparaison_sans_heure_et_doublons():
+    donnees = _table(
+        g=["Dupont Jean", "DUPONT  Jean ", "Dupônt jean", "Dupont Jean"],
+        d=["14/03/2025", "14/03/2025", "15/03/2025", "14/03/2025"],
+        m=["60", "45", "60", "60"],
+    )
+    natures = {"g": "texte", "d": DATE, "m": ENTIER}
+    sans_heure = _instance(
+        "intervalles_sans_chevauchement", ref="R03", groupe="g", date="d", duree="m"
+    )
+    ecarts, bilan = _controler(donnees, natures, regles=[sans_heure])
+    # Telle quelle : la ligne 5 est une copie exacte de la ligne 2, écartée.
+    assert ecarts.empty
+    assert _bilan(bilan)["ecartees_doublons"] == 1
+    normalisee = {**sans_heure, "comparaison": "après normalisation"}
+    ecarts, _ = _controler(donnees, natures, regles=[normalisee])
+    # À début égal, la ligne qui finit la première est prise d'abord.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (2, CONSTAT_CHEVAUCHEMENT,
+         "14/03/2025 00:00 à 01:00, après 14/03/2025 00:00 à 00:45 (t.csv, ligne 3)"),
+    ]
+    # Groupe sensible : valeur masquée.
+    ecarts, _ = _controler(donnees, natures, regles=[normalisee], sensibles={"t": {"g"}})
+    assert list(ecarts["valeur"]) == [VALEUR_MASQUEE]
+
+
+HORAIRES = {
+    "lundi": [{"debut": "07:30", "fin": "18:00"}],
+    "mardi": [{"debut": "07:30", "fin": "18:00"}],
+    "mercredi": [{"debut": "07:30", "fin": "18:00"}],
+    "jeudi": [{"debut": "07:30", "fin": "18:00"}],
+    "vendredi": [{"debut": "07:30", "fin": "18:00"}],
+}
+NATURES_HORAIRES = {"d": DATE, "h": HEURE, "c": "texte"}
+
+
+def _horaires(horaires=None, feries=None, valeurs=("Dépannage",), **autres):
+    return _instance(
+        "hors_horaires_selon_valeur", ref="R04", date="d", heure="h",
+        horaires=HORAIRES if horaires is None else horaires,
+        feries={2025: ["2025-05-01"]} if feries is None else feries,
+        colonne="c", valeurs=list(valeurs), **autres,
+    )
+
+
+def test_hors_horaires_selon_valeur():
+    donnees = _table(
+        d=["03/03/2025", "03/03/2025", "03/03/2025", "08/03/2025", "01/05/2025",
+           "09/03/2025", "04/03/2025", "14/03/2052", "04/03/2025", "14/03/2025"],
+        h=["07:30", "18:00", "07:29", "09:00", "10:00", "10:00", "", "10:00", "10:00", "18:30"],
+        c=["Maintenance", "Maintenance", "Dépannage", "Maintenance", "Contrôle", "", "Contrôle",
+           "Maintenance", "", "dépannage"],
+    )
+    ecarts, bilan = _controler(donnees, NATURES_HORAIRES, regles=[_horaires()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "valeur") == [
+        (3, CONSTAT_HORS_HORAIRES, "anomalie", "lundi 03/03/2025 18:00 | Maintenance"),
+        (5, CONSTAT_HORS_HORAIRES, "anomalie", "samedi 08/03/2025 09:00 | Maintenance"),
+        (6, CONSTAT_HORS_HORAIRES, "anomalie", "férié 01/05/2025 10:00 | Contrôle"),
+        (11, CONSTAT_HORS_HORAIRES, "anomalie", "vendredi 14/03/2025 18:30 | dépannage"),
+    ]
+    assert set(ecarts["colonnes"]) == {"d, h, c"}
+    resume = _bilan(bilan)
+    # Non évaluables : dimanche sans catégorie, heure vide, année 2052 sans jours
+    # fériés. Une catégorie vide dans les horaires est évaluable. Les valeurs admises
+    # sont comparées telles quelles (« dépannage » n'est pas admise).
+    assert (resume["vue"], resume["non_evaluables"], resume["controlees"]) == (VUE_TOUTES, 3, 7)
+    assert resume["avertissements"] == (
+        "année 2052 absente des jours fériés déclarés : 1 ligne non évaluable"
+    )
+
+
+def test_astreinte_creneaux_d_un_jour_ferie_et_aucune_valeur_admise():
+    horaires = {
+        **{jour: [{"debut": "07:30", "fin": "21:00"}] for jour in HORAIRES},
+        "samedi": [{"debut": "07:30", "fin": "13:00"}],
+        "dimanche": [{"debut": "00:00", "fin": "24:00"}],
+        "ferie": [{"debut": "07:30", "fin": "21:00"}],
+    }
+    donnees = _table(
+        d=["03/03/2025", "08/03/2025", "08/03/2025", "01/05/2025", "01/05/2025", "09/03/2025"],
+        h=["20:59", "12:59", "13:00", "20:00", "21:30", "23:59"],
+        c=["Dépannage"] * 6,
+    )
+    ecarts, bilan = _controler(
+        donnees, NATURES_HORAIRES, regles=[_horaires(horaires, valeurs=(), issue="à arbitrer")]
+    )
+    assert _lignes(ecarts, "num_ligne_source", "issue", "valeur") == [
+        (4, "à arbitrer", "samedi 08/03/2025 13:00 | Dépannage"),
+        (6, "à arbitrer", "férié 01/05/2025 21:30 | Dépannage"),
+    ]
+    assert (_bilan(bilan)["controlees"], _bilan(bilan)["a_arbitrer"]) == (6, 2)
+
+
+def test_avertissements_sur_les_jours_feries():
+    donnees = _table(
+        d=["03/03/2025", "03/03/2026", "04/03/2026", "03/03/2027"],
+        h=["10:00"] * 4,
+        c=["Maintenance"] * 4,
+    )
+    feries = {2025: ["2025-01-01", "2025-05-01"], "2026": [], 2028: ["2028-01-01"]}
+    _, bilan = _controler(
+        donnees, NATURES_HORAIRES, regles=[_horaires(feries=feries, feries_minimum=10)]
+    )
+    resume = _bilan(bilan)
+    assert resume["avertissements"] == (
+        "année 2025 : 2 jours fériés déclarés, moins que feries_minimum (10); "
+        "année 2026 : aucun jour férié déclaré; "
+        "année 2027 absente des jours fériés déclarés : 1 ligne non évaluable"
+    )
+    assert (resume["non_evaluables"], resume["controlees"]) == (1, 3)
+    for regle in (_horaires(feries=feries), _horaires(feries=feries, feries_minimum=2)):
+        _, bilan = _controler(donnees, NATURES_HORAIRES, regles=[regle])
+        assert _bilan(bilan)["avertissements"] == (
+            "année 2026 : aucun jour férié déclaré; "
+            "année 2027 absente des jours fériés déclarés : 1 ligne non évaluable"
+        )
+
+
+def test_structure_des_intervalles_et_des_horaires():
+    regles = [
+        _intervalles(battement=-1, comparaison="approchée"),
+        _horaires(
+            horaires={
+                "lundy": [],
+                "mardi": [{"debut": 450, "fin": "18:00"}],
+                "mercredi": [{"debut": "18:00", "fin": "07:30"}],
+                "jeudi": [{"debut": "07:30"}],
+                "vendredi": "07:30",
+                "samedi": [{"debut": "08:00", "fin": "08:00"}],
+                "dimanche": [{"debut": "7:30", "fin": "25:00"}],
+            },
+            feries={
+                "2025": ["2025-01-01", "2026-05-01", "2025-02-30", "2025-01-01"],
+                2025: [],
+                "an": [],
+                2026: "2026-01-01",
+            },
+            feries_minimum=1.5,
+        ),
+        {**_horaires(), "valeurs": "Dépannage", "horaires": {}},
+    ]
+    problemes = problemes_regles_gestion(regles)
+    assert problemes == [
+        "règle n° 1 (R03), comparaison : comparaison inconnue 'approchée' (comparaisons "
+        "possibles : telle quelle, après normalisation)",
+        "règle n° 2 (R04), horaires : jour inconnu 'lundy' (jours possibles : lundi, mardi, "
+        "mercredi, jeudi, vendredi, samedi, dimanche, ferie)",
+        "règle n° 2 (R04), horaires : mardi, créneau n° 1, debut : une heure HH:MM entre "
+        "guillemets est attendue (par exemple '07:30')",
+        "règle n° 2 (R04), horaires : mercredi, créneau n° 1 : debut (18:00) n'est pas avant "
+        "fin (07:30)",
+        "règle n° 2 (R04), horaires : jeudi, créneau n° 1 : clés debut et fin attendues",
+        "règle n° 2 (R04), horaires : vendredi : une liste de créneaux est attendue (chaque "
+        "créneau commence par un tiret, liste vide [] pour aucun)",
+        "règle n° 2 (R04), horaires : samedi, créneau n° 1 : debut (08:00) n'est pas avant "
+        "fin (08:00)",
+        "règle n° 2 (R04), horaires : dimanche, créneau n° 1, debut : une heure HH:MM entre "
+        "guillemets est attendue (par exemple '07:30')",
+        "règle n° 2 (R04), horaires : dimanche, créneau n° 1, fin : une heure HH:MM entre "
+        "guillemets est attendue (par exemple '07:30')",
+        "règle n° 2 (R04), feries : année 2025 : 2026-05-01 n'est pas de cette année",
+        "règle n° 2 (R04), feries : année 2025 : '2025-02-30' n'est pas une date AAAA-MM-JJ",
+        "règle n° 2 (R04), feries : année 2025 : 2025-01-01 déclaré deux fois",
+        "règle n° 2 (R04), feries : année 2025 déclarée deux fois",
+        "règle n° 2 (R04), feries : année 'an' : une année AAAA est attendue",
+        "règle n° 2 (R04), feries : année 2026 : une liste de dates est attendue (liste vide "
+        "[] pour aucune)",
+        "règle n° 3 (R04), horaires : un dictionnaire non vide est attendu (jour vers "
+        "créneaux, jours possibles : lundi, mardi, mercredi, jeudi, vendredi, samedi, "
+        "dimanche, ferie)",
+        "règle n° 3 (R04), valeurs : une liste de valeurs est attendue (liste vide [] pour "
+        "n'en admettre aucune)",
+    ]
+    # Les problèmes propres au type ne sont cherchés que si les paramètres sont bien formés.
+    assert problemes_regles_gestion(
+        [_intervalles(battement=-1), _horaires(feries_minimum=1.5)]
+    ) == [
+        "règle n° 1 (R03) : battement : un nombre positif ou nul est attendu",
+        "règle n° 2 (R04) : feries_minimum : un entier positif ou nul est attendu",
+    ]
+
+
+def test_colonne_d_heure_confrontee_au_dictionnaire():
+    donnees = _table(g=["A"], d=["14/03/2025"], h=["08:00"], m=["60"])
+    with pytest.raises(ValueError) as erreur:
+        _controler(donnees, {**NATURES_INTERVALLES, "h": "texte"}, regles=[_intervalles()])
+    assert (
+        "règle n° 1 (R03), heure : la nature en vigueur de t.h est 'texte', une heure est "
+        "attendue" in str(erreur.value)
+    )
+
+
+def test_catalogue_des_types_du_4b3():
+    catalogue = catalogue_types().set_index("type")
+    intervalles = catalogue.loc["intervalles_sans_chevauchement"].to_dict()
+    assert intervalles["parametres"] == (
+        "groupe (colonne), date (colonne de date), heure (colonne d'heure, facultatif), "
+        "duree (colonne de nombre), battement (nombre, facultatif), comparaison "
+        "(comparaison, facultatif)"
+    )
+    assert (intervalles["vue"], intervalles["issue"]) == (VUE_SANS_SURNOMBRE, "anomalie")
+    horaires = catalogue.loc["hors_horaires_selon_valeur"].to_dict()
+    assert horaires["parametres"] == (
+        "date (colonne de date), heure (colonne d'heure), horaires (horaires), feries "
+        "(jours fériés), feries_minimum (nombre, facultatif), colonne (colonne), valeurs "
+        "(liste de valeurs)"
+    )
+    assert (horaires["vue"], horaires["issue"]) == (VUE_TOUTES, "anomalie")
+
+
+def test_chargement_d_une_regle_d_horaires(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    texte = (
+        "regles:\n"
+        "  - ref: R04\n    libelle: Hors horaires\n    type: hors_horaires_selon_valeur\n"
+        "    table: interventions\n    date: date_debut\n    heure: heure_debut\n"
+        "    horaires:\n      lundi: [{debut: '07:30', fin: FIN}]\n"
+        "    feries:\n      2025: [2025-01-01, '2025-05-01']\n"
+        "    feries_minimum: 10\n    colonne: categorie\n    valeurs: []\n"
+    )
+    chemin.write_text(texte.replace("FIN", "'18:00'"), encoding="utf-8")
+    regle = charger_regles_gestion(chemin)[0]
+    assert regle["horaires"] == {"lundi": [{"debut": "07:30", "fin": "18:00"}]}
+    assert regle["feries"] == {2025: [dt.date(2025, 1, 1), "2025-05-01"]}
+    assert regle["valeurs"] == []
+    # Sans guillemets, 18:00 est lu par YAML comme un nombre (1080).
+    chemin.write_text(texte.replace("FIN", "18:00"), encoding="utf-8")
+    with pytest.raises(ValueError, match="lundi, créneau n° 1, fin : une heure HH:MM"):
+        charger_regles_gestion(chemin)

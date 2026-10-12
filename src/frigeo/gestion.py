@@ -38,6 +38,7 @@ bilan.
 
 from __future__ import annotations
 
+import datetime as dt
 import math
 import re
 from dataclasses import dataclass
@@ -60,13 +61,16 @@ from .controles import (
 )
 from .dictionnaire import est_masquee
 from .doublons import (
+    COMPARAISON_NORMALISEE,
+    COMPARAISON_TELLE_QUELLE,
     CONSTAT_EXACT,
     SEPARATEUR,
     _texte,
     charger_declarations_doublons,
     detecter_doublons,
+    normaliser,
 )
-from .typage import NATURES_DATE, NATURES_NOMBRE, ecrire_date, lire
+from .typage import NATURES_DATE, NATURES_HEURE, NATURES_NOMBRE, ecrire_date, lire
 
 ISSUE_INFORMATION = "information"
 ISSUES = (ISSUE_ANOMALIE, ISSUE_A_ARBITRER, ISSUE_INFORMATION)
@@ -87,17 +91,33 @@ VUE_SANS_SURNOMBRE = "sans les doublons exacts en surnombre"
 
 # Genre d'un paramètre, qui dit comment il est vérifié.
 GENRE_COLONNE_DATE = "colonne de date"
+GENRE_COLONNE_HEURE = "colonne d'heure"
 GENRE_COLONNE_NOMBRE = "colonne de nombre"
 GENRE_COLONNE = "colonne"
-GENRES_COLONNE = (GENRE_COLONNE_DATE, GENRE_COLONNE_NOMBRE, GENRE_COLONNE)
+GENRES_COLONNE = (GENRE_COLONNE_DATE, GENRE_COLONNE_HEURE, GENRE_COLONNE_NOMBRE, GENRE_COLONNE)
 GENRE_NOMBRE = "nombre"
 GENRE_PLAGES = "plages"
 GENRE_MOTIF_NUMERO = "motif de numéro"
+GENRE_COMPARAISON = "comparaison"
+GENRE_HORAIRES = "horaires"
+GENRE_FERIES = "jours fériés"
+GENRE_VALEURS = "liste de valeurs"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
 _NATURES_ATTENDUES = {
     GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
+    GENRE_COLONNE_HEURE: (NATURES_HEURE, "une heure est attendue"),
     GENRE_COLONNE_NOMBRE: (NATURES_NOMBRE, "un nombre est attendu"),
 }
+# Comparaison des valeurs d'une colonne de regroupement (voir doublons.normaliser).
+COMPARAISONS = (COMPARAISON_TELLE_QUELLE, COMPARAISON_NORMALISEE)
+# Horaires : créneaux de chaque jour de la semaine, et d'un jour férié. Un jour
+# absent n'a aucun créneau. Un créneau va de debut (inclus) à fin (exclue).
+JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
+JOUR_FERIE = "ferie"
+CLES_HORAIRES = (*JOURS, JOUR_FERIE)
+CLES_CRENEAU = ("debut", "fin")
+_MOTIF_HEURE = re.compile(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]|24:00")
+_MOTIF_JOUR = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
 # Bornes d'une plage, incluses.
 CLES_BORNES = ("min", "max")
 # Groupes nommés réservés d'un motif de numéro : le numéro (obligatoire) et
@@ -142,6 +162,7 @@ COLONNES_BILAN_GESTION = (
     "anomalies",
     "a_arbitrer",
     "informations",
+    "avertissements",
 )
 COLONNES_CATALOGUE = ("type", "description", "parametres", "vue", "issue")
 
@@ -156,11 +177,14 @@ class Constats:
     porter plusieurs écarts. Une colonne `valeur`, facultative, remplace la valeur
     affichée par défaut (les valeurs des colonnes de la règle) quand elle n'est pas
     vide. L'issue n'est pas donnée par le type : c'est celle de la règle, ou à
-    défaut celle du type.
+    défaut celle du type. `avertissements` : messages sur la règle elle-même (par
+    exemple une configuration incomplète pour une année des données), affichés au
+    bilan.
     """
 
     evaluables: pd.Series
     ecarts: pd.DataFrame
+    avertissements: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -501,11 +525,224 @@ def _numerotation_chronologique(donnees, parametres, natures) -> Constats:
     return Constats(evaluables, ecarts)
 
 
-def _verifier_debut(parametres: dict) -> list[str]:
-    debut = parametres.get("debut")
-    if debut is not None and (debut < 0 or not float(debut).is_integer()):
-        return ["debut : un entier positif ou nul est attendu"]
+CONSTAT_CHEVAUCHEMENT = "chevauche une ligne précédente du même groupe"
+CONSTAT_BATTEMENT = "écart inférieur au battement avec la ligne précédente"
+
+
+def _groupe_lu(valeur, normalisee: bool) -> str | None:
+    """Valeur d'une colonne de regroupement, None si elle est vide."""
+    texte = _valeur_constatee(valeur)
+    if texte is None or not texte.strip():
+        return None
+    return normaliser(texte) if normalisee else texte
+
+
+def _ecrire_creneau(debut: pd.Timestamp, fin: pd.Timestamp) -> str:
+    """Créneau écrit « 14/03/2025 10:00 à 11:35 » (date de fin donnée si elle change)."""
+    texte = f"{debut:%d/%m/%Y %H:%M} à "
+    if fin.normalize() == debut.normalize():
+        return texte + f"{fin:%H:%M}"
+    return texte + f"{fin:%d/%m/%Y %H:%M}"
+
+
+def _reperer_ligne(donnees: pd.DataFrame, position) -> str:
+    """Lignage d'une ligne écrit « fichier, feuille, ligne n »."""
+    morceaux = []
+    for colonne in COLONNES_LIGNAGE_ECART:
+        if colonne not in donnees.columns:
+            continue
+        texte = _valeur_constatee(donnees.at[position, colonne])
+        if texte:
+            morceaux.append(f"ligne {texte}" if colonne == "num_ligne_source" else texte)
+    return ", ".join(morceaux)
+
+
+def _intervalles_sans_chevauchement(donnees, parametres, natures) -> Constats:
+    """Intervalles d'un même groupe sans chevauchement, séparés d'au moins le battement.
+
+    Un intervalle commence à la date (et à l'heure, si elle est déclarée) et dure
+    `duree` minutes. Dans chaque groupe, les intervalles sont pris par début
+    croissant; chacun est comparé à l'intervalle précédent qui finit le plus tard
+    (une longue ligne peut en contenir une courte). Un début avant cette fin est un
+    chevauchement; un début avant cette fin plus le battement est un écart trop
+    court. L'écart est porté par la ligne qui commence le plus tard; la valeur
+    affichée donne les deux créneaux et le lignage de l'autre ligne. Un groupe vide,
+    une date, une heure ou une durée vide ou illisible, ou une durée négative,
+    rendent la ligne non évaluable.
+    """
+    colonne_date, colonne_duree = parametres["date"], parametres["duree"]
+    dates = lire(donnees[colonne_date], natures[colonne_date]).valeurs
+    if "heure" in parametres:
+        heures = lire(donnees[parametres["heure"]], natures[parametres["heure"]]).valeurs
+    else:
+        heures = pd.Series(pd.Timedelta(0), index=donnees.index, dtype="timedelta64[ns]")
+    durees = lire(donnees[colonne_duree], natures[colonne_duree]).valeurs
+    normalisee = parametres.get("comparaison") == COMPARAISON_NORMALISEE
+    groupes = donnees[parametres["groupe"]].map(lambda valeur: _groupe_lu(valeur, normalisee))
+    debuts = dates + heures
+    fins = debuts + pd.to_timedelta(durees, unit="min")
+    evaluables = (groupes.notna() & debuts.notna() & (durees >= 0)).astype(bool)
+    battement = pd.Timedelta(minutes=parametres.get("battement", 0))
+
+    ordre = pd.DataFrame(
+        {"groupe": groupes, "debut": debuts, "fin": fins, "position": donnees.index},
+        index=donnees.index,
+    )[evaluables.to_numpy()]
+    ordre = ordre.sort_values(["groupe", "debut", "fin", "position"], kind="stable")
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    valeurs = pd.Series(None, index=donnees.index, dtype=object)
+    precedents = {}
+    for groupe, debut, fin, position in ordre.itertuples(index=False):
+        avant = precedents.get(groupe)
+        if avant is not None:
+            fin_avant, position_avant = avant
+            constat = None
+            if debut < fin_avant:
+                constat = CONSTAT_CHEVAUCHEMENT
+            elif debut < fin_avant + battement:
+                constat = CONSTAT_BATTEMENT
+            if constat is not None:
+                constats.loc[position] = constat
+                valeurs.loc[position] = (
+                    f"{_ecrire_creneau(debut, fin)}, après "
+                    f"{_ecrire_creneau(debuts.loc[position_avant], fin_avant)} "
+                    f"({_reperer_ligne(donnees, position_avant)})"
+                )
+        if avant is None or fin > avant[0]:
+            precedents[groupe] = (fin, position)
+    return Constats(evaluables, _ecarts(constats, valeurs=valeurs))
+
+
+CONSTAT_HORS_HORAIRES = "hors horaires sans valeur admise"
+NOM_FERIE = "férié"
+
+
+def _minutes(texte) -> int | None:
+    """Minutes depuis minuit d'une heure « HH:MM » (24:00 admis), None si illisible."""
+    if not isinstance(texte, str) or not _MOTIF_HEURE.fullmatch(texte):
+        return None
+    heures, minutes = texte.split(":")
+    return int(heures) * 60 + int(minutes)
+
+
+def _annee_feries(cle) -> int | None:
+    """Année d'une clé de feries (nombre ou texte de quatre chiffres), None sinon."""
+    if isinstance(cle, int) and not isinstance(cle, bool):
+        return cle if 1 <= cle <= 9999 else None
+    if isinstance(cle, str) and _MOTIF_ANNEE.fullmatch(cle):
+        return int(cle)
+    return None
+
+
+def _jour_ferie(valeur) -> dt.date | None:
+    """Date d'un jour férié (date lue par YAML ou texte AAAA-MM-JJ), None sinon."""
+    if isinstance(valeur, dt.datetime):
+        return None
+    if isinstance(valeur, dt.date):
+        return valeur
+    if isinstance(valeur, str) and _MOTIF_JOUR.fullmatch(valeur):
+        try:
+            return dt.date.fromisoformat(valeur)
+        except ValueError:
+            return None
+    return None
+
+
+def _pluriel(nombre: int, singulier: str, pluriel: str) -> str:
+    return f"{nombre} {singulier if nombre <= 1 else pluriel}"
+
+
+def _hors_horaires_selon_valeur(donnees, parametres, natures) -> Constats:
+    """Ligne hors horaires portant l'une des valeurs admises dans sa colonne.
+
+    Le jour de la ligne est un jour férié s'il figure dans `feries`, sinon son jour
+    de la semaine; l'heure est comparée aux créneaux de ce jour (début inclus, fin
+    exclue). Une ligne hors de tout créneau doit porter, dans `colonne`, l'une des
+    `valeurs` (comparées telles quelles; une liste vide n'en admet aucune). Une date
+    ou une heure vide ou illisible, une année sans jours fériés déclarés, ou une
+    valeur vide pour une ligne hors horaires, rendent la ligne non évaluable.
+
+    Avertissements, pour chaque année des dates lues : année absente de `feries`,
+    année déclarée sans jour férié, ou avec moins de `feries_minimum` jours.
+    """
+    colonne_date, colonne_heure = parametres["date"], parametres["heure"]
+    dates = lire(donnees[colonne_date], natures[colonne_date]).valeurs
+    heures = lire(donnees[colonne_heure], natures[colonne_heure]).valeurs
+    feries = {
+        _annee_feries(cle): {pd.Timestamp(_jour_ferie(valeur)) for valeur in jours}
+        for cle, jours in parametres["feries"].items()
+    }
+    creneaux = {
+        jour: [(_minutes(creneau["debut"]), _minutes(creneau["fin"])) for creneau in liste]
+        for jour, liste in parametres["horaires"].items()
+    }
+    admises = set(parametres["valeurs"])
+    textes = donnees[parametres["colonne"]].map(_valeur_constatee)
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    valeurs = pd.Series(None, index=donnees.index, dtype=object)
+    for position in donnees.index:
+        date, heure = dates.loc[position], heures.loc[position]
+        if pd.isna(date) or pd.isna(heure) or date.year not in feries:
+            continue
+        ferie = date.normalize() in feries[date.year]
+        jour = JOUR_FERIE if ferie else JOURS[date.dayofweek]
+        minutes = int(heure.total_seconds() // 60)
+        if any(debut <= minutes < fin for debut, fin in creneaux.get(jour, [])):
+            evaluables.loc[position] = True
+            continue
+        texte = textes.loc[position]
+        if texte is None or not texte.strip():
+            continue
+        evaluables.loc[position] = True
+        if texte in admises:
+            continue
+        constats.loc[position] = CONSTAT_HORS_HORAIRES
+        valeurs.loc[position] = (
+            f"{NOM_FERIE if ferie else jour} {date:%d/%m/%Y} "
+            f"{minutes // 60:02d}:{minutes % 60:02d}{SEPARATEUR}{texte}"
+        )
+
+    avertissements = []
+    minimum = parametres.get("feries_minimum")
+    for annee, nombre in dates.dropna().dt.year.value_counts().sort_index().items():
+        annee = int(annee)
+        if annee not in feries:
+            avertissements.append(
+                f"année {annee} absente des jours fériés déclarés : "
+                + _pluriel(int(nombre), "ligne non évaluable", "lignes non évaluables")
+            )
+        elif not feries[annee]:
+            avertissements.append(f"année {annee} : aucun jour férié déclaré")
+        elif minimum is not None and len(feries[annee]) < minimum:
+            avertissements.append(
+                f"année {annee} : "
+                + _pluriel(len(feries[annee]), "jour férié déclaré", "jours fériés déclarés")
+                + f", moins que feries_minimum ({minimum:g})"
+            )
+    return Constats(evaluables, _ecarts(constats, valeurs=valeurs), tuple(avertissements))
+
+
+def _entier_positif(parametres: dict, nom: str) -> list[str]:
+    valeur = parametres.get(nom)
+    if valeur is not None and (valeur < 0 or not float(valeur).is_integer()):
+        return [f"{nom} : un entier positif ou nul est attendu"]
     return []
+
+
+def _verifier_debut(parametres: dict) -> list[str]:
+    return _entier_positif(parametres, "debut")
+
+
+def _verifier_intervalles(parametres: dict) -> list[str]:
+    if parametres.get("battement", 0) < 0:
+        return ["battement : un nombre positif ou nul est attendu"]
+    return []
+
+
+def _verifier_horaires(parametres: dict) -> list[str]:
+    return _entier_positif(parametres, "feries_minimum")
 
 
 def _verifier_rapport(parametres: dict) -> list[str]:
@@ -604,6 +841,49 @@ TYPES = {
         controler=_numerotation_chronologique,
         issue=ISSUE_A_ARBITRER,
     ),
+    "intervalles_sans_chevauchement": TypeRegle(
+        description=(
+            "Dans un même groupe (par exemple un intervenant), deux lignes ne se "
+            "chevauchent pas et sont séparées d'au moins battement minutes. Une ligne "
+            "commence à date (et heure) et dure duree minutes; comparaison vaut telle "
+            "quelle (par défaut) ou après normalisation (sans accent, casse ni espace "
+            "en trop)."
+        ),
+        parametres={
+            "groupe": GENRE_COLONNE,
+            "date": GENRE_COLONNE_DATE,
+            "heure": GENRE_COLONNE_HEURE,
+            "duree": GENRE_COLONNE_NOMBRE,
+            "battement": GENRE_NOMBRE,
+            "comparaison": GENRE_COMPARAISON,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_intervalles_sans_chevauchement,
+        facultatifs=("heure", "battement", "comparaison"),
+        verifier=_verifier_intervalles,
+    ),
+    "hors_horaires_selon_valeur": TypeRegle(
+        description=(
+            "Une ligne dont la date et l'heure tombent hors des créneaux de horaires "
+            "(par jour de la semaine, et ferie pour un jour férié de feries) porte dans "
+            "colonne l'une des valeurs. feries donne les jours fériés par année; une "
+            "année des données absente de feries, ou avec moins de feries_minimum "
+            "jours, est signalée au bilan."
+        ),
+        parametres={
+            "date": GENRE_COLONNE_DATE,
+            "heure": GENRE_COLONNE_HEURE,
+            "horaires": GENRE_HORAIRES,
+            "feries": GENRE_FERIES,
+            "feries_minimum": GENRE_NOMBRE,
+            "colonne": GENRE_COLONNE,
+            "valeurs": GENRE_VALEURS,
+        },
+        vue=VUE_TOUTES,
+        controler=_hors_horaires_selon_valeur,
+        facultatifs=("feries_minimum",),
+        verifier=_verifier_horaires,
+    ),
 }
 
 
@@ -671,6 +951,25 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
                 f"(?P<{GROUPE_NUMERO}>\\d{{6}})"
             ]
         return []
+    if genre == GENRE_COMPARAISON:
+        if valeur in COMPARAISONS:
+            return []
+        return [
+            f"comparaison inconnue {valeur!r} (comparaisons possibles : "
+            f"{', '.join(COMPARAISONS)})"
+        ]
+    if genre == GENRE_VALEURS:
+        if not isinstance(valeur, list):
+            return ["une liste de valeurs est attendue (liste vide [] pour n'en admettre aucune)"]
+        return [
+            f"{element!r} n'est pas un texte (mettre un nombre entre guillemets)"
+            for element in valeur
+            if not _texte_attendu(element)
+        ]
+    if genre == GENRE_HORAIRES:
+        return _problemes_horaires(valeur)
+    if genre == GENRE_FERIES:
+        return _problemes_feries(valeur)
     if not isinstance(valeur, dict) or not valeur:
         return ["un dictionnaire non vide est attendu (valeur vers min et max)"]
     problemes = []
@@ -691,6 +990,73 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
             )
             continue
         problemes.extend(f"valeur {cle!r} : {probleme}" for probleme in _problemes_bornes(bornes))
+    return problemes
+
+
+def _problemes_horaires(horaires) -> list[str]:
+    """Problèmes des horaires : jour vers liste de créneaux {debut, fin}."""
+    jours_possibles = f"jours possibles : {', '.join(CLES_HORAIRES)}"
+    if not isinstance(horaires, dict) or not horaires:
+        return [f"un dictionnaire non vide est attendu (jour vers créneaux, {jours_possibles})"]
+    problemes = []
+    for jour, creneaux in horaires.items():
+        if jour not in CLES_HORAIRES:
+            problemes.append(f"jour inconnu {jour!r} ({jours_possibles})")
+            continue
+        if not isinstance(creneaux, list):
+            problemes.append(
+                f"{jour} : une liste de créneaux est attendue (chaque créneau commence par "
+                "un tiret, liste vide [] pour aucun)"
+            )
+            continue
+        for rang, creneau in enumerate(creneaux, start=1):
+            nom = f"{jour}, créneau n° {rang}"
+            if not isinstance(creneau, dict) or set(creneau) != set(CLES_CRENEAU):
+                problemes.append(f"{nom} : clés debut et fin attendues")
+                continue
+            bornes = [_minutes(creneau[cle]) for cle in CLES_CRENEAU]
+            problemes.extend(
+                f"{nom}, {cle} : une heure HH:MM entre guillemets est attendue "
+                "(par exemple '07:30')"
+                for cle, minutes in zip(CLES_CRENEAU, bornes)
+                if minutes is None
+            )
+            if None not in bornes and bornes[0] >= bornes[1]:
+                problemes.append(
+                    f"{nom} : debut ({creneau['debut']}) n'est pas avant fin ({creneau['fin']})"
+                )
+    return problemes
+
+
+def _problemes_feries(feries) -> list[str]:
+    """Problèmes des jours fériés : année vers liste de dates AAAA-MM-JJ de cette année."""
+    if not isinstance(feries, dict) or not feries:
+        return ["un dictionnaire non vide est attendu (année vers liste de dates AAAA-MM-JJ)"]
+    problemes, annees = [], set()
+    for cle, jours in feries.items():
+        annee = _annee_feries(cle)
+        if annee is None:
+            problemes.append(f"année {cle!r} : une année AAAA est attendue")
+            continue
+        if annee in annees:
+            problemes.append(f"année {annee} déclarée deux fois")
+            continue
+        annees.add(annee)
+        if not isinstance(jours, list):
+            problemes.append(
+                f"année {annee} : une liste de dates est attendue (liste vide [] pour aucune)"
+            )
+            continue
+        vus = set()
+        for valeur in jours:
+            jour = _jour_ferie(valeur)
+            if jour is None:
+                problemes.append(f"année {annee} : {valeur!r} n'est pas une date AAAA-MM-JJ")
+            elif jour.year != annee:
+                problemes.append(f"année {annee} : {jour.isoformat()} n'est pas de cette année")
+            elif jour in vus:
+                problemes.append(f"année {annee} : {jour.isoformat()} déclaré deux fois")
+            vus.add(jour)
     return problemes
 
 
@@ -1023,7 +1389,9 @@ def controler_gestion(
     nombres de lignes de la table, de lignes écartées comme doublons exacts en
     surnombre, de lignes hors champ, de lignes non évaluables et contrôlées (ces
     quatre nombres font le total), d'anomalies, d'écarts à arbitrer et
-    d'informations. Les arguments ne sont pas modifiés.
+    d'informations, et les avertissements de la règle (par exemple une année des
+    données sans jours fériés déclarés), séparés par « ; », None s'il n'y en a pas.
+    Les arguments ne sont pas modifiés.
     """
     if sensibles is None:
         sensibles = charger_sensibilite()
@@ -1086,6 +1454,7 @@ def controler_gestion(
                 "anomalies": nombre if issue == ISSUE_ANOMALIE else 0,
                 "a_arbitrer": nombre if issue == ISSUE_A_ARBITRER else 0,
                 "informations": nombre if issue == ISSUE_INFORMATION else 0,
+                "avertissements": "; ".join(constats.avertissements) or None,
             }
         )
         if ecarts.empty:
