@@ -24,7 +24,7 @@ regles:
     table: achats_entetes
     colonne: date_facture
   - ref: decoupage
-    libelle: Date d'écriture dans la période de l'export
+    libelle: Date d'écriture dans la période de l'export, donc dans l'exercice (R06)
     type: date_dans_periode_export
     table: fec
     colonne: EcritureDate
@@ -148,3 +148,48 @@ regles:
       - colonne: statut
         valeurs: [Réalisée]
     issue: à arbitrer
+
+  - ref: R01
+    libelle: Numérotation des factures et des avoirs sans trou par année
+    type: numerotation_continue
+    table: factures_entetes
+    colonne: num_facture
+    motif: '(?P<prefixe>FA|AV)-(?P<annee>\d{4})-(?P<numero>\d{5})'
+    debut: 1
+  - ref: R01
+    libelle: Numérotation des factures et des avoirs dans l'ordre des dates
+    type: numerotation_chronologique
+    table: factures_entetes
+    colonne: num_facture
+    motif: '(?P<prefixe>FA|AV)-(?P<annee>\d{4})-(?P<numero>\d{5})'
+    date: date_facture
+
+  - ref: R05
+    libelle: Total HT égal à la somme des montants HT des lignes
+    type: total_des_lignes
+    table: factures_entetes
+    cle: [num_facture]
+    colonne: total_ht
+    table_lignes: factures_lignes
+    colonne_lignes: montant_ht
+  - ref: R05
+    libelle: TVA égale à 20 % du total HT, arrondie au centime
+    type: egalite_calculee
+    table: factures_entetes
+    cible: total_tva
+    termes: {total_ht: 0.2}
+    tolerance: 0.005
+  - ref: R05
+    libelle: Total TTC égal au total HT plus la TVA
+    type: egalite_calculee
+    table: factures_entetes
+    cible: total_ttc
+    termes: {total_ht: 1, total_tva: 1}
+
+  - ref: R06
+    libelle: Écriture comptable équilibrée, débit égal au crédit
+    type: equilibre_par_groupe
+    table: fec
+    groupe: [JournalCode, EcritureNum]
+    debit: Debit
+    credit: Credit
