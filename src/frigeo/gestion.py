@@ -118,6 +118,9 @@ CLES_EXCEPTION = ("libelle", "conditions")
 PREFIXE_PRATIQUE = "pratique normale : "
 # Date de coupure des données, transmise au type qui la demande (TypeRegle.contexte).
 CONTEXTE_DATE_COUPURE = "date_coupure"
+# Vue de la table de la règle avant le filtre (sans les doublons exacts en surnombre
+# selon la vue du type), pour juger qu'une clé est répétée dans toute la table.
+CONTEXTE_VUE_COMPLETE = "vue_complete"
 
 VUE_TOUTES = "toutes les lignes"
 VUE_SANS_SURNOMBRE = "sans les doublons exacts en surnombre"
@@ -275,7 +278,8 @@ class TypeRegle:
     vers `Liee`) au lieu d'une seule `Liee`. `rattachements` : paramètre de colonnes
     vers le paramètre de la table liée à laquelle ces colonnes appartiennent (par
     défaut `table_liee`). `contexte` : informations sur les données que le type
-    demande, transmises dans ses paramètres (`CONTEXTE_DATE_COUPURE`).
+    demande, transmises dans ses paramètres (`CONTEXTE_DATE_COUPURE`,
+    `CONTEXTE_VUE_COMPLETE`).
     """
 
     description: str
@@ -1330,13 +1334,16 @@ def _rattachement_unique_dans_delai(donnees, parametres, natures, liees) -> Cons
     Plusieurs documents sont un écart. Un seul document daté hors de delai_min à
     delai_max jours après la date de la ligne est un écart.
 
-    Non évaluable : clé vide ou répétée, date vide ou illisible, ligne liée sans
-    document, document absent de table_documents ou de clé répétée, date du
-    document vide ou illisible.
+    Non évaluable : clé vide ou répétée (dans toute la table, filtre compris, car les
+    lignes liées désignent la clé et non l'une de ses lignes), date vide ou illisible,
+    ligne liée sans document, document absent de table_documents ou de clé répétée,
+    date du document vide ou illisible.
     """
     lignes, documents = liees["table_lignes"], liees["table_documents"]
     cles = _cles_comparees(donnees, parametres["cle"])
-    _, repetees = _index_unique(cles)
+    _, repetees = _index_unique(
+        _cles_comparees(parametres[CONTEXTE_VUE_COMPLETE], parametres["cle"])
+    )
     colonne_date = parametres["date"]
     dates, etats = _lire_dates(donnees, colonne_date, natures[colonne_date])
     vue_lignes = lignes.donnees[_dans_le_champ(lignes.donnees, parametres.get("filtre_lignes"))]
@@ -1500,10 +1507,12 @@ def _sans_ligne_liee(donnees, parametres, natures, liee: Liee) -> Constats:
     Un écart qui remplit une exception devient une information; une condition sur
     une colonne « table_lignes.c » doit être remplie par toutes les lignes liées.
 
-    Non évaluable : clé vide ou répétée.
+    Non évaluable : clé vide ou répétée (dans toute la table, filtre compris).
     """
     cles = _cles_comparees(donnees, parametres["cle"])
-    _, repetees = _index_unique(cles)
+    _, repetees = _index_unique(
+        _cles_comparees(parametres[CONTEXTE_VUE_COMPLETE], parametres["cle"])
+    )
     vue_lignes = liee.donnees[_dans_le_champ(liee.donnees, parametres.get("filtre_lignes"))]
     par_cle = {}
     for position, cle in _cles_comparees(vue_lignes, parametres["cle_lignes"]).items():
@@ -1890,7 +1899,7 @@ TYPES = {
             "cle_documents": "table_documents",
             "date_document": "table_documents",
         },
-        contexte=(CONTEXTE_DATE_COUPURE,),
+        contexte=(CONTEXTE_DATE_COUPURE, CONTEXTE_VUE_COMPLETE),
     ),
     "reference_conforme": TypeRegle(
         description=(
@@ -1970,6 +1979,7 @@ TYPES = {
         table_liee="table_lignes",
         defauts={"cle_lignes": "cle"},
         rattachements={"filtre_lignes": "table_lignes"},
+        contexte=(CONTEXTE_VUE_COMPLETE,),
     ),
 }
 
@@ -2767,13 +2777,15 @@ def controler_gestion(
         if type_regle.vue == VUE_SANS_SURNOMBRE:
             ecartees = _positions_en_surnombre(doublons, table, donnees)
         vue = donnees.drop(index=ecartees)
+        vue_complete = vue
         dans_champ = _dans_le_champ(vue, filtre)
         hors_champ = int((~dans_champ).sum())
         vue = vue[dans_champ]
         complete = _avec_defauts(instance)
         parametres = {p: complete[p] for p in type_regle.parametres if p in complete}
+        contexte = {CONTEXTE_DATE_COUPURE: date_coupure, CONTEXTE_VUE_COMPLETE: vue_complete}
         for nom_contexte in type_regle.contexte:
-            parametres[nom_contexte] = date_coupure
+            parametres[nom_contexte] = contexte[nom_contexte]
         liees = {}
         for parametre_table, nom_liee in _tables_liees(instance).items():
             colonnes_liees = _colonnes_instance(instance, nom_liee)

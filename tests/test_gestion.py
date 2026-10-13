@@ -1955,6 +1955,25 @@ def test_delai_echu_le_jour_de_la_coupure():
     ]
 
 
+def test_cle_repetee_hors_du_filtre_non_evaluable():
+    # I1 est répété, une fois dans le champ de la règle et une fois hors champ : les
+    # lignes liées désignent la clé, sans dire laquelle des deux lignes.
+    tables = {
+        "t": _table(i=["I1", "I1", "I2"], d=["01/03/2025", "02/03/2025", "01/03/2025"],
+                    s=["R", "A", "A"]),
+        "l": _table("l.csv", i=["I9"], n=["FA-9"]),
+        "e": _table("e.csv", n=["FA-9"], f=[_date("01/03/2025")]),
+    }
+    _, bilan = _controler_tables(tables, NATURES_RATTACHEMENT, [_rattachement()])
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (2, 1, 0)
+    regle = _instance("sans_ligne_liee", ref="R16", cle=["i"], table_lignes="l",
+                      filtre=[{"colonne": "s", "valeurs": ["A"]}])
+    _, bilan = _controler_tables(tables, NATURES_RATTACHEMENT, [regle])
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (1, 1, 1)
+
+
 def _conforme(**autres):
     return _instance(
         "reference_conforme",
