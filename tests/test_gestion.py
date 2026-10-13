@@ -12,6 +12,8 @@ from frigeo.gestion import (
     COLONNES_BILAN_GESTION,
     COLONNES_CATALOGUE,
     COLONNES_ECARTS_GESTION,
+    CONSTAT_ABSENTE,
+    CONSTAT_ANNEE_ABSENTE,
     CONSTAT_ANNEE_DU_NUMERO,
     CONSTAT_BATTEMENT,
     CONSTAT_CHEVAUCHEMENT,
@@ -21,8 +23,10 @@ from frigeo.gestion import (
     CONSTAT_DESEQUILIBRE,
     CONSTAT_ECART_CALCUL,
     CONSTAT_HORS_HORAIRES,
+    CONSTAT_HORS_PERIODES,
     CONSTAT_INFERIEURE,
     CONSTAT_NUMEROS_MANQUANTS,
+    CONSTAT_PERIODE_NON_COUVERTE,
     CONSTAT_RAPPORT_INFERIEUR,
     CONSTAT_RAPPORT_NON_CALCULABLE,
     CONSTAT_RAPPORT_SUPERIEUR,
@@ -213,7 +217,9 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "règle n° 3 (decoupage) : type inconnu 'date_inconnue' (types possibles : "
         "date_dans_periode_export, plage, plage_selon_valeur, rapport_dans_plage, "
         "numerotation_continue, numerotation_chronologique, intervalles_sans_chevauchement, "
-        "hors_horaires_selon_valeur, egalite_calculee, total_des_lignes, equilibre_par_groupe)",
+        "hors_horaires_selon_valeur, egalite_calculee, total_des_lignes, equilibre_par_groupe, "
+        "existence_dans_reference, date_dans_periode_reference, "
+        "periodes_couvertes_par_paliers, annee_dans_reference)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -1056,7 +1062,7 @@ def test_structure_des_intervalles_et_des_horaires():
     problemes = problemes_regles_gestion(regles)
     assert problemes == [
         "règle n° 1 (R03), comparaison : comparaison inconnue 'approchée' (comparaisons "
-        "possibles : telle quelle, après normalisation)",
+        "possibles : telle quelle, après normalisation, mots dans le désordre)",
         "règle n° 2 (R04), horaires : jour inconnu 'lundy' (jours possibles : lundi, mardi, "
         "mercredi, jeudi, vendredi, samedi, dimanche, ferie)",
         "règle n° 2 (R04), horaires : mardi, créneau n° 1, debut : une heure HH:MM entre "
@@ -1440,3 +1446,341 @@ def test_chargement_des_regles_du_4c(tmp_path):
     assert regles[0]["termes"] == {"total_ht": 0.2}
     assert regles[1]["cle"] == ["num_facture"]
     assert regles[2]["groupe"] == ["JournalCode", "EcritureNum"]
+
+
+# Morceau 4d : confrontation aux référentiels (existence, périodes, paliers, années).
+
+NATIVE = "date native"
+
+
+def _reference(type_regle, ref="R10", **parametres):
+    return _instance(type_regle, ref=ref, table_reference="r", **parametres)
+
+
+def _controler_reference(donnees, reference, natures, natures_reference, regles,
+                         sensibles=AUCUNE_SENSIBLE, declarations=None):
+    """Contrôle d'une table « t » face à un référentiel « r »; aucune lecture de config/."""
+    return controler_gestion(
+        {"t": donnees, "r": reference},
+        {**_dictionnaire("t", **natures), **_dictionnaire("r", **natures_reference)},
+        regles,
+        {} if declarations is None else declarations,
+        None,
+        sensibles,
+    )
+
+
+def _existence(**autres):
+    return _reference("existence_dans_reference", ref="existence", **{"cle": ["c"], **autres})
+
+
+def test_existence_dans_reference():
+    donnees = _table(c=["A1", "B2", " ", "Z9", "a1 ", None, "Z9"],
+                     f=["o", "o", "o", "o", "o", "o", "n"])
+    reference = _table("r.csv", c=["A1", "B2", "", "C3"])
+    natures = {"c": "texte", "f": "texte"}
+    ecarts, bilan = _controler_reference(
+        donnees, reference, natures, {"c": "texte"}, [_existence()]
+    )
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (5, CONSTAT_ABSENTE, "anomalie", "c, r.c", "Z9"),
+        (6, CONSTAT_ABSENTE, "anomalie", "c, r.c", "a1 "),
+        (8, CONSTAT_ABSENTE, "anomalie", "c, r.c", "Z9"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["vue"], resume["hors_champ"], resume["non_evaluables"],
+            resume["controlees"], resume["anomalies"]) == (VUE_TOUTES, 0, 2, 5, 3)
+    # Après normalisation, « a1 » rejoint « A1 ».
+    ecarts, _ = _controler_reference(
+        donnees, reference, natures, {"c": "texte"},
+        [_existence(comparaison="après normalisation")],
+    )
+    assert _lignes(ecarts, "num_ligne_source") == [(5,), (8,)]
+    # Clé facultative : les clés vides sont hors champ, comptées avec celles du filtre.
+    ecarts, bilan = _controler_reference(
+        donnees, reference, natures, {"c": "texte"},
+        [_existence(cle_facultative=True, filtre=[{"colonne": "f", "valeurs": ["o"]}])],
+    )
+    assert _lignes(ecarts, "num_ligne_source") == [(5,), (6,)]
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (3, 0, 4)
+
+
+def test_existence_cle_de_plusieurs_colonnes_et_mots_dans_le_desordre():
+    donnees = _table(nom=["LEROUX Mathieu", "Mathieu Leroux", "leroux  mathieu", "LEROUX M.",
+                          "DUPONT Jean"])
+    reference = _table("r.csv", n=["LEROUX", "DUPONT"], p=["Mathieu", ""])
+    natures, natures_reference = {"nom": "texte"}, {"n": "texte", "p": "texte"}
+
+    def absentes(comparaison):
+        regle = _reference("existence_dans_reference", cle=["nom"], cle_reference=["n", "p"],
+                           comparaison=comparaison)
+        ecarts, _ = _controler_reference(
+            donnees, reference, natures, natures_reference, [regle]
+        )
+        return [ligne for (ligne,) in _lignes(ecarts, "num_ligne_source")]
+
+    # Le prénom vide de DUPONT rend sa clé vide : elle n'est rattachée à rien.
+    assert absentes("telle quelle") == [3, 4, 5, 6]
+    assert absentes("après normalisation") == [3, 5, 6]
+    assert absentes("mots dans le désordre") == [5, 6]
+    regle = _reference("existence_dans_reference", cle=["nom"], cle_reference=["n", "p"])
+    ecarts, _ = _controler_reference(
+        donnees, reference, natures, natures_reference, [regle], sensibles={"r": {"n"}}
+    )
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+    assert set(ecarts["colonnes"]) == {"nom, r.n, r.p"}
+
+
+def _periodes(**autres):
+    return _reference("date_dans_periode_reference",
+                      **{"cle": ["i"], "date": "d", "debut": "e", **autres})
+
+
+NATURES_PERIODES = ({"i": "texte", "d": DATE}, {"i": "texte", "e": NATIVE, "s": NATIVE})
+
+
+def _personnes_et_periodes():
+    jour = dt.datetime
+    reference = _table(
+        "r.xlsx",
+        i=["A", "A", "B", "B", "C", "D", "", "F"],
+        e=[jour(2025, 3, 1), jour(2020, 1, 1, 9, 0), "x", jour(2020, 1, 1), jour(2025, 6, 30),
+           None, jour(2020, 1, 1), jour(2020, 1, 1)],
+        s=[None, jour(2024, 12, 31), None, jour(2020, 12, 31), jour(2025, 1, 1), None, None,
+           "y"],
+    )
+    donnees = _table(
+        i=["A", "A", "A", "A", "B", "B", "C", "E", "A", "", "A", "F", "A"],
+        d=["15/06/2024", "31/12/2024", "15/01/2025", "01/03/2025", "15/06/2020", "15/06/2025",
+           "15/03/2025", "15/03/2025", "", "15/03/2025", "32/01/2025", "15/03/2025",
+           "01/01/2020"],
+    )
+    return donnees, reference
+
+
+def test_date_dans_periode_reference():
+    donnees, reference = _personnes_et_periodes()
+    ecarts, bilan = _controler_reference(donnees, reference, *NATURES_PERIODES,
+                                         [_periodes(fin="s")])
+    # A : deux périodes, données dans le désordre, la plus récente ouverte; un début à
+    # 9 h compte pour le jour entier.
+    # B et F ont une ligne inutilisable, C n'a que la sienne; E est absent.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (4, CONSTAT_HORS_PERIODES, "anomalie", "i, d, r.i, r.e, r.s",
+         "15/01/2025 (périodes du 01/01/2020 au 31/12/2024 et depuis le 01/03/2025)"),
+        (9, CONSTAT_ABSENTE, "anomalie", "i, d, r.i, r.e, r.s", "E | 15/03/2025"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["lignes"], resume["non_evaluables"], resume["controlees"],
+            resume["anomalies"]) == (13, 6, 7, 2)
+    assert resume["avertissements"] == (
+        "5 lignes de la table r inutilisables : clé vide 1, début vide 1, début illisible 1, "
+        "fin illisible 1, début après fin 1"
+    )
+    # Sans fin, toutes les périodes sont ouvertes.
+    ecarts, bilan = _controler_reference(donnees, reference, *NATURES_PERIODES, [_periodes()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "colonnes", "valeur") == [
+        (8, CONSTAT_HORS_PERIODES, "i, d, r.i, r.e", "15/03/2025 (période depuis le 30/06/2025)"),
+        (9, CONSTAT_ABSENTE, "i, d, r.i, r.e", "E | 15/03/2025"),
+    ]
+    assert _bilan(bilan)["avertissements"] == (
+        "3 lignes de la table r inutilisables : clé vide 1, début vide 1, début illisible 1"
+    )
+
+
+def test_date_dans_periode_reference_cle_facultative_cle_et_masquage():
+    donnees, reference = _personnes_et_periodes()
+    _, bilan = _controler_reference(donnees, reference, *NATURES_PERIODES,
+                                    [_periodes(fin="s", cle_facultative=True)])
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (1, 5, 7)
+    ecarts, _ = _controler_reference(donnees, reference, *NATURES_PERIODES, [_periodes(fin="s")],
+                                     declarations={"t": {"cle": ["i"]}})
+    assert _lignes(ecarts, "cle") == [("A",), ("E",)]
+    ecarts, _ = _controler_reference(donnees, reference, *NATURES_PERIODES, [_periodes(fin="s")],
+                                     sensibles={"r": {"s"}})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+
+
+def _paliers(**autres):
+    return _instance("periodes_couvertes_par_paliers", ref="R21", cle=["m"], debut="e",
+                     table_paliers="r", date_palier="d", **autres)
+
+
+def _periodes_et_paliers():
+    jour = dt.datetime
+    periodes = _table(
+        "p.xlsx",
+        m=["M1", "M1", "M2", "M3", "M4", "M6", "M6", "M7", "M8", "M8", ""],
+        e=[jour(2020, 1, 1), jour(2024, 1, 1), jour(2021, 5, 1), jour(2023, 1, 1), "x",
+           jour(2020, 1, 1), "y", jour(2022, 1, 1), jour(2019, 1, 1), jour(2021, 1, 1),
+           jour(2020, 1, 1)],
+        s=[jour(2022, 6, 30), None, None, None, None, None, None, None, "w", None, None],
+    )
+    paliers = _table(
+        "r.xlsx",
+        m=["M1", "M1", "M1", "M1", "M2", "M7", "M8", "", "M9"],
+        d=[jour(2020, 1, 1), jour(2022, 6, 30), jour(2025, 1, 1), jour(2024, 2, 1),
+           jour(2021, 4, 15), "z", jour(2019, 1, 1), jour(2020, 1, 1), None],
+    )
+    return periodes, paliers
+
+
+NATURES_PALIERS = ({"m": "texte", "e": NATIVE, "s": NATIVE}, {"m": "texte", "d": NATIVE})
+
+
+def test_periodes_couvertes_par_paliers():
+    periodes, paliers = _periodes_et_paliers()
+    ecarts, bilan = _controler_reference(periodes, paliers, *NATURES_PALIERS,
+                                         [_paliers(fin="s")])
+    # M1 : le palier du 30/06/2022, jour de la fin de la première période, ne couvre pas
+    # la seconde. M3 n'a aucun palier.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (3, CONSTAT_PERIODE_NON_COUVERTE, "anomalie", "m, e, s, r.m, r.d",
+         "période du 01/01/2024, premier palier le 01/02/2024"),
+        (5, CONSTAT_PERIODE_NON_COUVERTE, "anomalie", "m, e, s, r.m, r.d",
+         "période du 01/01/2023, aucun palier ensuite"),
+    ]
+    resume = _bilan(bilan)
+    # Non évaluables : début illisible (M4), autre période illisible (M6, deux lignes),
+    # palier illisible (M7), fin précédente illisible (M8), clé vide.
+    assert (resume["vue"], resume["lignes"], resume["non_evaluables"], resume["controlees"],
+            resume["anomalies"]) == (VUE_SANS_SURNOMBRE, 11, 6, 5, 2)
+    assert resume["avertissements"] == (
+        "3 lignes de la table r inutilisables : clé vide 1, date vide 1, date illisible 1"
+    )
+    # Un palier le lendemain de la fin de la première période couvre la seconde.
+    plus = pd.concat([paliers, _table("r.xlsx", premiere_ligne=11, m=["M1"],
+                                      d=[dt.datetime(2022, 7, 1)])], ignore_index=True)
+    ecarts, _ = _controler_reference(periodes, plus, *NATURES_PALIERS, [_paliers(fin="s")])
+    assert _lignes(ecarts, "num_ligne_source") == [(5,)]
+
+
+def test_annee_dans_reference():
+    donnees = _table(d=["14/03/2025", "01/01/2026", "14/03/2052", "", "x", "02/02/2052",
+                        "05/05/2062"])
+    reference = _table("r.xlsx", a=[2025, 2026.0, 2026.5, None, "deux"])
+    regle = _reference("annee_dans_reference", ref="R21", date="d", colonne_annee="a")
+    ecarts, bilan = _controler_reference(donnees, reference, {"d": DATE}, {"a": NATIF}, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (4, CONSTAT_ANNEE_ABSENTE, "anomalie", "d, r.a", "14/03/2052 (année 2052)"),
+        (7, CONSTAT_ANNEE_ABSENTE, "anomalie", "d, r.a", "02/02/2052 (année 2052)"),
+        (8, CONSTAT_ANNEE_ABSENTE, "anomalie", "d, r.a", "05/05/2062 (année 2062)"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["non_evaluables"], resume["controlees"], resume["anomalies"]) == (2, 5, 3)
+    assert resume["avertissements"] == (
+        "3 lignes de la table r inutilisables : année vide 1, année illisible 2; "
+        "année 2052 absente de r.a : 2 lignes; année 2062 absente de r.a : 1 ligne"
+    )
+
+
+def test_intervalles_mots_dans_le_desordre():
+    donnees = _table(g=["Dupont Jean", "jean  DUPONT"], d=["14/03/2025", "14/03/2025"],
+                     m=["60", "30"])
+    natures = {"g": "texte", "d": DATE, "m": ENTIER}
+    regle = _instance("intervalles_sans_chevauchement", ref="R03", groupe="g", date="d",
+                      duree="m", comparaison="mots dans le désordre")
+    ecarts, _ = _controler(donnees, natures, regles=[regle])
+    # À début égal, la plus longue porte l'écart.
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [(2, CONSTAT_CHEVAUCHEMENT)]
+
+
+def test_structure_des_types_du_4d():
+    regles = [
+        _existence(cle="c"),
+        _existence(cle_reference=[], cle_facultative="oui", comparaison="approchée"),
+        {key: valeur for key, valeur in _periodes(debut=3).items() if key != "date"},
+        _reference("annee_dans_reference", date="d"),
+        _paliers(cle_paliers=["m", "m"]),
+        _existence(),
+        _existence(cle_reference=["c"]),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (existence), cle : une liste non vide de noms de colonnes est attendue "
+        "(liste de colonnes)",
+        "règle n° 2 (existence), cle_reference : une liste non vide de noms de colonnes est "
+        "attendue (liste de colonnes de la table liée)",
+        "règle n° 2 (existence), comparaison : comparaison inconnue 'approchée' (comparaisons "
+        "possibles : telle quelle, après normalisation, mots dans le désordre)",
+        "règle n° 2 (existence), cle_facultative : true ou false est attendu",
+        "règle n° 3 (R10) : paramètre manquant (date)",
+        "règle n° 3 (R10), debut : un nom de colonne est attendu (colonne de date de la table "
+        "liée)",
+        "règle n° 4 (R10) : paramètre manquant (colonne_annee)",
+        "règle n° 5 (R21), cle_paliers : colonne citée deux fois",
+        # La clé du référentiel reprend par défaut celle de la table.
+        "règle n° 7 (existence) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 6 (existence))",
+    ]
+
+
+def test_referentiel_confronte_aux_donnees():
+    donnees, reference = _personnes_et_periodes()
+    with pytest.raises(ValueError) as erreur:
+        controler_gestion({"t": donnees}, _dictionnaire("t", **NATURES_PERIODES[0]),
+                          [_periodes(fin="s")], {}, None, AUCUNE_SENSIBLE)
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R10), table_reference : table r absente des données chargées"
+    ]
+    with pytest.raises(ValueError) as erreur:
+        _controler_reference(
+            donnees, reference.drop(columns=["i"]), NATURES_PERIODES[0],
+            {"i": "texte", "e": "texte", "s": NATIVE},
+            [_periodes(fin="s"), _existence(cle=["i"], cle_reference=["x"])],
+        )
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R10), cle_reference : colonne r.i absente des données chargées",
+        "règle n° 1 (R10), debut : la nature en vigueur de r.e est 'texte', une date est "
+        "attendue (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "règle n° 2 (existence), cle_reference : colonne r.x absente des données chargées",
+    ]
+
+
+def test_catalogue_des_types_du_4d():
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["existence_dans_reference", "parametres"] == (
+        "cle (liste de colonnes), table_reference (table), cle_reference (liste de colonnes "
+        "de la table liée, facultatif), comparaison (comparaison, facultatif), "
+        "cle_facultative (true ou false, facultatif)"
+    )
+    assert catalogue.loc["date_dans_periode_reference", "parametres"] == (
+        "cle (liste de colonnes), date (colonne de date), table_reference (table), "
+        "cle_reference (liste de colonnes de la table liée, facultatif), debut (colonne de "
+        "date de la table liée), fin (colonne de date de la table liée, facultatif), "
+        "comparaison (comparaison, facultatif), cle_facultative (true ou false, facultatif)"
+    )
+    assert catalogue.loc["periodes_couvertes_par_paliers", "parametres"] == (
+        "cle (liste de colonnes), debut (colonne de date), fin (colonne de date, facultatif), "
+        "table_paliers (table), cle_paliers (liste de colonnes de la table liée, facultatif), "
+        "date_palier (colonne de date de la table liée)"
+    )
+    assert catalogue.loc["annee_dans_reference", "parametres"] == (
+        "date (colonne de date), table_reference (table), colonne_annee (colonne de nombre de "
+        "la table liée)"
+    )
+    types = ["existence_dans_reference", "date_dans_periode_reference",
+             "periodes_couvertes_par_paliers", "annee_dans_reference"]
+    assert list(catalogue.loc[types, "vue"]) == [VUE_TOUTES, VUE_TOUTES, VUE_SANS_SURNOMBRE,
+                                                 VUE_TOUTES]
+    assert set(catalogue.loc[types, "issue"]) == {"anomalie"}
+
+
+def test_chargement_des_regles_du_4d(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: existence\n    libelle: Pièce\n    type: existence_dans_reference\n"
+        "    table: achats_lignes\n    cle: [ref_piece]\n"
+        "    table_reference: catalogue_pieces\n    cle_facultative: true\n"
+        "  - ref: R10\n    libelle: Intervenant\n    type: date_dans_periode_reference\n"
+        "    table: interventions\n    cle: [intervenant]\n    date: date_debut\n"
+        "    table_reference: intervenants\n    cle_reference: [nom, prenom]\n"
+        "    debut: date_entree\n    fin: date_sortie\n"
+        "    comparaison: mots dans le désordre\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[0]["cle_facultative"] is True
+    assert regles[1]["cle_reference"] == ["nom", "prenom"]

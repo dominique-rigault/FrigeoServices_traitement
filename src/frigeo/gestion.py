@@ -35,7 +35,9 @@ doublons exacts est gardée).
 Un type peut rapprocher la table de la règle d'une autre table, sa table liée (par
 exemple les en-têtes de factures et leurs lignes) : la vue s'applique aux deux
 tables, le filtre à la seule table de la règle, et les écarts sont portés par les
-lignes de la table de la règle.
+lignes de la table de la règle. Les types qui confrontent une table à un
+référentiel (existence d'une clé, date dans une période, année déclarée) suivent le
+même mécanisme, le référentiel étant la table liée.
 
 Rien n'est corrigé ni écrit : `controler_gestion` rend la table des écarts et un
 bilan.
@@ -46,7 +48,7 @@ from __future__ import annotations
 import datetime as dt
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -75,7 +77,16 @@ from .doublons import (
     detecter_doublons,
     normaliser,
 )
-from .typage import NATURES_DATE, NATURES_HEURE, NATURES_NOMBRE, ecrire_date, lire
+from .typage import (
+    ETAT_ILLISIBLE,
+    ETAT_LUE,
+    ETAT_VIDE,
+    NATURES_DATE,
+    NATURES_HEURE,
+    NATURES_NOMBRE,
+    ecrire_date,
+    lire,
+)
 
 ISSUE_INFORMATION = "information"
 ISSUES = (ISSUE_ANOMALIE, ISSUE_A_ARBITRER, ISSUE_INFORMATION)
@@ -110,14 +121,19 @@ GENRE_VALEURS = "liste de valeurs"
 GENRE_COLONNES = "liste de colonnes"
 GENRE_TERMES = "termes"
 GENRE_TABLE = "table"
+GENRE_BOOLEEN = "true ou false"
 # Colonnes de la table liée (nommée par un paramètre de genre « table »), avec le
 # genre de colonne qui dit leur nature attendue.
 GENRE_COLONNE_LIEE = "colonne de la table liée"
 GENRE_COLONNE_NOMBRE_LIEE = "colonne de nombre de la table liée"
+GENRE_COLONNE_DATE_LIEE = "colonne de date de la table liée"
 GENRES_COLONNE_LIEE = {
     GENRE_COLONNE_LIEE: GENRE_COLONNE,
     GENRE_COLONNE_NOMBRE_LIEE: GENRE_COLONNE_NOMBRE,
+    GENRE_COLONNE_DATE_LIEE: GENRE_COLONNE_DATE,
 }
+# Liste de colonnes de la table liée.
+GENRE_COLONNES_LIEES = "liste de colonnes de la table liée"
 # Colonnes de même nom dans la table de la règle et dans la table liée.
 GENRE_COLONNES_COMMUNES = "colonnes des deux tables"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
@@ -126,8 +142,11 @@ _NATURES_ATTENDUES = {
     GENRE_COLONNE_HEURE: (NATURES_HEURE, "une heure est attendue"),
     GENRE_COLONNE_NOMBRE: (NATURES_NOMBRE, "un nombre est attendu"),
 }
-# Comparaison des valeurs d'une colonne de regroupement (voir doublons.normaliser).
-COMPARAISONS = (COMPARAISON_TELLE_QUELLE, COMPARAISON_NORMALISEE)
+# Comparaison des valeurs d'une colonne de regroupement ou d'une clé : telle quelle,
+# après normalisation (voir doublons.normaliser), ou mots dans le désordre (après
+# normalisation, les mots étant triés, pour rapprocher « NOM Prénom » de « Prénom NOM »).
+COMPARAISON_MOTS = "mots dans le désordre"
+COMPARAISONS = (COMPARAISON_TELLE_QUELLE, COMPARAISON_NORMALISEE, COMPARAISON_MOTS)
 # Horaires : créneaux de chaque jour de la semaine, et d'un jour férié. Un jour
 # absent n'a aucun créneau. Un créneau va de debut (inclus) à fin (exclue).
 JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -197,12 +216,15 @@ class Constats:
     vide. L'issue n'est pas donnée par le type : c'est celle de la règle, ou à
     défaut celle du type. `avertissements` : messages sur la règle elle-même (par
     exemple une configuration incomplète pour une année des données), affichés au
-    bilan.
+    bilan. `hors_champ`, facultatif : vrai pour une ligne que le type laisse hors de
+    son champ (par exemple une clé facultative vide); elle est comptée avec les
+    lignes hors du filtre, et non parmi les lignes non évaluables.
     """
 
     evaluables: pd.Series
     ecarts: pd.DataFrame
     avertissements: tuple = ()
+    hors_champ: pd.Series | None = None
 
 
 @dataclass(frozen=True)
@@ -219,7 +241,9 @@ class TypeRegle:
     paramètre vérifié selon son genre. `issue` : issue des écarts quand la règle
     n'en déclare pas. `table_liee` : nom du paramètre qui désigne la table liée,
     pour un type qui rapproche deux tables; `controler` reçoit alors aussi la table
-    liée (`Liee`), prise selon la même vue.
+    liée (`Liee`), prise selon la même vue. `defauts` : paramètre facultatif vers le
+    paramètre dont il reprend la valeur quand il manque (par exemple la clé du
+    référentiel, qui reprend par défaut les noms de colonnes de la clé).
     """
 
     description: str
@@ -231,6 +255,7 @@ class TypeRegle:
     verifier: Callable | None = None
     issue: str = ISSUE_ANOMALIE
     table_liee: str | None = None
+    defauts: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -560,12 +585,22 @@ CONSTAT_CHEVAUCHEMENT = "chevauche une ligne précédente du même groupe"
 CONSTAT_BATTEMENT = "écart inférieur au battement avec la ligne précédente"
 
 
-def _groupe_lu(valeur, normalisee: bool) -> str | None:
+def _comparable(texte: str, comparaison: str) -> str:
+    """Texte sous la forme où il est comparé (voir `COMPARAISONS`)."""
+    if comparaison == COMPARAISON_TELLE_QUELLE:
+        return texte
+    normalise = normaliser(texte)
+    if comparaison == COMPARAISON_MOTS:
+        return " ".join(sorted(normalise.split()))
+    return normalise
+
+
+def _groupe_lu(valeur, comparaison: str) -> str | None:
     """Valeur d'une colonne de regroupement, None si elle est vide."""
     texte = _valeur_constatee(valeur)
     if texte is None or not texte.strip():
         return None
-    return normaliser(texte) if normalisee else texte
+    return _comparable(texte, comparaison)
 
 
 def _ecrire_creneau(debut: pd.Timestamp, fin: pd.Timestamp) -> str:
@@ -608,8 +643,8 @@ def _intervalles_sans_chevauchement(donnees, parametres, natures) -> Constats:
     else:
         heures = pd.Series(pd.Timedelta(0), index=donnees.index, dtype="timedelta64[ns]")
     durees = lire(donnees[colonne_duree], natures[colonne_duree]).valeurs
-    normalisee = parametres.get("comparaison") == COMPARAISON_NORMALISEE
-    groupes = donnees[parametres["groupe"]].map(lambda valeur: _groupe_lu(valeur, normalisee))
+    comparaison = parametres.get("comparaison", COMPARAISON_TELLE_QUELLE)
+    groupes = donnees[parametres["groupe"]].map(lambda valeur: _groupe_lu(valeur, comparaison))
     debuts = dates + heures
     fins = debuts + pd.to_timedelta(durees, unit="min")
     evaluables = (groupes.notna() & debuts.notna() & (durees >= 0)).astype(bool)
@@ -915,6 +950,286 @@ def _equilibre_par_groupe(donnees, parametres, natures) -> Constats:
     return Constats(evaluables, _ecarts(constats, valeurs=affichees))
 
 
+CONSTAT_ABSENTE = "absente de la table de référence"
+CONSTAT_HORS_PERIODES = "date hors des périodes de la table de référence"
+CONSTAT_PERIODE_NON_COUVERTE = "début de période non couvert par un palier"
+CONSTAT_ANNEE_ABSENTE = "année absente de la table de référence"
+# Raisons pour lesquelles une ligne d'un référentiel est inutilisable, dans l'ordre
+# où elles sont cherchées (une ligne n'est comptée que sous la première).
+RAISONS_PERIODE = ("clé vide", "début vide", "début illisible", "fin illisible",
+                   "début après fin")
+RAISONS_PALIER = ("clé vide", "date vide", "date illisible")
+RAISONS_ANNEE = ("année vide", "année illisible")
+
+
+def _cles_comparees(
+    donnees: pd.DataFrame, colonnes: list[str], comparaison: str = COMPARAISON_TELLE_QUELLE
+) -> pd.Series:
+    """Clé de chaque ligne : textes de ses colonnes reliés par une espace, sous la forme
+    où ils sont comparés; None si l'une des colonnes est vide ou faite d'espaces."""
+
+    def cle(ligne):
+        textes = [_valeur_constatee(valeur) for valeur in ligne]
+        if any(texte is None or not texte.strip() for texte in textes):
+            return None
+        return _comparable(" ".join(textes), comparaison)
+
+    return pd.Series(
+        [cle(ligne) for ligne in donnees[colonnes].itertuples(index=False)],
+        index=donnees.index,
+        dtype=object,
+    )
+
+
+def _hors_champ_cle(cles: pd.Series, parametres: dict) -> pd.Series:
+    """Lignes à clé vide, hors champ quand la clé est déclarée facultative."""
+    if parametres.get("cle_facultative"):
+        return cles.isna().astype(bool)
+    return pd.Series(False, index=cles.index, dtype=bool)
+
+
+def _jour(date: pd.Timestamp) -> str:
+    return f"{date:%d/%m/%Y}"
+
+
+def _inutilisables(table: str, raisons: dict) -> list[str]:
+    """Avertissement sur les lignes inutilisables d'un référentiel, par raison."""
+    total = sum(raisons.values())
+    if not total:
+        return []
+    detail = ", ".join(f"{raison} {nombre}" for raison, nombre in raisons.items() if nombre)
+    return [
+        _pluriel(
+            total,
+            f"ligne de la table {table} inutilisable",
+            f"lignes de la table {table} inutilisables",
+        )
+        + f" : {detail}"
+    ]
+
+
+def _lire_dates(donnees: pd.DataFrame, colonne: str | None, nature: str | None):
+    """Dates lues (ramenées à minuit) et états d'une colonne; sans colonne, des dates
+    vides."""
+    if colonne is None:
+        return (
+            pd.Series(pd.NaT, index=donnees.index, dtype="datetime64[ns]"),
+            pd.Series(ETAT_VIDE, index=donnees.index, dtype=object),
+        )
+    lecture = lire(donnees[colonne], nature)
+    return lecture.valeurs.dt.normalize(), lecture.etats
+
+
+def _existence_dans_reference(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Clé de chaque ligne présente dans la table de référence.
+
+    Les clés sont comparées selon `comparaison`. Une clé vide rend la ligne non
+    évaluable, ou hors champ si la clé est facultative.
+    """
+    comparaison = parametres.get("comparaison", COMPARAISON_TELLE_QUELLE)
+    cles = _cles_comparees(donnees, parametres["cle"], comparaison)
+    connues = set(_cles_comparees(liee.donnees, parametres["cle_reference"], comparaison).dropna())
+    constats = cles.map(lambda cle: None if cle is None or cle in connues else CONSTAT_ABSENTE)
+    return Constats(
+        cles.notna().astype(bool),
+        _ecarts(constats.astype(object)),
+        hors_champ=_hors_champ_cle(cles, parametres),
+    )
+
+
+def _ecrire_periodes(periodes: list) -> str:
+    """Périodes écrites « périodes du 01/01/2018 au 31/12/2023 et depuis le 01/05/2024 »."""
+    textes = [
+        f"depuis le {_jour(debut)}" if pd.isna(fin) else f"du {_jour(debut)} au {_jour(fin)}"
+        for debut, fin in sorted(periodes, key=lambda periode: periode[0])
+    ]
+    return ("période " if len(textes) == 1 else "périodes ") + " et ".join(textes)
+
+
+def _date_dans_periode_reference(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Date de chaque ligne dans l'une des périodes de sa clé dans la table de référence.
+
+    Une clé peut avoir plusieurs périodes (lignes du référentiel); une période va de
+    `debut` à `fin`, bornes incluses, et une fin vide (ou l'absence de `fin`) la laisse
+    ouverte. Une ligne du référentiel au début vide ou illisible, à la fin illisible,
+    ou au début postérieur à la fin, est inutilisable (avertissement au bilan). Une clé
+    absente du référentiel est un écart; une date hors des périodes utilisables est un
+    autre écart, sauf si la clé a une période inutilisable (ligne non évaluable). Une
+    clé vide rend la ligne non évaluable, ou hors champ si la clé est facultative; une
+    date vide ou illisible la rend non évaluable.
+    """
+    comparaison = parametres.get("comparaison", COMPARAISON_TELLE_QUELLE)
+    cles = _cles_comparees(donnees, parametres["cle"], comparaison)
+    colonne_date = parametres["date"]
+    dates, _ = _lire_dates(donnees, colonne_date, natures[colonne_date])
+    reference = _cles_comparees(liee.donnees, parametres["cle_reference"], comparaison)
+    debut, fin = parametres["debut"], parametres.get("fin")
+    debuts, etats_debut = _lire_dates(liee.donnees, debut, liee.natures[debut])
+    fins, etats_fin = _lire_dates(liee.donnees, fin, liee.natures.get(fin))
+    raisons = dict.fromkeys(RAISONS_PERIODE, 0)
+    periodes, inutilisables = {}, set()
+    for position, cle in reference.items():
+        raison = None
+        if cle is None:
+            raison = "clé vide"
+        elif etats_debut.loc[position] == ETAT_VIDE:
+            raison = "début vide"
+        elif etats_debut.loc[position] == ETAT_ILLISIBLE:
+            raison = "début illisible"
+        elif etats_fin.loc[position] == ETAT_ILLISIBLE:
+            raison = "fin illisible"
+        elif pd.notna(fins.loc[position]) and debuts.loc[position] > fins.loc[position]:
+            raison = "début après fin"
+        if raison is not None:
+            raisons[raison] += 1
+            if cle is not None:
+                inutilisables.add(cle)
+            continue
+        periodes.setdefault(cle, []).append((debuts.loc[position], fins.loc[position]))
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle, date in zip(donnees.index, cles, dates):
+        if cle is None or pd.isna(date):
+            continue
+        if cle not in periodes and cle not in inutilisables:
+            evaluables.loc[position] = True
+            constats.loc[position] = CONSTAT_ABSENTE
+            continue
+        liste = periodes.get(cle, [])
+        if any(debut <= date and (pd.isna(fin) or date <= fin) for debut, fin in liste):
+            evaluables.loc[position] = True
+            continue
+        if cle in inutilisables:
+            continue
+        evaluables.loc[position] = True
+        constats.loc[position] = CONSTAT_HORS_PERIODES
+        affichees.loc[position] = f"{_jour(date)} ({_ecrire_periodes(liste)})"
+    return Constats(
+        evaluables,
+        _ecarts(constats, valeurs=affichees),
+        tuple(_inutilisables(liee.table, raisons)),
+        hors_champ=_hors_champ_cle(cles, parametres),
+    )
+
+
+def _periodes_couvertes_par_paliers(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Début de chaque période couvert par un palier de même clé.
+
+    Un palier (ligne de la table liée, par exemple une rémunération) vaut de sa date
+    jusqu'au palier suivant de la même clé; seul le début d'une période peut donc
+    être découvert. Une période est couverte si un palier de sa clé est daté au plus
+    tard à son début et après la fin de la période précédente de la même clé (un
+    palier d'une période antérieure ne couvre pas la suivante). La valeur affichée
+    donne le début de la période et la date du premier palier qui le suit.
+
+    Non évaluable : clé vide, début vide ou illisible, autre période de la même clé
+    au début vide ou illisible, période précédente à la fin illisible, ou palier de
+    la clé à la date vide ou illisible quand aucun palier lisible ne couvre la
+    période. Les paliers inutilisables sont signalés au bilan.
+    """
+    cles = _cles_comparees(donnees, parametres["cle"])
+    debut, fin = parametres["debut"], parametres.get("fin")
+    debuts, etats_debut = _lire_dates(donnees, debut, natures[debut])
+    fins, etats_fin = _lire_dates(donnees, fin, natures.get(fin))
+    colonne_palier = parametres["date_palier"]
+    dates_paliers, etats_paliers = _lire_dates(
+        liee.donnees, colonne_palier, liee.natures[colonne_palier]
+    )
+    raisons = dict.fromkeys(RAISONS_PALIER, 0)
+    paliers, illisibles = {}, set()
+    for position, cle in _cles_comparees(liee.donnees, parametres["cle_paliers"]).items():
+        if cle is None:
+            raisons["clé vide"] += 1
+        elif etats_paliers.loc[position] == ETAT_LUE:
+            paliers.setdefault(cle, []).append(dates_paliers.loc[position])
+        else:
+            raisons["date vide" if etats_paliers.loc[position] == ETAT_VIDE
+                    else "date illisible"] += 1
+            illisibles.add(cle)
+    par_cle = {}
+    for position, cle in cles.items():
+        if cle is not None:
+            par_cle.setdefault(cle, []).append(position)
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle in cles.items():
+        if cle is None or etats_debut.loc[position] != ETAT_LUE:
+            continue
+        depart = debuts.loc[position]
+        autres = [p for p in par_cle[cle] if p != position]
+        if any(etats_debut.loc[p] != ETAT_LUE for p in autres):
+            continue
+        precedentes = [p for p in autres if debuts.loc[p] < depart]
+        borne = pd.NaT
+        if precedentes:
+            precedente = max(precedentes, key=lambda p: debuts.loc[p])
+            if etats_fin.loc[precedente] == ETAT_ILLISIBLE:
+                continue
+            borne = fins.loc[precedente]
+        dates = paliers.get(cle, [])
+        if any(date <= depart and (pd.isna(borne) or date > borne) for date in dates):
+            evaluables.loc[position] = True
+            continue
+        if cle in illisibles:
+            continue
+        evaluables.loc[position] = True
+        constats.loc[position] = CONSTAT_PERIODE_NON_COUVERTE
+        suivants = [date for date in dates if date > depart]
+        affichees.loc[position] = f"période du {_jour(depart)}, " + (
+            f"premier palier le {_jour(min(suivants))}" if suivants else "aucun palier ensuite"
+        )
+    return Constats(
+        evaluables,
+        _ecarts(constats, valeurs=affichees),
+        tuple(_inutilisables(liee.table, raisons)),
+    )
+
+
+def _annee_dans_reference(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Année de la date de chaque ligne déclarée dans la table de référence.
+
+    Une date vide ou illisible rend la ligne non évaluable. Les années absentes sont
+    aussi signalées au bilan, avec leur nombre de lignes, ainsi que les lignes du
+    référentiel dont l'année est vide, illisible ou n'est pas un entier.
+    """
+    colonne = parametres["date"]
+    dates, _ = _lire_dates(donnees, colonne, natures[colonne])
+    colonne_annee = parametres["colonne_annee"]
+    lecture = lire(liee.donnees[colonne_annee], liee.natures[colonne_annee])
+    raisons = dict.fromkeys(RAISONS_ANNEE, 0)
+    connues = set()
+    for valeur, etat in zip(lecture.valeurs, lecture.etats):
+        if etat == ETAT_VIDE:
+            raisons["année vide"] += 1
+        elif etat == ETAT_ILLISIBLE or not float(valeur).is_integer():
+            raisons["année illisible"] += 1
+        else:
+            connues.add(int(valeur))
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    absentes = {}
+    for position, date in dates.items():
+        if pd.isna(date) or date.year in connues:
+            continue
+        constats.loc[position] = CONSTAT_ANNEE_ABSENTE
+        affichees.loc[position] = (
+            f"{_valeur_constatee(donnees.at[position, colonne])} (année {date.year})"
+        )
+        absentes[date.year] = absentes.get(date.year, 0) + 1
+    avertissements = _inutilisables(liee.table, raisons) + [
+        f"année {annee} absente de {liee.table}.{colonne_annee} : "
+        + _pluriel(nombre, "ligne", "lignes")
+        for annee, nombre in sorted(absentes.items())
+    ]
+    return Constats(
+        dates.notna().astype(bool), _ecarts(constats, valeurs=affichees), tuple(avertissements)
+    )
+
+
 def _verifier_tolerance(parametres: dict) -> list[str]:
     if parametres.get("tolerance", 0) < 0:
         return ["tolerance : un nombre positif ou nul est attendu"]
@@ -1043,8 +1358,8 @@ TYPES = {
             "Dans un même groupe (par exemple un intervenant), deux lignes ne se "
             "chevauchent pas et sont séparées d'au moins battement minutes. Une ligne "
             "commence à date (et heure) et dure duree minutes; comparaison vaut telle "
-            "quelle (par défaut) ou après normalisation (sans accent, casse ni espace "
-            "en trop)."
+            "quelle (par défaut), après normalisation (sans accent, casse ni espace "
+            "en trop) ou mots dans le désordre (après normalisation, mots triés)."
         ),
         parametres={
             "groupe": GENRE_COLONNE,
@@ -1137,6 +1452,89 @@ TYPES = {
         facultatifs=("tolerance",),
         verifier=_verifier_tolerance,
     ),
+    "existence_dans_reference": TypeRegle(
+        description=(
+            "La clé de chaque ligne (cle, une ou plusieurs colonnes, textes reliés par "
+            "une espace) existe dans table_reference, sous les colonnes de "
+            "cle_reference (par défaut celles de cle). comparaison vaut telle quelle "
+            "(par défaut), après normalisation ou mots dans le désordre. Une clé vide "
+            "rend la ligne non évaluable, ou hors champ si cle_facultative vaut true."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "table_reference": GENRE_TABLE,
+            "cle_reference": GENRE_COLONNES_LIEES,
+            "comparaison": GENRE_COMPARAISON,
+            "cle_facultative": GENRE_BOOLEEN,
+        },
+        vue=VUE_TOUTES,
+        controler=_existence_dans_reference,
+        facultatifs=("cle_reference", "comparaison", "cle_facultative"),
+        table_liee="table_reference",
+        defauts={"cle_reference": "cle"},
+    ),
+    "date_dans_periode_reference": TypeRegle(
+        description=(
+            "La date de chaque ligne tombe dans l'une des périodes (debut à fin, "
+            "incluses; fin vide ou absente : période ouverte) que table_reference donne "
+            "pour sa clé (voir existence_dans_reference). Une clé absente du référentiel "
+            "est un écart; une ligne du référentiel inutilisable (début vide ou "
+            "illisible, fin illisible, début après fin) est signalée au bilan et rend "
+            "non évaluables les dates hors des autres périodes de sa clé."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "date": GENRE_COLONNE_DATE,
+            "table_reference": GENRE_TABLE,
+            "cle_reference": GENRE_COLONNES_LIEES,
+            "debut": GENRE_COLONNE_DATE_LIEE,
+            "fin": GENRE_COLONNE_DATE_LIEE,
+            "comparaison": GENRE_COMPARAISON,
+            "cle_facultative": GENRE_BOOLEEN,
+        },
+        vue=VUE_TOUTES,
+        controler=_date_dans_periode_reference,
+        facultatifs=("cle_reference", "fin", "comparaison", "cle_facultative"),
+        table_liee="table_reference",
+        defauts={"cle_reference": "cle"},
+    ),
+    "periodes_couvertes_par_paliers": TypeRegle(
+        description=(
+            "Chaque période (debut à fin) est couverte dès son début par un palier de "
+            "table_paliers de même clé (cle_paliers, par défaut les colonnes de cle), "
+            "daté au plus tard au début de la période et après la fin de la période "
+            "précédente de la même clé; un palier vaut jusqu'au palier suivant. Par "
+            "exemple des périodes d'emploi couvertes par des rémunérations."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "debut": GENRE_COLONNE_DATE,
+            "fin": GENRE_COLONNE_DATE,
+            "table_paliers": GENRE_TABLE,
+            "cle_paliers": GENRE_COLONNES_LIEES,
+            "date_palier": GENRE_COLONNE_DATE_LIEE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_periodes_couvertes_par_paliers,
+        facultatifs=("fin", "cle_paliers"),
+        table_liee="table_paliers",
+        defauts={"cle_paliers": "cle"},
+    ),
+    "annee_dans_reference": TypeRegle(
+        description=(
+            "L'année de la date de chaque ligne figure dans la colonne colonne_annee de "
+            "table_reference (par exemple des paramètres annuels); chaque année absente "
+            "est aussi signalée au bilan."
+        ),
+        parametres={
+            "date": GENRE_COLONNE_DATE,
+            "table_reference": GENRE_TABLE,
+            "colonne_annee": GENRE_COLONNE_NOMBRE_LIEE,
+        },
+        vue=VUE_TOUTES,
+        controler=_annee_dans_reference,
+        table_liee="table_reference",
+    ),
 }
 
 
@@ -1176,6 +1574,16 @@ def _texte_attendu(valeur) -> bool:
     return isinstance(valeur, str) and valeur.strip() != ""
 
 
+def _avec_defauts(instance: dict) -> dict:
+    """Instance complétée des paramètres facultatifs qui reprennent par défaut la valeur
+    d'un autre paramètre (voir `TypeRegle.defauts`)."""
+    complete = dict(instance)
+    for parametre, source in TYPES[instance["type"]].defauts.items():
+        if parametre not in complete and source in complete:
+            complete[parametre] = complete[source]
+    return complete
+
+
 def _references(instance: dict) -> list[tuple[str, str, str, str]]:
     """Colonnes citées par une instance : (paramètre, table, colonne, genre de colonne).
 
@@ -1183,6 +1591,7 @@ def _references(instance: dict) -> list[tuple[str, str, str, str]]:
     attendue (`GENRE_COLONNE` : aucune). Une colonne de la table liée est rattachée
     à la table que nomme le paramètre `table_liee` du type.
     """
+    instance = _avec_defauts(instance)
     type_regle = TYPES[instance["type"]]
     table = instance["table"]
     liee = instance.get(type_regle.table_liee) if type_regle.table_liee else None
@@ -1199,6 +1608,8 @@ def _references(instance: dict) -> list[tuple[str, str, str, str]]:
             references.extend(
                 (parametre, table, colonne, GENRE_COLONNE_NOMBRE) for colonne in valeur
             )
+        elif genre == GENRE_COLONNES_LIEES:
+            references.extend((parametre, liee, colonne, GENRE_COLONNE) for colonne in valeur)
         elif genre == GENRE_COLONNES_COMMUNES:
             for nom_table in (table, liee):
                 references.extend(
@@ -1256,7 +1667,9 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
             for element in valeur
             if not _texte_attendu(element)
         ]
-    if genre in (GENRE_COLONNES, GENRE_COLONNES_COMMUNES):
+    if genre == GENRE_BOOLEEN:
+        return [] if isinstance(valeur, bool) else ["true ou false est attendu"]
+    if genre in (GENRE_COLONNES, GENRE_COLONNES_COMMUNES, GENRE_COLONNES_LIEES):
         if not isinstance(valeur, list) or not valeur:
             return [f"une liste non vide de noms de colonnes est attendue ({genre})"]
         problemes = [
@@ -1483,14 +1896,16 @@ def problemes_regles_gestion(regles) -> list[str]:
                     for probleme in _problemes_parametre(genre, instance[parametre])
                 )
         if type_regle.verifier is not None and len(problemes) == avant_parametres:
-            parametres = {p: instance[p] for p in type_regle.parametres if p in instance}
+            complete = _avec_defauts(instance)
+            parametres = {p: complete[p] for p in type_regle.parametres if p in complete}
             problemes.extend(f"{nom} : {probleme}" for probleme in type_regle.verifier(parametres))
         if len(problemes) > deja:
             continue
+        complete = _avec_defauts(instance)
         repere = (
             instance["type"],
             instance["table"],
-            _figer({p: instance[p] for p in type_regle.parametres if p in instance}),
+            _figer({p: complete[p] for p in type_regle.parametres if p in complete}),
             _figer(instance.get(CLE_FILTRE)),
         )
         if repere in vues:
@@ -1698,7 +2113,9 @@ def controler_gestion(
     dictionnaire (`ValueError`).
 
     Les lignes en surnombre sont écartées d'abord (selon la vue du type), puis les
-    lignes qui ne remplissent pas le filtre de la règle (hors champ). Pour un type
+    lignes qui ne remplissent pas le filtre de la règle (hors champ), auxquelles
+    s'ajoutent les lignes que le type laisse hors champ (par exemple une clé
+    facultative vide). Pour un type
     qui rapproche deux tables, la table liée est prise selon la même vue, sans
     filtre; ses colonnes sont écrites « table.colonne » dans la colonne `colonnes`.
 
@@ -1756,7 +2173,8 @@ def controler_gestion(
         dans_champ = _dans_le_champ(vue, filtre)
         hors_champ = int((~dans_champ).sum())
         vue = vue[dans_champ]
-        parametres = {p: instance[p] for p in type_regle.parametres if p in instance}
+        complete = _avec_defauts(instance)
+        parametres = {p: complete[p] for p in type_regle.parametres if p in complete}
         liee, colonnes_liees = None, []
         if type_regle.table_liee is not None:
             nom_liee = instance[type_regle.table_liee]
@@ -1778,6 +2196,9 @@ def controler_gestion(
             [*colonnes, *(f"{liee.table}.{colonne}" for colonne in colonnes_liees)]
         )
         ecarts = constats.ecarts
+        hors_type = constats.hors_champ
+        if hors_type is None:
+            hors_type = pd.Series(False, index=constats.evaluables.index, dtype=bool)
         commun = {
             "ref": instance["ref"],
             "type": instance["type"],
@@ -1793,8 +2214,8 @@ def controler_gestion(
                 "filtre": _texte_filtre(filtre),
                 "lignes": len(donnees),
                 "ecartees_doublons": len(ecartees),
-                "hors_champ": hors_champ,
-                "non_evaluables": int((~constats.evaluables).sum()),
+                "hors_champ": hors_champ + int(hors_type.sum()),
+                "non_evaluables": int((~constats.evaluables & ~hors_type).sum()),
                 "controlees": int(constats.evaluables.sum()),
                 "anomalies": nombre if issue == ISSUE_ANOMALIE else 0,
                 "a_arbitrer": nombre if issue == ISSUE_A_ARBITRER else 0,
