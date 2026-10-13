@@ -37,7 +37,16 @@ exemple les en-têtes de factures et leurs lignes) : la vue s'applique aux deux
 tables, le filtre à la seule table de la règle, et les écarts sont portés par les
 lignes de la table de la règle. Les types qui confrontent une table à un
 référentiel (existence d'une clé, date dans une période, année déclarée) suivent le
-même mécanisme, le référentiel étant la table liée.
+même mécanisme, le référentiel étant la table liée. Un type peut aussi avoir
+plusieurs tables liées (par exemple une intervention, les lignes de facture qui la
+portent et les en-têtes de ces factures).
+
+Un filtre, comme les conditions d'un type, compare la valeur d'une colonne à une
+liste de valeurs ou à une expression régulière. Les pratiques que le métier tient
+pour normales se déclarent, pour les types qui l'admettent, comme des exceptions
+(paramètre `exceptions`) : un écart qui remplit toutes les conditions d'une
+exception prend l'issue « information ». Un type peut enfin avoir besoin de la date
+de coupure des données (fin de la période extraite), passée à `controler_gestion`.
 
 Rien n'est corrigé ni écrit : `controler_gestion` rend la table des écarts et un
 bilan.
@@ -99,8 +108,16 @@ CLES_COMMUNES = ("ref", "libelle", "type", "table")
 CLE_FILTRE = "filtre"
 CLE_ISSUE = "issue"
 CLES_FACULTATIVES = (CLE_FILTRE, CLE_ISSUE)
-# Clés d'une condition du filtre.
-CLES_CONDITION = ("colonne", "valeurs")
+# Clés d'une condition (filtre, conditions et exceptions d'un type) : la colonne, et
+# soit la liste des valeurs admises, soit un motif (expression régulière qui couvre la
+# valeur entière).
+CLES_CONDITION = ("colonne", "valeurs", "motif")
+CLES_TEST_CONDITION = ("valeurs", "motif")
+# Clés d'une exception (pratique normale) : son libellé et ses conditions.
+CLES_EXCEPTION = ("libelle", "conditions")
+PREFIXE_PRATIQUE = "pratique normale : "
+# Date de coupure des données, transmise au type qui la demande (TypeRegle.contexte).
+CONTEXTE_DATE_COUPURE = "date_coupure"
 
 VUE_TOUTES = "toutes les lignes"
 VUE_SANS_SURNOMBRE = "sans les doublons exacts en surnombre"
@@ -136,6 +153,12 @@ GENRES_COLONNE_LIEE = {
 GENRE_COLONNES_LIEES = "liste de colonnes de la table liée"
 # Colonnes de même nom dans la table de la règle et dans la table liée.
 GENRE_COLONNES_COMMUNES = "colonnes des deux tables"
+# Liste de conditions {colonne, valeurs ou motif}, toutes vraies, sur la table de la
+# règle ou sur la table liée que désigne TypeRegle.rattachements.
+GENRE_CONDITIONS = "liste de conditions"
+# Exceptions (pratiques normales) : liste de {libelle, conditions}; une colonne écrite
+# « table.colonne » est celle d'une table liée de la règle.
+GENRE_EXCEPTIONS = "exceptions"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
 _NATURES_ATTENDUES = {
     GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
@@ -218,7 +241,9 @@ class Constats:
     exemple une configuration incomplète pour une année des données), affichés au
     bilan. `hors_champ`, facultatif : vrai pour une ligne que le type laisse hors de
     son champ (par exemple une clé facultative vide); elle est comptée avec les
-    lignes hors du filtre, et non parmi les lignes non évaluables.
+    lignes hors du filtre, et non parmi les lignes non évaluables. Une colonne
+    `issue`, facultative, donne l'issue d'un écart quand elle n'est pas vide (par
+    exemple « information » pour une pratique normale déclarée en exception).
     """
 
     evaluables: pd.Series
@@ -244,6 +269,13 @@ class TypeRegle:
     liée (`Liee`), prise selon la même vue. `defauts` : paramètre facultatif vers le
     paramètre dont il reprend la valeur quand il manque (par exemple la clé du
     référentiel, qui reprend par défaut les noms de colonnes de la clé).
+
+    `tables_liees` : noms des paramètres qui désignent les tables liées, pour un type
+    qui en rapproche plusieurs; `controler` reçoit alors un dictionnaire (paramètre
+    vers `Liee`) au lieu d'une seule `Liee`. `rattachements` : paramètre de colonnes
+    vers le paramètre de la table liée à laquelle ces colonnes appartiennent (par
+    défaut `table_liee`). `contexte` : informations sur les données que le type
+    demande, transmises dans ses paramètres (`CONTEXTE_DATE_COUPURE`).
     """
 
     description: str
@@ -256,6 +288,15 @@ class TypeRegle:
     issue: str = ISSUE_ANOMALIE
     table_liee: str | None = None
     defauts: dict = field(default_factory=dict)
+    tables_liees: tuple = ()
+    rattachements: dict = field(default_factory=dict)
+    contexte: tuple = ()
+
+    def parametres_tables(self) -> tuple:
+        """Paramètres qui désignent les tables liées, dans leur ordre."""
+        if self.tables_liees:
+            return self.tables_liees
+        return (self.table_liee,) if self.table_liee else ()
 
 
 @dataclass(frozen=True)
@@ -272,6 +313,7 @@ def _ecarts(
     constats: pd.Series,
     propositions: pd.Series | None = None,
     valeurs: pd.Series | None = None,
+    issues: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Écarts d'un type : une ligne par constat renseigné, indexée par la position."""
     garde = constats.notna()
@@ -284,6 +326,8 @@ def _ecarts(
         ecarts["proposition"] = propositions[garde].astype(object)
     if valeurs is not None:
         ecarts["valeur"] = valeurs[garde].astype(object)
+    if issues is not None:
+        ecarts["issue"] = issues[garde].astype(object)
     return ecarts
 
 
@@ -1230,6 +1274,266 @@ def _annee_dans_reference(donnees, parametres, natures, liee: Liee) -> Constats:
     )
 
 
+CONSTAT_SANS_DOCUMENT = "aucun document rattaché"
+CONSTAT_DELAI_NON_ECHU = "aucun document rattaché, délai non échu à la date de coupure"
+CONSTAT_PLUSIEURS_DOCUMENTS = "rattachée à plusieurs documents"
+CONSTAT_HORS_DELAI = "document hors du délai"
+CONSTAT_NON_CONFORME = "référence non conforme"
+CONSTAT_VALEURS_DIFFERENTES = "valeurs différentes entre les deux références"
+CONSTAT_LIGNES_INATTENDUES = "lignes liées alors qu'aucune n'est attendue"
+
+
+def _index_unique(cles: pd.Series) -> tuple[dict, set]:
+    """Position de chaque clé présente une seule fois, et ensemble des clés répétées
+    (les clés vides sont ignorées)."""
+    comptes = cles.dropna().value_counts()
+    repetees = set(comptes.index[comptes > 1])
+    index = {
+        cle: position
+        for position, cle in cles.items()
+        if cle is not None and cle not in repetees
+    }
+    return index, repetees
+
+
+def _pratique(exceptions, donnees: pd.DataFrame, position, cibles: dict) -> str | None:
+    """Libellé de la première exception dont toutes les conditions sont remplies.
+
+    Une colonne sans préfixe est lue sur la ligne de la règle; une colonne « t.c » sur
+    les lignes de la table liée t que donne `cibles` (table vers vue et positions),
+    qui doivent toutes remplir la condition (et être au moins une).
+    """
+    for exception in exceptions or []:
+        remplie = True
+        for condition in exception["conditions"]:
+            table, colonne = _colonne_qualifiee(condition["colonne"], None, cibles)
+            if table is None:
+                textes = [_texte_lu(donnees.at[position, colonne])]
+            else:
+                vue, positions = cibles[table]
+                textes = [_texte_lu(vue.at[p, colonne]) for p in positions]
+            if not textes or not all(_condition_vraie(texte, condition) for texte in textes):
+                remplie = False
+                break
+        if remplie:
+            return exception["libelle"]
+    return None
+
+
+def _rattachement_unique_dans_delai(donnees, parametres, natures, liees) -> Constats:
+    """Chaque ligne est rattachée à un document et un seul, daté dans le délai.
+
+    Les lignes de table_lignes (celles qui remplissent filtre_lignes) de même clé
+    désignent les documents (colonnes de document), retrouvés dans table_documents.
+    Aucun document est un écart, qui devient une information quand le délai n'est pas
+    échu à la date de coupure (date de la ligne plus delai_max après la coupure).
+    Plusieurs documents sont un écart. Un seul document daté hors de delai_min à
+    delai_max jours après la date de la ligne est un écart.
+
+    Non évaluable : clé vide ou répétée, date vide ou illisible, ligne liée sans
+    document, document absent de table_documents ou de clé répétée, date du
+    document vide ou illisible.
+    """
+    lignes, documents = liees["table_lignes"], liees["table_documents"]
+    cles = _cles_comparees(donnees, parametres["cle"])
+    _, repetees = _index_unique(cles)
+    colonne_date = parametres["date"]
+    dates, etats = _lire_dates(donnees, colonne_date, natures[colonne_date])
+    vue_lignes = lignes.donnees[_dans_le_champ(lignes.donnees, parametres.get("filtre_lignes"))]
+    rattaches = {}
+    for cle, document in zip(
+        _cles_comparees(vue_lignes, parametres["cle_lignes"]),
+        _cles_comparees(vue_lignes, parametres["document"]),
+    ):
+        if cle is not None:
+            rattaches.setdefault(cle, set()).add(document)
+    index_documents, documents_repetes = _index_unique(
+        _cles_comparees(documents.donnees, parametres["cle_documents"])
+    )
+    colonne_document = parametres["date_document"]
+    dates_documents, etats_documents = _lire_dates(
+        documents.donnees, colonne_document, documents.natures[colonne_document]
+    )
+    mini, maxi = parametres["delai_min"], parametres["delai_max"]
+    coupure = pd.Timestamp(parametres[CONTEXTE_DATE_COUPURE]).normalize()
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    issues = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle in cles.items():
+        if cle is None or cle in repetees or etats.loc[position] != ETAT_LUE:
+            continue
+        date = dates.loc[position]
+        rattaches_ligne = rattaches.get(cle, set())
+        if None in rattaches_ligne:
+            continue
+        if not rattaches_ligne:
+            evaluables.loc[position] = True
+            limite = date + pd.Timedelta(days=maxi)
+            if limite > coupure:
+                constats.loc[position] = CONSTAT_DELAI_NON_ECHU
+                issues.loc[position] = ISSUE_INFORMATION
+                affichees.loc[position] = (
+                    f"{_jour(date)} (délai jusqu'au {_jour(limite)}, coupure au "
+                    f"{_jour(coupure)})"
+                )
+            else:
+                constats.loc[position] = CONSTAT_SANS_DOCUMENT
+            continue
+        if len(rattaches_ligne) > 1:
+            evaluables.loc[position] = True
+            constats.loc[position] = CONSTAT_PLUSIEURS_DOCUMENTS
+            affichees.loc[position] = (
+                f"{_jour(date)}, {len(rattaches_ligne)} documents : "
+                + SEPARATEUR.join(sorted(rattaches_ligne))
+            )
+            continue
+        (document,) = rattaches_ligne
+        if document in documents_repetes or document not in index_documents:
+            continue
+        rang = index_documents[document]
+        if etats_documents.loc[rang] != ETAT_LUE:
+            continue
+        evaluables.loc[position] = True
+        date_document = dates_documents.loc[rang]
+        delai = (date_document - date).days
+        if not mini <= delai <= maxi:
+            constats.loc[position] = CONSTAT_HORS_DELAI
+            affichees.loc[position] = (
+                f"{_jour(date)}, document {document} du {_jour(date_document)} (écart de "
+                + _pluriel(delai, "jour", "jours")
+                + ")"
+            )
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees, issues=issues))
+
+
+def _reference_conforme(donnees, parametres, natures, liee: Liee) -> Constats:
+    """La ligne de référence de chaque ligne remplit les conditions attendues.
+
+    La référence est la ligne de table_reference de même clé. Un écart qui remplit
+    une exception devient une information, son constat nommant la pratique.
+
+    Non évaluable : clé vide (hors champ si cle_facultative vaut true), référence
+    absente (l'existence relève de existence_dans_reference) ou de clé répétée,
+    valeur vide d'une colonne des conditions dans la référence.
+    """
+    cles = _cles_comparees(donnees, parametres["cle"])
+    index, repetees = _index_unique(_cles_comparees(liee.donnees, parametres["cle_reference"]))
+    attendu = parametres["attendu"]
+    exceptions = parametres.get("exceptions")
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    issues = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle in cles.items():
+        if cle is None or cle in repetees or cle not in index:
+            continue
+        reference = index[cle]
+        textes = [_texte_lu(liee.donnees.at[reference, c["colonne"]]) for c in attendu]
+        if any(texte is None for texte in textes):
+            continue
+        evaluables.loc[position] = True
+        echecs = [
+            f"{liee.table}.{condition['colonne']} = {texte}"
+            for condition, texte in zip(attendu, textes)
+            if not _condition_vraie(texte, condition)
+        ]
+        if not echecs:
+            continue
+        affichees.loc[position] = ", ".join(echecs)
+        libelle = _pratique(
+            exceptions, donnees, position, {liee.table: (liee.donnees, [reference])}
+        )
+        if libelle is None:
+            constats.loc[position] = CONSTAT_NON_CONFORME
+        else:
+            constats.loc[position] = PREFIXE_PRATIQUE + libelle
+            issues.loc[position] = ISSUE_INFORMATION
+    return Constats(
+        evaluables,
+        _ecarts(constats, valeurs=affichees, issues=issues),
+        hors_champ=_hors_champ_cle(cles, parametres),
+    )
+
+
+def _concordance_entre_references(donnees, parametres, natures, liees) -> Constats:
+    """Les deux références d'une ligne portent la même valeur.
+
+    Pour chacune des deux tables liées (a et b), la référence est la ligne de même
+    clé; colonne_a de la référence a doit égaler colonne_b de la référence b, selon
+    la comparaison (telle quelle par défaut).
+
+    Non évaluable : clé vide, référence absente ou de clé répétée, valeur vide.
+    """
+    comparaison = parametres.get("comparaison", COMPARAISON_TELLE_QUELLE)
+    lues = []
+    for suffixe in ("a", "b"):
+        liee = liees[f"table_{suffixe}"]
+        cles = _cles_comparees(donnees, parametres[f"cle_{suffixe}"])
+        index, repetees = _index_unique(
+            _cles_comparees(liee.donnees, parametres[f"cle_reference_{suffixe}"])
+        )
+        colonne = parametres[f"colonne_{suffixe}"]
+        valeurs = pd.Series(None, index=donnees.index, dtype=object)
+        for position, cle in cles.items():
+            if cle is not None and cle not in repetees and cle in index:
+                valeurs.loc[position] = _texte_lu(liee.donnees.at[index[cle], colonne])
+        lues.append((f"{liee.table}.{colonne}", valeurs))
+    (nom_a, valeurs_a), (nom_b, valeurs_b) = lues
+    evaluables = (valeurs_a.notna() & valeurs_b.notna()).astype(bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position in donnees.index[evaluables]:
+        a, b = valeurs_a.loc[position], valeurs_b.loc[position]
+        if _comparable(a, comparaison) != _comparable(b, comparaison):
+            constats.loc[position] = CONSTAT_VALEURS_DIFFERENTES
+            affichees.loc[position] = f"{a} ({nom_a}) | {b} ({nom_b})"
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees))
+
+
+def _sans_ligne_liee(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Aucune ligne de table_lignes (celles qui remplissent filtre_lignes) ne porte la
+    clé de la ligne.
+
+    Un écart qui remplit une exception devient une information; une condition sur
+    une colonne « table_lignes.c » doit être remplie par toutes les lignes liées.
+
+    Non évaluable : clé vide ou répétée.
+    """
+    cles = _cles_comparees(donnees, parametres["cle"])
+    _, repetees = _index_unique(cles)
+    vue_lignes = liee.donnees[_dans_le_champ(liee.donnees, parametres.get("filtre_lignes"))]
+    par_cle = {}
+    for position, cle in _cles_comparees(vue_lignes, parametres["cle_lignes"]).items():
+        if cle is not None:
+            par_cle.setdefault(cle, []).append(position)
+    exceptions = parametres.get("exceptions")
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    issues = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle in cles.items():
+        if cle is None or cle in repetees:
+            continue
+        evaluables.loc[position] = True
+        positions = par_cle.get(cle, [])
+        if not positions:
+            continue
+        affichees.loc[position] = _pluriel(
+            len(positions), f"ligne liée dans {liee.table}", f"lignes liées dans {liee.table}"
+        )
+        libelle = _pratique(exceptions, donnees, position, {liee.table: (vue_lignes, positions)})
+        if libelle is None:
+            constats.loc[position] = CONSTAT_LIGNES_INATTENDUES
+        else:
+            constats.loc[position] = PREFIXE_PRATIQUE + libelle
+            issues.loc[position] = ISSUE_INFORMATION
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees, issues=issues))
+
+
 def _verifier_tolerance(parametres: dict) -> list[str]:
     if parametres.get("tolerance", 0) < 0:
         return ["tolerance : un nombre positif ou nul est attendu"]
@@ -1255,6 +1559,20 @@ def _verifier_intervalles(parametres: dict) -> list[str]:
 
 def _verifier_horaires(parametres: dict) -> list[str]:
     return _entier_positif(parametres, "feries_minimum")
+
+
+def _verifier_delai(parametres: dict) -> list[str]:
+    problemes = [
+        f"{nom} : un nombre entier de jours est attendu"
+        for nom in ("delai_min", "delai_max")
+        if not float(parametres[nom]).is_integer()
+    ]
+    if not problemes and parametres["delai_min"] > parametres["delai_max"]:
+        problemes.append(
+            f"delai_min ({parametres['delai_min']}) supérieur à delai_max "
+            f"({parametres['delai_max']})"
+        )
+    return problemes
 
 
 def _verifier_rapport(parametres: dict) -> list[str]:
@@ -1535,6 +1853,124 @@ TYPES = {
         controler=_annee_dans_reference,
         table_liee="table_reference",
     ),
+    "rattachement_unique_dans_delai": TypeRegle(
+        description=(
+            "Chaque ligne est rattachée à un document et un seul (par exemple une "
+            "intervention à une facture) : les lignes de table_lignes de même clé "
+            "(cle_lignes, par défaut les colonnes de cle), parmi celles qui remplissent "
+            "filtre_lignes, désignent le document (colonnes de document), retrouvé dans "
+            "table_documents (cle_documents, par défaut les colonnes de document). Le "
+            "document est daté de delai_min à delai_max jours après la date de la ligne. "
+            "Une ligne sans document dont le délai n'est pas échu à la date de coupure "
+            "des données est une information."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "date": GENRE_COLONNE_DATE,
+            "table_lignes": GENRE_TABLE,
+            "cle_lignes": GENRE_COLONNES_LIEES,
+            "document": GENRE_COLONNES_LIEES,
+            "filtre_lignes": GENRE_CONDITIONS,
+            "table_documents": GENRE_TABLE,
+            "cle_documents": GENRE_COLONNES_LIEES,
+            "date_document": GENRE_COLONNE_DATE_LIEE,
+            "delai_min": GENRE_NOMBRE,
+            "delai_max": GENRE_NOMBRE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_rattachement_unique_dans_delai,
+        facultatifs=("cle_lignes", "filtre_lignes", "cle_documents"),
+        verifier=_verifier_delai,
+        defauts={"cle_lignes": "cle", "cle_documents": "document"},
+        tables_liees=("table_lignes", "table_documents"),
+        rattachements={
+            "cle_lignes": "table_lignes",
+            "document": "table_lignes",
+            "filtre_lignes": "table_lignes",
+            "cle_documents": "table_documents",
+            "date_document": "table_documents",
+        },
+        contexte=(CONTEXTE_DATE_COUPURE,),
+    ),
+    "reference_conforme": TypeRegle(
+        description=(
+            "La ligne de table_reference de même clé (cle_reference, par défaut les "
+            "colonnes de cle) remplit toutes les conditions de attendu (colonne et "
+            "valeurs ou motif). Un écart qui remplit une exception (libelle et "
+            "conditions, une colonne de la référence s'écrivant table.colonne) est une "
+            "information. Une référence absente ou une valeur vide rend la ligne non "
+            "évaluable; une clé vide aussi, ou la met hors champ si cle_facultative vaut "
+            "true."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "table_reference": GENRE_TABLE,
+            "cle_reference": GENRE_COLONNES_LIEES,
+            "attendu": GENRE_CONDITIONS,
+            "exceptions": GENRE_EXCEPTIONS,
+            "cle_facultative": GENRE_BOOLEEN,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_reference_conforme,
+        facultatifs=("cle_reference", "exceptions", "cle_facultative"),
+        table_liee="table_reference",
+        defauts={"cle_reference": "cle"},
+        rattachements={"attendu": "table_reference"},
+    ),
+    "concordance_entre_references": TypeRegle(
+        description=(
+            "Une ligne a deux références, dans table_a (clé cle_a, sous les colonnes de "
+            "cle_reference_a, par défaut celles de cle_a) et dans table_b (de même) : "
+            "colonne_a de la première égale colonne_b de la seconde (par exemple le "
+            "client d'une intervention et celui de la facture d'une même ligne). "
+            "comparaison vaut telle quelle (par défaut), après normalisation ou mots dans "
+            "le désordre."
+        ),
+        parametres={
+            "cle_a": GENRE_COLONNES,
+            "table_a": GENRE_TABLE,
+            "cle_reference_a": GENRE_COLONNES_LIEES,
+            "colonne_a": GENRE_COLONNE_LIEE,
+            "cle_b": GENRE_COLONNES,
+            "table_b": GENRE_TABLE,
+            "cle_reference_b": GENRE_COLONNES_LIEES,
+            "colonne_b": GENRE_COLONNE_LIEE,
+            "comparaison": GENRE_COMPARAISON,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_concordance_entre_references,
+        facultatifs=("cle_reference_a", "cle_reference_b", "comparaison"),
+        defauts={"cle_reference_a": "cle_a", "cle_reference_b": "cle_b"},
+        tables_liees=("table_a", "table_b"),
+        rattachements={
+            "cle_reference_a": "table_a",
+            "colonne_a": "table_a",
+            "cle_reference_b": "table_b",
+            "colonne_b": "table_b",
+        },
+    ),
+    "sans_ligne_liee": TypeRegle(
+        description=(
+            "Aucune ligne de table_lignes (parmi celles qui remplissent filtre_lignes) ne "
+            "porte la clé de la ligne (cle_lignes, par défaut les colonnes de cle); par "
+            "exemple une intervention annulée n'est pas facturée. Un écart qui remplit une "
+            "exception (une condition sur table_lignes.colonne devant être remplie par "
+            "toutes les lignes liées) est une information."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "table_lignes": GENRE_TABLE,
+            "cle_lignes": GENRE_COLONNES_LIEES,
+            "filtre_lignes": GENRE_CONDITIONS,
+            "exceptions": GENRE_EXCEPTIONS,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_sans_ligne_liee,
+        facultatifs=("cle_lignes", "filtre_lignes", "exceptions"),
+        table_liee="table_lignes",
+        defauts={"cle_lignes": "cle"},
+        rattachements={"filtre_lignes": "table_lignes"},
+    ),
 }
 
 
@@ -1584,17 +2020,44 @@ def _avec_defauts(instance: dict) -> dict:
     return complete
 
 
+def _tables_liees(instance: dict) -> dict:
+    """Tables liées d'une instance : paramètre vers nom de table, dans l'ordre du type."""
+    type_regle = TYPES[instance["type"]]
+    return {
+        parametre: instance[parametre]
+        for parametre in type_regle.parametres_tables()
+        if parametre in instance
+    }
+
+
+def _colonne_qualifiee(colonne: str, table: str, liees) -> tuple[str, str]:
+    """Table et colonne d'une colonne de condition d'exception : « t.c » désigne la
+    colonne c de la table liée t, une colonne sans préfixe celle de la table de la
+    règle."""
+    prefixe, point, reste = colonne.partition(".")
+    if point and prefixe in liees:
+        return prefixe, reste
+    return table, colonne
+
+
 def _references(instance: dict) -> list[tuple[str, str, str, str]]:
     """Colonnes citées par une instance : (paramètre, table, colonne, genre de colonne).
 
     Dans l'ordre des paramètres de son type. Le genre de colonne dit la nature
     attendue (`GENRE_COLONNE` : aucune). Une colonne de la table liée est rattachée
-    à la table que nomme le paramètre `table_liee` du type.
+    à la table que nomme le paramètre `table_liee` du type, ou celui que donne
+    `TypeRegle.rattachements` pour ce paramètre. Les colonnes des conditions et des
+    exceptions sont citées sans nature attendue.
     """
     instance = _avec_defauts(instance)
     type_regle = TYPES[instance["type"]]
     table = instance["table"]
-    liee = instance.get(type_regle.table_liee) if type_regle.table_liee else None
+    liees = set(_tables_liees(instance).values())
+
+    def table_liee(parametre):
+        source = type_regle.rattachements.get(parametre, type_regle.table_liee)
+        return instance.get(source) if source else None
+
     references = []
     for parametre, genre in type_regle.parametres.items():
         if parametre not in instance:
@@ -1609,14 +2072,30 @@ def _references(instance: dict) -> list[tuple[str, str, str, str]]:
                 (parametre, table, colonne, GENRE_COLONNE_NOMBRE) for colonne in valeur
             )
         elif genre == GENRE_COLONNES_LIEES:
-            references.extend((parametre, liee, colonne, GENRE_COLONNE) for colonne in valeur)
+            references.extend(
+                (parametre, table_liee(parametre), colonne, GENRE_COLONNE) for colonne in valeur
+            )
         elif genre == GENRE_COLONNES_COMMUNES:
-            for nom_table in (table, liee):
+            for nom_table in (table, table_liee(parametre)):
                 references.extend(
                     (parametre, nom_table, colonne, GENRE_COLONNE) for colonne in valeur
                 )
         elif genre in GENRES_COLONNE_LIEE:
-            references.append((parametre, liee, valeur, GENRES_COLONNE_LIEE[genre]))
+            references.append(
+                (parametre, table_liee(parametre), valeur, GENRES_COLONNE_LIEE[genre])
+            )
+        elif genre == GENRE_CONDITIONS:
+            nom_table = table_liee(parametre) if parametre in type_regle.rattachements else table
+            references.extend(
+                (parametre, nom_table, condition["colonne"], GENRE_COLONNE) for condition in valeur
+            )
+        elif genre == GENRE_EXCEPTIONS:
+            for exception in valeur:
+                for condition in exception["conditions"]:
+                    references.append(
+                        (parametre, *_colonne_qualifiee(condition["colonne"], table, liees),
+                         GENRE_COLONNE)
+                    )
     return references
 
 
@@ -1697,6 +2176,10 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
             elif not _est_nombre(coefficient):
                 problemes.append(f"{colonne} : un nombre est attendu comme coefficient")
         return problemes
+    if genre == GENRE_CONDITIONS:
+        return _problemes_conditions(valeur)
+    if genre == GENRE_EXCEPTIONS:
+        return _problemes_exceptions(valeur)
     if genre == GENRE_HORAIRES:
         return _problemes_horaires(valeur)
     if genre == GENRE_FERIES:
@@ -1791,15 +2274,17 @@ def _problemes_feries(feries) -> list[str]:
     return problemes
 
 
-def _problemes_filtre(filtre) -> list[str]:
-    """Problèmes d'un filtre : liste de conditions {colonne, valeurs}."""
-    if not isinstance(filtre, list) or not filtre:
+def _problemes_conditions(conditions) -> list[str]:
+    """Problèmes d'une liste de conditions {colonne, valeurs} ou {colonne, motif}."""
+    if not isinstance(conditions, list) or not conditions:
         return ["une liste de conditions est attendue (chaque condition commence par un tiret)"]
     problemes = []
-    for rang, condition in enumerate(filtre, start=1):
+    for rang, condition in enumerate(conditions, start=1):
         nom = f"condition n° {rang}"
         if not isinstance(condition, dict):
-            problemes.append(f"{nom} : un dictionnaire est attendu (clés colonne et valeurs)")
+            problemes.append(
+                f"{nom} : un dictionnaire est attendu (clés colonne et valeurs ou motif)"
+            )
             continue
         inconnues = [str(cle) for cle in condition if cle not in CLES_CONDITION]
         if inconnues:
@@ -1807,9 +2292,13 @@ def _problemes_filtre(filtre) -> list[str]:
                 f"{nom} : clé inconnue {', '.join(inconnues)} (clés possibles : "
                 f"{', '.join(CLES_CONDITION)})"
             )
-        manquantes = [cle for cle in CLES_CONDITION if cle not in condition]
-        if manquantes:
-            problemes.append(f"{nom} : clé manquante ({', '.join(manquantes)})")
+        if "colonne" not in condition:
+            problemes.append(f"{nom} : clé manquante (colonne)")
+        tests = [cle for cle in CLES_TEST_CONDITION if cle in condition]
+        if not tests:
+            problemes.append(f"{nom} : clé manquante (valeurs ou motif)")
+        elif len(tests) > 1:
+            problemes.append(f"{nom} : valeurs ou motif attendu, pas les deux")
         if "colonne" in condition and not _texte_attendu(condition["colonne"]):
             problemes.append(f"{nom}, colonne : un nom de colonne est attendu")
         if "valeurs" in condition:
@@ -1823,6 +2312,77 @@ def _problemes_filtre(filtre) -> list[str]:
                     for valeur in valeurs
                     if not _texte_attendu(valeur)
                 )
+        if "motif" in condition:
+            motif = condition["motif"]
+            if not _texte_attendu(motif):
+                problemes.append(
+                    f"{nom}, motif : une expression régulière est attendue (entre "
+                    "guillemets simples, par exemple 'FA-.*')"
+                )
+            else:
+                try:
+                    re.compile(motif)
+                except re.error as erreur:
+                    problemes.append(f"{nom}, motif : expression régulière invalide ({erreur})")
+    return problemes
+
+
+def _problemes_filtre(filtre) -> list[str]:
+    """Problèmes d'un filtre : liste de conditions (voir `_problemes_conditions`)."""
+    return _problemes_conditions(filtre)
+
+
+def _problemes_exceptions(exceptions) -> list[str]:
+    """Problèmes des exceptions : liste de {libelle, conditions}."""
+    if not isinstance(exceptions, list) or not exceptions:
+        return [
+            "une liste d'exceptions est attendue (chaque exception commence par un tiret, "
+            "avec les clés libelle et conditions)"
+        ]
+    problemes = []
+    for rang, exception in enumerate(exceptions, start=1):
+        nom = f"exception n° {rang}"
+        if not isinstance(exception, dict):
+            problemes.append(f"{nom} : un dictionnaire est attendu (clés libelle et conditions)")
+            continue
+        inconnues = [str(cle) for cle in exception if cle not in CLES_EXCEPTION]
+        if inconnues:
+            problemes.append(
+                f"{nom} : clé inconnue {', '.join(inconnues)} (clés possibles : "
+                f"{', '.join(CLES_EXCEPTION)})"
+            )
+        manquantes = [cle for cle in CLES_EXCEPTION if cle not in exception]
+        if manquantes:
+            problemes.append(f"{nom} : clé manquante ({', '.join(manquantes)})")
+        if "libelle" in exception and not _texte_attendu(exception["libelle"]):
+            problemes.append(f"{nom}, libelle : un texte non vide est attendu")
+        if "conditions" in exception:
+            problemes.extend(
+                f"{nom}, {probleme}" if probleme.startswith("condition")
+                else f"{nom}, conditions : {probleme}"
+                for probleme in _problemes_conditions(exception["conditions"])
+            )
+    return problemes
+
+
+def _problemes_prefixes(instance: dict) -> list[str]:
+    """Colonnes d'exception écrites « t.c » dont t n'est pas une table liée de la règle."""
+    type_regle = TYPES[instance["type"]]
+    liees = list(_tables_liees(instance).values())
+    problemes = []
+    for parametre, genre in type_regle.parametres.items():
+        if genre != GENRE_EXCEPTIONS or parametre not in instance:
+            continue
+        for rang, exception in enumerate(instance[parametre], start=1):
+            for numero, condition in enumerate(exception["conditions"], start=1):
+                prefixe, point, _ = condition["colonne"].partition(".")
+                if point and prefixe not in liees:
+                    problemes.append(
+                        f"{parametre}, exception n° {rang}, condition n° {numero} : "
+                        f"{prefixe} n'est pas une table liée de la règle (tables liées : "
+                        f"{', '.join(liees)}); une colonne de la table de la règle "
+                        "s'écrit sans préfixe"
+                    )
     return problemes
 
 
@@ -1895,6 +2455,8 @@ def problemes_regles_gestion(regles) -> list[str]:
                     f"{nom}, {parametre} : {probleme}"
                     for probleme in _problemes_parametre(genre, instance[parametre])
                 )
+        if len(problemes) == avant_parametres:
+            problemes.extend(f"{nom}, {probleme}" for probleme in _problemes_prefixes(instance))
         if type_regle.verifier is not None and len(problemes) == avant_parametres:
             complete = _avec_defauts(instance)
             parametres = {p: complete[p] for p in type_regle.parametres if p in complete}
@@ -1987,8 +2549,11 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
         for parametre, nom_table, colonne, genre in _references(instance):
             if nom_table not in tables:
                 if nom_table not in absentes:
+                    parametre_table = next(
+                        p for p, t in _tables_liees(instance).items() if t == nom_table
+                    )
                     problemes.append(
-                        f"{nom}, {type_regle.table_liee} : table {nom_table} absente des "
+                        f"{nom}, {parametre_table} : table {nom_table} absente des "
                         "données chargées"
                     )
                     absentes.add(nom_table)
@@ -2031,25 +2596,44 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
 def _dans_le_champ(donnees: pd.DataFrame, filtre) -> pd.Series:
     """Vrai pour une ligne qui remplit toutes les conditions du filtre.
 
-    La valeur de la ligne est comparée telle quelle aux valeurs de la condition;
-    une cellule vide ne remplit aucune condition.
+    La valeur de la ligne est comparée telle quelle aux valeurs de la condition, ou à
+    son motif (qui doit couvrir la valeur entière); une cellule vide ou faite
+    d'espaces ne remplit aucune condition.
     """
     champ = pd.Series(True, index=donnees.index, dtype=bool)
     for condition in filtre or []:
-        valeurs = set(condition["valeurs"])
         champ &= donnees[condition["colonne"]].map(
-            lambda valeur: _valeur_constatee(valeur) in valeurs
+            lambda valeur, condition=condition: _condition_vraie(_texte_lu(valeur), condition)
         ).astype(bool)
     return champ
+
+
+def _texte_lu(valeur) -> str | None:
+    """Texte d'une cellule, None si elle est vide ou faite d'espaces."""
+    texte = _valeur_constatee(valeur)
+    return texte if texte is not None and texte.strip() else None
+
+
+def _condition_vraie(texte: str | None, condition: dict) -> bool:
+    """Vrai si le texte remplit la condition (valeurs, ou motif sur la valeur entière)."""
+    if texte is None:
+        return False
+    if "valeurs" in condition:
+        return texte in condition["valeurs"]
+    return re.fullmatch(condition["motif"], texte) is not None
+
+
+def _ecrire_condition(condition: dict) -> str:
+    if "valeurs" in condition:
+        return f"{condition['colonne']} = {' ou '.join(condition['valeurs'])}"
+    return f"{condition['colonne']} suit le motif {condition['motif']}"
 
 
 def _texte_filtre(filtre) -> str | None:
     """Filtre écrit pour le bilan : « statut = Réalisée ou Annulée et ... »."""
     if not filtre:
         return None
-    return " et ".join(
-        f"{condition['colonne']} = {' ou '.join(condition['valeurs'])}" for condition in filtre
-    )
+    return " et ".join(_ecrire_condition(condition) for condition in filtre)
 
 
 def _cle_ligne(donnees: pd.DataFrame) -> tuple:
@@ -2096,6 +2680,7 @@ def controler_gestion(
     declarations: dict | None = None,
     doublons: pd.DataFrame | None = None,
     sensibles: dict[str, frozenset[str]] | None = None,
+    date_coupure: dt.date | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Applique les règles de gestion et rend les écarts et le bilan.
 
@@ -2106,6 +2691,8 @@ def controler_gestion(
     chaque table, affichée dans la colonne `cle`. `doublons` est la table rendue par
     `doublons.detecter_doublons`; elle n'est utile qu'aux types qui travaillent sans
     les doublons exacts en surnombre, et elle est calculée si elle manque.
+    `date_coupure` est la fin de la période extraite (`Perimetre.date_coupure`),
+    demandée par les types qui en ont besoin (par exemple pour un délai non échu).
 
     Avant tout contrôle, sont vérifiés, chacun avec la liste complète des
     problèmes : la classification de sensibilité (`RuntimeError`), la structure des
@@ -2116,12 +2703,15 @@ def controler_gestion(
     lignes qui ne remplissent pas le filtre de la règle (hors champ), auxquelles
     s'ajoutent les lignes que le type laisse hors champ (par exemple une clé
     facultative vide). Pour un type
-    qui rapproche deux tables, la table liée est prise selon la même vue, sans
-    filtre; ses colonnes sont écrites « table.colonne » dans la colonne `colonnes`.
+    qui rapproche plusieurs tables, chaque table liée est prise selon la même vue,
+    sans filtre; ses colonnes sont écrites « table.colonne » dans la colonne
+    `colonnes`.
 
     Table des écarts (`COLONNES_ECARTS_GESTION`) : une ligne par ligne source et
     par constat, avec le lignage, la référence, le type et le libellé de la règle,
-    l'issue (celle de la règle, sinon celle du type), le constat, les colonnes en
+    l'issue (celle que donne le type pour cet écart, par exemple « information »
+    pour une pratique normale, sinon celle de la règle, sinon celle du type), le
+    constat, les colonnes en
     cause, la clé de la ligne, la valeur constatée (ou celle que donne le type, par
     exemple la plage des numéros manquants) et la correction proposée par l'outil,
     le cas échéant. Clé, valeur et proposition valent « masqué » dès
@@ -2148,6 +2738,13 @@ def controler_gestion(
     problemes = problemes_regles_gestion(regles)
     if not problemes:
         problemes = _problemes_de_donnees(regles, tables, dictionnaire)
+    if not problemes and date_coupure is None:
+        problemes = [
+            f"{_nommer(rang, instance)} : la date de coupure des données est attendue "
+            "(argument date_coupure, perimetre.date_coupure dans le notebook)"
+            for rang, instance in enumerate(regles, start=1)
+            if CONTEXTE_DATE_COUPURE in TYPES[instance["type"]].contexte
+        ]
     if problemes:
         raise ValueError("Règles de gestion invalides\n  " + "\n  ".join(problemes))
     if declarations is None:
@@ -2175,27 +2772,44 @@ def controler_gestion(
         vue = vue[dans_champ]
         complete = _avec_defauts(instance)
         parametres = {p: complete[p] for p in type_regle.parametres if p in complete}
-        liee, colonnes_liees = None, []
-        if type_regle.table_liee is not None:
-            nom_liee = instance[type_regle.table_liee]
+        for nom_contexte in type_regle.contexte:
+            parametres[nom_contexte] = date_coupure
+        liees = {}
+        for parametre_table, nom_liee in _tables_liees(instance).items():
             colonnes_liees = _colonnes_instance(instance, nom_liee)
             donnees_liees = tables[nom_liee].reset_index(drop=True)
             if type_regle.vue == VUE_SANS_SURNOMBRE:
                 donnees_liees = donnees_liees.drop(
                     index=_positions_en_surnombre(doublons, nom_liee, donnees_liees)
                 )
-            liee = Liee(
+            liees[parametre_table] = Liee(
                 nom_liee,
                 donnees_liees,
                 {c: dictionnaire[nom_liee][c]["nature"]["regle"] for c in colonnes_liees},
             )
-            constats = type_regle.controler(vue, parametres, natures, liee)
+        if type_regle.tables_liees:
+            constats = type_regle.controler(vue, parametres, natures, liees)
+        elif liees:
+            constats = type_regle.controler(vue, parametres, natures, *liees.values())
         else:
             constats = type_regle.controler(vue, parametres, natures)
+        colonnes_liees = {}
+        for liee in liees.values():
+            colonnes_liees.setdefault(liee.table, list(liee.natures))
         texte_colonnes = ", ".join(
-            [*colonnes, *(f"{liee.table}.{colonne}" for colonne in colonnes_liees)]
+            [
+                *colonnes,
+                *(
+                    f"{nom_liee}.{colonne}"
+                    for nom_liee, noms in colonnes_liees.items()
+                    for colonne in noms
+                ),
+            ]
         )
         ecarts = constats.ecarts
+        issues = pd.Series(issue, index=ecarts.index, dtype=object)
+        if "issue" in ecarts.columns:
+            issues = ecarts["issue"].where(ecarts["issue"].notna(), issue).astype(object)
         hors_type = constats.hors_champ
         if hors_type is None:
             hors_type = pd.Series(False, index=constats.evaluables.index, dtype=bool)
@@ -2205,7 +2819,6 @@ def controler_gestion(
             "libelle": instance["libelle"],
             "table": table,
         }
-        nombre = len(ecarts)
         bilan.append(
             {
                 **commun,
@@ -2217,9 +2830,9 @@ def controler_gestion(
                 "hors_champ": hors_champ + int(hors_type.sum()),
                 "non_evaluables": int((~constats.evaluables & ~hors_type).sum()),
                 "controlees": int(constats.evaluables.sum()),
-                "anomalies": nombre if issue == ISSUE_ANOMALIE else 0,
-                "a_arbitrer": nombre if issue == ISSUE_A_ARBITRER else 0,
-                "informations": nombre if issue == ISSUE_INFORMATION else 0,
+                "anomalies": int((issues == ISSUE_ANOMALIE).sum()),
+                "a_arbitrer": int((issues == ISSUE_A_ARBITRER).sum()),
+                "informations": int((issues == ISSUE_INFORMATION).sum()),
                 "avertissements": "; ".join(constats.avertissements) or None,
             }
         )
@@ -2237,9 +2850,9 @@ def controler_gestion(
                 SEPARATEUR.join(_texte(v) for v in ligne)
                 for ligne in donnees.loc[positions, cle].itertuples(index=False)
             ]
-        sensible = _sensible(sensibles, table, regles_colonnes, colonnes) or (
-            liee is not None
-            and _sensible(sensibles, liee.table, dictionnaire[liee.table], colonnes_liees)
+        sensible = _sensible(sensibles, table, regles_colonnes, colonnes) or any(
+            _sensible(sensibles, nom_liee, dictionnaire[nom_liee], noms)
+            for nom_liee, noms in colonnes_liees.items()
         )
         if sensible:
             valeurs = [VALEUR_MASQUEE] * len(positions)
@@ -2264,7 +2877,7 @@ def controler_gestion(
             {
                 "_position": positions,
                 **commun,
-                "issue": issue,
+                "issue": issues.to_numpy(),
                 "constat": ecarts["constat"].to_numpy(),
                 "colonnes": texte_colonnes,
                 "cle": pd.Series(cles, dtype=object).to_numpy(),

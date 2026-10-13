@@ -20,19 +20,27 @@ from frigeo.gestion import (
     CONSTAT_DATE_ANTERIEURE,
     CONSTAT_DATE_AVANT_PRECEDENT,
     CONSTAT_DATE_POSTERIEURE,
+    CONSTAT_DELAI_NON_ECHU,
     CONSTAT_DESEQUILIBRE,
     CONSTAT_ECART_CALCUL,
+    CONSTAT_HORS_DELAI,
     CONSTAT_HORS_HORAIRES,
     CONSTAT_HORS_PERIODES,
     CONSTAT_INFERIEURE,
+    CONSTAT_LIGNES_INATTENDUES,
+    CONSTAT_NON_CONFORME,
     CONSTAT_NUMEROS_MANQUANTS,
     CONSTAT_PERIODE_NON_COUVERTE,
+    CONSTAT_PLUSIEURS_DOCUMENTS,
     CONSTAT_RAPPORT_INFERIEUR,
     CONSTAT_RAPPORT_NON_CALCULABLE,
     CONSTAT_RAPPORT_SUPERIEUR,
+    CONSTAT_SANS_DOCUMENT,
     CONSTAT_SANS_LIGNE,
     CONSTAT_SUPERIEURE,
     CONSTAT_TOTAL_DIFFERENT,
+    CONSTAT_VALEURS_DIFFERENTES,
+    PREFIXE_PRATIQUE,
     ISSUE_INFORMATION,
     VUE_SANS_SURNOMBRE,
     VUE_TOUTES,
@@ -219,7 +227,9 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "numerotation_continue, numerotation_chronologique, intervalles_sans_chevauchement, "
         "hors_horaires_selon_valeur, egalite_calculee, total_des_lignes, equilibre_par_groupe, "
         "existence_dans_reference, date_dans_periode_reference, "
-        "periodes_couvertes_par_paliers, annee_dans_reference)",
+        "periodes_couvertes_par_paliers, annee_dans_reference, "
+        "rattachement_unique_dans_delai, reference_conforme, concordance_entre_references, "
+        "sans_ligne_liee)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -597,10 +607,10 @@ def test_structure_des_plages_filtres_et_issues():
         "règle n° 4 (R22), filtre : une liste de conditions est attendue (chaque condition "
         "commence par un tiret)",
         "règle n° 5 (R22), filtre, condition n° 1 : un dictionnaire est attendu (clés "
-        "colonne et valeurs)",
+        "colonne et valeurs ou motif)",
         "règle n° 5 (R22), filtre, condition n° 2 : clé inconnue valeur (clés possibles : "
-        "colonne, valeurs)",
-        "règle n° 5 (R22), filtre, condition n° 2 : clé manquante (valeurs)",
+        "colonne, valeurs, motif)",
+        "règle n° 5 (R22), filtre, condition n° 2 : clé manquante (valeurs ou motif)",
         "règle n° 5 (R22), filtre, condition n° 3, colonne : un nom de colonne est attendu",
         "règle n° 5 (R22), filtre, condition n° 3, valeurs : une liste non vide est attendue",
         "règle n° 5 (R22), filtre, condition n° 4, valeurs : 1 n'est pas un texte (mettre "
@@ -1784,3 +1794,456 @@ def test_chargement_des_regles_du_4d(tmp_path):
     regles = charger_regles_gestion(chemin)
     assert regles[0]["cle_facultative"] is True
     assert regles[1]["cle_reference"] == ["nom", "prenom"]
+
+
+# Morceau 4e : rattachement à un document, référence conforme, concordance, aucune ligne
+# liée; conditions par motif, exceptions (pratiques normales) et date de coupure.
+
+COUPURE = dt.date(2026, 3, 31)
+
+
+def _controler_tables(tables, natures, regles, sensibles=AUCUNE_SENSIBLE, date_coupure=COUPURE):
+    """Contrôle de plusieurs tables fictives; aucune lecture des fichiers de config/."""
+    dictionnaire = {}
+    for nom, natures_table in natures.items():
+        dictionnaire.update(_dictionnaire(nom, **natures_table))
+    return controler_gestion(
+        tables, dictionnaire, regles, {}, None, sensibles, date_coupure=date_coupure
+    )
+
+
+def _date(texte):
+    return dt.datetime.strptime(texte, "%d/%m/%Y")
+
+
+def _rattachement(**autres):
+    return _instance(
+        "rattachement_unique_dans_delai",
+        ref="R12",
+        **{
+            "cle": ["i"],
+            "date": "d",
+            "table_lignes": "l",
+            "document": ["n"],
+            "filtre_lignes": [{"colonne": "n", "motif": "FA-.*"}],
+            "table_documents": "e",
+            "date_document": "f",
+            "delai_min": 0,
+            "delai_max": 30,
+            "filtre": [{"colonne": "s", "valeurs": ["R"]}],
+            **autres,
+        },
+    )
+
+
+NATURES_RATTACHEMENT = {
+    "t": {"i": "texte", "d": DATE, "s": "texte"},
+    "l": {"i": "texte", "n": "texte"},
+    "e": {"n": "texte", "f": NATIVE},
+}
+
+
+def _interventions_et_factures():
+    """Interventions « t », lignes de facture « l » et factures « e », avec un doublon
+    exact dans « t » et dans « e »."""
+    interventions = _table(
+        i=["I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "", "I9", "I10", "I10", "I11",
+           "I12", "I13", "I14", "I15", "I1"],
+        d=["10/03/2025", "01/03/2025", "01/03/2025", "10/03/2025", "01/02/2026",
+           "15/03/2026", "05/03/2025", "05/03/2025", "05/03/2025", "2025-03-05",
+           "05/03/2025", "06/03/2025", "05/03/2025", "05/03/2025", "05/03/2025",
+           "05/03/2025", "05/03/2025", "10/03/2025"],
+        s=["R"] * 16 + ["A", "R"],
+    )
+    lignes = _table(
+        "l.csv",
+        i=["I1", "I2", "I3", "I4", "I7", "I7", "I8", "I8", "I11", "I12", "I13", "I14", "I10",
+           "I1", "I1"],
+        n=["FA-1", "FA-2", "FA-3", "FA-4", "FA-5", "FA-6", "FA-7", "AV-1", " ", "FA-8", "FA-9",
+           "FA-10", "FA-11", "FA-1", ""],
+    )
+    factures = _table(
+        "e.csv",
+        n=["FA-1", "FA-2", "FA-3", "FA-4", "FA-5", "FA-6", "FA-7", "AV-1", "FA-9", "FA-9",
+           "FA-10", "FA-11", "FA-1"],
+        f=[_date("10/03/2025"), _date("31/03/2025"), _date("01/04/2025"), _date("09/03/2025"),
+           _date("06/03/2025"), _date("07/03/2025"), _date("06/03/2025"), _date("07/03/2025"),
+           _date("01/04/2025"), _date("02/04/2025"), "x", _date("06/03/2025"),
+           _date("10/03/2025")],
+    )
+    return {"t": interventions, "l": lignes, "e": factures}
+
+
+def test_rattachement_unique_dans_delai():
+    tables = _interventions_et_factures()
+    ecarts, bilan = _controler_tables(tables, NATURES_RATTACHEMENT, [_rattachement()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "valeur") == [
+        (4, CONSTAT_HORS_DELAI, "anomalie",
+         "01/03/2025, document FA-3 du 01/04/2025 (écart de 31 jours)"),
+        (5, CONSTAT_HORS_DELAI, "anomalie",
+         "10/03/2025, document FA-4 du 09/03/2025 (écart de -1 jour)"),
+        (6, CONSTAT_SANS_DOCUMENT, "anomalie", "I5 | 01/02/2026"),
+        (7, CONSTAT_DELAI_NON_ECHU, ISSUE_INFORMATION,
+         "15/03/2026 (délai jusqu'au 14/04/2026, coupure au 31/03/2026)"),
+        (8, CONSTAT_PLUSIEURS_DOCUMENTS, "anomalie", "05/03/2025, 2 documents : FA-5 | FA-6"),
+        # La ligne liée sans numéro ne passe pas filtre_lignes : aucun document.
+        (14, CONSTAT_SANS_DOCUMENT, "anomalie", "I11 | 05/03/2025"),
+    ]
+    assert set(ecarts["colonnes"]) == {"i, d, l.i, l.n, e.n, e.f"}
+    resume = _bilan(bilan)
+    assert {cle: resume[cle] for cle in (
+        "vue", "filtre", "lignes", "ecartees_doublons", "hors_champ", "non_evaluables",
+        "controlees", "anomalies", "a_arbitrer", "informations",
+    )} == {
+        "vue": VUE_SANS_SURNOMBRE,
+        "filtre": "s = R",
+        "lignes": 18,
+        "ecartees_doublons": 1,
+        "hors_champ": 1,
+        # Clé vide, date illisible, clé répétée (deux lignes), facture absente, numéro
+        # de facture répété, date de facture illisible.
+        "non_evaluables": 7,
+        "controlees": 9,
+        "anomalies": 5,
+        "a_arbitrer": 0,
+        "informations": 1,
+    }
+    # Sans filtre_lignes, l'avoir compte comme un second document, et une ligne liée
+    # sans numéro rend l'intervention non évaluable, même avec un autre document.
+    regle = {cle: v for cle, v in _rattachement().items() if cle != "filtre_lignes"}
+    ecarts, bilan = _controler_tables(tables, NATURES_RATTACHEMENT, [regle])
+    assert [(ligne, constat) for ligne, constat in _lignes(
+        ecarts, "num_ligne_source", "constat") if ligne in (9, 14)] == [
+        (9, CONSTAT_PLUSIEURS_DOCUMENTS)
+    ]
+    assert _bilan(bilan)["non_evaluables"] == 9
+    assert 2 not in set(ecarts["num_ligne_source"])
+
+
+def test_rattachement_bornes_du_delai_et_issue_de_la_regle():
+    tables = _interventions_et_factures()
+    regle = _rattachement(delai_min=-1, delai_max=31, issue="à arbitrer")
+    ecarts, bilan = _controler_tables(tables, NATURES_RATTACHEMENT, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "issue") == [
+        (6, "à arbitrer"), (7, ISSUE_INFORMATION), (8, "à arbitrer"), (14, "à arbitrer"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["anomalies"], resume["a_arbitrer"], resume["informations"]) == (0, 3, 1)
+
+
+def test_date_de_coupure_attendue():
+    tables = _interventions_et_factures()
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(tables, NATURES_RATTACHEMENT, [_rattachement()], date_coupure=None)
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R12) : la date de coupure des données est attendue (argument "
+        "date_coupure, perimetre.date_coupure dans le notebook)"
+    ]
+
+
+def test_delai_echu_le_jour_de_la_coupure():
+    tables = {
+        "t": _table(i=["I1", "I2"], d=["01/03/2026", "02/03/2026"], s=["R", "R"]),
+        "l": _table("l.csv", i=["I9"], n=["FA-9"]),
+        "e": _table("e.csv", n=["FA-9"], f=[_date("01/03/2026")]),
+    }
+    ecarts, _ = _controler_tables(tables, NATURES_RATTACHEMENT, [_rattachement()])
+    # Le 01/03/2026 plus 30 jours tombe le jour de la coupure : le délai est échu.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue") == [
+        (2, CONSTAT_SANS_DOCUMENT, "anomalie"),
+        (3, CONSTAT_DELAI_NON_ECHU, ISSUE_INFORMATION),
+    ]
+
+
+def _conforme(**autres):
+    return _instance(
+        "reference_conforme",
+        ref="R13",
+        **{
+            "cle": ["i"],
+            "table_reference": "r",
+            "attendu": [
+                {"colonne": "s", "valeurs": ["Réalisée"]},
+                {"colonne": "f", "motif": "O"},
+            ],
+            "exceptions": [{
+                "libelle": "déplacement seul",
+                "conditions": [
+                    {"colonne": "a", "valeurs": ["DEPL"]},
+                    {"colonne": "r.s", "valeurs": ["Annulée"]},
+                ],
+            }],
+            **autres,
+        },
+    )
+
+
+NATURES_CONFORME = {"t": {"i": "texte", "a": "texte"}, "r": {"i": "texte", "s": "texte",
+                                                            "f": "texte"}}
+
+
+def _lignes_et_references():
+    lignes = _table(i=["R1", "R2", "R2", "R3", "R4", "R5", "R9", "", "R6"],
+                    a=["MO", "DEPL", "MO", "MO", "MO", "MO", "MO", "MO", "DEPL"])
+    references = _table("r.csv", i=["R1", "R2", "R3", "R4", "R5", "R5", "R6"],
+                        s=["Réalisée", "Annulée", "Réalisée", " ", "Réalisée", "Annulée", "Fait"],
+                        f=["O", "O", "N", "O", "O", "O", "O"])
+    return {"t": lignes, "r": references}
+
+
+def test_reference_conforme_et_exception():
+    tables = _lignes_et_references()
+    ecarts, bilan = _controler_tables(tables, NATURES_CONFORME, [_conforme()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "valeur") == [
+        (3, PREFIXE_PRATIQUE + "déplacement seul", ISSUE_INFORMATION, "r.s = Annulée"),
+        (4, CONSTAT_NON_CONFORME, "anomalie", "r.s = Annulée"),
+        (5, CONSTAT_NON_CONFORME, "anomalie", "r.f = N"),
+        # L'exception demande une intervention annulée.
+        (10, CONSTAT_NON_CONFORME, "anomalie", "r.s = Fait"),
+    ]
+    assert set(ecarts["colonnes"]) == {"i, a, r.i, r.s, r.f"}
+    resume = _bilan(bilan)
+    # Statut vide, référence répétée, référence absente, clé vide : non évaluables.
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"],
+            resume["anomalies"], resume["informations"]) == (0, 4, 5, 3, 1)
+    ecarts, bilan = _controler_tables(tables, NATURES_CONFORME,
+                                      [_conforme(cle_facultative=True, issue="à arbitrer")])
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["a_arbitrer"],
+            resume["informations"]) == (1, 3, 3, 1)
+    # Sans exception, la ligne de déplacement est aussi une anomalie.
+    regle = {cle: v for cle, v in _conforme().items() if cle != "exceptions"}
+    ecarts, _ = _controler_tables(tables, NATURES_CONFORME, [regle])
+    assert set(ecarts["constat"]) == {CONSTAT_NON_CONFORME}
+    assert len(ecarts) == 4
+
+
+def _concordance(**autres):
+    return _instance(
+        "concordance_entre_references",
+        ref="R13",
+        **{"cle_a": ["i"], "table_a": "a", "colonne_a": "c", "cle_b": ["n"], "table_b": "b",
+           "colonne_b": "c", **autres},
+    )
+
+
+NATURES_CONCORDANCE = {"t": {"i": "texte", "n": "texte"}, "a": {"i": "texte", "c": "texte"},
+                       "b": {"n": "texte", "c": "texte"}}
+
+
+def _lignes_et_deux_references():
+    lignes = _table(i=["I1", "I2", "I3", "I4", "I1", "I2"], n=["N1", "N2", "N1", "N1", "N9", "N3"])
+    interventions = _table("a.csv", i=["I1", "I2", "I3", "I4", "I4"],
+                           c=["C1", "C2", "", "C4", "C5"])
+    factures = _table("b.csv", n=["N1", "N2", "N3"], c=["C1", "c2", "C3"])
+    return {"t": lignes, "a": interventions, "b": factures}
+
+
+def test_concordance_entre_references():
+    tables = _lignes_et_deux_references()
+    ecarts, bilan = _controler_tables(tables, NATURES_CONCORDANCE, [_concordance()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (3, CONSTAT_VALEURS_DIFFERENTES, "C2 (a.c) | c2 (b.c)"),
+        (7, CONSTAT_VALEURS_DIFFERENTES, "C2 (a.c) | C3 (b.c)"),
+    ]
+    assert set(ecarts["colonnes"]) == {"i, n, a.i, a.c, b.n, b.c"}
+    resume = _bilan(bilan)
+    # Valeur vide, référence répétée, référence absente : non évaluables.
+    assert (resume["non_evaluables"], resume["controlees"], resume["anomalies"]) == (3, 3, 2)
+    ecarts, _ = _controler_tables(tables, NATURES_CONCORDANCE,
+                                  [_concordance(comparaison="après normalisation")])
+    assert _lignes(ecarts, "num_ligne_source") == [(7,)]
+    ecarts, _ = _controler_tables(tables, NATURES_CONCORDANCE, [_concordance()],
+                                  sensibles={"b": {"c"}})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+
+
+def _sans_ligne(**autres):
+    return _instance(
+        "sans_ligne_liee",
+        ref="R16",
+        **{
+            "cle": ["i"],
+            "table_lignes": "l",
+            "filtre": [{"colonne": "s", "valeurs": ["Annulée", "Reportée"]}],
+            "exceptions": [{
+                "libelle": "déplacement seul",
+                "conditions": [
+                    {"colonne": "s", "valeurs": ["Annulée"]},
+                    {"colonne": "l.a", "valeurs": ["DEPL"]},
+                ],
+            }],
+            **autres,
+        },
+    )
+
+
+NATURES_SANS_LIGNE = {"t": {"i": "texte", "s": "texte", "x": "texte"},
+                      "l": {"i": "texte", "a": "texte", "q": "texte"}}
+
+
+def test_sans_ligne_liee_et_exception_sur_toutes_les_lignes():
+    tables = {
+        "t": _table(i=["I1", "I2", "I3", "I4", "I5", "", "I6", "I6"],
+                    s=["Annulée", "Annulée", "Annulée", "Reportée", "Réalisée", "Annulée",
+                       "Annulée", "Annulée"],
+                    x=["1", "2", "3", "4", "5", "6", "7", "8"]),
+        "l": _table("l.csv", i=["I2", "I2", "I3", "I3", "I4", "I5", "I6"],
+                    a=["DEPL", "DEPL", "DEPL", "MO", "DEPL", "MO", "MO"],
+                    q=["1", "2", "1", "1", "1", "1", "1"]),
+    }
+    ecarts, bilan = _controler_tables(tables, NATURES_SANS_LIGNE, [_sans_ligne()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "valeur") == [
+        (3, PREFIXE_PRATIQUE + "déplacement seul", ISSUE_INFORMATION, "2 lignes liées dans l"),
+        # Une ligne liée n'est pas un déplacement : l'exception ne s'applique pas.
+        (4, CONSTAT_LIGNES_INATTENDUES, "anomalie", "2 lignes liées dans l"),
+        # L'exception demande une intervention annulée.
+        (5, CONSTAT_LIGNES_INATTENDUES, "anomalie", "1 ligne liée dans l"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"],
+            resume["anomalies"], resume["informations"]) == (1, 3, 4, 2, 1)
+    # filtre_lignes restreint les lignes liées qui comptent (et que juge l'exception).
+    ecarts, _ = _controler_tables(
+        tables, NATURES_SANS_LIGNE,
+        [_sans_ligne(filtre_lignes=[{"colonne": "a", "valeurs": ["MO"]}])],
+    )
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (4, CONSTAT_LIGNES_INATTENDUES, "1 ligne liée dans l"),
+    ]
+
+
+def test_filtre_par_motif():
+    donnees = _table(n=["FA-1", "AV-1", " ", "XFA-2", "FA-3"], km=["1,0", "1,0", "1,0", "1,0",
+                                                                      "9,0"])
+    filtre = [{"colonne": "n", "motif": "FA-.*"}]
+    ecarts, bilan = _controler(donnees, {"n": "texte", "km": DECIMAL},
+                               regles=[_instance(colonne="km", max=5, filtre=filtre)])
+    assert _lignes(ecarts, "num_ligne_source") == [(6,)]
+    resume = _bilan(bilan)
+    # Le motif couvre la valeur entière; une cellule faite d'espaces ne le remplit pas.
+    assert (resume["filtre"], resume["hors_champ"], resume["controlees"]) == (
+        "n suit le motif FA-.*", 3, 2
+    )
+
+
+def test_structure_des_types_du_4e():
+    regles = [
+        _rattachement(delai_min=5, delai_max=2),
+        _rattachement(delai_min=0.5),
+        {cle: v for cle, v in _rattachement().items() if cle != "document"},
+        _rattachement(filtre_lignes=[{"colonne": "n", "valeurs": ["A"], "motif": "A"}]),
+        _rattachement(filtre=[{"colonne": "s", "motif": "("}, {"colonne": "s", "motif": 3}]),
+        _conforme(exceptions=[{"libelle": "", "conditions": []}, "x",
+                              {"conditions": [{"colonne": "a", "valeurs": ["D"]}], "autre": 1}]),
+        _conforme(exceptions=[{"libelle": "L", "conditions": [{"colonne": "x.s",
+                                                               "valeurs": ["A"]}]}]),
+        _conforme(attendu=[]),
+        _sans_ligne(),
+        _sans_ligne(cle_lignes=["i"]),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (R12) : delai_min (5) supérieur à delai_max (2)",
+        "règle n° 2 (R12) : delai_min : un nombre entier de jours est attendu",
+        "règle n° 3 (R12) : paramètre manquant (document)",
+        "règle n° 4 (R12), filtre_lignes : condition n° 1 : valeurs ou motif attendu, pas les "
+        "deux",
+        "règle n° 5 (R12), filtre, condition n° 1, motif : expression régulière invalide "
+        "(missing ), unterminated subpattern at position 0)",
+        "règle n° 5 (R12), filtre, condition n° 2, motif : une expression régulière est "
+        "attendue (entre guillemets simples, par exemple 'FA-.*')",
+        "règle n° 6 (R13), exceptions : exception n° 1, libelle : un texte non vide est "
+        "attendu",
+        "règle n° 6 (R13), exceptions : exception n° 1, conditions : une liste de conditions "
+        "est attendue (chaque condition commence par un tiret)",
+        "règle n° 6 (R13), exceptions : exception n° 2 : un dictionnaire est attendu (clés "
+        "libelle et conditions)",
+        "règle n° 6 (R13), exceptions : exception n° 3 : clé inconnue autre (clés possibles : "
+        "libelle, conditions)",
+        "règle n° 6 (R13), exceptions : exception n° 3 : clé manquante (libelle)",
+        "règle n° 7 (R13), exceptions, exception n° 1, condition n° 1 : x n'est pas une table "
+        "liée de la règle (tables liées : r); une colonne de la table de la règle s'écrit "
+        "sans préfixe",
+        "règle n° 8 (R13), attendu : une liste de conditions est attendue (chaque condition "
+        "commence par un tiret)",
+        # La clé des lignes reprend par défaut celle de la table.
+        "règle n° 10 (R16) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 9 (R16))",
+    ]
+
+
+def test_tables_liees_du_4e_confrontees_aux_donnees():
+    tables = _lignes_et_deux_references()
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(
+            {"t": tables["t"], "a": tables["a"]},
+            {"t": NATURES_CONCORDANCE["t"], "a": NATURES_CONCORDANCE["a"]},
+            [_concordance()],
+        )
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R13), table_b : table b absente des données chargées"
+    ]
+    tables = _lignes_et_references()
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(tables, NATURES_CONFORME, [_conforme(
+            attendu=[{"colonne": "z", "valeurs": ["O"]}],
+            exceptions=[{"libelle": "L", "conditions": [{"colonne": "r.x", "valeurs": ["A"]},
+                                                        {"colonne": "y", "valeurs": ["A"]}]}],
+        )])
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R13), attendu : colonne r.z absente des données chargées",
+        "règle n° 1 (R13), exceptions : colonne r.x absente des données chargées",
+        "règle n° 1 (R13), exceptions : colonne t.y absente des données chargées",
+    ]
+
+
+def test_masquage_selon_une_seconde_table_liee():
+    tables = _interventions_et_factures()
+    ecarts, _ = _controler_tables(tables, NATURES_RATTACHEMENT, [_rattachement()],
+                                  sensibles={"e": {"f"}})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+
+
+def test_catalogue_des_types_du_4e():
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["rattachement_unique_dans_delai", "parametres"] == (
+        "cle (liste de colonnes), date (colonne de date), table_lignes (table), cle_lignes "
+        "(liste de colonnes de la table liée, facultatif), document (liste de colonnes de la "
+        "table liée), filtre_lignes (liste de conditions, facultatif), table_documents "
+        "(table), cle_documents (liste de colonnes de la table liée, facultatif), "
+        "date_document (colonne de date de la table liée), delai_min (nombre), delai_max "
+        "(nombre)"
+    )
+    assert catalogue.loc["reference_conforme", "parametres"] == (
+        "cle (liste de colonnes), table_reference (table), cle_reference (liste de colonnes "
+        "de la table liée, facultatif), attendu (liste de conditions), exceptions "
+        "(exceptions, facultatif), cle_facultative (true ou false, facultatif)"
+    )
+    types = ["rattachement_unique_dans_delai", "reference_conforme",
+             "concordance_entre_references", "sans_ligne_liee"]
+    assert set(catalogue.loc[types, "vue"]) == {VUE_SANS_SURNOMBRE}
+    assert set(catalogue.loc[types, "issue"]) == {"anomalie"}
+
+
+def test_chargement_des_regles_du_4e(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: R12\n    libelle: Facturée\n    type: rattachement_unique_dans_delai\n"
+        "    table: interventions\n    cle: [id_intervention]\n    date: date_debut\n"
+        "    table_lignes: factures_lignes\n    document: [num_facture]\n"
+        "    filtre_lignes:\n      - colonne: num_facture\n        motif: 'FA-.*'\n"
+        "    table_documents: factures_entetes\n    date_document: date_facture\n"
+        "    delai_min: 0\n    delai_max: 30\n"
+        "  - ref: R16\n    libelle: Non facturée\n    type: sans_ligne_liee\n"
+        "    table: interventions\n    cle: [id_intervention]\n"
+        "    table_lignes: factures_lignes\n"
+        "    exceptions:\n      - libelle: annulation sur place\n        conditions:\n"
+        "          - colonne: factures_lignes.code_article\n            valeurs: [DEPL]\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[0]["filtre_lignes"] == [{"colonne": "num_facture", "motif": "FA-.*"}]
+    assert regles[1]["exceptions"][0]["conditions"][0]["colonne"] == (
+        "factures_lignes.code_article"
+    )
