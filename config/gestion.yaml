@@ -193,3 +193,115 @@ regles:
     groupe: [JournalCode, EcritureNum]
     debit: Debit
     credit: Credit
+
+  - ref: R10
+    libelle: Intervenant connu et en poste à la date de l'intervention
+    type: date_dans_periode_reference
+    table: interventions
+    cle: [intervenant]
+    date: date_debut
+    table_reference: intervenants
+    cle_reference: [nom, prenom]
+    debut: date_entree
+    fin: date_sortie
+    comparaison: mots dans le désordre
+  - ref: R11
+    libelle: Client connu et actif à la date de l'intervention
+    type: date_dans_periode_reference
+    table: interventions
+    cle: [code_client]
+    date: date_debut
+    table_reference: clients
+    debut: date_creation
+    fin: date_fin_relation
+
+  - ref: R21
+    libelle: Début de chaque période d'emploi couvert par une rémunération
+    type: periodes_couvertes_par_paliers
+    table: intervenants
+    cle: [matricule]
+    debut: date_entree
+    fin: date_sortie
+    table_paliers: remunerations
+    date_palier: date_effet
+  - ref: R21
+    libelle: Date d'effet d'une rémunération dans une période d'emploi
+    type: date_dans_periode_reference
+    table: remunerations
+    cle: [matricule]
+    date: date_effet
+    table_reference: intervenants
+    debut: date_entree
+    fin: date_sortie
+  - ref: R21
+    libelle: Paramètres de coûts déclarés pour l'année de chaque intervention
+    type: annee_dans_reference
+    table: interventions
+    date: date_debut
+    table_reference: parametres_couts
+    colonne_annee: annee
+
+  # Existence des codes dans leur référentiel (hors chapitre 5, R13, R19 et R20 en dépendent).
+  - ref: existence
+    libelle: Fournisseur de la facture d'achat connu
+    type: existence_dans_reference
+    table: achats_entetes
+    cle: [code_fournisseur]
+    table_reference: fournisseurs
+  - ref: existence
+    libelle: Fournisseur principal d'une pièce connu
+    type: existence_dans_reference
+    table: catalogue_pieces
+    cle: [fournisseur_principal]
+    table_reference: fournisseurs
+    cle_reference: [code_fournisseur]
+  - ref: existence
+    libelle: Pièce consommée connue du catalogue
+    type: existence_dans_reference
+    table: pieces_interventions
+    cle: [ref_piece]
+    table_reference: catalogue_pieces
+  - ref: existence
+    libelle: Pièce achetée connue du catalogue
+    type: existence_dans_reference
+    table: achats_lignes
+    cle: [ref_piece]
+    table_reference: catalogue_pieces
+    cle_facultative: true
+  - ref: existence
+    libelle: Pièce facturée connue du catalogue
+    type: existence_dans_reference
+    table: factures_lignes
+    cle: [ref_piece]
+    table_reference: catalogue_pieces
+    cle_facultative: true
+  - ref: existence
+    libelle: Ligne de facture rattachée à un en-tête
+    type: existence_dans_reference
+    table: factures_lignes
+    cle: [num_facture]
+    table_reference: factures_entetes
+  - ref: existence
+    libelle: Ligne d'achat rattachée à un en-tête
+    type: existence_dans_reference
+    table: achats_lignes
+    cle: [num_piece_achat]
+    table_reference: achats_entetes
+  - ref: existence
+    libelle: Pièce consommée sur une intervention connue
+    type: existence_dans_reference
+    table: pieces_interventions
+    cle: [id_intervention]
+    table_reference: interventions
+  - ref: existence
+    libelle: Ligne de facture rattachée à une intervention connue
+    type: existence_dans_reference
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+  - ref: existence
+    libelle: Client de la facture connu
+    type: existence_dans_reference
+    table: factures_entetes
+    cle: [code_client]
+    table_reference: clients
