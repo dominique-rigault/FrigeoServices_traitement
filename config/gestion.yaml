@@ -305,3 +305,69 @@ regles:
     table: factures_entetes
     cle: [code_client]
     table_reference: clients
+
+  # Interventions et factures (R12, R13, R16), pratiques normales déclarées en exceptions.
+  - ref: R12
+    libelle: Intervention réalisée et facturable facturée une fois et une seule, 0 à 30 jours après sa date
+    type: rattachement_unique_dans_delai
+    table: interventions
+    cle: [id_intervention]
+    date: date_debut
+    table_lignes: factures_lignes
+    document: [num_facture]
+    filtre_lignes:
+      - colonne: num_facture
+        motif: 'FA-.*'
+    table_documents: factures_entetes
+    date_document: date_facture
+    delai_min: 0
+    delai_max: 30
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+  - ref: R13
+    libelle: Ligne de facture rattachée à une intervention réalisée et facturable
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+    exceptions:
+      - libelle: annulation sur place facturée en déplacement seul
+        conditions:
+          - colonne: code_article
+            valeurs: [DEPL]
+          - colonne: interventions.statut
+            valeurs: [Annulée]
+  - ref: R13
+    libelle: Client de l'intervention identique à celui de la facture
+    type: concordance_entre_references
+    table: factures_lignes
+    cle_a: [id_intervention]
+    table_a: interventions
+    colonne_a: code_client
+    cle_b: [num_facture]
+    table_b: factures_entetes
+    colonne_b: code_client
+  - ref: R16
+    libelle: Intervention annulée ou reportée non facturée
+    type: sans_ligne_liee
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    filtre:
+      - colonne: statut
+        valeurs: [Annulée, Reportée]
+    exceptions:
+      - libelle: annulation sur place facturée en déplacement seul
+        conditions:
+          - colonne: statut
+            valeurs: [Annulée]
+          - colonne: factures_lignes.code_article
+            valeurs: [DEPL]
