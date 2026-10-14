@@ -21,6 +21,7 @@ from frigeo.gestion import (
     CONSTAT_CHEVAUCHEMENT,
     CONSTAT_DATE_ANTERIEURE,
     CONSTAT_DATE_AVANT_PRECEDENT,
+    CONSTAT_DATE_DIFFERENTE,
     CONSTAT_DATE_POSTERIEURE,
     CONSTAT_DELAI_NON_ECHU,
     CONSTAT_DESEQUILIBRE,
@@ -37,6 +38,7 @@ from frigeo.gestion import (
     CONSTAT_PERIODE_NON_COUVERTE,
     CONSTAT_PLUSIEURS_NON_NULLES,
     CONSTAT_PLUSIEURS_DOCUMENTS,
+    CONSTAT_PLUSIEURS_GROUPES,
     CONSTAT_QUANTITES_DIFFERENTES,
     CONSTAT_RAPPORT_INFERIEUR,
     CONSTAT_RAPPORT_NON_CALCULABLE,
@@ -44,6 +46,7 @@ from frigeo.gestion import (
     CONSTAT_SANS_DOCUMENT,
     CONSTAT_SANS_LIGNE,
     CONSTAT_SOMME_DIFFERENTE,
+    CONSTAT_SOMMES_DIFFERENTES,
     CONSTAT_SUPERIEURE,
     CONSTAT_TOTAL_DIFFERENT,
     CONSTAT_VALEURS_DIFFERENTES,
@@ -237,7 +240,8 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "periodes_couvertes_par_paliers, annee_dans_reference, "
         "rattachement_unique_dans_delai, reference_conforme, concordance_entre_references, "
         "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
-        "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle)",
+        "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle, "
+        "sommes_liees_concordantes)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -2931,3 +2935,257 @@ def test_chargement_des_regles_du_4f2(tmp_path):
     }
     assert regles[1]["arrondi"] == "supérieur"
     assert regles[2]["au_moins_une"] is True
+
+
+MONTANTS = [
+    {"colonne": "ttc", "conditions": [{"colonne": "c", "motif": "411.*"}],
+     "termes": {"deb": 1, "cre": -1}},
+    {"colonne": "ht", "conditions": [{"colonne": "c", "motif": "70.*"}],
+     "termes": {"cre": 1, "deb": -1}},
+]
+
+
+def _concordantes(**autres):
+    return _instance(
+        "sommes_liees_concordantes",
+        ref="R14",
+        **{
+            "cle": ["n"],
+            "table_lignes": "l",
+            "cle_lignes": ["p"],
+            "filtre_lignes": [{"colonne": "j", "valeurs": ["VT"]}],
+            "date": "d",
+            "date_lignes": "dt",
+            "groupe_lignes": ["j", "e"],
+            "montants": deepcopy(MONTANTS),
+            **autres,
+        },
+    )
+
+
+NATURES_CONCORDANTES = {
+    "t": {"n": "texte", "d": NATIVE, "ttc": NATIF, "ht": NATIF},
+    "l": {"p": "texte", "j": "texte", "e": "texte", "dt": "date AAAAMMJJ", "c": "texte",
+          "deb": DECIMAL, "cre": DECIMAL},
+}
+
+
+def _factures_et_ecritures():
+    d = _date("01/03/2025")
+    factures = _table(
+        n=["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "", "F11", "F11",
+           "F12", "F13", "F14", "F15"],
+        d=[d, d, d, _date("04/03/2025"), d, d, d, d, d, None, d, d, d, d, d, d, d],
+        ttc=[120.0, 60.0, 12.0, 12.0, 36.0, -24.0, None, 30.0, 12.0, 12.0, 12.0, 12.0, 13.0,
+             0.0, 10.0, 12.0, 12.0],
+        ht=[100.0, 50.0, 10.0, 10.0, 30.0, -20.0, 10.0, 25.0, 10.0, 10.0, 10.0, 10.0, 11.0,
+            0.0, 10.0, 10.0, 10.0],
+    )
+    lignes = [
+        # p, j, e, dt, c, deb, cre
+        ("F1", "VT", "E1", "20250301", "411000", "120,00", "0,00"),
+        ("F1", "VT", "E1", "20250301", "706100", "0,00", "100,00"),
+        ("F1", "VT", "E1", "20250301", "445710", "0,00", "20,00"),
+        # Doublon exact, compté une fois.
+        ("F1", "VT", "E1", "20250301", "445710", "0,00", "20,00"),
+        ("F2", "VT", "E2", "20250301", "411000", "60,00", "0,00"),
+        ("F2", "VT", "E2", "20250301", "706100", "0,00", "40,00"),
+        # Hors du filtre des lignes : F3 n'a aucune ligne liée.
+        ("F3", "BQ", "B1", "20250301", "411000", "0,00", "12,00"),
+        ("F4", "VT", "E4", "20250304", "706100", "0,00", "10,00"),
+        ("F4", "VT", "E4", "20250305", "411000", "12,00", "0,00"),
+        ("F5", "VT", "E5", "20250301", "411000", "30,00", "0,00"),
+        ("F5", "VT", "E6", "20250301", "706100", "0,00", "30,00"),
+        ("F6", "VT", "E7", "20250301", "411000", "0,00", "24,00"),
+        ("F6", "VT", "E7", "20250301", "706100", "20,00", "0,00"),
+        ("F7", "VT", "E8", "20250301", "411000", "12,00", "0,00"),
+        ("F8", "VT", "E9", "20250301", "411000", "30,00", "0,00"),
+        ("F8", "VT", "E9", "20250301", "", "0,00", "25,00"),
+        ("F9", "VT", "E10", "20250301", "411000", "x", "0,00"),
+        ("F10", "VT", "E11", "20250301", "411000", "12,00", "0,00"),
+        ("F11", "VT", "E12", "20250301", "411000", "12,00", "0,00"),
+        ("F12", "VT", "E13", "20250301", "411000", "0,00", "0,00"),
+        ("F13", "VT", "E14", "20250301", "411000", "10,00", "0,00"),
+        # Date illisible (F14) et groupe vide (F15).
+        ("F14", "VT", "E15", "20250301", "411000", "12,00", "0,00"),
+        ("F14", "VT", "E15", "20250231", "706100", "0,00", "10,00"),
+        ("F15", "VT", "E16", "20250301", "411000", "12,00", "0,00"),
+        ("F15", "VT", "", "20250301", "706100", "0,00", "10,00"),
+    ]
+    colonnes = dict(zip(["p", "j", "e", "dt", "c", "deb", "cre"], map(list, zip(*lignes))))
+    return {"t": factures, "l": _table("l.csv", **colonnes)}
+
+
+def test_sommes_liees_concordantes():
+    tables = _factures_et_ecritures()
+    ecarts, bilan = _controler_tables(tables, NATURES_CONCORDANTES, [_concordantes()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "valeur") == [
+        (3, CONSTAT_SOMMES_DIFFERENTES, "anomalie",
+         "ht 50 pour une somme de 40 sur 1 ligne liée (écart 10)"),
+        (4, CONSTAT_SANS_LIGNE, "anomalie", "F3 | 2025-03-01 00:00:00 | 12.0 | 10.0"),
+        (5, CONSTAT_DATE_DIFFERENTE, "anomalie", "04/03/2025 (lignes liées : 05/03/2025)"),
+        (6, CONSTAT_PLUSIEURS_GROUPES, "anomalie", "2 groupes : VT E5 | VT E6"),
+        (6, CONSTAT_SOMMES_DIFFERENTES, "anomalie",
+         "ttc 36 pour une somme de 30 sur 1 ligne liée (écart 6)"),
+        # Un montant sans ligne retenue est comparé à une somme nulle.
+        (16, CONSTAT_SOMMES_DIFFERENTES, "anomalie",
+         "ht 10 pour une somme de 0 sur 0 ligne liée (écart 10)"),
+    ]
+    assert ecarts["colonnes"].iloc[0] == (
+        "n, d, ttc, ht, l.p, l.j, l.dt, l.e, l.c, l.deb, l.cre"
+    )
+    resume = _bilan(bilan)
+    # Non évaluables : montant vide (F7), compte vide (F8), débit illisible (F9), date
+    # vide (F10), clé vide, F11 répétée, date illisible d'une ligne liée (F14), groupe
+    # vide (F15).
+    assert (resume["vue"], resume["lignes"], resume["hors_champ"], resume["non_evaluables"],
+            resume["controlees"], resume["anomalies"]) == (VUE_SANS_SURNOMBRE, 17, 0, 9, 8, 6)
+    # Une clé répétée hors du filtre rend la ligne non évaluable : seule la première
+    # F11 remplit le filtre.
+    _, bilan = _controler_tables(tables, NATURES_CONCORDANTES, [
+        _concordantes(filtre=[{"colonne": "ttc", "valeurs": ["12.0"]}])])
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (9, 6, 2)
+
+
+def test_sommes_liees_concordantes_sans_date_ni_groupe_et_tolerance():
+    tables = _factures_et_ecritures()
+    regle = {cle: v for cle, v in _concordantes().items()
+             if cle not in ("date", "date_lignes", "groupe_lignes")}
+    ecarts, bilan = _controler_tables(tables, NATURES_CONCORDANTES, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (3, CONSTAT_SOMMES_DIFFERENTES),
+        (4, CONSTAT_SANS_LIGNE),
+        (6, CONSTAT_SOMMES_DIFFERENTES),
+        (11, CONSTAT_SOMMES_DIFFERENTES),
+        (16, CONSTAT_SOMMES_DIFFERENTES),
+    ]
+    # La date vide de F10 ne compte plus : son montant HT, sans ligne 70, est en écart.
+    # F14 et F15 deviennent évaluables, sans écart.
+    assert _bilan(bilan)["non_evaluables"] == 6
+    # Un écart égal à la tolérance n'en est pas un; une somme sur deux montants n'en
+    # liste que ceux en écart.
+    ecarts, _ = _controler_tables(tables, NATURES_CONCORDANTES, [_concordantes(tolerance=6)])
+    assert _lignes(ecarts, "num_ligne_source", "valeur") == [
+        (3, "ht 50 pour une somme de 40 sur 1 ligne liée (écart 10)"),
+        (4, "F3 | 2025-03-01 00:00:00 | 12.0 | 10.0"),
+        (5, "04/03/2025 (lignes liées : 05/03/2025)"),
+        (6, "2 groupes : VT E5 | VT E6"),
+        (16, "ht 10 pour une somme de 0 sur 0 ligne liée (écart 10)"),
+    ]
+    # Sans conditions, toutes les lignes liées sont retenues.
+    montants = [{"colonne": "ttc", "termes": {"deb": 1, "cre": -1}}]
+    regle = _concordantes(montants=montants,
+                          filtre=[{"colonne": "n", "valeurs": ["F1", "F2", "F6"]}])
+    ecarts, bilan = _controler_tables(tables, NATURES_CONCORDANTES, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "valeur") == [
+        (2, "ttc 120 pour une somme de 0 sur 3 lignes liées (écart 120)"),
+        (3, "ttc 60 pour une somme de 20 sur 2 lignes liées (écart 40)"),
+        (7, "ttc -24 pour une somme de -4 sur 2 lignes liées (écart -20)"),
+    ]
+    assert _bilan(bilan)["hors_champ"] == 14
+
+
+def test_sommes_liees_concordantes_masquees():
+    tables = _factures_et_ecritures()
+    ecarts, _ = _controler_tables(tables, NATURES_CONCORDANTES, [_concordantes()],
+                                  sensibles={"l": frozenset({"c"})})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+    assert set(ecarts["cle"]) == {None}
+
+
+def test_structure_du_type_du_4g1():
+    regles = [
+        _concordantes(montants=[]),
+        _concordantes(montants=["ttc"]),
+        _concordantes(montants=[{"colonne": "ttc", "terme": {"deb": 1}}]),
+        _concordantes(montants=[{"colonne": "ttc", "termes": {"deb": "1"},
+                                 "conditions": [{"colonne": "c"}]}]),
+        {cle: v for cle, v in _concordantes(tolerance=-1).items() if cle != "date_lignes"},
+        _concordantes(),
+        _concordantes(cle_lignes=["n"], groupe_lignes=["j", "e"], filtre_lignes=[
+            {"colonne": "j", "valeurs": ["VT"]}]),
+        _concordantes(cle_lignes=["n"]),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (R14), montants : une liste non vide de montants est attendue (chaque "
+        "montant commence par un tiret, avec les clés colonne, termes et, si besoin, "
+        "conditions)",
+        "règle n° 2 (R14), montants : montant n° 1 : un dictionnaire est attendu (clés "
+        "colonne, conditions, termes)",
+        "règle n° 3 (R14), montants : montant n° 1 : clé inconnue terme (clés possibles : "
+        "colonne, conditions, termes)",
+        "règle n° 3 (R14), montants : montant n° 1 : clé manquante (termes)",
+        "règle n° 4 (R14), montants : montant n° 1, termes : deb : un nombre est attendu "
+        "comme coefficient",
+        "règle n° 4 (R14), montants : montant n° 1, condition n° 1 : clé manquante (valeurs "
+        "ou motif)",
+        "règle n° 5 (R14) : tolerance : un nombre positif ou nul est attendu",
+        "règle n° 5 (R14) : date et date_lignes : les deux sont attendues, ou aucune",
+        "règle n° 8 (R14) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 7 (R14))",
+    ]
+    # La clé des lignes reprend par défaut celle de la règle.
+    assert problemes_regles_gestion([
+        _concordantes(cle_lignes=["n"]),
+        {cle: v for cle, v in _concordantes().items() if cle != "cle_lignes"},
+    ]) == [
+        "règle n° 2 (R14) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 1 (R14))",
+    ]
+
+
+def test_colonnes_du_4g1_confrontees_aux_donnees():
+    tables = _factures_et_ecritures()
+    natures = deepcopy(NATURES_CONCORDANTES)
+    natures["t"]["ht"] = "texte"
+    natures["l"]["cre"] = "texte"
+    montants = deepcopy(MONTANTS)
+    montants[1]["conditions"] = [{"colonne": "z", "motif": "70.*"}]
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(tables, natures, [_concordantes(montants=montants)])
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R14), montants : la nature en vigueur de l.cre est 'texte', un nombre "
+        "est attendu (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "règle n° 1 (R14), montants : la nature en vigueur de t.ht est 'texte', un nombre "
+        "est attendu (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "règle n° 1 (R14), montants : colonne l.z absente des données chargées",
+    ]
+
+
+def test_catalogue_et_chargement_du_4g1(tmp_path):
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["sommes_liees_concordantes", "parametres"] == (
+        "cle (liste de colonnes), table_lignes (table), cle_lignes (liste de colonnes de la "
+        "table liée, facultatif), filtre_lignes (liste de conditions, facultatif), date "
+        "(colonne de date, facultatif), date_lignes (colonne de date de la table liée, "
+        "facultatif), groupe_lignes (liste de colonnes de la table liée, facultatif), "
+        "montants (montants), tolerance (nombre, facultatif)"
+    )
+    assert catalogue.loc["sommes_liees_concordantes", ["vue", "issue"]].tolist() == [
+        VUE_SANS_SURNOMBRE, "anomalie"
+    ]
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: R14\n    libelle: Facture comptabilisée\n"
+        "    type: sommes_liees_concordantes\n    table: factures_entetes\n"
+        "    cle: [num_facture]\n    table_lignes: fec\n    cle_lignes: [PieceRef]\n"
+        "    filtre_lignes:\n      - colonne: JournalCode\n        valeurs: [VT]\n"
+        "    date: date_facture\n    date_lignes: EcritureDate\n"
+        "    groupe_lignes: [JournalCode, EcritureNum]\n"
+        "    montants:\n"
+        "      - colonne: total_ttc\n"
+        "        conditions:\n          - colonne: CompteNum\n            motif: '411.*'\n"
+        "        termes: {Debit: 1, Credit: -1}\n"
+        "      - colonne: total_ht\n"
+        "        conditions:\n          - colonne: CompteNum\n            motif: '70[678].*'\n"
+        "        termes: {Credit: 1, Debit: -1}\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[0]["montants"][1] == {
+        "colonne": "total_ht",
+        "conditions": [{"colonne": "CompteNum", "motif": "70[678].*"}],
+        "termes": {"Credit": 1, "Debit": -1},
+    }

@@ -171,6 +171,9 @@ GENRE_COLONNES_NOMBRE = "liste de colonnes de nombre"
 GENRE_FACTEURS = "facteurs"
 # Sens d'un arrondi à un pas (voir `ARRONDIS`).
 GENRE_ARRONDI = "arrondi"
+# Montants comparés aux lignes liées : liste de {colonne, conditions, termes} (voir
+# `CLES_MONTANT`).
+GENRE_MONTANTS = "montants"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
 _NATURES_ATTENDUES = {
     GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
@@ -190,6 +193,10 @@ ARRONDI_PROCHE = "au plus proche"
 ARRONDIS = (ARRONDI_SUPERIEUR, ARRONDI_INFERIEUR, ARRONDI_PROCHE)
 # Clés d'un facteur écrit en dictionnaire.
 CLES_FACTEUR = ("colonne", "coefficient", "constante", "vide")
+# Clés d'un montant : la colonne de la table de la règle, les conditions (facultatives)
+# que remplissent les lignes liées retenues, et les termes (colonne de la table liée
+# vers coefficient) dont la somme fait la valeur de chaque ligne liée.
+CLES_MONTANT = ("colonne", "conditions", "termes")
 # Horaires : créneaux de chaque jour de la semaine, et d'un jour férié. Un jour
 # absent n'a aucun créneau. Un créneau va de debut (inclus) à fin (exclue).
 JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -1956,6 +1963,170 @@ def _au_plus_une_non_nulle(donnees, parametres, natures) -> Constats:
     return Constats(evaluables, _ecarts(constats))
 
 
+CONSTAT_DATE_DIFFERENTE = "date différente de celle des lignes liées"
+CONSTAT_PLUSIEURS_GROUPES = "lignes liées réparties en plusieurs groupes"
+CONSTAT_SOMMES_DIFFERENTES = "sommes des lignes liées différentes des montants"
+
+
+def _sommes_liees_concordantes(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Chaque ligne (par exemple une facture) a des lignes liées (par exemple les lignes
+    de son écriture comptable) de même date, réunies en un seul groupe, dont les sommes
+    égalent ses montants.
+
+    Les lignes liées sont celles de table_lignes de même clé qui remplissent
+    filtre_lignes. Pour chaque montant, les lignes liées qui remplissent ses conditions
+    sont retenues, chacune valant la somme de ses termes (colonne multipliée par son
+    coefficient, par exemple Debit 1 et Credit -1); la somme des lignes retenues doit
+    égaler la valeur de la colonne du montant à la tolérance près (une somme sans ligne
+    retenue vaut 0). Si date et date_lignes sont déclarées, chaque ligne liée a la date
+    de la ligne. Si groupe_lignes est déclaré, les lignes liées ont toutes la même valeur
+    de groupe (par exemple une seule écriture).
+
+    Écarts : aucune ligne liée; date différente; plusieurs groupes; sommes différentes
+    (un seul écart par ligne, la valeur affichée donnant chaque montant en écart).
+
+    Non évaluable : clé vide ou répétée (dans toute la table, filtre compris); et, pour
+    une ligne qui a des lignes liées, date vide ou illisible d'un côté ou de l'autre,
+    groupe vide, montant vide ou illisible, terme vide ou illisible d'une ligne
+    retenue, ou valeur vide d'une colonne de conditions dans une ligne liée (elle aurait
+    pu porter le montant).
+    """
+    cles = _cles_comparees(donnees, parametres["cle"])
+    _, repetees = _index_unique(
+        _cles_comparees(parametres[CONTEXTE_VUE_COMPLETE], parametres["cle"])
+    )
+    vue_lignes = liee.donnees[_dans_le_champ(liee.donnees, parametres.get("filtre_lignes"))]
+    par_cle = {}
+    for position, cle in _cles_comparees(vue_lignes, parametres["cle_lignes"]).items():
+        if cle is not None:
+            par_cle.setdefault(cle, []).append(position)
+
+    colonne_date, colonne_date_lignes = parametres.get("date"), parametres.get("date_lignes")
+    avec_date = colonne_date is not None and colonne_date_lignes is not None
+    if avec_date:
+        dates, etats_dates = _lire_dates(donnees, colonne_date, natures[colonne_date])
+        dates_lignes, etats_lignes = _lire_dates(
+            vue_lignes, colonne_date_lignes, liee.natures[colonne_date_lignes]
+        )
+    groupes = None
+    if "groupe_lignes" in parametres:
+        groupes = _cles_comparees(vue_lignes, parametres["groupe_lignes"])
+
+    montants = []
+    for montant in parametres["montants"]:
+        colonne = montant["colonne"]
+        conditions = montant.get("conditions") or []
+        retenues = _dans_le_champ(vue_lignes, conditions)
+        conditions_vides = pd.Series(False, index=vue_lignes.index, dtype=bool)
+        for condition in conditions:
+            conditions_vides |= vue_lignes[condition["colonne"]].map(_texte_lu).isna().to_numpy()
+        valeurs_lignes = pd.Series(0.0, index=vue_lignes.index)
+        for terme, coefficient in montant["termes"].items():
+            valeurs_lignes = valeurs_lignes + coefficient * lire(
+                vue_lignes[terme], liee.natures[terme]
+            ).valeurs
+        montants.append(
+            {
+                "colonne": colonne,
+                "valeurs": lire(donnees[colonne], natures[colonne]).valeurs,
+                "retenues": retenues,
+                "conditions_vides": conditions_vides,
+                "valeurs_lignes": valeurs_lignes,
+            }
+        )
+    tolerance = parametres.get("tolerance", 0)
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    morceaux = []
+    for position, cle in cles.items():
+        if cle is None or cle in repetees:
+            continue
+        positions = par_cle.get(cle, [])
+        if not positions:
+            evaluables.loc[position] = True
+            constats.loc[position] = CONSTAT_SANS_LIGNE
+            continue
+        if avec_date and (
+            etats_dates.loc[position] != ETAT_LUE
+            or any(etats_lignes.loc[p] != ETAT_LUE for p in positions)
+        ):
+            continue
+        if groupes is not None and any(groupes.loc[p] is None for p in positions):
+            continue
+        lisible = True
+        sommes = []
+        for montant in montants:
+            valeur = montant["valeurs"].loc[position]
+            retenues = [p for p in positions if montant["retenues"].loc[p]]
+            if (
+                pd.isna(valeur)
+                or any(montant["conditions_vides"].loc[p] for p in positions)
+                or any(pd.isna(montant["valeurs_lignes"].loc[p]) for p in retenues)
+            ):
+                lisible = False
+                break
+            somme = round(
+                sum(montant["valeurs_lignes"].loc[p] for p in retenues), _DECIMALES_CALCUL
+            )
+            sommes.append((montant["colonne"], valeur, somme, len(retenues)))
+        if not lisible:
+            continue
+        evaluables.loc[position] = True
+        ecarts_ligne = []
+        if groupes is not None:
+            distincts = sorted({groupes.loc[p] for p in positions})
+            if len(distincts) > 1:
+                ecarts_ligne.append(
+                    (
+                        CONSTAT_PLUSIEURS_GROUPES,
+                        f"{len(distincts)} groupes : " + SEPARATEUR.join(distincts),
+                    )
+                )
+        if avec_date:
+            date = dates.loc[position]
+            autres = sorted({dates_lignes.loc[p] for p in positions} - {date})
+            if autres:
+                ecarts_ligne.append(
+                    (
+                        CONSTAT_DATE_DIFFERENTE,
+                        f"{_jour(date)} (lignes liées : "
+                        + ", ".join(_jour(jour) for jour in autres)
+                        + ")",
+                    )
+                )
+        en_ecart = [
+            f"{colonne} {_ecrire_nombre(valeur)} pour une somme de {_ecrire_nombre(somme)} sur "
+            + _pluriel(nombre, "ligne liée", "lignes liées")
+            + f" (écart {_ecrire_nombre(round(valeur - somme, _DECIMALES_CALCUL))})"
+            for colonne, valeur, somme, nombre in sommes
+            if abs(round(valeur - somme, _DECIMALES_CALCUL)) > tolerance
+        ]
+        if en_ecart:
+            ecarts_ligne.append((CONSTAT_SOMMES_DIFFERENTES, "; ".join(en_ecart)))
+        for constat, affichee in ecarts_ligne:
+            morceaux.append((position, constat, affichee))
+    ecarts = _ecarts(constats)
+    if morceaux:
+        supplementaires = pd.DataFrame(
+            {
+                "constat": [constat for _, constat, _ in morceaux],
+                "proposition": None,
+                "valeur": [affichee for _, _, affichee in morceaux],
+            },
+            index=pd.Index([position for position, _, _ in morceaux]),
+        )
+        ecarts = pd.concat([ecarts, supplementaires])
+    return Constats(evaluables, ecarts)
+
+
+def _verifier_sommes_liees(parametres: dict) -> list[str]:
+    problemes = _verifier_tolerance(parametres)
+    if ("date" in parametres) != ("date_lignes" in parametres):
+        problemes.append("date et date_lignes : les deux sont attendues, ou aucune")
+    return problemes
+
+
 def _verifier_conforme_horaires(parametres: dict) -> list[str]:
     problemes = _entier_positif(parametres, "feries_minimum")
     if "dans_horaires" not in parametres and "hors_horaires" not in parametres:
@@ -2580,6 +2751,39 @@ TYPES = {
         facultatifs=("au_moins_une",),
         verifier=_verifier_plusieurs_colonnes,
     ),
+    "sommes_liees_concordantes": TypeRegle(
+        description=(
+            "Chaque ligne a des lignes liées dans table_lignes (même clé, cle_lignes par "
+            "défaut les colonnes de cle, parmi celles qui remplissent filtre_lignes), par "
+            "exemple une facture et les lignes de son écriture comptable. Pour chaque "
+            "élément de montants (colonne, conditions facultatives et termes), la somme des "
+            "lignes liées qui remplissent les conditions, chacune valant la somme de ses "
+            "termes (colonne de la table liée vers coefficient), égale la valeur de colonne à "
+            "tolerance près (0 par défaut). Si date et date_lignes sont déclarées, les lignes "
+            "liées ont la date de la ligne; si groupe_lignes est déclaré, elles forment un "
+            "seul groupe. Une ligne sans aucune ligne liée est un écart."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "table_lignes": GENRE_TABLE,
+            "cle_lignes": GENRE_COLONNES_LIEES,
+            "filtre_lignes": GENRE_CONDITIONS,
+            "date": GENRE_COLONNE_DATE,
+            "date_lignes": GENRE_COLONNE_DATE_LIEE,
+            "groupe_lignes": GENRE_COLONNES_LIEES,
+            "montants": GENRE_MONTANTS,
+            "tolerance": GENRE_NOMBRE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_sommes_liees_concordantes,
+        facultatifs=("cle_lignes", "filtre_lignes", "date", "date_lignes", "groupe_lignes",
+                     "tolerance"),
+        verifier=_verifier_sommes_liees,
+        table_liee="table_lignes",
+        defauts={"cle_lignes": "cle"},
+        rattachements={"filtre_lignes": "table_lignes"},
+        contexte=(CONTEXTE_VUE_COMPLETE,),
+    ),
 }
 
 
@@ -2689,6 +2893,20 @@ def _references(instance: dict) -> list[tuple[str, str, str, str]]:
             references.extend(
                 (parametre, table, colonne, GENRE_COLONNE_NOMBRE) for colonne in valeur
             )
+        elif genre == GENRE_MONTANTS:
+            # Une colonne citée par plusieurs montants n'est rapportée qu'une fois.
+            citees = []
+            for montant in valeur:
+                citees.append((parametre, table, montant["colonne"], GENRE_COLONNE_NOMBRE))
+                citees.extend(
+                    (parametre, table_liee(parametre), condition["colonne"], GENRE_COLONNE)
+                    for condition in montant.get("conditions") or []
+                )
+                citees.extend(
+                    (parametre, table_liee(parametre), colonne, GENRE_COLONNE_NOMBRE)
+                    for colonne in montant["termes"]
+                )
+            references.extend(dict.fromkeys(citees))
         elif genre == GENRE_COLONNES_LIEES:
             references.extend(
                 (parametre, table_liee(parametre), colonne, GENRE_COLONNE) for colonne in valeur
@@ -2789,18 +3007,9 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
     if genre in GENRES_COLONNE_LIEE:
         return [] if _texte_attendu(valeur) else [f"un nom de colonne est attendu ({genre})"]
     if genre == GENRE_TERMES:
-        if not isinstance(valeur, dict) or not valeur:
-            return [
-                "un dictionnaire non vide est attendu (colonne vers coefficient, par "
-                "exemple {total_ht: 1, total_tva: 1})"
-            ]
-        problemes = []
-        for colonne, coefficient in valeur.items():
-            if not _texte_attendu(colonne):
-                problemes.append(f"{colonne!r} n'est pas un nom de colonne")
-            elif not _est_nombre(coefficient):
-                problemes.append(f"{colonne} : un nombre est attendu comme coefficient")
-        return problemes
+        return _problemes_termes(valeur)
+    if genre == GENRE_MONTANTS:
+        return _problemes_montants(valeur)
     if genre == GENRE_CONDITIONS:
         return _problemes_conditions(valeur)
     if genre == GENRE_EXCEPTIONS:
@@ -2829,6 +3038,62 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
             )
             continue
         problemes.extend(f"valeur {cle!r} : {probleme}" for probleme in _problemes_bornes(bornes))
+    return problemes
+
+
+def _problemes_termes(termes) -> list[str]:
+    """Problèmes des termes : dictionnaire non vide, colonne vers coefficient."""
+    if not isinstance(termes, dict) or not termes:
+        return [
+            "un dictionnaire non vide est attendu (colonne vers coefficient, par "
+            "exemple {total_ht: 1, total_tva: 1})"
+        ]
+    problemes = []
+    for colonne, coefficient in termes.items():
+        if not _texte_attendu(colonne):
+            problemes.append(f"{colonne!r} n'est pas un nom de colonne")
+        elif not _est_nombre(coefficient):
+            problemes.append(f"{colonne} : un nombre est attendu comme coefficient")
+    return problemes
+
+
+def _problemes_montants(montants) -> list[str]:
+    """Problèmes des montants : liste de {colonne, conditions, termes}, conditions
+    facultatives."""
+    if not isinstance(montants, list) or not montants:
+        return [
+            "une liste non vide de montants est attendue (chaque montant commence par un "
+            "tiret, avec les clés colonne, termes et, si besoin, conditions)"
+        ]
+    problemes = []
+    for rang, montant in enumerate(montants, start=1):
+        nom = f"montant n° {rang}"
+        if not isinstance(montant, dict):
+            problemes.append(
+                f"{nom} : un dictionnaire est attendu (clés {', '.join(CLES_MONTANT)})"
+            )
+            continue
+        inconnues = [str(cle) for cle in montant if cle not in CLES_MONTANT]
+        if inconnues:
+            problemes.append(
+                f"{nom} : clé inconnue {', '.join(inconnues)} (clés possibles : "
+                f"{', '.join(CLES_MONTANT)})"
+            )
+        manquantes = [cle for cle in ("colonne", "termes") if cle not in montant]
+        if manquantes:
+            problemes.append(f"{nom} : clé manquante ({', '.join(manquantes)})")
+        if "colonne" in montant and not _texte_attendu(montant["colonne"]):
+            problemes.append(f"{nom}, colonne : un nom de colonne est attendu")
+        if "termes" in montant:
+            problemes.extend(
+                f"{nom}, termes : {probleme}" for probleme in _problemes_termes(montant["termes"])
+            )
+        if "conditions" in montant:
+            problemes.extend(
+                f"{nom}, {probleme}" if probleme.startswith("condition")
+                else f"{nom}, conditions : {probleme}"
+                for probleme in _problemes_conditions(montant["conditions"])
+            )
     return problemes
 
 
