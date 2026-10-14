@@ -164,6 +164,13 @@ GENRE_CONDITIONS = "liste de conditions"
 # Exceptions (pratiques normales) : liste de {libelle, conditions}; une colonne écrite
 # « table.colonne » est celle d'une table liée de la règle.
 GENRE_EXCEPTIONS = "exceptions"
+# Liste d'au moins une colonne de nombre de la table de la règle.
+GENRE_COLONNES_NOMBRE = "liste de colonnes de nombre"
+# Facteurs d'un produit : liste de colonnes de nombre, chacune écrite seule ou en
+# dictionnaire {colonne, coefficient, constante, vide} (voir `_facteur`).
+GENRE_FACTEURS = "facteurs"
+# Sens d'un arrondi à un pas (voir `ARRONDIS`).
+GENRE_ARRONDI = "arrondi"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
 _NATURES_ATTENDUES = {
     GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
@@ -175,6 +182,14 @@ _NATURES_ATTENDUES = {
 # normalisation, les mots étant triés, pour rapprocher « NOM Prénom » de « Prénom NOM »).
 COMPARAISON_MOTS = "mots dans le désordre"
 COMPARAISONS = (COMPARAISON_TELLE_QUELLE, COMPARAISON_NORMALISEE, COMPARAISON_MOTS)
+# Arrondi d'une valeur à un pas : au multiple supérieur, inférieur ou le plus proche
+# (à égale distance, le multiple supérieur).
+ARRONDI_SUPERIEUR = "supérieur"
+ARRONDI_INFERIEUR = "inférieur"
+ARRONDI_PROCHE = "au plus proche"
+ARRONDIS = (ARRONDI_SUPERIEUR, ARRONDI_INFERIEUR, ARRONDI_PROCHE)
+# Clés d'un facteur écrit en dictionnaire.
+CLES_FACTEUR = ("colonne", "coefficient", "constante", "vide")
 # Horaires : créneaux de chaque jour de la semaine, et d'un jour férié. Un jour
 # absent n'a aucun créneau. Un créneau va de debut (inclus) à fin (exclue).
 JOURS = ("lundi", "mardi", "mercredi", "jeudi", "vendredi", "samedi", "dimanche")
@@ -1777,6 +1792,170 @@ def _quantites_concordantes(donnees, parametres, natures, liees) -> Constats:
     return Constats(evaluables, _ecarts(constats, valeurs=affichees), hors_champ=hors_champ)
 
 
+CONSTAT_SOMME_DIFFERENTE = "somme des lignes liées différente de la valeur attendue"
+CONSTAT_PLUSIEURS_NON_NULLES = "plusieurs valeurs non nulles"
+CONSTAT_AUCUNE_NON_NULLE = "aucune valeur non nulle"
+
+
+def _facteur(element) -> dict:
+    """Facteur complet : colonne, coefficient (1 par défaut), constante (0 par défaut) et
+    valeur d'une cellule vide (None par défaut : la ligne est non évaluable)."""
+    if isinstance(element, str):
+        element = {"colonne": element}
+    return {
+        "colonne": element["colonne"],
+        "coefficient": element.get("coefficient", 1),
+        "constante": element.get("constante", 0),
+        "vide": element.get("vide"),
+    }
+
+
+def _produit_calcule(donnees, parametres, natures) -> Constats:
+    """Valeur d'une colonne égale, à la tolérance près, au produit de facteurs lus sur la
+    même ligne.
+
+    Chaque facteur vaut constante + coefficient × valeur de sa colonne; une cellule
+    vide prend la valeur `vide` du facteur quand elle est déclarée. Par exemple un
+    montant égal à quantite × prix × (1 - 0,01 × remise), la remise vide valant 0. Un
+    écart (valeur moins produit) dont la valeur absolue dépasse la tolérance est un
+    écart; la valeur affichée donne la valeur, le calcul et l'écart, comme pour
+    egalite_calculee. Une cible vide ou illisible, un facteur illisible, ou un facteur
+    vide sans valeur `vide`, rendent la ligne non évaluable.
+    """
+    cible = parametres["cible"]
+    valeurs = lire(donnees[cible], natures[cible]).valeurs
+    calcul = pd.Series(1.0, index=donnees.index)
+    for element in parametres["facteurs"]:
+        facteur = _facteur(element)
+        lecture = lire(donnees[facteur["colonne"]], natures[facteur["colonne"]])
+        lues = lecture.valeurs
+        if facteur["vide"] is not None:
+            lues = lues.where((lecture.etats != ETAT_VIDE).to_numpy(), float(facteur["vide"]))
+        calcul = calcul * (facteur["constante"] + facteur["coefficient"] * lues)
+    evaluables = (valeurs.notna() & calcul.notna()).astype(bool)
+    differences = (valeurs - calcul).round(_DECIMALES_CALCUL)
+    en_ecart = evaluables & (differences.abs() > parametres.get("tolerance", 0))
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position in donnees.index[en_ecart.to_numpy(dtype=bool)]:
+        constats.loc[position] = CONSTAT_ECART_CALCUL
+        affichees.loc[position] = (
+            f"{_ecrire_nombre(valeurs.loc[position])} pour un calcul de "
+            f"{_ecrire_nombre(calcul.loc[position])} (écart "
+            f"{_ecrire_nombre(differences.loc[position])})"
+        )
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees))
+
+
+def _arrondir(valeur: float, pas: float, sens: str) -> float:
+    """Valeur arrondie à un multiple du pas, dans le sens demandé (voir `ARRONDIS`).
+
+    Le quotient est d'abord arrondi à 9 décimales, pour qu'une erreur de calcul en
+    virgule flottante ne fasse pas passer au multiple suivant (75 / 60 / 0,25 vaut 5).
+    """
+    quotient = round(valeur / pas, _DECIMALES_CALCUL)
+    if sens == ARRONDI_INFERIEUR:
+        multiple = math.floor(quotient)
+    elif sens == ARRONDI_PROCHE:
+        multiple = math.floor(quotient + 0.5)
+    else:
+        multiple = math.ceil(quotient)
+    return round(multiple * pas, _DECIMALES_CALCUL)
+
+
+def _somme_liee_arrondie(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Somme de colonne_lignes sur les lignes liées égale à la valeur de colonne divisée
+    par diviseur, arrondie au pas dans le sens de arrondi, et au moins égale à minimum.
+
+    Par exemple la main d'oeuvre facturée (somme des quantités des lignes de main
+    d'oeuvre) égale à la durée en minutes divisée par 60, arrondie au quart d'heure
+    supérieur, avec un minimum d'une demi-heure. Les lignes liées sont celles de
+    table_lignes de même clé qui remplissent filtre_lignes. Un écart au-delà de la
+    tolérance est un écart; la valeur affichée donne la somme, le nombre de lignes
+    liées, la valeur attendue et la valeur de colonne.
+
+    Hors champ : ligne sans aucune ligne liée retenue (par exemple une intervention
+    facturée au forfait). Non évaluable : clé vide ou répétée (dans toute la table,
+    filtre compris), valeur de colonne vide ou illisible, quantité vide ou illisible
+    parmi les lignes liées retenues.
+    """
+    cles = _cles_comparees(donnees, parametres["cle"])
+    _, repetees = _index_unique(
+        _cles_comparees(parametres[CONTEXTE_VUE_COMPLETE], parametres["cle"])
+    )
+    colonne = parametres["colonne"]
+    valeurs = lire(donnees[colonne], natures[colonne]).valeurs
+    vue_lignes = liee.donnees[_dans_le_champ(liee.donnees, parametres.get("filtre_lignes"))]
+    colonne_lignes = parametres["colonne_lignes"]
+    quantites = lire(vue_lignes[colonne_lignes], liee.natures[colonne_lignes]).valeurs
+    sommes, nombres, illisibles = {}, {}, set()
+    for cle, quantite in zip(_cles_comparees(vue_lignes, parametres["cle_lignes"]), quantites):
+        if cle is None:
+            continue
+        nombres[cle] = nombres.get(cle, 0) + 1
+        if pd.isna(quantite):
+            illisibles.add(cle)
+        else:
+            sommes[cle] = sommes.get(cle, 0.0) + quantite
+    diviseur = parametres.get("diviseur", 1)
+    pas = parametres["pas"]
+    sens = parametres.get("arrondi", ARRONDI_SUPERIEUR)
+    minimum = parametres.get("minimum")
+    tolerance = parametres.get("tolerance", 0)
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    hors_champ = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle in cles.items():
+        if cle is None or cle in repetees:
+            continue
+        if cle not in nombres:
+            hors_champ.loc[position] = True
+            continue
+        valeur = valeurs.loc[position]
+        if pd.isna(valeur) or cle in illisibles:
+            continue
+        evaluables.loc[position] = True
+        attendu = _arrondir(round(valeur / diviseur, _DECIMALES_CALCUL), pas, sens)
+        if minimum is not None:
+            attendu = max(attendu, minimum)
+        somme = round(sommes.get(cle, 0.0), _DECIMALES_CALCUL)
+        if abs(round(somme - attendu, _DECIMALES_CALCUL)) > tolerance:
+            constats.loc[position] = CONSTAT_SOMME_DIFFERENTE
+            affichees.loc[position] = (
+                f"{_ecrire_nombre(somme)} sur "
+                + _pluriel(nombres[cle], "ligne liée", "lignes liées")
+                + f" pour {_ecrire_nombre(attendu)} attendu ({colonne} "
+                f"{_ecrire_nombre(valeur)})"
+            )
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees), hors_champ=hors_champ)
+
+
+def _au_plus_une_non_nulle(donnees, parametres, natures) -> Constats:
+    """Au plus une des colonnes porte une valeur non nulle sur chaque ligne (par exemple
+    le débit ou le crédit d'une ligne d'écriture); si au_moins_une vaut true, au moins
+    une aussi.
+
+    Une valeur est nulle après arrondi à 9 décimales. Une valeur vide ou illisible
+    rend la ligne non évaluable (une cellule vide n'est pas lue comme un zéro).
+    """
+    colonnes = parametres["colonnes"]
+    lues = [lire(donnees[colonne], natures[colonne]) for colonne in colonnes]
+    evaluables = pd.Series(True, index=donnees.index, dtype=bool)
+    non_nulles = pd.Series(0, index=donnees.index, dtype="int64")
+    for lecture in lues:
+        evaluables &= (lecture.etats == ETAT_LUE).to_numpy()
+        non_nulles += (lecture.valeurs.round(_DECIMALES_CALCUL).fillna(0) != 0).astype("int64")
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    constats[(evaluables & (non_nulles > 1)).to_numpy(dtype=bool)] = CONSTAT_PLUSIEURS_NON_NULLES
+    if parametres.get("au_moins_une", False):
+        constats[(evaluables & (non_nulles == 0)).to_numpy(dtype=bool)] = (
+            CONSTAT_AUCUNE_NON_NULLE
+        )
+    return Constats(evaluables, _ecarts(constats))
+
+
 def _verifier_conforme_horaires(parametres: dict) -> list[str]:
     problemes = _entier_positif(parametres, "feries_minimum")
     if "dans_horaires" not in parametres and "hors_horaires" not in parametres:
@@ -1823,6 +2002,20 @@ def _verifier_delai(parametres: dict) -> list[str]:
             f"({parametres['delai_max']})"
         )
     return problemes
+
+
+def _verifier_somme_arrondie(parametres: dict) -> list[str]:
+    problemes = _verifier_tolerance(parametres)
+    for nom in ("diviseur", "pas"):
+        if nom in parametres and parametres[nom] <= 0:
+            problemes.append(f"{nom} : un nombre strictement positif est attendu")
+    return problemes
+
+
+def _verifier_plusieurs_colonnes(parametres: dict) -> list[str]:
+    if len(parametres["colonnes"]) < 2:
+        return ["colonnes : au moins deux colonnes sont attendues"]
+    return []
 
 
 def _verifier_rapport(parametres: dict) -> list[str]:
@@ -2318,6 +2511,75 @@ TYPES = {
         },
         contexte=(CONTEXTE_VUE_COMPLETE,),
     ),
+    "produit_calcule": TypeRegle(
+        description=(
+            "La valeur de cible égale, à tolerance près (0 par défaut), le produit des "
+            "facteurs lus sur la même ligne. Un facteur est une colonne, ou un dictionnaire "
+            "{colonne, coefficient, constante, vide} qui vaut constante + coefficient × "
+            "colonne (coefficient 1 et constante 0 par défaut), vide donnant la valeur d'une "
+            "cellule vide (sans vide, la ligne est non évaluable); par exemple montant_ht "
+            "égale quantite × pu_ht × (1 - 0,01 × remise_pct)."
+        ),
+        parametres={
+            "cible": GENRE_COLONNE_NOMBRE,
+            "facteurs": GENRE_FACTEURS,
+            "tolerance": GENRE_NOMBRE,
+        },
+        vue=VUE_TOUTES,
+        controler=_produit_calcule,
+        facultatifs=("tolerance",),
+        verifier=_verifier_tolerance,
+    ),
+    "somme_liee_arrondie": TypeRegle(
+        description=(
+            "La somme de colonne_lignes sur les lignes de table_lignes de même clé "
+            "(cle_lignes, par défaut les colonnes de cle) qui remplissent filtre_lignes "
+            "égale, à tolerance près (0 par défaut), la valeur de colonne divisée par "
+            "diviseur (1 par défaut), arrondie au multiple de pas (arrondi vaut supérieur par "
+            "défaut, inférieur ou au plus proche), et au moins égale à minimum; par exemple "
+            "la main d'oeuvre facturée au quart d'heure supérieur d'une durée en minutes, "
+            "avec un minimum d'une demi-heure. Une ligne sans aucune ligne liée retenue est "
+            "hors champ."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "colonne": GENRE_COLONNE_NOMBRE,
+            "diviseur": GENRE_NOMBRE,
+            "pas": GENRE_NOMBRE,
+            "arrondi": GENRE_ARRONDI,
+            "minimum": GENRE_NOMBRE,
+            "table_lignes": GENRE_TABLE,
+            "cle_lignes": GENRE_COLONNES_LIEES,
+            "filtre_lignes": GENRE_CONDITIONS,
+            "colonne_lignes": GENRE_COLONNE_NOMBRE_LIEE,
+            "tolerance": GENRE_NOMBRE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_somme_liee_arrondie,
+        facultatifs=("diviseur", "arrondi", "minimum", "cle_lignes", "filtre_lignes",
+                     "tolerance"),
+        verifier=_verifier_somme_arrondie,
+        table_liee="table_lignes",
+        defauts={"cle_lignes": "cle"},
+        rattachements={"filtre_lignes": "table_lignes"},
+        contexte=(CONTEXTE_VUE_COMPLETE,),
+    ),
+    "au_plus_une_non_nulle": TypeRegle(
+        description=(
+            "Sur chaque ligne, au plus une des colonnes (au moins deux colonnes de nombre) "
+            "porte une valeur non nulle, et au moins une si au_moins_une vaut true (false "
+            "par défaut); par exemple le débit et le crédit d'une ligne d'écriture, l'un "
+            "des deux à zéro. Une valeur vide ou illisible rend la ligne non évaluable."
+        ),
+        parametres={
+            "colonnes": GENRE_COLONNES_NOMBRE,
+            "au_moins_une": GENRE_BOOLEEN,
+        },
+        vue=VUE_TOUTES,
+        controler=_au_plus_une_non_nulle,
+        facultatifs=("au_moins_une",),
+        verifier=_verifier_plusieurs_colonnes,
+    ),
 }
 
 
@@ -2414,6 +2676,15 @@ def _references(instance: dict) -> list[tuple[str, str, str, str]]:
             references.append((parametre, table, valeur, genre))
         elif genre == GENRE_COLONNES:
             references.extend((parametre, table, colonne, GENRE_COLONNE) for colonne in valeur)
+        elif genre == GENRE_COLONNES_NOMBRE:
+            references.extend(
+                (parametre, table, colonne, GENRE_COLONNE_NOMBRE) for colonne in valeur
+            )
+        elif genre == GENRE_FACTEURS:
+            references.extend(
+                (parametre, table, _facteur(element)["colonne"], GENRE_COLONNE_NOMBRE)
+                for element in valeur
+            )
         elif genre == GENRE_TERMES:
             references.extend(
                 (parametre, table, colonne, GENRE_COLONNE_NOMBRE) for colonne in valeur
@@ -2495,7 +2766,14 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
         ]
     if genre == GENRE_BOOLEEN:
         return [] if isinstance(valeur, bool) else ["true ou false est attendu"]
-    if genre in (GENRE_COLONNES, GENRE_COLONNES_COMMUNES, GENRE_COLONNES_LIEES):
+    if genre == GENRE_FACTEURS:
+        return _problemes_facteurs(valeur)
+    if genre == GENRE_ARRONDI:
+        if valeur in ARRONDIS:
+            return []
+        return [f"arrondi inconnu {valeur!r} (arrondis possibles : {', '.join(ARRONDIS)})"]
+    if genre in (GENRE_COLONNES, GENRE_COLONNES_NOMBRE, GENRE_COLONNES_COMMUNES,
+                 GENRE_COLONNES_LIEES):
         if not isinstance(valeur, list) or not valeur:
             return [f"une liste non vide de noms de colonnes est attendue ({genre})"]
         problemes = [
@@ -2551,6 +2829,46 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
             )
             continue
         problemes.extend(f"valeur {cle!r} : {probleme}" for probleme in _problemes_bornes(bornes))
+    return problemes
+
+
+def _problemes_facteurs(facteurs) -> list[str]:
+    """Problèmes des facteurs : liste de colonnes, chacune écrite seule ou en
+    dictionnaire {colonne, coefficient, constante, vide}."""
+    if not isinstance(facteurs, list) or not facteurs:
+        return [
+            "une liste non vide de facteurs est attendue (chaque facteur commence par un "
+            "tiret : une colonne, ou un dictionnaire de clés colonne, coefficient, "
+            "constante et vide)"
+        ]
+    problemes = []
+    for rang, element in enumerate(facteurs, start=1):
+        nom = f"facteur n° {rang}"
+        if isinstance(element, str):
+            if not _texte_attendu(element):
+                problemes.append(f"{nom} : un nom de colonne est attendu")
+            continue
+        if not isinstance(element, dict):
+            problemes.append(
+                f"{nom} : un nom de colonne ou un dictionnaire (clés {', '.join(CLES_FACTEUR)}) "
+                "est attendu"
+            )
+            continue
+        inconnues = [str(cle) for cle in element if cle not in CLES_FACTEUR]
+        if inconnues:
+            problemes.append(
+                f"{nom} : clé inconnue {', '.join(inconnues)} (clés possibles : "
+                f"{', '.join(CLES_FACTEUR)})"
+            )
+        if "colonne" not in element:
+            problemes.append(f"{nom} : clé manquante (colonne)")
+        elif not _texte_attendu(element["colonne"]):
+            problemes.append(f"{nom}, colonne : un nom de colonne est attendu")
+        problemes.extend(
+            f"{nom}, {cle} : un nombre est attendu"
+            for cle in CLES_FACTEUR[1:]
+            if cle in element and not _est_nombre(element[cle])
+        )
     return problemes
 
 
@@ -2742,6 +3060,15 @@ def _figer(valeur):
     return valeur
 
 
+def _parametre_compare(genre: str, valeur):
+    """Valeur d'un paramètre sous la forme où deux règles sont comparées : les facteurs
+    d'un produit sous leur forme complète, dans un ordre fixe (un produit ne dépend pas
+    de l'ordre de ses facteurs)."""
+    if genre == GENRE_FACTEURS:
+        return sorted((_figer(_facteur(element)) for element in valeur), key=repr)
+    return valeur
+
+
 def problemes_regles_gestion(regles) -> list[str]:
     """Problèmes de structure des règles de gestion, tous listés en une fois."""
     if not isinstance(regles, list):
@@ -2814,7 +3141,13 @@ def problemes_regles_gestion(regles) -> list[str]:
         repere = (
             instance["type"],
             instance["table"],
-            _figer({p: complete[p] for p in type_regle.parametres if p in complete}),
+            _figer(
+                {
+                    p: _parametre_compare(genre, complete[p])
+                    for p, genre in type_regle.parametres.items()
+                    if p in complete
+                }
+            ),
             _figer(instance.get(CLE_FILTRE)),
         )
         if repere in vues:

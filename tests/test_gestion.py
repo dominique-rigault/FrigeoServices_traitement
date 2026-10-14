@@ -16,6 +16,7 @@ from frigeo.gestion import (
     CONSTAT_ANNEE_ABSENTE,
     CONSTAT_AUCUNE_LIGNE_CONFORME,
     CONSTAT_ANNEE_DU_NUMERO,
+    CONSTAT_AUCUNE_NON_NULLE,
     CONSTAT_BATTEMENT,
     CONSTAT_CHEVAUCHEMENT,
     CONSTAT_DATE_ANTERIEURE,
@@ -34,6 +35,7 @@ from frigeo.gestion import (
     CONSTAT_NON_CONFORME_HORS_HORAIRES,
     CONSTAT_NUMEROS_MANQUANTS,
     CONSTAT_PERIODE_NON_COUVERTE,
+    CONSTAT_PLUSIEURS_NON_NULLES,
     CONSTAT_PLUSIEURS_DOCUMENTS,
     CONSTAT_QUANTITES_DIFFERENTES,
     CONSTAT_RAPPORT_INFERIEUR,
@@ -41,6 +43,7 @@ from frigeo.gestion import (
     CONSTAT_RAPPORT_SUPERIEUR,
     CONSTAT_SANS_DOCUMENT,
     CONSTAT_SANS_LIGNE,
+    CONSTAT_SOMME_DIFFERENTE,
     CONSTAT_SUPERIEURE,
     CONSTAT_TOTAL_DIFFERENT,
     CONSTAT_VALEURS_DIFFERENTES,
@@ -234,7 +237,7 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "periodes_couvertes_par_paliers, annee_dans_reference, "
         "rattachement_unique_dans_delai, reference_conforme, concordance_entre_references, "
         "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
-        "quantites_concordantes)",
+        "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -2624,3 +2627,307 @@ def test_chargement_des_regles_du_4f1(tmp_path):
     regles = charger_regles_gestion(chemin)
     assert regles[1]["horaires"] == {"lundi": [{"debut": "07:30", "fin": "18:00"}]}
     assert regles[2]["hors_champ_sans_b"] is True
+
+
+# Morceau 4f2 : produit calculé, somme liée arrondie, au plus une valeur non nulle.
+
+REMISE = {"colonne": "r", "constante": 1, "coefficient": -0.01, "vide": 0}
+
+
+def _produit(**autres):
+    return _instance(
+        "produit_calcule", ref="calcul",
+        **{"cible": "m", "facteurs": ["q", "p", REMISE], "tolerance": 0.005, **autres},
+    )
+
+
+def test_produit_calcule_facteurs_et_cellule_vide():
+    donnees = _table(
+        q=[2.0, 1.5, 1.5, 1.0, "x", None, 1.0, 0.0, 1.0],
+        p=[46.8, 46.8, 46.8, 10.005, 1.0, 1.0, 1.0, 420.0, 1.0],
+        r=[None, 10.0, 10.0, 0.0, 0.0, 0.0, 0.0, None, "y"],
+        m=[93.6, 63.18, 70.2, 10.01, 1.0, 1.0, "", 0.0, 1.0],
+    )
+    natures = {"q": NATIF, "p": NATIF, "r": NATIF, "m": NATIF}
+    ecarts, bilan = _controler(donnees, natures, regles=[_produit()])
+    # Une remise vide vaut 0; un écart égal à la tolérance n'en est pas un.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (4, CONSTAT_ECART_CALCUL, "anomalie", "m, q, p, r",
+         "70,2 pour un calcul de 63,18 (écart 7,02)"),
+    ]
+    resume = _bilan(bilan)
+    # Non évaluables : quantité illisible, quantité vide (sans valeur vide déclarée),
+    # cible vide, remise illisible (la valeur vide ne vaut que pour une cellule vide).
+    assert (resume["vue"], resume["non_evaluables"], resume["controlees"],
+            resume["anomalies"]) == (VUE_TOUTES, 4, 5, 1)
+    # Sans valeur vide, une remise vide rend la ligne non évaluable; sans tolérance,
+    # l'écart d'arrondi en est un.
+    sans_vide = {cle: v for cle, v in REMISE.items() if cle != "vide"}
+    ecarts, bilan = _controler(donnees, natures,
+                               regles=[_produit(facteurs=["q", "p", sans_vide], tolerance=0)])
+    assert _lignes(ecarts, "num_ligne_source") == [(4,), (5,)]
+    assert _bilan(bilan)["non_evaluables"] == 6
+    ecarts, _ = _controler(donnees, natures, regles=[_produit()], sensibles={"t": {"r"}})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+
+
+def test_produit_calcule_en_decimaux_a_virgule():
+    donnees = _table(q=["12,00", "0,1", "3,00"], p=["31,20", "3,0", "7,75"],
+                     m=["374,40", "0,30", "23,26"])
+    ecarts, _ = _controler(
+        donnees, {"q": DECIMAL, "p": DECIMAL, "m": DECIMAL},
+        regles=[_produit(facteurs=["q", "p"], tolerance=0)],
+    )
+    # 0,1 x 3 ne fait pas un écart malgré le calcul en virgule flottante.
+    assert _lignes(ecarts, "num_ligne_source", "colonnes", "valeur") == [
+        (4, "m, q, p", "23,26 pour un calcul de 23,25 (écart 0,01)")
+    ]
+
+
+def _somme(**autres):
+    return _instance(
+        "somme_liee_arrondie", ref="grille",
+        **{
+            "cle": ["i"],
+            "colonne": "d",
+            "diviseur": 60,
+            "pas": 0.25,
+            "minimum": 0.5,
+            "table_lignes": "l",
+            "filtre_lignes": [
+                {"colonne": "a", "motif": "MO-.*"},
+                {"colonne": "n", "motif": "FA-.*"},
+            ],
+            "colonne_lignes": "q",
+            "filtre": [{"colonne": "s", "valeurs": ["Réalisée"]}],
+            **autres,
+        },
+    )
+
+
+NATURES_SOMME = {"t": {"i": "texte", "d": ENTIER, "s": "texte"},
+                 "l": {"i": "texte", "a": "texte", "n": "texte", "q": NATIF}}
+
+
+def _interventions_et_main_d_oeuvre():
+    interventions = _table(
+        i=["I1", "I2", "I3", "I4", "I5", "I6", "I7", "", "I8", "I8", "I9"],
+        d=["70", "75", "20", "61", "90", "", "60", "60", "30", "30", "45"],
+        s=["Réalisée"] * 9 + ["Annulée", "Réalisée"],
+    )
+    lignes = _table(
+        "l.csv",
+        i=["I1", "I1", "I1", "I2", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "I9", "I9", ""],
+        a=["MO-STD", "MO-STD", "DEPL", "MO-STD", "MO-URG", "MO-STD", "MO-STD", "DEPL",
+           "MO-STD", "MO-STD", "MO-STD", "MO-STD", "MO-STD", "MO-STD"],
+        n=["FA-1", "FA-1", "FA-1", "FA-2", "FA-2", "FA-3", "FA-4", "FA-5", "FA-6", "FA-7",
+           "FA-8", "FA-9", "AV-1", "FA-10"],
+        q=[1.25, 1.25, 1.0, 1.0, 0.25, 0.5, 1.0, 1.0, 1.0, "x", 0.5, 0.75, -0.75, 1.0],
+    )
+    return {"t": interventions, "l": lignes}
+
+
+def test_somme_liee_arrondie():
+    tables = _interventions_et_main_d_oeuvre()
+    ecarts, bilan = _controler_tables(tables, NATURES_SOMME, [_somme()])
+    # 70 minutes donnent 1,25 h et 75 minutes aussi; 20 minutes donnent le minimum de
+    # 0,5 h; 61 minutes donnent 1,25 h. La ligne de main d'oeuvre de I1 en double exact
+    # n'est comptée qu'une fois, l'avoir de I9 est hors du filtre des lignes.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (5, CONSTAT_SOMME_DIFFERENTE, "anomalie", "i, d, l.i, l.a, l.n, l.q",
+         "1 sur 1 ligne liée pour 1,25 attendu (d 61)"),
+    ]
+    resume = _bilan(bilan)
+    # Hors champ : I8 annulée (filtre) et I5, sans ligne de main d'oeuvre. Non
+    # évaluables : durée vide (I6), quantité illisible (I7), clé vide, I8 répété hors du
+    # filtre.
+    assert (resume["vue"], resume["hors_champ"], resume["non_evaluables"],
+            resume["controlees"], resume["anomalies"]) == (VUE_SANS_SURNOMBRE, 2, 4, 5, 1)
+    # Avec les lignes d'avoir, I9 n'a plus d'heure facturée.
+    ecarts, _ = _controler_tables(tables, NATURES_SOMME, [_somme(
+        filtre_lignes=[{"colonne": "a", "motif": "MO-.*"}])])
+    assert _lignes(ecarts, "num_ligne_source", "valeur") == [
+        (5, "1 sur 1 ligne liée pour 1,25 attendu (d 61)"),
+        (12, "0 sur 2 lignes liées pour 0,75 attendu (d 45)"),
+    ]
+    # Arrondi au plus proche : 61 minutes donnent 1 h. Arrondi inférieur : 70 minutes
+    # donnent 1 h.
+    ecarts, _ = _controler_tables(tables, NATURES_SOMME, [_somme(arrondi="au plus proche")])
+    assert ecarts.empty
+    ecarts, _ = _controler_tables(tables, NATURES_SOMME, [_somme(arrondi="inférieur")])
+    assert _lignes(ecarts, "num_ligne_source", "valeur") == [
+        (2, "1,25 sur 1 ligne liée pour 1 attendu (d 70)"),
+    ]
+    # Sans minimum, 20 minutes donnent 0,5 h au quart d'heure supérieur, mais 0,25 h à
+    # l'arrondi inférieur; un écart égal à la tolérance n'en est pas un.
+    ecarts, _ = _controler_tables(tables, NATURES_SOMME, [
+        {cle: v for cle, v in _somme(arrondi="inférieur").items() if cle != "minimum"}])
+    assert _lignes(ecarts, "num_ligne_source") == [(2,), (4,)]
+    ecarts, _ = _controler_tables(tables, NATURES_SOMME, [_somme(tolerance=0.25)])
+    assert ecarts.empty
+
+
+
+def test_somme_liee_arrondie_pas_decimal_et_valeur_a_mi_pas():
+    interventions = _table(i=["I1", "I2"], d=[2.1, 1.125], s=["Réalisée", "Réalisée"])
+    lignes = _table("l.csv", i=["I1", "I2"], a=["MO-STD", "MO-STD"], n=["FA-1", "FA-2"],
+                    q=[2.1, 1.25])
+    tables = {"t": interventions, "l": lignes}
+    natures = deepcopy(NATURES_SOMME)
+    natures["t"]["d"] = NATIF
+    # 2,1 / 0,3 vaut 7 malgré le calcul en virgule flottante : 2,1 au multiple supérieur.
+    regle = _somme(diviseur=1, pas=0.3, minimum=0, filtre=[{"colonne": "i", "valeurs": ["I1"]}])
+    ecarts, bilan = _controler_tables(tables, natures, [regle])
+    assert ecarts.empty and _bilan(bilan)["controlees"] == 1
+    # À égale distance de deux multiples, l'arrondi au plus proche prend le supérieur.
+    regle = _somme(diviseur=1, arrondi="au plus proche",
+                   filtre=[{"colonne": "i", "valeurs": ["I2"]}])
+    ecarts, bilan = _controler_tables(tables, natures, [regle])
+    assert ecarts.empty and _bilan(bilan)["controlees"] == 1
+
+
+def _non_nulle(**autres):
+    return _instance("au_plus_une_non_nulle", ref="fec",
+                     **{"colonnes": ["debit", "credit"], **autres})
+
+
+def test_au_plus_une_non_nulle():
+    donnees = _table(
+        debit=["0,00", "5,00", "5,00", "0,00", "", "1 000,00", "-3,00", "0,0000000001"],
+        credit=["10,00", "0,00", "5,00", "0,00", "10,00", "0,00", "0,00", "2,00"],
+    )
+    natures = {"debit": DECIMAL, "credit": DECIMAL}
+    ecarts, bilan = _controler(donnees, natures, regles=[_non_nulle()])
+    # Une valeur nulle après arrondi à 9 décimales est nulle; une valeur négative ne
+    # l'est pas.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (4, CONSTAT_PLUSIEURS_NON_NULLES, "anomalie", "debit, credit", "5,00 | 5,00"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["vue"], resume["non_evaluables"], resume["controlees"]) == (
+        VUE_TOUTES, 2, 6
+    )
+    ecarts, _ = _controler(donnees, natures, regles=[_non_nulle(au_moins_une=True)])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (4, CONSTAT_PLUSIEURS_NON_NULLES),
+        (5, CONSTAT_AUCUNE_NON_NULLE),
+    ]
+    trois = _table(a=["1", "0", "0"], b=["0", "0", "2"], c=["0", "3", "4"])
+    ecarts, _ = _controler(trois, {"a": ENTIER, "b": ENTIER, "c": ENTIER},
+                           regles=[_non_nulle(colonnes=["a", "b", "c"])])
+    assert _lignes(ecarts, "num_ligne_source") == [(4,)]
+
+
+def test_structure_des_types_du_4f2():
+    regles = [
+        _produit(facteurs=[]),
+        _produit(facteurs=["q", {"colonne": "r", "coef": 1}, {"constante": 1},
+                           {"colonne": "r", "vide": "0"}, 3, " "]),
+        _somme(arrondi="haut"),
+        _somme(pas=0),
+        _somme(diviseur=-60, tolerance=-1),
+        _non_nulle(colonnes=["debit"]),
+        _non_nulle(colonnes=["debit", "debit"]),
+        _non_nulle(au_moins_une="oui"),
+        _produit(),
+        # Mêmes facteurs, écrits autrement et dans un autre ordre.
+        _produit(facteurs=[{"colonne": "p"}, dict(REMISE), {"colonne": "q", "coefficient": 1}]),
+        {cle: v for cle, v in _somme().items() if cle != "pas"},
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (calcul), facteurs : une liste non vide de facteurs est attendue "
+        "(chaque facteur commence par un tiret : une colonne, ou un dictionnaire de clés "
+        "colonne, coefficient, constante et vide)",
+        "règle n° 2 (calcul), facteurs : facteur n° 2 : clé inconnue coef (clés possibles : "
+        "colonne, coefficient, constante, vide)",
+        "règle n° 2 (calcul), facteurs : facteur n° 3 : clé manquante (colonne)",
+        "règle n° 2 (calcul), facteurs : facteur n° 4, vide : un nombre est attendu",
+        "règle n° 2 (calcul), facteurs : facteur n° 5 : un nom de colonne ou un dictionnaire "
+        "(clés colonne, coefficient, constante, vide) est attendu",
+        "règle n° 2 (calcul), facteurs : facteur n° 6 : un nom de colonne est attendu",
+        "règle n° 3 (grille), arrondi : arrondi inconnu 'haut' (arrondis possibles : "
+        "supérieur, inférieur, au plus proche)",
+        "règle n° 4 (grille) : pas : un nombre strictement positif est attendu",
+        "règle n° 5 (grille) : tolerance : un nombre positif ou nul est attendu",
+        "règle n° 5 (grille) : diviseur : un nombre strictement positif est attendu",
+        "règle n° 6 (fec) : colonnes : au moins deux colonnes sont attendues",
+        "règle n° 7 (fec), colonnes : colonne citée deux fois",
+        "règle n° 8 (fec), au_moins_une : true ou false est attendu",
+        "règle n° 10 (calcul) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 9 (calcul))",
+        "règle n° 11 (grille) : paramètre manquant (pas)",
+    ]
+
+
+def test_colonnes_du_4f2_confrontees_aux_donnees():
+    donnees = _table(q=[1.0], p=[1.0], r=[0.0], m=[1.0], debit=["1"], credit=["0"])
+    with pytest.raises(ValueError) as erreur:
+        _controler(
+            donnees,
+            {"q": NATIF, "p": NATIF, "r": "texte", "m": NATIF, "debit": ENTIER,
+             "credit": "texte"},
+            regles=[_produit(facteurs=["q", "z", REMISE]), _non_nulle()],
+        )
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (calcul), facteurs : colonne t.z absente des données chargées",
+        "règle n° 1 (calcul), facteurs : la nature en vigueur de t.r est 'texte', un nombre "
+        "est attendu (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "règle n° 2 (fec), colonnes : la nature en vigueur de t.credit est 'texte', un nombre "
+        "est attendu (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+    ]
+    tables = _interventions_et_main_d_oeuvre()
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(tables, NATURES_SOMME, [_somme(colonne_lignes="a")])
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (grille), colonne_lignes : la nature en vigueur de l.a est 'texte', un "
+        "nombre est attendu (à trancher dans la revue du dictionnaire, notebook "
+        "02c_dictionnaire)",
+    ]
+
+
+def test_catalogue_des_types_du_4f2():
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["produit_calcule", "parametres"] == (
+        "cible (colonne de nombre), facteurs (facteurs), tolerance (nombre, facultatif)"
+    )
+    assert catalogue.loc["somme_liee_arrondie", "parametres"] == (
+        "cle (liste de colonnes), colonne (colonne de nombre), diviseur (nombre, "
+        "facultatif), pas (nombre), arrondi (arrondi, facultatif), minimum (nombre, "
+        "facultatif), table_lignes (table), cle_lignes (liste de colonnes de la table liée, "
+        "facultatif), filtre_lignes (liste de conditions, facultatif), colonne_lignes "
+        "(colonne de nombre de la table liée), tolerance (nombre, facultatif)"
+    )
+    assert catalogue.loc["au_plus_une_non_nulle", "parametres"] == (
+        "colonnes (liste de colonnes de nombre), au_moins_une (true ou false, facultatif)"
+    )
+    assert catalogue.loc[["produit_calcule", "au_plus_une_non_nulle"], "vue"].tolist() == [
+        VUE_TOUTES, VUE_TOUTES
+    ]
+    assert catalogue.loc["somme_liee_arrondie", "vue"] == VUE_SANS_SURNOMBRE
+    types = ["produit_calcule", "somme_liee_arrondie", "au_plus_une_non_nulle"]
+    assert set(catalogue.loc[types, "issue"]) == {"anomalie"}
+
+
+def test_chargement_des_regles_du_4f2(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: calcul\n    libelle: Montant\n    type: produit_calcule\n"
+        "    table: factures_lignes\n    cible: montant_ht\n"
+        "    facteurs:\n      - quantite\n      - pu_ht\n"
+        "      - {colonne: remise_pct, constante: 1, coefficient: -0.01, vide: 0}\n"
+        "    tolerance: 0.005\n"
+        "  - ref: grille\n    libelle: Quart d'heure\n    type: somme_liee_arrondie\n"
+        "    table: interventions\n    cle: [id_intervention]\n    colonne: duree_min\n"
+        "    diviseur: 60\n    pas: 0.25\n    arrondi: supérieur\n    minimum: 0.5\n"
+        "    table_lignes: factures_lignes\n    colonne_lignes: quantite\n"
+        "  - ref: fec\n    libelle: Un des deux\n    type: au_plus_une_non_nulle\n"
+        "    table: fec\n    colonnes: [Debit, Credit]\n    au_moins_une: true\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[0]["facteurs"][2] == {
+        "colonne": "remise_pct", "constante": 1, "coefficient": -0.01, "vide": 0
+    }
+    assert regles[1]["arrondi"] == "supérieur"
+    assert regles[2]["au_moins_une"] is True
