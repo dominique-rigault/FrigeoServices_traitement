@@ -371,3 +371,202 @@ regles:
             valeurs: [Annulée]
           - colonne: factures_lignes.code_article
             valeurs: [DEPL]
+
+  # Contenu des factures (R17, R04 partie facture, R18).
+  - ref: R17
+    libelle: Ligne de forfait de contrôle rattachée à une intervention de contrôle
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Contrôle]
+    filtre:
+      - colonne: code_article
+        valeurs: [CTRL-F]
+  - ref: R17
+    libelle: Ligne de forfait d'installation rattachée à une installation
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Installation]
+    filtre:
+      - colonne: code_article
+        valeurs: [INST-F]
+  - ref: R17
+    libelle: Ligne de forfait de visite préventive rattachée à une intervention préventive
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Intervention préventive]
+    filtre:
+      - colonne: code_article
+        valeurs: [PREV-F]
+  - ref: R17
+    libelle: Ligne de main d'oeuvre d'urgence rattachée à un dépannage
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Dépannage]
+    filtre:
+      - colonne: code_article
+        valeurs: [MO-URG]
+  - ref: R17
+    libelle: Ligne de main d'oeuvre horaire rattachée à une préventive, une maintenance ou un dépannage
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Intervention préventive, Maintenance, Dépannage]
+    filtre:
+      - colonne: code_article
+        valeurs: [MO-STD]
+  - ref: R17
+    libelle: Contrôle réalisé et facturable facturé avec un forfait de contrôle
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [CTRL-F]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Contrôle]
+  - ref: R17
+    libelle: Installation réalisée et facturable facturée avec un forfait d'installation
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [INST-F]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Installation]
+  - ref: R17
+    libelle: Dépannage réalisé et facturable facturé avec de la main d'oeuvre
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [MO-STD, MO-URG]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Dépannage]
+  - ref: R17
+    libelle: Maintenance réalisée et facturable facturée avec de la main d'oeuvre horaire
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [MO-STD]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Maintenance]
+  - ref: R17
+    libelle: Intervention préventive réalisée et facturable facturée au forfait ou à l'heure
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [PREV-F, MO-STD]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Intervention préventive]
+  - ref: R04
+    libelle: Main d'oeuvre facturée en urgence hors des horaires ouvrés, au tarif normal dans ces horaires
+    type: conforme_selon_horaires
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    date: date_debut
+    heure: heure_debut
+    horaires:
+      lundi: [{debut: '07:30', fin: '18:00'}]
+      mardi: [{debut: '07:30', fin: '18:00'}]
+      mercredi: [{debut: '07:30', fin: '18:00'}]
+      jeudi: [{debut: '07:30', fin: '18:00'}]
+      vendredi: [{debut: '07:30', fin: '18:00'}]
+    feries: *feries
+    feries_minimum: 10
+    dans_horaires:
+      - colonne: code_article
+        valeurs: [MO-STD]
+    hors_horaires:
+      - colonne: code_article
+        valeurs: [MO-URG]
+    filtre:
+      - colonne: code_article
+        motif: 'MO-.*'
+  - ref: R18
+    libelle: Pièces posées sur une intervention facturable facturées avec la même référence et la même quantité
+    type: quantites_concordantes
+    table: interventions
+    cle: [id_intervention]
+    table_a: pieces_interventions
+    detail_a: ref_piece
+    quantite_a: quantite
+    table_b: factures_lignes
+    filtre_b:
+      - colonne: code_article
+        valeurs: [PIECE, FLUIDE]
+    detail_b: ref_piece
+    quantite_b: quantite
+    hors_champ_sans_b: true
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+  - ref: R18
+    libelle: Aucune pièce facturée sur une intervention non facturable
+    type: sans_ligne_liee
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    filtre_lignes:
+      - colonne: code_article
+        valeurs: [PIECE, FLUIDE]
+    filtre:
+      - colonne: facturable
+        valeurs: [N]
