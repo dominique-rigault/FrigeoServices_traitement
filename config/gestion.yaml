@@ -625,3 +625,83 @@ regles:
     table: fec
     colonnes: [Debit, Credit]
     au_moins_une: true
+
+  # Ventes et achats face au FEC, pièce par pièce (R14, R20).
+  - ref: R14
+    libelle: Facture ou avoir comptabilisé en une écriture VT de même date et de mêmes montants
+    type: sommes_liees_concordantes
+    table: factures_entetes
+    cle: [num_facture]
+    table_lignes: fec
+    cle_lignes: [PieceRef]
+    filtre_lignes:
+      - colonne: JournalCode
+        valeurs: [VT]
+    date: date_facture
+    date_lignes: EcritureDate
+    groupe_lignes: [JournalCode, EcritureNum]
+    montants:
+      - colonne: total_ttc
+        conditions:
+          - colonne: CompteNum
+            motif: '411.*'
+        termes: {Debit: 1, Credit: -1}
+      - colonne: total_ht
+        conditions:
+          - colonne: CompteNum
+            motif: '70[678].*'
+        termes: {Credit: 1, Debit: -1}
+      - colonne: total_tva
+        conditions:
+          - colonne: CompteNum
+            motif: '44571.*'
+        termes: {Credit: 1, Debit: -1}
+  - ref: R20
+    libelle: Facture fournisseur comptabilisée en une écriture AC de même date et de mêmes montants
+    type: sommes_liees_concordantes
+    table: achats_entetes
+    cle: [num_piece_achat]
+    table_lignes: fec
+    cle_lignes: [PieceRef]
+    filtre_lignes:
+      - colonne: JournalCode
+        valeurs: [AC]
+    date: date_facture
+    date_lignes: EcritureDate
+    groupe_lignes: [JournalCode, EcritureNum]
+    montants:
+      - colonne: total_ttc
+        conditions:
+          - colonne: CompteNum
+            motif: '401.*'
+        termes: {Credit: 1, Debit: -1}
+      - colonne: total_ht
+        conditions:
+          - colonne: CompteNum
+            motif: '6.*'
+        termes: {Debit: 1, Credit: -1}
+      - colonne: total_tva
+        conditions:
+          - colonne: CompteNum
+            motif: '44566.*'
+        termes: {Debit: 1, Credit: -1}
+  - ref: existence
+    libelle: Pièce d'une écriture de vente connue des factures
+    type: existence_dans_reference
+    table: fec
+    cle: [PieceRef]
+    table_reference: factures_entetes
+    cle_reference: [num_facture]
+    filtre:
+      - colonne: JournalCode
+        valeurs: [VT]
+  - ref: existence
+    libelle: Pièce d'une écriture d'achat connue des achats
+    type: existence_dans_reference
+    table: fec
+    cle: [PieceRef]
+    table_reference: achats_entetes
+    cle_reference: [num_piece_achat]
+    filtre:
+      - colonne: JournalCode
+        valeurs: [AC]
