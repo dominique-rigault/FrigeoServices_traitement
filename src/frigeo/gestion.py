@@ -39,7 +39,7 @@ lignes de la table de la règle. Les types qui confrontent une table à un
 référentiel (existence d'une clé, date dans une période, année déclarée) suivent le
 même mécanisme, le référentiel étant la table liée. Un type peut aussi avoir
 plusieurs tables liées (par exemple une intervention, les lignes de facture qui la
-portent et les en-têtes de ces factures).
+portent et les en-têtes de ces factures, ou les pièces posées et les pièces facturées).
 
 Un filtre, comme les conditions d'un type, compare la valeur d'une colonne à une
 liste de valeurs ou à une expression régulière. Les pratiques que le métier tient
@@ -147,10 +147,12 @@ GENRE_BOOLEEN = "true ou false"
 GENRE_COLONNE_LIEE = "colonne de la table liée"
 GENRE_COLONNE_NOMBRE_LIEE = "colonne de nombre de la table liée"
 GENRE_COLONNE_DATE_LIEE = "colonne de date de la table liée"
+GENRE_COLONNE_HEURE_LIEE = "colonne d'heure de la table liée"
 GENRES_COLONNE_LIEE = {
     GENRE_COLONNE_LIEE: GENRE_COLONNE,
     GENRE_COLONNE_NOMBRE_LIEE: GENRE_COLONNE_NOMBRE,
     GENRE_COLONNE_DATE_LIEE: GENRE_COLONNE_DATE,
+    GENRE_COLONNE_HEURE_LIEE: GENRE_COLONNE_HEURE,
 }
 # Liste de colonnes de la table liée.
 GENRE_COLONNES_LIEES = "liste de colonnes de la table liée"
@@ -766,6 +768,61 @@ def _pluriel(nombre: int, singulier: str, pluriel: str) -> str:
     return f"{nombre} {singulier if nombre <= 1 else pluriel}"
 
 
+def _lire_horaires(parametres: dict) -> tuple[dict, dict]:
+    """Jours fériés (année vers ensemble de dates) et créneaux (jour vers liste de
+    couples début, fin en minutes) des paramètres horaires et feries."""
+    feries = {
+        _annee_feries(cle): {pd.Timestamp(_jour_ferie(valeur)) for valeur in jours}
+        for cle, jours in parametres["feries"].items()
+    }
+    creneaux = {
+        jour: [(_minutes(creneau["debut"]), _minutes(creneau["fin"])) for creneau in liste]
+        for jour, liste in parametres["horaires"].items()
+    }
+    return feries, creneaux
+
+
+def _situer(date, heure, feries: dict, creneaux: dict):
+    """Situation d'une date et d'une heure face aux horaires : None si la date ou l'heure
+    manque, ou si l'année n'a pas de jours fériés déclarés; sinon le jour écrit
+    (« samedi 08/03/2025 13:00 », « férié 01/05/2025 10:00 ») et vrai si l'heure tombe
+    dans un créneau de ce jour (début inclus, fin exclue)."""
+    if pd.isna(date) or pd.isna(heure) or date.year not in feries:
+        return None
+    ferie = date.normalize() in feries[date.year]
+    jour = JOUR_FERIE if ferie else JOURS[date.dayofweek]
+    minutes = int(heure.total_seconds() // 60)
+    dans = any(debut <= minutes < fin for debut, fin in creneaux.get(jour, []))
+    texte = (
+        f"{NOM_FERIE if ferie else jour} {date:%d/%m/%Y} "
+        f"{minutes // 60:02d}:{minutes % 60:02d}"
+    )
+    return texte, dans
+
+
+def _avertissements_feries(dates: pd.Series, feries: dict, minimum) -> list[str]:
+    """Avertissements, pour chaque année des dates lues : année absente des jours
+    fériés déclarés (avec son nombre de lignes), année sans jour férié, ou avec moins
+    de jours que le minimum."""
+    avertissements = []
+    for annee, nombre in dates.dropna().dt.year.value_counts().sort_index().items():
+        annee = int(annee)
+        if annee not in feries:
+            avertissements.append(
+                f"année {annee} absente des jours fériés déclarés : "
+                + _pluriel(int(nombre), "ligne non évaluable", "lignes non évaluables")
+            )
+        elif not feries[annee]:
+            avertissements.append(f"année {annee} : aucun jour férié déclaré")
+        elif minimum is not None and len(feries[annee]) < minimum:
+            avertissements.append(
+                f"année {annee} : "
+                + _pluriel(len(feries[annee]), "jour férié déclaré", "jours fériés déclarés")
+                + f", moins que feries_minimum ({minimum:g})"
+            )
+    return avertissements
+
+
 def _hors_horaires_selon_valeur(donnees, parametres, natures) -> Constats:
     """Ligne hors horaires portant l'une des valeurs admises dans sa colonne.
 
@@ -782,14 +839,7 @@ def _hors_horaires_selon_valeur(donnees, parametres, natures) -> Constats:
     colonne_date, colonne_heure = parametres["date"], parametres["heure"]
     dates = lire(donnees[colonne_date], natures[colonne_date]).valeurs
     heures = lire(donnees[colonne_heure], natures[colonne_heure]).valeurs
-    feries = {
-        _annee_feries(cle): {pd.Timestamp(_jour_ferie(valeur)) for valeur in jours}
-        for cle, jours in parametres["feries"].items()
-    }
-    creneaux = {
-        jour: [(_minutes(creneau["debut"]), _minutes(creneau["fin"])) for creneau in liste]
-        for jour, liste in parametres["horaires"].items()
-    }
+    feries, creneaux = _lire_horaires(parametres)
     admises = set(parametres["valeurs"])
     textes = donnees[parametres["colonne"]].map(_valeur_constatee)
 
@@ -797,13 +847,11 @@ def _hors_horaires_selon_valeur(donnees, parametres, natures) -> Constats:
     constats = pd.Series(None, index=donnees.index, dtype=object)
     valeurs = pd.Series(None, index=donnees.index, dtype=object)
     for position in donnees.index:
-        date, heure = dates.loc[position], heures.loc[position]
-        if pd.isna(date) or pd.isna(heure) or date.year not in feries:
+        situation = _situer(dates.loc[position], heures.loc[position], feries, creneaux)
+        if situation is None:
             continue
-        ferie = date.normalize() in feries[date.year]
-        jour = JOUR_FERIE if ferie else JOURS[date.dayofweek]
-        minutes = int(heure.total_seconds() // 60)
-        if any(debut <= minutes < fin for debut, fin in creneaux.get(jour, [])):
+        moment, dans = situation
+        if dans:
             evaluables.loc[position] = True
             continue
         texte = textes.loc[position]
@@ -813,28 +861,8 @@ def _hors_horaires_selon_valeur(donnees, parametres, natures) -> Constats:
         if texte in admises:
             continue
         constats.loc[position] = CONSTAT_HORS_HORAIRES
-        valeurs.loc[position] = (
-            f"{NOM_FERIE if ferie else jour} {date:%d/%m/%Y} "
-            f"{minutes // 60:02d}:{minutes % 60:02d}{SEPARATEUR}{texte}"
-        )
-
-    avertissements = []
-    minimum = parametres.get("feries_minimum")
-    for annee, nombre in dates.dropna().dt.year.value_counts().sort_index().items():
-        annee = int(annee)
-        if annee not in feries:
-            avertissements.append(
-                f"année {annee} absente des jours fériés déclarés : "
-                + _pluriel(int(nombre), "ligne non évaluable", "lignes non évaluables")
-            )
-        elif not feries[annee]:
-            avertissements.append(f"année {annee} : aucun jour férié déclaré")
-        elif minimum is not None and len(feries[annee]) < minimum:
-            avertissements.append(
-                f"année {annee} : "
-                + _pluriel(len(feries[annee]), "jour férié déclaré", "jours fériés déclarés")
-                + f", moins que feries_minimum ({minimum:g})"
-            )
+        valeurs.loc[position] = f"{moment}{SEPARATEUR}{texte}"
+    avertissements = _avertissements_feries(dates, feries, parametres.get("feries_minimum"))
     return Constats(evaluables, _ecarts(constats, valeurs=valeurs), tuple(avertissements))
 
 
@@ -1543,6 +1571,219 @@ def _sans_ligne_liee(donnees, parametres, natures, liee: Liee) -> Constats:
     return Constats(evaluables, _ecarts(constats, valeurs=affichees, issues=issues))
 
 
+CONSTAT_AUCUNE_LIGNE_CONFORME = "aucune ligne liée ne remplit les conditions attendues"
+CONSTAT_NON_CONFORME_DANS_HORAIRES = "non conforme dans les horaires"
+CONSTAT_NON_CONFORME_HORS_HORAIRES = "non conforme hors horaires"
+CONSTAT_QUANTITES_DIFFERENTES = "quantités différentes entre les deux tables liées"
+
+
+def _ligne_liee_attendue(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Au moins une ligne de table_lignes (parmi celles qui remplissent filtre_lignes)
+    de même clé remplit toutes les conditions de attendu.
+
+    Une ligne sans aucune ligne liée retenue est hors champ (l'absence de lignes liées
+    relève d'une autre règle, par exemple sans_ligne_liee ou un rattachement). La
+    valeur affichée donne, pour chaque colonne de attendu, les valeurs des lignes
+    liées. Un écart qui remplit une exception devient une information; une condition
+    sur une colonne « table_lignes.c » doit être remplie par toutes les lignes liées.
+
+    Non évaluable : clé vide ou répétée (dans toute la table, filtre compris), ou,
+    quand aucune ligne liée ne remplit les conditions, valeur vide d'une colonne de
+    attendu dans l'une d'elles (elle aurait pu les remplir).
+    """
+    cles = _cles_comparees(donnees, parametres["cle"])
+    _, repetees = _index_unique(
+        _cles_comparees(parametres[CONTEXTE_VUE_COMPLETE], parametres["cle"])
+    )
+    vue_lignes = liee.donnees[_dans_le_champ(liee.donnees, parametres.get("filtre_lignes"))]
+    par_cle = {}
+    for position, cle in _cles_comparees(vue_lignes, parametres["cle_lignes"]).items():
+        if cle is not None:
+            par_cle.setdefault(cle, []).append(position)
+    attendu = parametres["attendu"]
+    exceptions = parametres.get("exceptions")
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    hors_champ = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    issues = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle in cles.items():
+        if cle is None or cle in repetees:
+            continue
+        positions = par_cle.get(cle, [])
+        if not positions:
+            hors_champ.loc[position] = True
+            continue
+        textes = [
+            [_texte_lu(vue_lignes.at[p, condition["colonne"]]) for condition in attendu]
+            for p in positions
+        ]
+        if any(
+            all(_condition_vraie(texte, condition) for texte, condition in zip(ligne, attendu))
+            for ligne in textes
+        ):
+            evaluables.loc[position] = True
+            continue
+        if any(texte is None for ligne in textes for texte in ligne):
+            continue
+        evaluables.loc[position] = True
+        affichees.loc[position] = "; ".join(
+            f"{liee.table}.{condition['colonne']} = "
+            + ", ".join(sorted({ligne[rang] for ligne in textes}))
+            for rang, condition in enumerate(attendu)
+        )
+        libelle = _pratique(exceptions, donnees, position, {liee.table: (vue_lignes, positions)})
+        if libelle is None:
+            constats.loc[position] = CONSTAT_AUCUNE_LIGNE_CONFORME
+        else:
+            constats.loc[position] = PREFIXE_PRATIQUE + libelle
+            issues.loc[position] = ISSUE_INFORMATION
+    return Constats(
+        evaluables,
+        _ecarts(constats, valeurs=affichees, issues=issues),
+        hors_champ=hors_champ,
+    )
+
+
+def _conforme_selon_horaires(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Chaque ligne remplit les conditions de dans_horaires ou de hors_horaires, selon
+    la date et l'heure de sa référence face aux horaires.
+
+    La référence est la ligne de table_reference de même clé; sa date et son heure
+    sont situées comme pour hors_horaires_selon_valeur (jour férié de feries, sinon
+    jour de la semaine; créneaux de ce jour, début inclus, fin exclue). Une liste de
+    conditions absente n'impose rien. Les conditions portent sur la ligne elle-même.
+    La valeur affichée donne les conditions en échec et le moment de la référence.
+
+    Non évaluable : clé vide, référence absente ou de clé répétée, date ou heure vide
+    ou illisible, année sans jours fériés déclarés, valeur vide d'une colonne des
+    conditions à remplir. Avertissements comme pour hors_horaires_selon_valeur, sur
+    les dates des références des lignes.
+    """
+    cles = _cles_comparees(donnees, parametres["cle"])
+    index, repetees = _index_unique(_cles_comparees(liee.donnees, parametres["cle_reference"]))
+    colonne_date, colonne_heure = parametres["date"], parametres["heure"]
+    dates = lire(liee.donnees[colonne_date], liee.natures[colonne_date]).valeurs
+    heures = lire(liee.donnees[colonne_heure], liee.natures[colonne_heure]).valeurs
+    feries, creneaux = _lire_horaires(parametres)
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    dates_lignes = pd.Series(pd.NaT, index=donnees.index, dtype="datetime64[ns]")
+    for position, cle in cles.items():
+        if cle is None or cle in repetees or cle not in index:
+            continue
+        reference = index[cle]
+        dates_lignes.loc[position] = dates.loc[reference]
+        situation = _situer(dates.loc[reference], heures.loc[reference], feries, creneaux)
+        if situation is None:
+            continue
+        moment, dans = situation
+        conditions = parametres.get("dans_horaires" if dans else "hors_horaires") or []
+        textes = [_texte_lu(donnees.at[position, c["colonne"]]) for c in conditions]
+        if any(texte is None for texte in textes):
+            continue
+        evaluables.loc[position] = True
+        echecs = [
+            f"{condition['colonne']} = {texte}"
+            for condition, texte in zip(conditions, textes)
+            if not _condition_vraie(texte, condition)
+        ]
+        if echecs:
+            constats.loc[position] = (
+                CONSTAT_NON_CONFORME_DANS_HORAIRES if dans else CONSTAT_NON_CONFORME_HORS_HORAIRES
+            )
+            affichees.loc[position] = f"{', '.join(echecs)}{SEPARATEUR}{moment}"
+    avertissements = _avertissements_feries(
+        dates_lignes, feries, parametres.get("feries_minimum")
+    )
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees), tuple(avertissements))
+
+
+def _quantites_concordantes(donnees, parametres, natures, liees) -> Constats:
+    """Les quantités des lignes liées de table_a et de table_b concordent, détail par
+    détail (par exemple les pièces posées sur une intervention et les pièces facturées).
+
+    Pour chaque table liée, les lignes de même clé qui remplissent son filtre sont
+    regroupées par valeur de la colonne de détail (comparée telle quelle), et leurs
+    quantités additionnées; un détail absent d'une table y vaut 0. Un écart entre les
+    deux sommes d'un même détail au-delà de la tolérance est un écart, un seul par
+    ligne; la valeur affichée donne chaque détail en écart et ses deux sommes.
+
+    Hors champ, si hors_champ_sans_b vaut true : ligne sans aucune ligne dans table_b
+    (avant filtre_b). Non évaluable : clé vide ou répétée (dans toute la table, filtre
+    compris), ligne liée retenue au détail vide ou à la quantité vide ou illisible.
+    """
+    cles = _cles_comparees(donnees, parametres["cle"])
+    _, repetees = _index_unique(
+        _cles_comparees(parametres[CONTEXTE_VUE_COMPLETE], parametres["cle"])
+    )
+    sommes, illisibles, noms = [], [], []
+    presentes_b = set()
+    for suffixe in ("a", "b"):
+        liee = liees[f"table_{suffixe}"]
+        if suffixe == "b":
+            presentes_b = set(_cles_comparees(liee.donnees, parametres["cle_b"]).dropna())
+        vue = liee.donnees[_dans_le_champ(liee.donnees, parametres.get(f"filtre_{suffixe}"))]
+        colonne_quantite = parametres[f"quantite_{suffixe}"]
+        quantites = lire(vue[colonne_quantite], liee.natures[colonne_quantite]).valeurs
+        details = [_texte_lu(valeur) for valeur in vue[parametres[f"detail_{suffixe}"]]]
+        par_cle, mauvaises = {}, set()
+        for cle, detail, quantite in zip(
+            _cles_comparees(vue, parametres[f"cle_{suffixe}"]), details, quantites
+        ):
+            if cle is None:
+                continue
+            if detail is None or pd.isna(quantite):
+                mauvaises.add(cle)
+                continue
+            par_detail = par_cle.setdefault(cle, {})
+            par_detail[detail] = par_detail.get(detail, 0.0) + quantite
+        sommes.append(par_cle)
+        illisibles.append(mauvaises)
+        noms.append(liee.table)
+    tolerance = parametres.get("tolerance", 0)
+    sans_b = parametres.get("hors_champ_sans_b", False)
+
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    hors_champ = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position, cle in cles.items():
+        if cle is None or cle in repetees:
+            continue
+        if sans_b and cle not in presentes_b:
+            hors_champ.loc[position] = True
+            continue
+        if cle in illisibles[0] or cle in illisibles[1]:
+            continue
+        evaluables.loc[position] = True
+        a, b = sommes[0].get(cle, {}), sommes[1].get(cle, {})
+        en_ecart = [
+            detail
+            for detail in sorted(set(a) | set(b))
+            if abs(round(a.get(detail, 0.0) - b.get(detail, 0.0), _DECIMALES_CALCUL))
+            > tolerance
+        ]
+        if en_ecart:
+            constats.loc[position] = CONSTAT_QUANTITES_DIFFERENTES
+            affichees.loc[position] = "; ".join(
+                f"{detail} : {_ecrire_nombre(a.get(detail, 0.0))} dans {noms[0]}, "
+                f"{_ecrire_nombre(b.get(detail, 0.0))} dans {noms[1]}"
+                for detail in en_ecart
+            )
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees), hors_champ=hors_champ)
+
+
+def _verifier_conforme_horaires(parametres: dict) -> list[str]:
+    problemes = _entier_positif(parametres, "feries_minimum")
+    if "dans_horaires" not in parametres and "hors_horaires" not in parametres:
+        problemes.append("dans_horaires ou hors_horaires attendu")
+    return problemes
+
+
 def _verifier_tolerance(parametres: dict) -> list[str]:
     if parametres.get("tolerance", 0) < 0:
         return ["tolerance : un nombre positif ou nul est attendu"]
@@ -1979,6 +2220,102 @@ TYPES = {
         table_liee="table_lignes",
         defauts={"cle_lignes": "cle"},
         rattachements={"filtre_lignes": "table_lignes"},
+        contexte=(CONTEXTE_VUE_COMPLETE,),
+    ),
+    "ligne_liee_attendue": TypeRegle(
+        description=(
+            "Parmi les lignes de table_lignes de même clé (cle_lignes, par défaut les "
+            "colonnes de cle) qui remplissent filtre_lignes, au moins une remplit toutes "
+            "les conditions de attendu; par exemple une intervention de contrôle facturée "
+            "avec un forfait de contrôle. Une ligne sans aucune ligne liée est hors champ. "
+            "Un écart qui remplit une exception (une condition sur table_lignes.colonne "
+            "devant être remplie par toutes les lignes liées) est une information."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "table_lignes": GENRE_TABLE,
+            "cle_lignes": GENRE_COLONNES_LIEES,
+            "filtre_lignes": GENRE_CONDITIONS,
+            "attendu": GENRE_CONDITIONS,
+            "exceptions": GENRE_EXCEPTIONS,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_ligne_liee_attendue,
+        facultatifs=("cle_lignes", "filtre_lignes", "exceptions"),
+        table_liee="table_lignes",
+        defauts={"cle_lignes": "cle"},
+        rattachements={"filtre_lignes": "table_lignes", "attendu": "table_lignes"},
+        contexte=(CONTEXTE_VUE_COMPLETE,),
+    ),
+    "conforme_selon_horaires": TypeRegle(
+        description=(
+            "Selon que la date et l'heure de la ligne de table_reference de même clé "
+            "(cle_reference, par défaut les colonnes de cle) tombent dans les créneaux de "
+            "horaires ou non (voir hors_horaires_selon_valeur pour horaires, feries et "
+            "feries_minimum), la ligne remplit les conditions de dans_horaires ou de "
+            "hors_horaires (l'une des deux au moins est déclarée); par exemple une main "
+            "d'oeuvre facturée au tarif majoré hors des horaires ouvrés."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "table_reference": GENRE_TABLE,
+            "cle_reference": GENRE_COLONNES_LIEES,
+            "date": GENRE_COLONNE_DATE_LIEE,
+            "heure": GENRE_COLONNE_HEURE_LIEE,
+            "horaires": GENRE_HORAIRES,
+            "feries": GENRE_FERIES,
+            "feries_minimum": GENRE_NOMBRE,
+            "dans_horaires": GENRE_CONDITIONS,
+            "hors_horaires": GENRE_CONDITIONS,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_conforme_selon_horaires,
+        facultatifs=("cle_reference", "feries_minimum", "dans_horaires", "hors_horaires"),
+        verifier=_verifier_conforme_horaires,
+        table_liee="table_reference",
+        defauts={"cle_reference": "cle"},
+    ),
+    "quantites_concordantes": TypeRegle(
+        description=(
+            "Les lignes de table_a et de table_b de même clé (cle_a et cle_b, par défaut "
+            "les colonnes de cle), parmi celles qui remplissent filtre_a et filtre_b, ont "
+            "pour chaque valeur de detail_a et detail_b la même somme de quantite_a et "
+            "quantite_b, à tolerance près (0 par défaut); par exemple les pièces posées sur "
+            "une intervention et les pièces facturées. Si hors_champ_sans_b vaut true, une "
+            "ligne sans aucune ligne dans table_b est hors champ."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "table_a": GENRE_TABLE,
+            "cle_a": GENRE_COLONNES_LIEES,
+            "filtre_a": GENRE_CONDITIONS,
+            "detail_a": GENRE_COLONNE_LIEE,
+            "quantite_a": GENRE_COLONNE_NOMBRE_LIEE,
+            "table_b": GENRE_TABLE,
+            "cle_b": GENRE_COLONNES_LIEES,
+            "filtre_b": GENRE_CONDITIONS,
+            "detail_b": GENRE_COLONNE_LIEE,
+            "quantite_b": GENRE_COLONNE_NOMBRE_LIEE,
+            "tolerance": GENRE_NOMBRE,
+            "hors_champ_sans_b": GENRE_BOOLEEN,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_quantites_concordantes,
+        facultatifs=("cle_a", "filtre_a", "cle_b", "filtre_b", "tolerance",
+                     "hors_champ_sans_b"),
+        verifier=_verifier_tolerance,
+        defauts={"cle_a": "cle", "cle_b": "cle"},
+        tables_liees=("table_a", "table_b"),
+        rattachements={
+            "cle_a": "table_a",
+            "filtre_a": "table_a",
+            "detail_a": "table_a",
+            "quantite_a": "table_a",
+            "cle_b": "table_b",
+            "filtre_b": "table_b",
+            "detail_b": "table_b",
+            "quantite_b": "table_b",
+        },
         contexte=(CONTEXTE_VUE_COMPLETE,),
     ),
 }

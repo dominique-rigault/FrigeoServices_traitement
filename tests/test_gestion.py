@@ -14,6 +14,7 @@ from frigeo.gestion import (
     COLONNES_ECARTS_GESTION,
     CONSTAT_ABSENTE,
     CONSTAT_ANNEE_ABSENTE,
+    CONSTAT_AUCUNE_LIGNE_CONFORME,
     CONSTAT_ANNEE_DU_NUMERO,
     CONSTAT_BATTEMENT,
     CONSTAT_CHEVAUCHEMENT,
@@ -29,9 +30,12 @@ from frigeo.gestion import (
     CONSTAT_INFERIEURE,
     CONSTAT_LIGNES_INATTENDUES,
     CONSTAT_NON_CONFORME,
+    CONSTAT_NON_CONFORME_DANS_HORAIRES,
+    CONSTAT_NON_CONFORME_HORS_HORAIRES,
     CONSTAT_NUMEROS_MANQUANTS,
     CONSTAT_PERIODE_NON_COUVERTE,
     CONSTAT_PLUSIEURS_DOCUMENTS,
+    CONSTAT_QUANTITES_DIFFERENTES,
     CONSTAT_RAPPORT_INFERIEUR,
     CONSTAT_RAPPORT_NON_CALCULABLE,
     CONSTAT_RAPPORT_SUPERIEUR,
@@ -229,7 +233,8 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "existence_dans_reference, date_dans_periode_reference, "
         "periodes_couvertes_par_paliers, annee_dans_reference, "
         "rattachement_unique_dans_delai, reference_conforme, concordance_entre_references, "
-        "sans_ligne_liee)",
+        "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
+        "quantites_concordantes)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -2266,3 +2271,356 @@ def test_chargement_des_regles_du_4e(tmp_path):
     assert regles[1]["exceptions"][0]["conditions"][0]["colonne"] == (
         "factures_lignes.code_article"
     )
+
+
+# Morceau 4f1 : ligne liée attendue, conformité selon les horaires d'une référence,
+# quantités concordantes entre deux tables liées.
+
+
+def _attendue(**autres):
+    return _instance(
+        "ligne_liee_attendue",
+        ref="R17",
+        **{
+            "cle": ["i"],
+            "table_lignes": "l",
+            "attendu": [
+                {"colonne": "a", "valeurs": ["CTRL"]},
+                {"colonne": "q", "motif": "[1-9][0-9]*"},
+            ],
+            "exceptions": [{
+                "libelle": "déplacement seul",
+                "conditions": [
+                    {"colonne": "s", "valeurs": ["Annulée"]},
+                    {"colonne": "l.a", "valeurs": ["DEPL"]},
+                ],
+            }],
+            "filtre": [{"colonne": "s", "valeurs": ["Réalisée", "Annulée"]}],
+            **autres,
+        },
+    )
+
+
+NATURES_ATTENDUE = {"t": {"i": "texte", "s": "texte"},
+                    "l": {"i": "texte", "a": "texte", "q": "texte"}}
+
+
+def _interventions_et_articles():
+    interventions = _table(
+        i=["I1", "I2", "I3", "I4", "I5", "I6", "", "I7", "I7", "I8", "I9"],
+        s=["Réalisée"] * 7 + ["Réalisée", "Reportée", "Annulée", "Annulée"],
+    )
+    lignes = _table(
+        "l.csv",
+        i=["I1", "I1", "I2", "I4", "I4", "I5", "I6", "I6", "I8", "I9", "I9"],
+        a=["CTRL", "DEPL", "DEPL", " ", "DEPL", "CTRL", "CTRL", "CTRL", "DEPL", "DEPL", "MO"],
+        q=["1", "1", "1", "1", "1", "0", "", "2", "1", "1", "1"],
+    )
+    return {"t": interventions, "l": lignes}
+
+
+def test_ligne_liee_attendue_et_exception():
+    tables = _interventions_et_articles()
+    ecarts, bilan = _controler_tables(tables, NATURES_ATTENDUE, [_attendue()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "valeur") == [
+        (3, CONSTAT_AUCUNE_LIGNE_CONFORME, "anomalie", "l.a = DEPL; l.q = 1"),
+        # La ligne de contrôle a une quantité nulle : aucune ligne ne remplit tout.
+        (6, CONSTAT_AUCUNE_LIGNE_CONFORME, "anomalie", "l.a = CTRL; l.q = 0"),
+        (11, PREFIXE_PRATIQUE + "déplacement seul", ISSUE_INFORMATION, "l.a = DEPL; l.q = 1"),
+        # L'exception demande que toutes les lignes liées soient des déplacements.
+        (12, CONSTAT_AUCUNE_LIGNE_CONFORME, "anomalie", "l.a = DEPL, MO; l.q = 1"),
+    ]
+    assert set(ecarts["colonnes"]) == {"i, s, l.i, l.a, l.q"}
+    resume = _bilan(bilan)
+    # Hors champ : la ligne reportée (filtre) et I3, sans ligne liée. Non évaluables :
+    # I4 (article vide, aucune autre ligne conforme), clé vide, I7 répété hors du filtre.
+    # I6 est conforme malgré sa ligne à quantité vide.
+    assert (resume["vue"], resume["hors_champ"], resume["non_evaluables"],
+            resume["controlees"], resume["anomalies"], resume["informations"]) == (
+        VUE_SANS_SURNOMBRE, 2, 3, 6, 3, 1
+    )
+    # filtre_lignes restreint les lignes liées : I1 n'a plus que son déplacement, I5 et
+    # I6 n'ont plus de ligne liée.
+    regle = _attendue(filtre_lignes=[{"colonne": "a", "valeurs": ["DEPL"]}])
+    ecarts, bilan = _controler_tables(tables, NATURES_ATTENDUE, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (2, CONSTAT_AUCUNE_LIGNE_CONFORME),
+        (3, CONSTAT_AUCUNE_LIGNE_CONFORME),
+        (5, CONSTAT_AUCUNE_LIGNE_CONFORME),
+        (11, PREFIXE_PRATIQUE + "déplacement seul"),
+        (12, PREFIXE_PRATIQUE + "déplacement seul"),
+    ]
+    assert _bilan(bilan)["hors_champ"] == 4
+
+
+NATURES_SELON_HORAIRES = {"t": {"i": "texte", "c": "texte"},
+                          "r": {"i": "texte", "d": DATE, "h": HEURE}}
+
+
+def _selon_horaires(**autres):
+    return _instance(
+        "conforme_selon_horaires",
+        ref="R04",
+        **{
+            "cle": ["i"],
+            "table_reference": "r",
+            "date": "d",
+            "heure": "h",
+            "horaires": HORAIRES,
+            "feries": {2025: ["2025-05-01"]},
+            "dans_horaires": [{"colonne": "c", "valeurs": ["STD"]}],
+            "hors_horaires": [{"colonne": "c", "valeurs": ["URG"]}],
+            "filtre": [{"colonne": "c", "motif": "[A-Z]+"}],
+            **autres,
+        },
+    )
+
+
+def _lignes_et_horaires():
+    lignes = _table(
+        i=["R1", "R1", "R2", "R2", "R3", "R4", "R5", "R6", "R9", "", "R7", "R1"],
+        c=["STD", "URG", "URG", "STD", "STD", "URG", "STD", "STD", "STD", "STD", "URG", ""],
+    )
+    references = _table(
+        "r.csv",
+        i=["R1", "R2", "R3", "R4", "R5", "R6", "R6", "R7"],
+        d=["03/03/2025", "08/03/2025", "01/05/2025", "03/03/2025", "14/03/2052",
+           "03/03/2025", "04/03/2025", "03/03/2025"],
+        h=["10:00", "09:00", "10:00", "", "10:00", "10:00", "10:00", "18:00"],
+    )
+    return {"t": lignes, "r": references}
+
+
+def test_conforme_selon_horaires():
+    tables = _lignes_et_horaires()
+    ecarts, bilan = _controler_tables(tables, NATURES_SELON_HORAIRES,
+                                      [_selon_horaires(feries_minimum=2)])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (3, CONSTAT_NON_CONFORME_DANS_HORAIRES, "c = URG | lundi 03/03/2025 10:00"),
+        (5, CONSTAT_NON_CONFORME_HORS_HORAIRES, "c = STD | samedi 08/03/2025 09:00"),
+        (6, CONSTAT_NON_CONFORME_HORS_HORAIRES, "c = STD | férié 01/05/2025 10:00"),
+    ]
+    assert set(ecarts["colonnes"]) == {"i, c, r.i, r.d, r.h"}
+    resume = _bilan(bilan)
+    # Non évaluables : heure vide, année sans jours fériés, référence répétée, référence
+    # absente, clé vide. La fin d'un créneau est exclue (R7 à 18:00 est hors horaires).
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"],
+            resume["anomalies"]) == (1, 5, 6, 3)
+    assert resume["avertissements"] == (
+        "année 2025 : 1 jour férié déclaré, moins que feries_minimum (2); "
+        "année 2052 absente des jours fériés déclarés : 1 ligne non évaluable"
+    )
+    # Sans conditions dans les horaires, une ligne dans les horaires n'a rien à remplir.
+    regle = {cle: v for cle, v in _selon_horaires().items() if cle != "dans_horaires"}
+    ecarts, bilan = _controler_tables(tables, NATURES_SELON_HORAIRES, [regle])
+    assert _lignes(ecarts, "num_ligne_source") == [(5,), (6,)]
+    assert _bilan(bilan)["controlees"] == 6
+    ecarts, _ = _controler_tables(tables, NATURES_SELON_HORAIRES, [_selon_horaires()],
+                                  sensibles={"r": {"h"}})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+
+
+def test_conforme_selon_horaires_valeur_vide_non_evaluable():
+    tables = {
+        "t": _table(i=["R1", "R2", "R1"], c=["STD", " ", " "]),
+        "r": _table("r.csv", i=["R1", "R2"], d=["03/03/2025", "08/03/2025"],
+                    h=["10:00", "09:00"]),
+    }
+    regle = {cle: v for cle, v in _selon_horaires().items() if cle != "filtre"}
+    regle["dans_horaires"] = [{"colonne": "c", "valeurs": ["STD"]}]
+    regle["hors_horaires"] = [{"colonne": "c", "valeurs": ["URG"]}]
+    regle_sans_hors = {cle: v for cle, v in regle.items() if cle != "hors_horaires"}
+    _, bilan = _controler_tables(tables, NATURES_SELON_HORAIRES, [regle, regle_sans_hors])
+    # Une valeur vide n'est jugée que si une condition porte sur elle.
+    assert [(_bilan(bilan, rang)["non_evaluables"], _bilan(bilan, rang)["controlees"],
+             _bilan(bilan, rang)["anomalies"]) for rang in (0, 1)] == [(2, 1, 0), (1, 2, 0)]
+
+
+def _quantites(**autres):
+    return _instance(
+        "quantites_concordantes",
+        ref="R18",
+        **{
+            "cle": ["i"],
+            "table_a": "a",
+            "detail_a": "p",
+            "quantite_a": "q",
+            "table_b": "b",
+            "filtre_b": [{"colonne": "art", "valeurs": ["PIECE"]}],
+            "detail_b": "p",
+            "quantite_b": "q",
+            "hors_champ_sans_b": True,
+            "filtre": [{"colonne": "s", "valeurs": ["R"]}],
+            **autres,
+        },
+    )
+
+
+NATURES_QUANTITES = {"t": {"i": "texte", "s": "texte"},
+                     "a": {"i": "texte", "p": "texte", "q": DECIMAL},
+                     "b": {"i": "texte", "art": "texte", "p": "texte", "q": DECIMAL}}
+
+
+def _poses_et_factures():
+    interventions = _table(
+        i=["I1", "I2", "I3", "I4", "I5", "I6", "I7", "I8", "", "I9", "I9"],
+        s=["R"] * 10 + ["X"],
+    )
+    poses = _table(
+        "a.csv",
+        i=["I1", "I1", "I2", "I2", "I3", "I6", "I7", "I7", "I9"],
+        p=["P1", "P2", "P1", "P4", "P1", "P1", "P1", "P2", "P1"],
+        q=["1,0", "2,0", "1,0", "2,0", "1,0", "x", "1,0", "1,0", "1,0"],
+    )
+    factures = _table(
+        "b.csv",
+        i=["I1", "I1", "I1", "I1", "I2", "I3", "I4", "I4", "I7", "I7", "I8", "I9", "I6"],
+        art=["PIECE", "PIECE", "PIECE", "MO", "PIECE", "MO", "PIECE", "MO", "PIECE", "PIECE",
+             "PIECE", "PIECE", "MO"],
+        p=["P1", "P2", "P2", "", "P1", "", "P3", "", "P2", "P1", " ", "P1", ""],
+        q=["1,0", "1,0", "1,0", "1,0", "2,0", "1,0", "1,5", "1,0", "1,0", "1,004", "1,0",
+           "1,0", "1,0"],
+        n=[str(rang) for rang in range(13)],
+    )
+    return {"t": interventions, "a": poses, "b": factures}
+
+
+def test_quantites_concordantes():
+    tables = _poses_et_factures()
+    natures = deepcopy(NATURES_QUANTITES)
+    natures["b"]["n"] = "texte"
+    ecarts, bilan = _controler_tables(tables, natures, [_quantites()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (3, CONSTAT_QUANTITES_DIFFERENTES, "P1 : 1 dans a, 2 dans b; P4 : 2 dans a, 0 dans b"),
+        (4, CONSTAT_QUANTITES_DIFFERENTES, "P1 : 1 dans a, 0 dans b"),
+        (5, CONSTAT_QUANTITES_DIFFERENTES, "P3 : 0 dans a, 1,5 dans b"),
+        (8, CONSTAT_QUANTITES_DIFFERENTES, "P1 : 1 dans a, 1,004 dans b"),
+    ]
+    assert set(ecarts["colonnes"]) == {"i, a.i, a.p, a.q, b.i, b.art, b.p, b.q"}
+    resume = _bilan(bilan)
+    # Hors champ : la ligne hors du filtre et I5, sans ligne dans b. Non évaluables :
+    # quantité illisible (I6), détail vide (I8), clé vide, I9 répété hors du filtre.
+    # Une ligne sans ligne dans b est hors champ avant d'être jugée (I6 le serait sans
+    # sa ligne de main d'oeuvre).
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"],
+            resume["anomalies"]) == (2, 4, 5, 4)
+    ecarts, bilan = _controler_tables(
+        tables, natures, [_quantites(tolerance=0.005, hors_champ_sans_b=False)]
+    )
+    assert _lignes(ecarts, "num_ligne_source") == [(3,), (4,), (5,)]
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["controlees"]) == (1, 6)
+    ecarts, _ = _controler_tables(tables, natures, [_quantites()], sensibles={"a": {"p"}})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+
+
+def test_structure_des_types_du_4f1():
+    sans_conditions = {cle: v for cle, v in _selon_horaires().items()
+                       if cle not in ("dans_horaires", "hors_horaires")}
+    regles = [
+        sans_conditions,
+        _selon_horaires(feries_minimum=1.5),
+        _quantites(hors_champ_sans_b="oui"),
+        _quantites(tolerance=-1),
+        {cle: v for cle, v in _attendue().items() if cle != "attendu"},
+        _attendue(exceptions=[{"libelle": "L", "conditions": [{"colonne": "x.a",
+                                                               "valeurs": ["A"]}]}]),
+        _quantites(),
+        _quantites(cle_a=["i"], cle_b=["i"]),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (R04) : dans_horaires ou hors_horaires attendu",
+        "règle n° 2 (R04) : feries_minimum : un entier positif ou nul est attendu",
+        "règle n° 3 (R18), hors_champ_sans_b : true ou false est attendu",
+        "règle n° 4 (R18) : tolerance : un nombre positif ou nul est attendu",
+        "règle n° 5 (R17) : paramètre manquant (attendu)",
+        "règle n° 6 (R17), exceptions, exception n° 1, condition n° 1 : x n'est pas une table "
+        "liée de la règle (tables liées : l); une colonne de la table de la règle s'écrit "
+        "sans préfixe",
+        # Les clés des tables liées reprennent par défaut celle de la table.
+        "règle n° 8 (R18) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 7 (R18))",
+    ]
+
+
+def test_tables_et_natures_du_4f1_confrontees_aux_donnees():
+    tables = _lignes_et_horaires()
+    natures = deepcopy(NATURES_SELON_HORAIRES)
+    natures["r"]["h"] = "texte"
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(tables, natures, [_selon_horaires(
+            hors_horaires=[{"colonne": "z", "valeurs": ["URG"]}])])
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R04), heure : la nature en vigueur de r.h est 'texte', une heure est "
+        "attendue (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "règle n° 1 (R04), hors_horaires : colonne t.z absente des données chargées",
+    ]
+    tables = _poses_et_factures()
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(tables, NATURES_QUANTITES, [_quantites(
+            filtre_a=[{"colonne": "y", "valeurs": ["A"]}])])
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R18), filtre_a : colonne a.y absente des données chargées",
+    ]
+    tables = _interventions_et_articles()
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(tables, NATURES_ATTENDUE, [_attendue(
+            attendu=[{"colonne": "w", "valeurs": ["CTRL"]}])])
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R17), attendu : colonne l.w absente des données chargées",
+    ]
+
+
+def test_catalogue_des_types_du_4f1():
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["ligne_liee_attendue", "parametres"] == (
+        "cle (liste de colonnes), table_lignes (table), cle_lignes (liste de colonnes de la "
+        "table liée, facultatif), filtre_lignes (liste de conditions, facultatif), attendu "
+        "(liste de conditions), exceptions (exceptions, facultatif)"
+    )
+    assert catalogue.loc["conforme_selon_horaires", "parametres"] == (
+        "cle (liste de colonnes), table_reference (table), cle_reference (liste de colonnes "
+        "de la table liée, facultatif), date (colonne de date de la table liée), heure "
+        "(colonne d'heure de la table liée), horaires (horaires), feries (jours fériés), "
+        "feries_minimum (nombre, facultatif), dans_horaires (liste de conditions, "
+        "facultatif), hors_horaires (liste de conditions, facultatif)"
+    )
+    assert catalogue.loc["quantites_concordantes", "parametres"] == (
+        "cle (liste de colonnes), table_a (table), cle_a (liste de colonnes de la table "
+        "liée, facultatif), filtre_a (liste de conditions, facultatif), detail_a (colonne "
+        "de la table liée), quantite_a (colonne de nombre de la table liée), table_b "
+        "(table), cle_b (liste de colonnes de la table liée, facultatif), filtre_b (liste "
+        "de conditions, facultatif), detail_b (colonne de la table liée), quantite_b "
+        "(colonne de nombre de la table liée), tolerance (nombre, facultatif), "
+        "hors_champ_sans_b (true ou false, facultatif)"
+    )
+    types = ["ligne_liee_attendue", "conforme_selon_horaires", "quantites_concordantes"]
+    assert set(catalogue.loc[types, "vue"]) == {VUE_SANS_SURNOMBRE}
+    assert set(catalogue.loc[types, "issue"]) == {"anomalie"}
+
+
+def test_chargement_des_regles_du_4f1(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: R04\n    libelle: Urgence\n    type: conforme_selon_horaires\n"
+        "    table: factures_lignes\n    cle: [id_intervention]\n"
+        "    table_reference: interventions\n    date: date_debut\n    heure: heure_debut\n"
+        "    horaires: &ouvres\n      lundi: [{debut: '07:30', fin: '18:00'}]\n"
+        "    feries: {2025: [2025-05-01]}\n"
+        "    hors_horaires:\n      - colonne: code_article\n        valeurs: [MO-URG]\n"
+        "  - ref: R04\n    libelle: Urgence bis\n    type: conforme_selon_horaires\n"
+        "    table: factures_lignes\n    cle: [id_intervention]\n"
+        "    table_reference: interventions\n    date: date_debut\n    heure: heure_debut\n"
+        "    horaires: *ouvres\n    feries: {2025: [2025-05-01]}\n"
+        "    dans_horaires:\n      - colonne: code_article\n        valeurs: [MO-STD]\n"
+        "  - ref: R18\n    libelle: Pièces\n    type: quantites_concordantes\n"
+        "    table: interventions\n    cle: [id_intervention]\n"
+        "    table_a: pieces_interventions\n    detail_a: ref_piece\n    quantite_a: quantite\n"
+        "    table_b: factures_lignes\n    detail_b: ref_piece\n    quantite_b: quantite\n"
+        "    hors_champ_sans_b: true\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[1]["horaires"] == {"lundi": [{"debut": "07:30", "fin": "18:00"}]}
+    assert regles[2]["hors_champ_sans_b"] is True
