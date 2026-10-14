@@ -570,3 +570,58 @@ regles:
     filtre:
       - colonne: facturable
         valeurs: [N]
+
+  # Calculs et cohérence interne (montants des lignes, main d'oeuvre au quart d'heure, FEC).
+  - ref: calcul
+    libelle: Montant HT de la ligne de facture égal à quantité × prix unitaire × (1 - remise)
+    type: produit_calcule
+    table: factures_lignes
+    cible: montant_ht
+    facteurs:
+      - quantite
+      - pu_ht
+      - {colonne: remise_pct, constante: 1, coefficient: -0.01, vide: 0}
+    tolerance: 0.005
+  - ref: calcul
+    libelle: Montant HT de la ligne d'achat égal à quantité × prix unitaire d'achat
+    type: produit_calcule
+    table: achats_lignes
+    cible: montant_ht
+    facteurs: [quantite, pu_achat_ht]
+    tolerance: 0.005
+  - ref: grille
+    libelle: Remise réservée à la main d'oeuvre
+    type: plage
+    table: factures_lignes
+    colonne: remise_pct
+    max: 0
+    filtre:
+      - colonne: code_article
+        motif: '(?!MO-).*'
+  - ref: grille
+    libelle: Main d'oeuvre facturée au quart d'heure supérieur, une demi-heure au moins
+    type: somme_liee_arrondie
+    table: interventions
+    cle: [id_intervention]
+    colonne: duree_min
+    diviseur: 60
+    pas: 0.25
+    minimum: 0.5
+    table_lignes: factures_lignes
+    filtre_lignes:
+      - colonne: code_article
+        motif: 'MO-.*'
+      - colonne: num_facture
+        motif: 'FA-.*'
+    colonne_lignes: quantite
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+  - ref: fec
+    libelle: Ligne d'écriture avec un débit ou un crédit, l'un des deux à zéro
+    type: au_plus_une_non_nulle
+    table: fec
+    colonnes: [Debit, Credit]
+    au_moins_une: true
