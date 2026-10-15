@@ -732,3 +732,23 @@ regles:
     filtre:
       - colonne: compte_charge
         valeurs: ['601100', '601200']
+
+  # Stock théorique par référence (R19). Le catalogue ne porte pas la date du stock
+  # initial (01/01/2025 selon le dossier), d'où date_initial; achats avancés de 7 jours
+  # pour le réapprovisionnement hebdomadaire (facture datée après la livraison).
+  - ref: R19
+    libelle: Stock théorique d'une pièce jamais négatif (stock initial, achats et consommations)
+    type: solde_jamais_negatif
+    table: pieces_interventions
+    cle: [ref_piece]
+    date: date_sortie
+    quantite: quantite
+    table_initial: catalogue_pieces
+    colonne_initial: stock_initial
+    date_initial: 2025-01-01
+    table_entrees: achats_lignes
+    quantite_entrees: quantite
+    table_en_tetes: achats_entetes
+    lien_entrees: [num_piece_achat]
+    date_en_tetes: date_facture
+    avance_entrees: 7
