@@ -1,0 +1,754 @@
+# Règles de gestion propres au client, écrites à la main d'après ce que dit le métier.
+# Chaque règle est une instance d'un type du catalogue (voir frigeo.gestion.catalogue_types) :
+# ref (référence de la règle), libelle (texte affiché), type, table, puis les paramètres du type.
+# Une règle qui n'entre dans aucun type demande un nouveau type générique dans src/.
+regles:
+  - ref: decoupage
+    libelle: Date de début dans la période de l'export
+    type: date_dans_periode_export
+    table: interventions
+    colonne: date_debut
+  - ref: decoupage
+    libelle: Date de l'intervention dans la période de l'export
+    type: date_dans_periode_export
+    table: pieces_interventions
+    colonne: date_sortie
+  - ref: decoupage
+    libelle: Date de facture dans la période de l'export
+    type: date_dans_periode_export
+    table: factures_entetes
+    colonne: date_facture
+  - ref: decoupage
+    libelle: Date de facture fournisseur dans la période de l'export
+    type: date_dans_periode_export
+    table: achats_entetes
+    colonne: date_facture
+  - ref: decoupage
+    libelle: Date d'écriture dans la période de l'export, donc dans l'exercice (R06)
+    type: date_dans_periode_export
+    table: fec
+    colonne: EcritureDate
+
+  - ref: R02
+    libelle: Durée sur site dans la plage de sa catégorie
+    type: plage_selon_valeur
+    table: interventions
+    colonne: duree_min
+    selon: categorie
+    plages:
+      Intervention préventive: {min: 45, max: 150}
+      Maintenance: {min: 45, max: 240}
+      Dépannage: {min: 30, max: 300}
+      Contrôle: {min: 30, max: 90}
+      Installation: {min: 120, max: 600}
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+    issue: anomalie
+  - ref: R22
+    libelle: Distance imputée de 2 à 120 km
+    type: plage
+    table: interventions
+    colonne: distance_km
+    min: 2
+    max: 120
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+    issue: anomalie
+  - ref: R22
+    libelle: Vitesse du trajet imputé de 30 à 70 km/h
+    type: rapport_dans_plage
+    table: interventions
+    numerateur: distance_km
+    denominateur: duree_trajet_min
+    facteur: 60
+    min: 30
+    max: 70
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+    issue: anomalie
+
+  - ref: R01
+    libelle: Numérotation des interventions sans trou par année
+    type: numerotation_continue
+    table: interventions
+    colonne: id_intervention
+    motif: 'INT-(?P<annee>\d{4})-(?P<numero>\d{6})'
+    debut: 1
+  - ref: R01
+    libelle: Numérotation des interventions dans l'ordre des dates
+    type: numerotation_chronologique
+    table: interventions
+    colonne: id_intervention
+    motif: 'INT-(?P<annee>\d{4})-(?P<numero>\d{6})'
+    date: date_debut
+
+  - ref: R03
+    libelle: Interventions d'un même intervenant sans chevauchement, 20 minutes d'écart au moins
+    type: intervalles_sans_chevauchement
+    table: interventions
+    groupe: intervenant
+    date: date_debut
+    heure: heure_debut
+    duree: duree_min
+    battement: 20
+    comparaison: après normalisation
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+
+  # Jours fériés : liste à compléter chaque année (&feries la nomme, *feries la reprend).
+  - ref: R04
+    libelle: Intervention hors horaires ouvrés réservée aux dépannages
+    type: hors_horaires_selon_valeur
+    table: interventions
+    date: date_debut
+    heure: heure_debut
+    horaires:
+      lundi: [{debut: '07:30', fin: '18:00'}]
+      mardi: [{debut: '07:30', fin: '18:00'}]
+      mercredi: [{debut: '07:30', fin: '18:00'}]
+      jeudi: [{debut: '07:30', fin: '18:00'}]
+      vendredi: [{debut: '07:30', fin: '18:00'}]
+    feries: &feries
+      2025: ['2025-01-01', '2025-04-21', '2025-05-01', '2025-05-08', '2025-05-29', '2025-06-09',
+             '2025-07-14', '2025-08-15', '2025-11-01', '2025-11-11', '2025-12-25']
+      2026: ['2026-01-01', '2026-04-06', '2026-05-01', '2026-05-08', '2026-05-14', '2026-05-25',
+             '2026-07-14', '2026-08-15', '2026-11-01', '2026-11-11', '2026-12-25']
+      2027: ['2027-01-01', '2027-03-29', '2027-05-01', '2027-05-06', '2027-05-08', '2027-05-17',
+             '2027-07-14', '2027-08-15', '2027-11-01', '2027-11-11', '2027-12-25']
+    feries_minimum: 10
+    colonne: categorie
+    valeurs: [Dépannage]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+
+  - ref: R04
+    libelle: Intervention hors des horaires d'astreinte
+    type: hors_horaires_selon_valeur
+    table: interventions
+    date: date_debut
+    heure: heure_debut
+    horaires:
+      lundi: [{debut: '07:30', fin: '21:00'}]
+      mardi: [{debut: '07:30', fin: '21:00'}]
+      mercredi: [{debut: '07:30', fin: '21:00'}]
+      jeudi: [{debut: '07:30', fin: '21:00'}]
+      vendredi: [{debut: '07:30', fin: '21:00'}]
+      samedi: [{debut: '07:30', fin: '13:00'}]
+      ferie: [{debut: '07:30', fin: '21:00'}]
+    feries: *feries
+    feries_minimum: 10
+    colonne: categorie
+    valeurs: []
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+    issue: à arbitrer
+
+  - ref: R01
+    libelle: Numérotation des factures et des avoirs sans trou par année
+    type: numerotation_continue
+    table: factures_entetes
+    colonne: num_facture
+    motif: '(?P<prefixe>FA|AV)-(?P<annee>\d{4})-(?P<numero>\d{5})'
+    debut: 1
+  - ref: R01
+    libelle: Numérotation des factures et des avoirs dans l'ordre des dates
+    type: numerotation_chronologique
+    table: factures_entetes
+    colonne: num_facture
+    motif: '(?P<prefixe>FA|AV)-(?P<annee>\d{4})-(?P<numero>\d{5})'
+    date: date_facture
+
+  - ref: R05
+    libelle: Total HT égal à la somme des montants HT des lignes
+    type: total_des_lignes
+    table: factures_entetes
+    cle: [num_facture]
+    colonne: total_ht
+    table_lignes: factures_lignes
+    colonne_lignes: montant_ht
+  - ref: R05
+    libelle: TVA égale à 20 % du total HT, arrondie au centime
+    type: egalite_calculee
+    table: factures_entetes
+    cible: total_tva
+    termes: {total_ht: 0.2}
+    tolerance: 0.005
+  - ref: R05
+    libelle: Total TTC égal au total HT plus la TVA
+    type: egalite_calculee
+    table: factures_entetes
+    cible: total_ttc
+    termes: {total_ht: 1, total_tva: 1}
+
+  - ref: R06
+    libelle: Écriture comptable équilibrée, débit égal au crédit
+    type: equilibre_par_groupe
+    table: fec
+    groupe: [JournalCode, EcritureNum]
+    debit: Debit
+    credit: Credit
+
+  - ref: R10
+    libelle: Intervenant connu et en poste à la date de l'intervention
+    type: date_dans_periode_reference
+    table: interventions
+    cle: [intervenant]
+    date: date_debut
+    table_reference: intervenants
+    cle_reference: [nom, prenom]
+    debut: date_entree
+    fin: date_sortie
+    comparaison: mots dans le désordre
+  - ref: R11
+    libelle: Client connu et actif à la date de l'intervention
+    type: date_dans_periode_reference
+    table: interventions
+    cle: [code_client]
+    date: date_debut
+    table_reference: clients
+    debut: date_creation
+    fin: date_fin_relation
+
+  - ref: R21
+    libelle: Début de chaque période d'emploi couvert par une rémunération
+    type: periodes_couvertes_par_paliers
+    table: intervenants
+    cle: [matricule]
+    debut: date_entree
+    fin: date_sortie
+    table_paliers: remunerations
+    date_palier: date_effet
+  - ref: R21
+    libelle: Date d'effet d'une rémunération dans une période d'emploi
+    type: date_dans_periode_reference
+    table: remunerations
+    cle: [matricule]
+    date: date_effet
+    table_reference: intervenants
+    debut: date_entree
+    fin: date_sortie
+  - ref: R21
+    libelle: Paramètres de coûts déclarés pour l'année de chaque intervention
+    type: annee_dans_reference
+    table: interventions
+    date: date_debut
+    table_reference: parametres_couts
+    colonne_annee: annee
+
+  # Existence des codes dans leur référentiel (hors chapitre 5, R13, R19 et R20 en dépendent).
+  - ref: existence
+    libelle: Fournisseur de la facture d'achat connu
+    type: existence_dans_reference
+    table: achats_entetes
+    cle: [code_fournisseur]
+    table_reference: fournisseurs
+  - ref: existence
+    libelle: Fournisseur principal d'une pièce connu
+    type: existence_dans_reference
+    table: catalogue_pieces
+    cle: [fournisseur_principal]
+    table_reference: fournisseurs
+    cle_reference: [code_fournisseur]
+  - ref: existence
+    libelle: Pièce consommée connue du catalogue
+    type: existence_dans_reference
+    table: pieces_interventions
+    cle: [ref_piece]
+    table_reference: catalogue_pieces
+  - ref: existence
+    libelle: Pièce achetée connue du catalogue
+    type: existence_dans_reference
+    table: achats_lignes
+    cle: [ref_piece]
+    table_reference: catalogue_pieces
+    cle_facultative: true
+  - ref: existence
+    libelle: Pièce facturée connue du catalogue
+    type: existence_dans_reference
+    table: factures_lignes
+    cle: [ref_piece]
+    table_reference: catalogue_pieces
+    cle_facultative: true
+  - ref: existence
+    libelle: Ligne de facture rattachée à un en-tête
+    type: existence_dans_reference
+    table: factures_lignes
+    cle: [num_facture]
+    table_reference: factures_entetes
+  - ref: existence
+    libelle: Ligne d'achat rattachée à un en-tête
+    type: existence_dans_reference
+    table: achats_lignes
+    cle: [num_piece_achat]
+    table_reference: achats_entetes
+  - ref: existence
+    libelle: Pièce consommée sur une intervention connue
+    type: existence_dans_reference
+    table: pieces_interventions
+    cle: [id_intervention]
+    table_reference: interventions
+  - ref: existence
+    libelle: Ligne de facture rattachée à une intervention connue
+    type: existence_dans_reference
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+  - ref: existence
+    libelle: Client de la facture connu
+    type: existence_dans_reference
+    table: factures_entetes
+    cle: [code_client]
+    table_reference: clients
+
+  # Interventions et factures (R12, R13, R16), pratiques normales déclarées en exceptions.
+  - ref: R12
+    libelle: Intervention réalisée et facturable facturée une fois et une seule, 0 à 30 jours après sa date
+    type: rattachement_unique_dans_delai
+    table: interventions
+    cle: [id_intervention]
+    date: date_debut
+    table_lignes: factures_lignes
+    document: [num_facture]
+    filtre_lignes:
+      - colonne: num_facture
+        motif: 'FA-.*'
+    table_documents: factures_entetes
+    date_document: date_facture
+    delai_min: 0
+    delai_max: 30
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+  - ref: R13
+    libelle: Ligne de facture rattachée à une intervention réalisée et facturable
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+    exceptions:
+      - libelle: annulation sur place facturée en déplacement seul
+        conditions:
+          - colonne: code_article
+            valeurs: [DEPL]
+          - colonne: interventions.statut
+            valeurs: [Annulée]
+  - ref: R13
+    libelle: Client de l'intervention identique à celui de la facture
+    type: concordance_entre_references
+    table: factures_lignes
+    cle_a: [id_intervention]
+    table_a: interventions
+    colonne_a: code_client
+    cle_b: [num_facture]
+    table_b: factures_entetes
+    colonne_b: code_client
+  - ref: R16
+    libelle: Intervention annulée ou reportée non facturée
+    type: sans_ligne_liee
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    filtre:
+      - colonne: statut
+        valeurs: [Annulée, Reportée]
+    exceptions:
+      - libelle: annulation sur place facturée en déplacement seul
+        conditions:
+          - colonne: statut
+            valeurs: [Annulée]
+          - colonne: factures_lignes.code_article
+            valeurs: [DEPL]
+
+  # Contenu des factures (R17, R04 partie facture, R18).
+  - ref: R17
+    libelle: Ligne de forfait de contrôle rattachée à une intervention de contrôle
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Contrôle]
+    filtre:
+      - colonne: code_article
+        valeurs: [CTRL-F]
+  - ref: R17
+    libelle: Ligne de forfait d'installation rattachée à une installation
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Installation]
+    filtre:
+      - colonne: code_article
+        valeurs: [INST-F]
+  - ref: R17
+    libelle: Ligne de forfait de visite préventive rattachée à une intervention préventive
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Intervention préventive]
+    filtre:
+      - colonne: code_article
+        valeurs: [PREV-F]
+  - ref: R17
+    libelle: Ligne de main d'oeuvre d'urgence rattachée à un dépannage
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Dépannage]
+    filtre:
+      - colonne: code_article
+        valeurs: [MO-URG]
+  - ref: R17
+    libelle: Ligne de main d'oeuvre horaire rattachée à une préventive, une maintenance ou un dépannage
+    type: reference_conforme
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    attendu:
+      - colonne: categorie
+        valeurs: [Intervention préventive, Maintenance, Dépannage]
+    filtre:
+      - colonne: code_article
+        valeurs: [MO-STD]
+  - ref: R17
+    libelle: Contrôle réalisé et facturable facturé avec un forfait de contrôle
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [CTRL-F]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Contrôle]
+  - ref: R17
+    libelle: Installation réalisée et facturable facturée avec un forfait d'installation
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [INST-F]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Installation]
+  - ref: R17
+    libelle: Dépannage réalisé et facturable facturé avec de la main d'oeuvre
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [MO-STD, MO-URG]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Dépannage]
+  - ref: R17
+    libelle: Maintenance réalisée et facturable facturée avec de la main d'oeuvre horaire
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [MO-STD]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Maintenance]
+  - ref: R17
+    libelle: Intervention préventive réalisée et facturable facturée au forfait ou à l'heure
+    type: ligne_liee_attendue
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    attendu:
+      - colonne: code_article
+        valeurs: [PREV-F, MO-STD]
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+      - colonne: categorie
+        valeurs: [Intervention préventive]
+  - ref: R04
+    libelle: Main d'oeuvre facturée en urgence hors des horaires ouvrés, au tarif normal dans ces horaires
+    type: conforme_selon_horaires
+    table: factures_lignes
+    cle: [id_intervention]
+    table_reference: interventions
+    date: date_debut
+    heure: heure_debut
+    horaires:
+      lundi: [{debut: '07:30', fin: '18:00'}]
+      mardi: [{debut: '07:30', fin: '18:00'}]
+      mercredi: [{debut: '07:30', fin: '18:00'}]
+      jeudi: [{debut: '07:30', fin: '18:00'}]
+      vendredi: [{debut: '07:30', fin: '18:00'}]
+    feries: *feries
+    feries_minimum: 10
+    dans_horaires:
+      - colonne: code_article
+        valeurs: [MO-STD]
+    hors_horaires:
+      - colonne: code_article
+        valeurs: [MO-URG]
+    filtre:
+      - colonne: code_article
+        motif: 'MO-.*'
+  - ref: R18
+    libelle: Pièces posées sur une intervention facturable facturées avec la même référence et la même quantité
+    type: quantites_concordantes
+    table: interventions
+    cle: [id_intervention]
+    table_a: pieces_interventions
+    detail_a: ref_piece
+    quantite_a: quantite
+    table_b: factures_lignes
+    filtre_b:
+      - colonne: code_article
+        valeurs: [PIECE, FLUIDE]
+    detail_b: ref_piece
+    quantite_b: quantite
+    hors_champ_sans_b: true
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+  - ref: R18
+    libelle: Aucune pièce facturée sur une intervention non facturable
+    type: sans_ligne_liee
+    table: interventions
+    cle: [id_intervention]
+    table_lignes: factures_lignes
+    filtre_lignes:
+      - colonne: code_article
+        valeurs: [PIECE, FLUIDE]
+    filtre:
+      - colonne: facturable
+        valeurs: [N]
+
+  # Calculs et cohérence interne (montants des lignes, main d'oeuvre au quart d'heure, FEC).
+  - ref: calcul
+    libelle: Montant HT de la ligne de facture égal à quantité × prix unitaire × (1 - remise)
+    type: produit_calcule
+    table: factures_lignes
+    cible: montant_ht
+    facteurs:
+      - quantite
+      - pu_ht
+      - {colonne: remise_pct, constante: 1, coefficient: -0.01, vide: 0}
+    tolerance: 0.005
+  - ref: calcul
+    libelle: Montant HT de la ligne d'achat égal à quantité × prix unitaire d'achat
+    type: produit_calcule
+    table: achats_lignes
+    cible: montant_ht
+    facteurs: [quantite, pu_achat_ht]
+    tolerance: 0.005
+  - ref: grille
+    libelle: Remise réservée à la main d'oeuvre
+    type: plage
+    table: factures_lignes
+    colonne: remise_pct
+    max: 0
+    filtre:
+      - colonne: code_article
+        motif: '(?!MO-).*'
+  - ref: grille
+    libelle: Main d'oeuvre facturée au quart d'heure supérieur, une demi-heure au moins
+    type: somme_liee_arrondie
+    table: interventions
+    cle: [id_intervention]
+    colonne: duree_min
+    diviseur: 60
+    pas: 0.25
+    minimum: 0.5
+    table_lignes: factures_lignes
+    filtre_lignes:
+      - colonne: code_article
+        motif: 'MO-.*'
+      - colonne: num_facture
+        motif: 'FA-.*'
+    colonne_lignes: quantite
+    filtre:
+      - colonne: statut
+        valeurs: [Réalisée]
+      - colonne: facturable
+        valeurs: [O]
+  - ref: fec
+    libelle: Ligne d'écriture avec un débit ou un crédit, l'un des deux à zéro
+    type: au_plus_une_non_nulle
+    table: fec
+    colonnes: [Debit, Credit]
+    au_moins_une: true
+
+  # Ventes et achats face au FEC, pièce par pièce (R14, R20).
+  - ref: R14
+    libelle: Facture ou avoir comptabilisé en une écriture VT de même date et de mêmes montants
+    type: sommes_liees_concordantes
+    table: factures_entetes
+    cle: [num_facture]
+    table_lignes: fec
+    cle_lignes: [PieceRef]
+    filtre_lignes:
+      - colonne: JournalCode
+        valeurs: [VT]
+    date: date_facture
+    date_lignes: EcritureDate
+    groupe_lignes: [JournalCode, EcritureNum]
+    montants:
+      - colonne: total_ttc
+        conditions:
+          - colonne: CompteNum
+            motif: '411.*'
+        termes: {Debit: 1, Credit: -1}
+      - colonne: total_ht
+        conditions:
+          - colonne: CompteNum
+            motif: '70[678].*'
+        termes: {Credit: 1, Debit: -1}
+      - colonne: total_tva
+        conditions:
+          - colonne: CompteNum
+            motif: '44571.*'
+        termes: {Credit: 1, Debit: -1}
+  - ref: R20
+    libelle: Facture fournisseur comptabilisée en une écriture AC de même date et de mêmes montants
+    type: sommes_liees_concordantes
+    table: achats_entetes
+    cle: [num_piece_achat]
+    table_lignes: fec
+    cle_lignes: [PieceRef]
+    filtre_lignes:
+      - colonne: JournalCode
+        valeurs: [AC]
+    date: date_facture
+    date_lignes: EcritureDate
+    groupe_lignes: [JournalCode, EcritureNum]
+    montants:
+      - colonne: total_ttc
+        conditions:
+          - colonne: CompteNum
+            motif: '401.*'
+        termes: {Credit: 1, Debit: -1}
+      - colonne: total_ht
+        conditions:
+          - colonne: CompteNum
+            motif: '6.*'
+        termes: {Debit: 1, Credit: -1}
+      - colonne: total_tva
+        conditions:
+          - colonne: CompteNum
+            motif: '44566.*'
+        termes: {Debit: 1, Credit: -1}
+  - ref: existence
+    libelle: Pièce d'une écriture de vente connue des factures
+    type: existence_dans_reference
+    table: fec
+    cle: [PieceRef]
+    table_reference: factures_entetes
+    cle_reference: [num_facture]
+    filtre:
+      - colonne: JournalCode
+        valeurs: [VT]
+  - ref: existence
+    libelle: Pièce d'une écriture d'achat connue des achats
+    type: existence_dans_reference
+    table: fec
+    cle: [PieceRef]
+    table_reference: achats_entetes
+    cle_reference: [num_piece_achat]
+    filtre:
+      - colonne: JournalCode
+        valeurs: [AC]
+
+  # Totaux par période face au FEC (R15, R20).
+  - ref: R15
+    libelle: Total HT des factures moins les avoirs égal au solde des comptes 706 à 708, par période
+    type: totaux_par_periode
+    table: factures_entetes
+    termes: {total_ht: 1}
+    table_lignes: fec
+    filtre_lignes:
+      - colonne: CompteNum
+        motif: '70[678].*'
+    termes_lignes: {Credit: 1, Debit: -1}
+  - ref: R20
+    libelle: Achats de pièces et de fluides égaux au solde des comptes 601100 et 601200, par période
+    type: totaux_par_periode
+    table: achats_lignes
+    termes: {montant_ht: 1}
+    detail: compte_charge
+    table_lignes: fec
+    filtre_lignes:
+      - colonne: CompteNum
+        valeurs: ['601100', '601200']
+    detail_lignes: CompteNum
+    termes_lignes: {Debit: 1, Credit: -1}
+    filtre:
+      - colonne: compte_charge
+        valeurs: ['601100', '601200']
+
+  # Stock théorique par référence (R19). Le catalogue ne porte pas la date du stock
+  # initial (01/01/2025 selon le dossier), d'où date_initial; achats avancés de 7 jours
+  # pour le réapprovisionnement hebdomadaire (facture datée après la livraison).
+  - ref: R19
+    libelle: Stock théorique d'une pièce jamais négatif (stock initial, achats et consommations)
+    type: solde_jamais_negatif
+    table: pieces_interventions
+    cle: [ref_piece]
+    date: date_sortie
+    quantite: quantite
+    table_initial: catalogue_pieces
+    colonne_initial: stock_initial
+    date_initial: 2025-01-01
+    table_entrees: achats_lignes
+    quantite_entrees: quantite
+    table_en_tetes: achats_entetes
+    lien_entrees: [num_piece_achat]
+    date_en_tetes: date_facture
+    avance_entrees: 7
