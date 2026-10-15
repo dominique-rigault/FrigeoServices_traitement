@@ -705,3 +705,30 @@ regles:
     filtre:
       - colonne: JournalCode
         valeurs: [AC]
+
+  # Totaux par période face au FEC (R15, R20).
+  - ref: R15
+    libelle: Total HT des factures moins les avoirs égal au solde des comptes 706 à 708, par période
+    type: totaux_par_periode
+    table: factures_entetes
+    termes: {total_ht: 1}
+    table_lignes: fec
+    filtre_lignes:
+      - colonne: CompteNum
+        motif: '70[678].*'
+    termes_lignes: {Credit: 1, Debit: -1}
+  - ref: R20
+    libelle: Achats de pièces et de fluides égaux au solde des comptes 601100 et 601200, par période
+    type: totaux_par_periode
+    table: achats_lignes
+    termes: {montant_ht: 1}
+    detail: compte_charge
+    table_lignes: fec
+    filtre_lignes:
+      - colonne: CompteNum
+        valeurs: ['601100', '601200']
+    detail_lignes: CompteNum
+    termes_lignes: {Debit: 1, Credit: -1}
+    filtre:
+      - colonne: compte_charge
+        valeurs: ['601100', '601200']
