@@ -14,10 +14,10 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 
 | Étape | Contenu | Outil | Notebook | Avancement |
 | --- | --- | --- | --- | --- |
-| 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | 01 | Terminé |
-| 2 | Profilage de chaque fichier | Python, Jupyter | 02 | Terminé |
+| 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | 01 | Fait sur le cas Frigéo, à rendre générique |
+| 2 | Profilage de chaque fichier | Python, Jupyter | 02 | Fait sur le cas Frigéo, à rendre générique |
 | 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | aucun | Terminé |
-| 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 02c | Terminé |
+02c | Terminé, sauf une cellule propre au cas (comparaison avec le chapitre 4) |
 | 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 02c | Terminé |
 | 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 03 | Terminé |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 04 | Terminé |
@@ -27,6 +27,8 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 8 | Tableaux de bord direction et qualité | Power BI | aucun | À venir |
 | 9 | Documentation de la méthode, des choix et des limites | Markdown | aucun | À venir |
 | 10 | Déploiement sur Azure et passation | Azure, Power Automate | aucun | À venir |
+
+Le mode opératoire d'un cycle de traitement (qui fait quoi et dans quel ordre, entre le consultant, le métier du client et l'assistant LLM) est décrit dans [mode_operatoire.md](mode_operatoire.md).
 
 ## Principes
 
@@ -38,7 +40,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 
 ## Limites et adaptation à un autre client
 
-Les notebooks ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services. Tout ce qui est propre au client tient dans les quatre fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`) et dans le dictionnaire revu par le métier. Le code porte cependant l'empreinte des données rencontrées sur quelques points :
+Les notebooks 03 et 04 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services, et le notebook 02c une seule cellule, la comparaison avec le chapitre 4, à retirer chez un autre client. Les notebooks 01 et 02 en contiennent encore (formats des fichiers texte déclarés dans le notebook, colonnes examinées une à une, valeurs affichées), et sont à rendre génériques avant un cas réel. Hors de ces notebooks, tout ce qui est propre au client tient dans les quatre fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`) et dans le dictionnaire revu par le métier. Le code porte cependant l'empreinte des données rencontrées sur quelques points :
 
 - **Types de règles de gestion.** Le catalogue de l'étape 4 (28 types génériques) ne couvre que les règles de ce cas. Un autre client demandera des types nouveaux, ajoutés au catalogue sans reprendre les autres.
 - **Natures reconnues.** Trois formes de date, l'heure HH:MM, les décimaux à virgule ou à point. Des heures HH:MM:SS, des milliers séparés par une espace ou des dates MM/JJ/AAAA demanderaient d'étendre `profilage.py` et `typage.py`.
