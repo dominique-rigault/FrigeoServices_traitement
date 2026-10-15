@@ -46,6 +46,7 @@ from frigeo.gestion import (
     CONSTAT_SANS_DOCUMENT,
     CONSTAT_SANS_LIGNE,
     CONSTAT_SOMME_DIFFERENTE,
+    CONSTAT_SOLDE_NEGATIF,
     CONSTAT_SOMMES_DIFFERENTES,
     CONSTAT_SUPERIEURE,
     CONSTAT_TOTAL_DIFFERENT,
@@ -241,7 +242,7 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "rattachement_unique_dans_delai, reference_conforme, concordance_entre_references, "
         "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
         "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle, "
-        "sommes_liees_concordantes, totaux_par_periode)",
+        "sommes_liees_concordantes, totaux_par_periode, solde_jamais_negatif)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -3467,3 +3468,239 @@ def test_catalogue_et_chargement_du_4g2(tmp_path):
         {"colonne": "CompteNum", "valeurs": ["601100", "601200"]}
     ]
     assert regles[0]["termes_lignes"] == {"Debit": 1, "Credit": -1}
+
+
+def _solde(**autres):
+    return _instance(
+        "solde_jamais_negatif",
+        ref="R19",
+        **{
+            "cle": ["r"],
+            "date": "d",
+            "quantite": "q",
+            "table_initial": "c",
+            "colonne_initial": "s",
+            "date_initial": "2025-01-01",
+            "table_entrees": "l",
+            "quantite_entrees": "q",
+            "table_en_tetes": "e",
+            "lien_entrees": ["n"],
+            "date_en_tetes": "f",
+            **autres,
+        },
+    )
+
+
+NATURES_SOLDE = {
+    "t": {"r": "texte", "d": DATE, "q": DECIMAL},
+    "c": {"r": "texte", "s": NATIF},
+    "l": {"n": "texte", "r": "texte", "q": NATIF},
+    "e": {"n": "texte", "f": NATIVE},
+}
+
+
+def _stock_et_mouvements():
+    return {
+        "c": _table("c.xlsx", r=["P1", "P2", "P3", "P4"], s=[2, 0, 1, 0.3]),
+        "e": _table("e.xlsx", n=["A1", "A2", "A3"],
+                    f=[_date("15/01/2025"), _date("10/02/2025"), _date("01/03/2025")]),
+        "l": _table("l.xlsx", n=["A1", "A2", "A3", "A3"], r=["P1", "P3", "P1", "P9"],
+                    q=[5, 1, -6, 2]),
+        "t": _table(
+            "t.csv",
+            r=["P1", "P1", "P1", "P1", "P1", "P2", "P3", "P4", "P4", "P2"],
+            d=["10/01/2025", "11/01/2025", "12/01/2025", "20/01/2025", "05/03/2025",
+               "05/02/2025", "10/02/2025", "01/02/2025", "02/02/2025", "06/02/2025"],
+            q=["1,00", "2,00", "1,00", "1,00", "1,00", "0,50", "2,00", "0,10", "0,20", "1,00"],
+        ),
+    }
+
+
+def test_solde_cumule_jamais_negatif_porte_par_la_sortie_qui_le_rend_negatif():
+    ecarts, bilan = _controler_tables(_stock_et_mouvements(), NATURES_SOLDE, [_solde()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (3, CONSTAT_SOLDE_NEGATIF,
+         "solde -1 au 11/01/2025 (solde initial 2 au 01/01/2025, entrées 0, sorties 3), "
+         "puis 1 sortie en solde négatif avant le retour à un solde positif ou nul"),
+        # L'entrée négative (avoir) rend le solde négatif : la sortie suivante porte l'écart.
+        (6, CONSTAT_SOLDE_NEGATIF,
+         "solde -5 au 05/03/2025 (solde initial 2 au 01/01/2025, entrées -1, sorties 6), "
+         "aucune autre sortie jusqu'à la fin des données"),
+        (7, CONSTAT_SOLDE_NEGATIF,
+         "solde -0,5 au 05/02/2025 (solde initial 0 au 01/01/2025, entrées 0, sorties 0,5), "
+         "puis 1 sortie en solde négatif jusqu'à la fin des données"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["lignes"], resume["ecartees_doublons"], resume["hors_champ"],
+            resume["non_evaluables"], resume["controlees"], resume["anomalies"],
+            resume["avertissements"]) == (10, 0, 0, 0, 10, 3, None)
+    assert resume["colonnes"] == "r, d, q, c.r, c.s, l.r, l.q, l.n, e.n, e.f"
+    # Colonne sensible dans une table liée : valeur masquée.
+    ecarts, _ = _controler_tables(_stock_et_mouvements(), NATURES_SOLDE, [_solde()],
+                                  sensibles={"c": frozenset({"s"})})
+    assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+
+
+def test_solde_avance_des_entrees_et_ordre_d_un_meme_jour():
+    tables = {
+        "c": _table("c.xlsx", r=["P1"], s=[0]),
+        "e": _table("e.xlsx", n=["A1"], f=[_date("06/01/2025")]),
+        "l": _table("l.xlsx", n=["A1"], r=["P1"], q=[2]),
+        "t": _table("t.csv", r=["P1"], d=["01/01/2025"], q=["1,00"]),
+    }
+    for avance, attendu in ((0, 1), (4, 1), (5, 0), (7, 0)):
+        _, bilan = _controler_tables(tables, NATURES_SOLDE, [_solde(avance_entrees=avance)])
+        assert _bilan(bilan)["anomalies"] == attendu, avance
+
+
+def test_solde_non_evaluable_et_avertissements():
+    tables = {
+        "c": _table(
+            "c.xlsx",
+            r=["P1", "P2", "P3", "P3", None, "P4", "P5", "P6", "P7", "P8", "P10", "P11", "P12"],
+            s=[1, None, 1, 2, 1, -1, 1, 1, 1, "x", 1, 1, 1],
+        ),
+        "e": _table("e.xlsx", n=["A1", "A2", "A2", "A3"],
+                    f=[_date("15/01/2025"), _date("16/01/2025"), _date("17/01/2025"), None]),
+        "l": _table(
+            "l.xlsx",
+            n=["A1", "A9", "A2", None, "A3", "A1", "A1", "A1", "A9"],
+            r=["P5", "P6", "P10", "P11", "P12", "P1", None, "P99", "P98"],
+            q=["x", 1, 1, 1, 1, 1, 3, 3, 1],
+        ),
+        "t": _table(
+            "t.csv",
+            r=["P1", "P2", "P3", "P4", "P5", "P6", "P8", "P10", "P11", "P12", "P7", "P7",
+               "P99", None, "  "],
+            d=["01/02/2025"] * 10 + ["31/02/2025", "01/02/2025"] + ["01/02/2025"] * 3,
+            q=["2,00"] + ["1,00"] * 13 + ["3,00"],
+        ),
+    }
+    ecarts, bilan = _controler_tables(tables, NATURES_SOLDE, [_solde()])
+    assert ecarts.empty
+    resume = _bilan(bilan)
+    assert (resume["non_evaluables"], resume["controlees"], resume["hors_champ"]) == (14, 1, 0)
+    assert resume["avertissements"] == (
+        "6 lignes de la table c inutilisables : clé vide 1, clé répétée 2, solde vide 1, "
+        "solde illisible 1, solde négatif 1; 5 lignes de la table l inutilisables : "
+        "quantité illisible 1, date vide 1, en-tête vide 1, en-tête absent 1, en-tête "
+        "répété 1"
+    )
+
+
+def test_solde_date_initiale_unique_ou_par_ligne():
+    tables = {
+        "c": _table("c.xlsx", r=["P1"], s=[1]),
+        "e": _table("e.xlsx", n=["A1", "A2"], f=[_date("20/12/2024"), _date("05/01/2025")]),
+        "l": _table("l.xlsx", n=["A1", "A2"], r=["P1", "P1"], q=[5, 1]),
+        "t": _table("t.csv", r=["P1", "P1", "P1"], d=["30/12/2024", "10/01/2025", "11/01/2025"],
+                    q=["1,00", "2,00", "1,00"]),
+    }
+    ecarts, bilan = _controler_tables(tables, NATURES_SOLDE, [_solde()])
+    assert _lignes(ecarts, "num_ligne_source") == [(4,)]
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (1, 0, 2)
+    assert resume["avertissements"] == (
+        "aucun contrôle avant la date du solde initial : 1 sortie antérieure hors champ, "
+        "1 entrée antérieure écartée"
+    )
+    # Date du solde initial lue dans le référentiel, ligne par ligne.
+    natures = deepcopy(NATURES_SOLDE)
+    natures["c"]["j"] = NATIVE
+    tables["c"] = _table("c.xlsx", r=["P1", "P2", "P3"], s=[1, 0, 1],
+                         j=[_date("01/01/2025"), _date("01/06/2025"), None])
+    tables["t"] = _table("t.csv", r=["P2", "P2", "P1", "P3"],
+                         d=["01/03/2025", "02/06/2025", "06/01/2025", "06/01/2025"],
+                         q=["1,00", "1,00", "1,00", "1,00"])
+    regle = _solde(colonne_date_initial="j")
+    del regle["date_initial"]
+    ecarts, bilan = _controler_tables(tables, natures, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "valeur") == [
+        (3, "solde -1 au 02/06/2025 (solde initial 0 au 01/06/2025, entrées 0, sorties 1), "
+            "aucune autre sortie jusqu'à la fin des données"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (1, 1, 2)
+    assert resume["avertissements"] == (
+        "1 ligne de la table c inutilisable : date vide 1; aucun contrôle avant la date du "
+        "solde initial : 1 sortie antérieure hors champ, 1 entrée antérieure écartée"
+    )
+
+
+def test_solde_entrees_datees_directement_filtrees_et_sans_doublons():
+    natures = {
+        "t": NATURES_SOLDE["t"],
+        "c": NATURES_SOLDE["c"],
+        "l": {"r": "texte", "q": NATIF, "j": NATIVE, "k": "texte"},
+    }
+    tables = {
+        "c": _table("c.xlsx", r=["P1"], s=[0]),
+        "l": _table("l.xlsx", r=["P1", "P1", "P1"], q=[2, 2, 10],
+                    j=[_date("05/01/2025")] * 3, k=["FA", "FA", "AV"]),
+        "t": _table("t.csv", r=["P1", "P1", "P1"], d=["06/01/2025", "07/01/2025", "07/01/2025"],
+                    q=["2,00", "1,00", "1,00"]),
+    }
+    regle = _solde(date_entrees="j", filtre_entrees=[{"colonne": "k", "valeurs": ["FA"]}])
+    for nom in ("table_en_tetes", "lien_entrees", "date_en_tetes"):
+        del regle[nom]
+    ecarts, bilan = _controler_tables(tables, natures, [regle])
+    assert _lignes(ecarts, "num_ligne_source") == [(3,)]
+    resume = _bilan(bilan)
+    assert (resume["ecartees_doublons"], resume["controlees"], resume["anomalies"]) == (1, 2, 1)
+
+
+def test_solde_verification_des_parametres():
+    sans_en_tete = _solde()
+    for nom in ("table_en_tetes", "lien_entrees", "date_en_tetes"):
+        del sans_en_tete[nom]
+    sans_date = dict(sans_en_tete)
+    del sans_date["date_initial"]
+    regles = [
+        _solde(colonne_date_initial="j"),
+        sans_date,
+        _solde(date_entrees="j"),
+        _solde(avance_entrees=1.5),
+        _solde(date_initial="2025-13-01"),
+        _solde(date_initial=dt.date(2025, 1, 1)),
+        _solde(),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (R19) : date_initial ou colonne_date_initial : l'une des deux est "
+        "attendue, pas les deux",
+        "règle n° 2 (R19) : date_initial ou colonne_date_initial : l'une des deux est "
+        "attendue, pas les deux",
+        "règle n° 2 (R19) : date des entrées : date_entrees est attendue, ou "
+        "table_en_tetes, lien_entrees et date_en_tetes",
+        "règle n° 3 (R19) : date_entrees ou table_en_tetes : la date d'une entrée est lue "
+        "dans table_entrees ou dans un en-tête, pas les deux",
+        "règle n° 4 (R19) : avance_entrees : un entier positif ou nul est attendu",
+        "règle n° 5 (R19), date_initial : une date AAAA-MM-JJ est attendue",
+        "règle n° 7 (R19) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 6 (R19))",
+    ]
+
+
+def test_catalogue_et_chargement_du_4h(tmp_path):
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["solde_jamais_negatif", ["vue", "issue"]].tolist() == [
+        VUE_SANS_SURNOMBRE, "anomalie"
+    ]
+    assert "date_initial (date AAAA-MM-JJ, facultatif)" in catalogue.loc[
+        "solde_jamais_negatif", "parametres"
+    ]
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: R19\n    libelle: Stock théorique jamais négatif\n"
+        "    type: solde_jamais_negatif\n    table: pieces_interventions\n"
+        "    cle: [ref_piece]\n    date: date_sortie\n    quantite: quantite\n"
+        "    table_initial: catalogue_pieces\n    colonne_initial: stock_initial\n"
+        "    date_initial: 2025-01-01\n    table_entrees: achats_lignes\n"
+        "    quantite_entrees: quantite\n    table_en_tetes: achats_entetes\n"
+        "    lien_entrees: [num_piece_achat]\n    date_en_tetes: date_facture\n"
+        "    avance_entrees: 7\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[0]["date_initial"] == dt.date(2025, 1, 1)
+    assert regles[0]["avance_entrees"] == 7

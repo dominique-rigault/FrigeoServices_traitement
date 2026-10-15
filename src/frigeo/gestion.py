@@ -52,6 +52,11 @@ Un type peut enfin comparer des totaux par période d'export (par exemple le chi
 d'affaires des factures et celui du FEC) : un tel écart n'appartient à aucune ligne
 source, il est rendu sans lignage, la clé donnant la période.
 
+Un type peut aussi suivre un solde cumulé dans le temps (par exemple le stock
+théorique d'une pièce, à partir d'un stock initial, des achats et des
+consommations) : l'écart est porté par la sortie après laquelle le solde devient
+négatif.
+
 Rien n'est corrigé ni écrit : `controler_gestion` rend la table des écarts et un
 bilan.
 """
@@ -182,6 +187,8 @@ GENRE_ARRONDI = "arrondi"
 GENRE_MONTANTS = "montants"
 # Termes portés par les colonnes de nombre de la table liée (colonne vers coefficient).
 GENRE_TERMES_LIES = "termes de la table liée"
+# Date écrite dans la configuration (AAAA-MM-JJ, avec ou sans guillemets).
+GENRE_DATE = "date AAAA-MM-JJ"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
 _NATURES_ATTENDUES = {
     GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
@@ -2250,6 +2257,254 @@ def _totaux_par_periode(donnees, parametres, natures, liee: Liee) -> Constats:
     )
 
 
+CONSTAT_SOLDE_NEGATIF = "solde cumulé devenu négatif après cette sortie"
+# Raisons d'inutilisabilité d'une ligne de la table du solde initial et d'une entrée.
+RAISONS_INITIAL = ("clé vide", "clé répétée", "solde vide", "solde illisible",
+                   "solde négatif", "date vide", "date illisible")
+RAISONS_ENTREE = ("quantité vide", "quantité illisible", "date vide", "date illisible",
+                  "en-tête vide", "en-tête absent", "en-tête répété")
+
+
+def _solde_jamais_negatif(donnees, parametres, natures, liees) -> Constats:
+    """Le solde cumulé d'une clé ne devient jamais négatif (par exemple le stock
+    théorique d'une référence de pièce).
+
+    Le solde part de la valeur de colonne_initial de table_initial, à sa date
+    (colonne_date_initial de la même ligne, ou à défaut date_initial). Les entrées
+    (lignes de table_entrees qui remplissent filtre_entrees, de quantité signée
+    quantite_entrees) l'augmentent, les sorties (lignes de la table de la règle, de
+    quantité signée quantite) le diminuent, dans l'ordre des dates. La date d'une entrée
+    est lue dans table_entrees (date_entrees) ou dans l'en-tête qu'elle désigne
+    (table_en_tetes, lien_entrees face à cle_en_tetes, date_en_tetes); elle est avancée
+    de avance_entrees jours (0 par défaut, par exemple pour une facture datée après la
+    livraison). Un même jour, les entrées passent avant les sorties, puis l'ordre des
+    tables. Une entrée à clé vide ou absente de table_initial n'entre dans aucun solde.
+
+    Écart : la sortie après laquelle le solde devient négatif, alors qu'il était positif
+    ou nul après le mouvement précédent ou depuis le dernier écart (un solde rendu
+    négatif par une entrée négative est porté par la sortie suivante). La valeur donne
+    le solde, ce qui l'a formé et le nombre de sorties qui suivent avant le retour à
+    un solde positif ou nul.
+
+    Hors champ : sortie datée avant la date du solde initial de sa clé (aucun contrôle
+    avant cette date, avec un avertissement). Non évaluable : sortie à clé vide ou
+    absente de table_initial, et toutes les sorties d'une clé dont une ligne de
+    table_initial est inutilisable (clé répétée, solde vide, illisible ou négatif, date
+    vide ou illisible), ou dont une sortie ou une entrée a une date ou une quantité vide
+    ou illisible, ou un en-tête vide, absent ou répété. Chaque cause donne un
+    avertissement, sauf celles des sorties, déjà signalées par l'étape 3.
+    """
+    initiaux, entrees = liees["table_initial"], liees["table_entrees"]
+    avertissements = []
+
+    # Solde initial et date par clé.
+    colonne_solde = parametres["colonne_initial"]
+    soldes = lire(initiaux.donnees[colonne_solde], initiaux.natures[colonne_solde])
+    if "colonne_date_initial" in parametres:
+        colonne_date = parametres["colonne_date_initial"]
+        dates_initiales, etats_initiaux = _lire_dates(
+            initiaux.donnees, colonne_date, initiaux.natures[colonne_date]
+        )
+    else:
+        date_unique = pd.Timestamp(_jour_ferie(parametres["date_initial"]))
+        dates_initiales = pd.Series(date_unique, index=initiaux.donnees.index)
+        etats_initiaux = pd.Series(ETAT_LUE, index=initiaux.donnees.index, dtype=object)
+    cles_initiales = _cles_comparees(initiaux.donnees, parametres["cle_initial"])
+    index_initial, repetees = _index_unique(cles_initiales)
+    raisons = dict.fromkeys(RAISONS_INITIAL, 0)
+    bloquees = set(repetees)
+    raisons["clé répétée"] = int(cles_initiales.isin(repetees).sum())
+    for position, cle in cles_initiales.items():
+        if cle is None:
+            raisons["clé vide"] += 1
+        elif cle not in repetees:
+            raison = None
+            if soldes.etats.loc[position] != ETAT_LUE:
+                raison = f"solde {soldes.etats.loc[position]}"
+            elif soldes.valeurs.loc[position] < 0:
+                raison = "solde négatif"
+            elif etats_initiaux.loc[position] != ETAT_LUE:
+                raison = f"date {etats_initiaux.loc[position]}"
+            if raison:
+                raisons[raison] += 1
+                bloquees.add(cle)
+    avertissements.extend(_inutilisables(initiaux.table, raisons))
+    depart = {
+        cle: (soldes.valeurs.loc[position], dates_initiales.loc[position])
+        for cle, position in index_initial.items()
+        if cle not in bloquees
+    }
+
+    # Entrées.
+    avance = pd.Timedelta(days=parametres.get("avance_entrees", 0))
+    vue_entrees = entrees.donnees[
+        _dans_le_champ(entrees.donnees, parametres.get("filtre_entrees"))
+    ]
+    colonne_quantite = parametres["quantite_entrees"]
+    quantites_entrees = lire(vue_entrees[colonne_quantite], entrees.natures[colonne_quantite])
+    if "table_en_tetes" in parametres:
+        en_tetes = liees["table_en_tetes"]
+        index_en_tetes, en_tetes_repetes = _index_unique(
+            _cles_comparees(en_tetes.donnees, parametres["cle_en_tetes"])
+        )
+        colonne_date = parametres["date_en_tetes"]
+        dates_en_tetes, etats_en_tetes = _lire_dates(
+            en_tetes.donnees, colonne_date, en_tetes.natures[colonne_date]
+        )
+        dates_entrees, etats_dates = [], []
+        for lien in _cles_comparees(vue_entrees, parametres["lien_entrees"]):
+            if lien is None:
+                etat = "en-tête vide"
+            elif lien in en_tetes_repetes:
+                etat = "en-tête répété"
+            elif lien not in index_en_tetes:
+                etat = "en-tête absent"
+            else:
+                rang = index_en_tetes[lien]
+                etat = etats_en_tetes.loc[rang]
+                etat = ETAT_LUE if etat == ETAT_LUE else f"date {etat}"
+                if etat == ETAT_LUE:
+                    dates_entrees.append(dates_en_tetes.loc[rang])
+                    etats_dates.append(etat)
+                    continue
+            dates_entrees.append(pd.NaT)
+            etats_dates.append(etat)
+    else:
+        colonne_date = parametres["date_entrees"]
+        lues, etats = _lire_dates(vue_entrees, colonne_date, entrees.natures[colonne_date])
+        dates_entrees = list(lues)
+        etats_dates = [ETAT_LUE if etat == ETAT_LUE else f"date {etat}" for etat in etats]
+    connues = set(index_initial) | repetees
+    mouvements = {}
+    raisons_entrees = dict.fromkeys(RAISONS_ENTREE, 0)
+    anterieures = {"entrées": 0, "sorties": 0}
+    for position, cle, quantite, etat_quantite, date, etat_date in zip(
+        vue_entrees.index,
+        _cles_comparees(vue_entrees, parametres["cle_entrees"]),
+        quantites_entrees.valeurs,
+        quantites_entrees.etats,
+        dates_entrees,
+        etats_dates,
+    ):
+        if cle is None or cle not in connues:
+            continue
+        if etat_quantite != ETAT_LUE or etat_date != ETAT_LUE:
+            raisons_entrees[
+                f"quantité {etat_quantite}" if etat_quantite != ETAT_LUE else etat_date
+            ] += 1
+            bloquees.add(cle)
+            continue
+        if cle in depart and date < depart[cle][1]:
+            anterieures["entrées"] += 1
+            continue
+        mouvements.setdefault(cle, []).append((date - avance, 0, position, quantite))
+    avertissements.extend(_inutilisables(entrees.table, raisons_entrees))
+
+    # Sorties.
+    colonne_date, colonne_quantite = parametres["date"], parametres["quantite"]
+    cles = _cles_comparees(donnees, parametres["cle"])
+    dates, etats_dates = _lire_dates(donnees, colonne_date, natures[colonne_date])
+    quantites = lire(donnees[colonne_quantite], natures[colonne_quantite])
+    hors_champ = pd.Series(False, index=donnees.index, dtype=bool)
+    retenues = pd.Series(False, index=donnees.index, dtype=bool)
+    for position, cle in cles.items():
+        if cle is None or cle not in connues:
+            continue
+        if etats_dates.loc[position] != ETAT_LUE or quantites.etats.loc[position] != ETAT_LUE:
+            bloquees.add(cle)
+            continue
+        date = dates.loc[position]
+        if cle in depart and date < depart[cle][1]:
+            hors_champ.loc[position] = True
+            anterieures["sorties"] += 1
+            continue
+        retenues.loc[position] = True
+        mouvements.setdefault(cle, []).append(
+            (date, 1, position, -quantites.valeurs.loc[position])
+        )
+    if anterieures["entrées"] or anterieures["sorties"]:
+        avertissements.append(
+            "aucun contrôle avant la date du solde initial : "
+            + _pluriel(anterieures["sorties"], "sortie antérieure", "sorties antérieures")
+            + " hors champ, "
+            + _pluriel(anterieures["entrées"], "entrée antérieure", "entrées antérieures")
+            + " écartée" + ("s" if anterieures["entrées"] > 1 else "")
+        )
+
+    # Soldes cumulés.
+    evaluables = retenues & cles.map(lambda cle: cle in depart and cle not in bloquees).astype(
+        bool
+    )
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for cle, liste in mouvements.items():
+        if cle not in depart or cle in bloquees:
+            continue
+        solde, date_initiale = depart[cle]
+        cumul = {0: 0.0, 1: 0.0}
+        arme, ecart, suivantes = True, None, 0
+        for date, genre, position, quantite in sorted(liste, key=lambda m: m[:3]):
+            solde = round(solde + quantite, _DECIMALES_CALCUL)
+            cumul[genre] += -quantite if genre else quantite
+            if solde >= 0:
+                arme = True
+                if ecart is not None:
+                    affichees.loc[ecart] += _suite_negative(suivantes)
+                    ecart = None
+                continue
+            if genre == 0:
+                continue
+            if arme:
+                arme, ecart, suivantes = False, position, 0
+                constats.loc[position] = CONSTAT_SOLDE_NEGATIF
+                affichees.loc[position] = (
+                    f"solde {_ecrire_nombre(solde)} au {_jour(date)} (solde initial "
+                    f"{_ecrire_nombre(depart[cle][0])} au {_jour(date_initiale)}, entrées "
+                    f"{_ecrire_nombre(cumul[0])}, sorties {_ecrire_nombre(cumul[1])})"
+                )
+            else:
+                suivantes += 1
+        if ecart is not None:
+            affichees.loc[ecart] += _suite_negative(suivantes, fin=True)
+    return Constats(
+        evaluables,
+        _ecarts(constats, valeurs=affichees),
+        tuple(avertissements),
+        hors_champ=hors_champ,
+    )
+
+
+def _suite_negative(suivantes: int, fin: bool = False) -> str:
+    """Fin de la valeur affichée d'un écart de solde : sorties suivantes en solde
+    négatif, avant le retour à un solde positif ou nul (ou jusqu'à la fin des données)."""
+    retour = "jusqu'à la fin des données" if fin else "avant le retour à un solde positif ou nul"
+    if not suivantes:
+        return f", aucune autre sortie {retour}"
+    return ", puis " + _pluriel(suivantes, "sortie", "sorties") + f" en solde négatif {retour}"
+
+
+def _verifier_solde(parametres: dict) -> list[str]:
+    problemes = _entier_positif(parametres, "avance_entrees")
+    if ("date_initial" in parametres) == ("colonne_date_initial" in parametres):
+        problemes.append(
+            "date_initial ou colonne_date_initial : l'une des deux est attendue, pas les deux"
+        )
+    en_tete = [nom for nom in ("table_en_tetes", "lien_entrees", "date_en_tetes")
+               if nom in parametres]
+    if "date_entrees" in parametres:
+        if en_tete or "cle_en_tetes" in parametres:
+            problemes.append(
+                "date_entrees ou table_en_tetes : la date d'une entrée est lue dans "
+                "table_entrees ou dans un en-tête, pas les deux"
+            )
+    elif len(en_tete) < 3:
+        problemes.append(
+            "date des entrées : date_entrees est attendue, ou table_en_tetes, lien_entrees "
+            "et date_en_tetes"
+        )
+    return problemes
+
+
 def _verifier_totaux(parametres: dict) -> list[str]:
     problemes = _verifier_tolerance(parametres)
     if ("detail" in parametres) != ("detail_lignes" in parametres):
@@ -2951,6 +3206,63 @@ TYPES = {
         contexte=(CONTEXTE_TABLE,),
         prerequis_liees=_prerequis_export,
     ),
+    "solde_jamais_negatif": TypeRegle(
+        description=(
+            "Le solde cumulé d'une clé ne devient jamais négatif (par exemple le stock "
+            "théorique d'une référence de pièce) : il part de colonne_initial dans "
+            "table_initial (cle_initial, par défaut les colonnes de cle), à la date de "
+            "colonne_date_initial ou à défaut date_initial (AAAA-MM-JJ), augmente des "
+            "entrées de table_entrees (cle_entrees, par défaut les colonnes de cle, parmi "
+            "les lignes qui remplissent filtre_entrees, quantité quantite_entrees) et "
+            "diminue des sorties de la table (quantité quantite), dans l'ordre des dates, "
+            "les entrées d'un jour avant ses sorties. La date d'une entrée est date_entrees, "
+            "ou date_en_tetes de l'en-tête de table_en_tetes que désigne lien_entrees "
+            "(cle_en_tetes, par défaut les colonnes de lien_entrees); elle est avancée de "
+            "avance_entrees jours (0 par défaut). L'écart est porté par la sortie après "
+            "laquelle le solde devient négatif. Rien n'est contrôlé avant la date du solde "
+            "initial."
+        ),
+        parametres={
+            "cle": GENRE_COLONNES,
+            "date": GENRE_COLONNE_DATE,
+            "quantite": GENRE_COLONNE_NOMBRE,
+            "table_initial": GENRE_TABLE,
+            "cle_initial": GENRE_COLONNES_LIEES,
+            "colonne_initial": GENRE_COLONNE_NOMBRE_LIEE,
+            "date_initial": GENRE_DATE,
+            "colonne_date_initial": GENRE_COLONNE_DATE_LIEE,
+            "table_entrees": GENRE_TABLE,
+            "cle_entrees": GENRE_COLONNES_LIEES,
+            "filtre_entrees": GENRE_CONDITIONS,
+            "quantite_entrees": GENRE_COLONNE_NOMBRE_LIEE,
+            "date_entrees": GENRE_COLONNE_DATE_LIEE,
+            "table_en_tetes": GENRE_TABLE,
+            "lien_entrees": GENRE_COLONNES_LIEES,
+            "cle_en_tetes": GENRE_COLONNES_LIEES,
+            "date_en_tetes": GENRE_COLONNE_DATE_LIEE,
+            "avance_entrees": GENRE_NOMBRE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_solde_jamais_negatif,
+        facultatifs=("cle_initial", "date_initial", "colonne_date_initial", "cle_entrees",
+                     "filtre_entrees", "date_entrees", "table_en_tetes", "lien_entrees",
+                     "cle_en_tetes", "date_en_tetes", "avance_entrees"),
+        verifier=_verifier_solde,
+        defauts={"cle_initial": "cle", "cle_entrees": "cle", "cle_en_tetes": "lien_entrees"},
+        tables_liees=("table_initial", "table_entrees", "table_en_tetes"),
+        rattachements={
+            "cle_initial": "table_initial",
+            "colonne_initial": "table_initial",
+            "colonne_date_initial": "table_initial",
+            "cle_entrees": "table_entrees",
+            "filtre_entrees": "table_entrees",
+            "quantite_entrees": "table_entrees",
+            "date_entrees": "table_entrees",
+            "lien_entrees": "table_entrees",
+            "cle_en_tetes": "table_en_tetes",
+            "date_en_tetes": "table_en_tetes",
+        },
+    ),
 }
 
 
@@ -3190,6 +3502,8 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
         return _problemes_horaires(valeur)
     if genre == GENRE_FERIES:
         return _problemes_feries(valeur)
+    if genre == GENRE_DATE:
+        return [] if _jour_ferie(valeur) is not None else ["une date AAAA-MM-JJ est attendue"]
     if not isinstance(valeur, dict) or not valeur:
         return ["un dictionnaire non vide est attendu (valeur vers min et max)"]
     problemes = []
@@ -3503,6 +3817,8 @@ def _parametre_compare(genre: str, valeur):
     de l'ordre de ses facteurs)."""
     if genre == GENRE_FACTEURS:
         return sorted((_figer(_facteur(element)) for element in valeur), key=repr)
+    if genre == GENRE_DATE:
+        return _jour_ferie(valeur)
     return valeur
 
 
