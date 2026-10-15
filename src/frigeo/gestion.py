@@ -48,6 +48,10 @@ pour normales se déclarent, pour les types qui l'admettent, comme des exception
 exception prend l'issue « information ». Un type peut enfin avoir besoin de la date
 de coupure des données (fin de la période extraite), passée à `controler_gestion`.
 
+Un type peut enfin comparer des totaux par période d'export (par exemple le chiffre
+d'affaires des factures et celui du FEC) : un tel écart n'appartient à aucune ligne
+source, il est rendu sans lignage, la clé donnant la période.
+
 Rien n'est corrigé ni écrit : `controler_gestion` rend la table des écarts et un
 bilan.
 """
@@ -121,6 +125,8 @@ CONTEXTE_DATE_COUPURE = "date_coupure"
 # Vue de la table de la règle avant le filtre (sans les doublons exacts en surnombre
 # selon la vue du type), pour juger qu'une clé est répétée dans toute la table.
 CONTEXTE_VUE_COMPLETE = "vue_complete"
+# Nom de la table de la règle, pour un type qui le cite dans ses valeurs affichées.
+CONTEXTE_TABLE = "table"
 
 VUE_TOUTES = "toutes les lignes"
 VUE_SANS_SURNOMBRE = "sans les doublons exacts en surnombre"
@@ -174,6 +180,8 @@ GENRE_ARRONDI = "arrondi"
 # Montants comparés aux lignes liées : liste de {colonne, conditions, termes} (voir
 # `CLES_MONTANT`).
 GENRE_MONTANTS = "montants"
+# Termes portés par les colonnes de nombre de la table liée (colonne vers coefficient).
+GENRE_TERMES_LIES = "termes de la table liée"
 # Natures en vigueur admises pour une colonne, selon le genre du paramètre.
 _NATURES_ATTENDUES = {
     GENRE_COLONNE_DATE: (NATURES_DATE, "une date est attendue"),
@@ -271,12 +279,17 @@ class Constats:
     lignes hors du filtre, et non parmi les lignes non évaluables. Une colonne
     `issue`, facultative, donne l'issue d'un écart quand elle n'est pas vide (par
     exemple « information » pour une pratique normale déclarée en exception).
+    `ecarts_periodes`, facultatif : écarts qui n'appartiennent à aucune ligne source
+    (par exemple un total de période), une ligne par écart, avec les colonnes
+    `constat`, `cle` (par exemple la période) et `valeur`, et une colonne `issue`
+    facultative; ils sont rendus sans lignage, après les écarts des lignes de la règle.
     """
 
     evaluables: pd.Series
     ecarts: pd.DataFrame
     avertissements: tuple = ()
     hors_champ: pd.Series | None = None
+    ecarts_periodes: pd.DataFrame | None = None
 
 
 @dataclass(frozen=True)
@@ -303,7 +316,8 @@ class TypeRegle:
     vers le paramètre de la table liée à laquelle ces colonnes appartiennent (par
     défaut `table_liee`). `contexte` : informations sur les données que le type
     demande, transmises dans ses paramètres (`CONTEXTE_DATE_COUPURE`,
-    `CONTEXTE_VUE_COMPLETE`).
+    `CONTEXTE_VUE_COMPLETE`, `CONTEXTE_TABLE`). `prerequis_liees(donnees)` rend le
+    problème qui empêche d'appliquer le type à une table liée, None s'il n'y en a pas.
     """
 
     description: str
@@ -319,6 +333,7 @@ class TypeRegle:
     tables_liees: tuple = ()
     rattachements: dict = field(default_factory=dict)
     contexte: tuple = ()
+    prerequis_liees: Callable | None = None
 
     def parametres_tables(self) -> tuple:
         """Paramètres qui désignent les tables liées, dans leur ordre."""
@@ -2120,6 +2135,128 @@ def _sommes_liees_concordantes(donnees, parametres, natures, liee: Liee) -> Cons
     return Constats(evaluables, ecarts)
 
 
+CONSTAT_TOTAL_PERIODE = "total différent de celui de la table liée"
+
+
+def _totaux_par_periode(donnees, parametres, natures, liee: Liee) -> Constats:
+    """Par période d'export (periode_export), et par valeur de detail si detail et
+    detail_lignes sont déclarés, le total de la table de la règle égale celui de la
+    table liée (par exemple le total HT des factures et le solde des comptes de
+    produits du FEC).
+
+    Chaque ligne vaut la somme de ses termes (colonne multipliée par son coefficient);
+    les lignes de la table liée sont celles qui remplissent filtre_lignes. Les totaux
+    sont des sommes exactes (`math.fsum`); un groupe présent d'un seul côté vaut 0 de
+    l'autre côté. L'écart, signé et arrondi à 9 décimales, est comparé à la tolérance.
+
+    Écart, sans ligne source : un par groupe dont les totaux diffèrent, la clé donnant
+    la période (et la valeur de détail), la valeur donnant les deux totaux, leurs
+    nombres de lignes et l'écart.
+
+    Non évaluable (lignes de la table de la règle du groupe) : un terme vide ou
+    illisible, d'un côté ou de l'autre, rend son groupe non évaluable; une valeur de
+    détail vide rend sa période non évaluable; une ligne sans période lisible rend
+    tous les groupes non évaluables. Chaque cause donne un avertissement.
+    """
+    vue_lignes = liee.donnees[_dans_le_champ(liee.donnees, parametres.get("filtre_lignes"))]
+    noms = (parametres[CONTEXTE_TABLE], liee.table)
+    cotes = (
+        (donnees, parametres["termes"], parametres.get("detail"), natures),
+        (vue_lignes, parametres["termes_lignes"], parametres.get("detail_lignes"),
+         liee.natures),
+    )
+    sans_periode = [0, 0]
+    details_vides = {}
+    groupes = {}
+    for cote, (vue, termes, colonne_detail, natures_vue) in enumerate(cotes):
+        valeurs = pd.Series(0.0, index=vue.index)
+        for colonne, coefficient in termes.items():
+            valeurs = valeurs + coefficient * lire(vue[colonne], natures_vue[colonne]).valeurs
+        if colonne_detail is None:
+            details = [""] * len(vue)
+        else:
+            details = [_texte_lu(valeur) for valeur in vue[colonne_detail]]
+        for position, valeur, periode, detail in zip(
+            vue.index, valeurs, vue[COLONNE_PERIODE], details
+        ):
+            if _bornes_periode(periode) is None:
+                sans_periode[cote] += 1
+                continue
+            if detail is None:
+                details_vides.setdefault((periode, cote), []).append(position)
+                continue
+            groupe = groupes.setdefault(
+                (periode, detail),
+                {"positions": [], "valeurs": ([], []), "illisibles": [0, 0]},
+            )
+            if cote == 0:
+                groupe["positions"].append(position)
+            if pd.isna(valeur):
+                groupe["illisibles"][cote] += 1
+            else:
+                groupe["valeurs"][cote].append(float(valeur))
+
+    avertissements = []
+    for cote, nombre in enumerate(sans_periode):
+        if nombre:
+            avertissements.append(
+                _pluriel(nombre, "ligne", "lignes")
+                + f" sans période d'export lisible dans {noms[cote]} : aucun total évaluable"
+            )
+    for (periode, cote), positions in sorted(details_vides.items()):
+        colonne_detail = cotes[cote][2]
+        avertissements.append(
+            f"période {periode} : "
+            + _pluriel(len(positions), "ligne", "lignes")
+            + f" au détail vide dans {noms[cote]} ({colonne_detail})"
+        )
+    bloquees = {periode for periode, _ in details_vides}
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    lignes_ecarts = []
+    tolerance = parametres.get("tolerance", 0)
+    for (periode, detail), groupe in sorted(groupes.items()):
+        cle = periode if detail == "" else f"{periode}{SEPARATEUR}{detail}"
+        for cote, nombre in enumerate(groupe["illisibles"]):
+            if nombre:
+                avertissements.append(
+                    f"période {cle} : "
+                    + _pluriel(nombre, "montant vide ou illisible", "montants vides ou illisibles")
+                    + f" dans {noms[cote]}"
+                )
+        if any(sans_periode) or periode in bloquees or any(groupe["illisibles"]):
+            continue
+        evaluables.loc[groupe["positions"]] = True
+        totaux = [round(math.fsum(groupe["valeurs"][cote]), _DECIMALES_CALCUL) for cote in (0, 1)]
+        ecart = round(totaux[0] - totaux[1], _DECIMALES_CALCUL)
+        if abs(ecart) > tolerance:
+            lignes_ecarts.append(
+                {
+                    "constat": CONSTAT_TOTAL_PERIODE,
+                    "cle": cle,
+                    "valeur": " pour ".join(
+                        f"{noms[cote]} {_ecrire_nombre(totaux[cote])} sur "
+                        + _pluriel(len(groupe["valeurs"][cote]), "ligne", "lignes")
+                        for cote in (0, 1)
+                    )
+                    + f" (écart {_ecrire_nombre(ecart)})",
+                }
+            )
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    return Constats(
+        evaluables,
+        _ecarts(constats),
+        tuple(avertissements),
+        ecarts_periodes=pd.DataFrame(lignes_ecarts, columns=["constat", "cle", "valeur"]),
+    )
+
+
+def _verifier_totaux(parametres: dict) -> list[str]:
+    problemes = _verifier_tolerance(parametres)
+    if ("detail" in parametres) != ("detail_lignes" in parametres):
+        problemes.append("detail et detail_lignes : les deux sont attendues, ou aucune")
+    return problemes
+
+
 def _verifier_sommes_liees(parametres: dict) -> list[str]:
     problemes = _verifier_tolerance(parametres)
     if ("date" in parametres) != ("date_lignes" in parametres):
@@ -2784,6 +2921,36 @@ TYPES = {
         rattachements={"filtre_lignes": "table_lignes"},
         contexte=(CONTEXTE_VUE_COMPLETE,),
     ),
+    "totaux_par_periode": TypeRegle(
+        description=(
+            "Par période d'export (periode_export), et par valeur de detail face à "
+            "detail_lignes si les deux sont déclarées, la somme des lignes de la table "
+            "(chacune valant la somme de ses termes, colonne vers coefficient) égale la "
+            "somme des lignes de table_lignes qui remplissent filtre_lignes (chacune valant "
+            "la somme de termes_lignes), à tolerance près (0 par défaut); par exemple le "
+            "total HT des factures et le solde des comptes de produits du FEC. Un écart est "
+            "rendu par période, sans ligne source. Un montant vide ou illisible rend sa "
+            "période non évaluable."
+        ),
+        parametres={
+            "termes": GENRE_TERMES,
+            "detail": GENRE_COLONNE,
+            "table_lignes": GENRE_TABLE,
+            "filtre_lignes": GENRE_CONDITIONS,
+            "termes_lignes": GENRE_TERMES_LIES,
+            "detail_lignes": GENRE_COLONNE_LIEE,
+            "tolerance": GENRE_NOMBRE,
+        },
+        vue=VUE_SANS_SURNOMBRE,
+        controler=_totaux_par_periode,
+        prerequis=_prerequis_export,
+        facultatifs=("detail", "filtre_lignes", "detail_lignes", "tolerance"),
+        verifier=_verifier_totaux,
+        table_liee="table_lignes",
+        rattachements={"filtre_lignes": "table_lignes"},
+        contexte=(CONTEXTE_TABLE,),
+        prerequis_liees=_prerequis_export,
+    ),
 }
 
 
@@ -2892,6 +3059,11 @@ def _references(instance: dict) -> list[tuple[str, str, str, str]]:
         elif genre == GENRE_TERMES:
             references.extend(
                 (parametre, table, colonne, GENRE_COLONNE_NOMBRE) for colonne in valeur
+            )
+        elif genre == GENRE_TERMES_LIES:
+            references.extend(
+                (parametre, table_liee(parametre), colonne, GENRE_COLONNE_NOMBRE)
+                for colonne in valeur
             )
         elif genre == GENRE_MONTANTS:
             # Une colonne citée par plusieurs montants n'est rapportée qu'une fois.
@@ -3006,7 +3178,7 @@ def _problemes_parametre(genre: str, valeur) -> list[str]:
         return [] if _texte_attendu(valeur) else ["un nom de table est attendu"]
     if genre in GENRES_COLONNE_LIEE:
         return [] if _texte_attendu(valeur) else [f"un nom de colonne est attendu ({genre})"]
-    if genre == GENRE_TERMES:
+    if genre in (GENRE_TERMES, GENRE_TERMES_LIES):
         return _problemes_termes(valeur)
     if genre == GENRE_MONTANTS:
         return _problemes_montants(valeur)
@@ -3535,6 +3707,14 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
             probleme = type_regle.prerequis(donnees)
             if probleme:
                 problemes.append(f"{nom} : table {table}, {probleme}")
+        if type_regle.prerequis_liees is not None:
+            for parametre_table, nom_liee in _tables_liees(instance).items():
+                if nom_liee in tables:
+                    probleme = type_regle.prerequis_liees(tables[nom_liee])
+                    if probleme:
+                        problemes.append(
+                            f"{nom}, {parametre_table} : table {nom_liee}, {probleme}"
+                        )
     return problemes
 
 
@@ -3718,7 +3898,11 @@ def controler_gestion(
         vue = vue[dans_champ]
         complete = _avec_defauts(instance)
         parametres = {p: complete[p] for p in type_regle.parametres if p in complete}
-        contexte = {CONTEXTE_DATE_COUPURE: date_coupure, CONTEXTE_VUE_COMPLETE: vue_complete}
+        contexte = {
+            CONTEXTE_DATE_COUPURE: date_coupure,
+            CONTEXTE_VUE_COMPLETE: vue_complete,
+            CONTEXTE_TABLE: table,
+        }
         for nom_contexte in type_regle.contexte:
             parametres[nom_contexte] = contexte[nom_contexte]
         liees = {}
@@ -3757,6 +3941,15 @@ def controler_gestion(
         issues = pd.Series(issue, index=ecarts.index, dtype=object)
         if "issue" in ecarts.columns:
             issues = ecarts["issue"].where(ecarts["issue"].notna(), issue).astype(object)
+        periodes = constats.ecarts_periodes
+        if periodes is None:
+            periodes = pd.DataFrame(columns=["constat", "cle", "valeur"])
+        issues_periodes = pd.Series(issue, index=periodes.index, dtype=object)
+        if "issue" in periodes.columns:
+            issues_periodes = (
+                periodes["issue"].where(periodes["issue"].notna(), issue).astype(object)
+            )
+        toutes_issues = pd.concat([issues, issues_periodes], ignore_index=True)
         hors_type = constats.hors_champ
         if hors_type is None:
             hors_type = pd.Series(False, index=constats.evaluables.index, dtype=bool)
@@ -3777,12 +3970,39 @@ def controler_gestion(
                 "hors_champ": hors_champ + int(hors_type.sum()),
                 "non_evaluables": int((~constats.evaluables & ~hors_type).sum()),
                 "controlees": int(constats.evaluables.sum()),
-                "anomalies": int((issues == ISSUE_ANOMALIE).sum()),
-                "a_arbitrer": int((issues == ISSUE_A_ARBITRER).sum()),
-                "informations": int((issues == ISSUE_INFORMATION).sum()),
+                "anomalies": int((toutes_issues == ISSUE_ANOMALIE).sum()),
+                "a_arbitrer": int((toutes_issues == ISSUE_A_ARBITRER).sum()),
+                "informations": int((toutes_issues == ISSUE_INFORMATION).sum()),
                 "avertissements": "; ".join(constats.avertissements) or None,
             }
         )
+        sensible = _sensible(sensibles, table, regles_colonnes, colonnes) or any(
+            _sensible(sensibles, nom_liee, dictionnaire[nom_liee], noms)
+            for nom_liee, noms in colonnes_liees.items()
+        )
+        if not periodes.empty:
+            masquer = [VALEUR_MASQUEE] * len(periodes)
+            morceau_periodes = pd.DataFrame(
+                {
+                    "_position": range(len(periodes)),
+                    **commun,
+                    "issue": issues_periodes.to_numpy(),
+                    "constat": periodes["constat"].to_numpy(),
+                    "colonnes": texte_colonnes,
+                    "cle": pd.Series(
+                        masquer if sensible else list(periodes["cle"]), dtype=object
+                    ).to_numpy(),
+                    "valeur": pd.Series(
+                        masquer if sensible else list(periodes["valeur"]), dtype=object
+                    ).to_numpy(),
+                    "proposition": None,
+                }
+            )
+            for lignage in COLONNES_LIGNAGE_ECART:
+                morceau_periodes[lignage] = None
+            morceau_periodes["_regle"] = rang
+            morceau_periodes["_sans_ligne"] = 1
+            morceaux.append(morceau_periodes)
         if ecarts.empty:
             continue
 
@@ -3797,10 +4017,6 @@ def controler_gestion(
                 SEPARATEUR.join(_texte(v) for v in ligne)
                 for ligne in donnees.loc[positions, cle].itertuples(index=False)
             ]
-        sensible = _sensible(sensibles, table, regles_colonnes, colonnes) or any(
-            _sensible(sensibles, nom_liee, dictionnaire[nom_liee], noms)
-            for nom_liee, noms in colonnes_liees.items()
-        )
         if sensible:
             valeurs = [VALEUR_MASQUEE] * len(positions)
             propositions = [
@@ -3839,11 +4055,12 @@ def controler_gestion(
                 else None
             )
         morceau["_regle"] = rang
+        morceau["_sans_ligne"] = 0
         morceaux.append(morceau)
 
     if morceaux:
         ecarts = pd.concat(morceaux, ignore_index=True).sort_values(
-            ["_regle", *COLONNES_LIGNAGE_ECART, "_position"],
+            ["_regle", "_sans_ligne", *COLONNES_LIGNAGE_ECART, "_position"],
             kind="stable",
             na_position="first",
         )

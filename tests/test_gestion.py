@@ -241,7 +241,7 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "rattachement_unique_dans_delai, reference_conforme, concordance_entre_references, "
         "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
         "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle, "
-        "sommes_liees_concordantes)",
+        "sommes_liees_concordantes, totaux_par_periode)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
@@ -3189,3 +3189,281 @@ def test_catalogue_et_chargement_du_4g1(tmp_path):
         "conditions": [{"colonne": "CompteNum", "motif": "70[678].*"}],
         "termes": {"Credit": 1, "Debit": -1},
     }
+
+
+# Morceau 4g2 : totaux par période d'export, écarts sans ligne source.
+
+def _totaux(**autres):
+    return _instance(
+        "totaux_par_periode",
+        ref="R15",
+        **{
+            "termes": {"ht": 1},
+            "table_lignes": "l",
+            "filtre_lignes": [{"colonne": "c", "motif": "70.*"}],
+            "termes_lignes": {"cre": 1, "deb": -1},
+            **autres,
+        },
+    )
+
+
+NATURES_TOTAUX = {
+    "t": {"n": "texte", "ht": NATIF},
+    "l": {"c": "texte", "deb": DECIMAL, "cre": DECIMAL},
+}
+
+
+def _factures_et_comptes():
+    factures = pd.concat(
+        [
+            # Avoir négatif; doublon exact de F1, compté une fois.
+            _table("a.csv", "2025", n=["F1", "A1", "F1"], ht=[100.0, -20.0, 100.0]),
+            _table("b.csv", "2026-01", n=["F2"], ht=[30.0]),
+            # Montant vide : période non évaluable.
+            _table("c.csv", "2026-03", n=["F3", "F4"], ht=[10.0, None]),
+            _table("d.csv", "2026-04", n=["F5"], ht=[7.0]),
+        ],
+        ignore_index=True,
+    )
+    ecritures = pd.concat(
+        [
+            _table("fa.txt", "2025", c=["706000", "707000", "411000", "706000"],
+                   deb=["0,00", "20,00", "80,00", "0,00"],
+                   cre=["100,00", "0,00", "0,00", "100,00"]),
+            _table("fb.txt", "2026-01", c=["706000"], deb=["0,00"], cre=["20,00"]),
+            # Période sans facture.
+            _table("fc.txt", "2026-02", c=["708000"], deb=["0,00"], cre=["5,00"]),
+            _table("fd.txt", "2026-03", c=["706000"], deb=["0,00"], cre=["10,00"]),
+            # Débit illisible : période non évaluable.
+            _table("fe.txt", "2026-04", c=["706000"], deb=["x"], cre=["7,00"]),
+        ],
+        ignore_index=True,
+    )
+    return {"t": factures, "l": ecritures}
+
+
+def test_totaux_par_periode():
+    tables = _factures_et_comptes()
+    ecarts, bilan = _controler_tables(tables, NATURES_TOTAUX, [_totaux()])
+    assert _lignes(ecarts, "fichier_source", "feuille_source", "num_ligne_source", "issue",
+                   "constat", "cle", "valeur", "proposition") == [
+        (None, None, None, "anomalie", gestion.CONSTAT_TOTAL_PERIODE, "2026-01",
+         "t 30 sur 1 ligne pour l 20 sur 1 ligne (écart 10)", None),
+        (None, None, None, "anomalie", gestion.CONSTAT_TOTAL_PERIODE, "2026-02",
+         "t 0 sur 0 ligne pour l 5 sur 1 ligne (écart -5)", None),
+    ]
+    assert set(ecarts["colonnes"]) == {"ht, l.c, l.cre, l.deb"}
+    resume = _bilan(bilan)
+    assert (resume["vue"], resume["lignes"], resume["ecartees_doublons"], resume["hors_champ"],
+            resume["non_evaluables"], resume["controlees"], resume["anomalies"]) == (
+        VUE_SANS_SURNOMBRE, 7, 1, 0, 3, 3, 2)
+    assert resume["avertissements"] == (
+        "période 2026-03 : 1 montant vide ou illisible dans t; "
+        "période 2026-04 : 1 montant vide ou illisible dans l"
+    )
+    # Un écart égal à la tolérance n'en est pas un; l'issue de la règle s'applique.
+    ecarts, bilan = _controler_tables(
+        tables, NATURES_TOTAUX, [_totaux(tolerance=5, issue="à arbitrer")])
+    assert _lignes(ecarts, "cle", "issue") == [("2026-01", "à arbitrer")]
+    assert (_bilan(bilan)["anomalies"], _bilan(bilan)["a_arbitrer"]) == (0, 1)
+    # Les lignes hors du filtre de la règle ne comptent pas dans les totaux; le montant
+    # vide de 2026-03, hors champ, ne bloque plus sa période.
+    ecarts, bilan = _controler_tables(
+        tables, NATURES_TOTAUX, [_totaux(filtre=[{"colonne": "n", "valeurs": ["F2"]}])])
+    assert _lignes(ecarts, "cle", "valeur") == [
+        ("2025", "t 0 sur 0 ligne pour l 80 sur 2 lignes (écart -80)"),
+        ("2026-01", "t 30 sur 1 ligne pour l 20 sur 1 ligne (écart 10)"),
+        ("2026-02", "t 0 sur 0 ligne pour l 5 sur 1 ligne (écart -5)"),
+        ("2026-03", "t 0 sur 0 ligne pour l 10 sur 1 ligne (écart -10)"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (5, 0, 1)
+
+
+def test_totaux_par_periode_somme_exacte():
+    tables = {
+        "t": _table(n=["F1", "F2", "F3"], ht=[1e16, 1.0, -1e16]),
+        "l": _table("f.txt", c=["706000"], deb=["0,00"], cre=["1,00"]),
+    }
+    ecarts, bilan = _controler_tables(tables, NATURES_TOTAUX, [_totaux()])
+    # Une somme ordinaire perdrait le 1 (1e16 + 1 vaut 1e16 en virgule flottante); la
+    # fonction sum de Python ne compense les arrondis qu'à partir de la version 3.12.
+    assert ecarts.empty
+    assert _bilan(bilan)["controlees"] == 3
+
+
+NATURES_DETAIL = {
+    "t": {"k": "texte", "m": NATIF},
+    "l": {"kl": "texte", "v": DECIMAL},
+}
+
+
+def _comptes_detailles():
+    achats = pd.concat(
+        [
+            _table("a.xlsx", "2025", k=["A", "A", "B"], m=[10.0, 5.0, 3.0]),
+            # Détail vide : la période 2026-01 n'est pas évaluable.
+            _table("b.xlsx", "2026-01", k=["", "A"], m=[4.0, 1.0]),
+        ],
+        ignore_index=True,
+    )
+    ecritures = pd.concat(
+        [
+            _table("fa.txt", "2025", kl=["A", "B", "C"], v=["15,00", "2,00", "1,00"]),
+            _table("fb.txt", "2026-01", kl=["A"], v=["1,00"]),
+            _table("fc.txt", "2026-02", kl=[" "], v=["2,00"]),
+        ],
+        ignore_index=True,
+    )
+    return {"t": achats, "l": ecritures}
+
+
+def _detail(**autres):
+    return _instance(
+        "totaux_par_periode",
+        ref="R20",
+        **{"termes": {"m": 1}, "detail": "k", "table_lignes": "l",
+           "termes_lignes": {"v": 1}, "detail_lignes": "kl", **autres},
+    )
+
+
+def test_totaux_par_periode_et_par_detail():
+    tables = _comptes_detailles()
+    ecarts, bilan = _controler_tables(tables, NATURES_DETAIL, [_detail()])
+    assert _lignes(ecarts, "num_ligne_source", "cle", "valeur") == [
+        (None, "2025 | B", "t 3 sur 1 ligne pour l 2 sur 1 ligne (écart 1)"),
+        (None, "2025 | C", "t 0 sur 0 ligne pour l 1 sur 1 ligne (écart -1)"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["lignes"], resume["non_evaluables"], resume["controlees"],
+            resume["anomalies"]) == (5, 2, 3, 2)
+    assert resume["avertissements"] == (
+        "période 2026-01 : 1 ligne au détail vide dans t (k); "
+        "période 2026-02 : 1 ligne au détail vide dans l (kl)"
+    )
+    # Clé et valeur masquées dès qu'une colonne de la règle est sensible.
+    ecarts, _ = _controler_tables(tables, NATURES_DETAIL, [_detail()],
+                                  sensibles={"l": frozenset({"kl"})})
+    assert _lignes(ecarts, "cle", "valeur") == [(VALEUR_MASQUEE, VALEUR_MASQUEE)] * 2
+
+
+def test_totaux_par_periode_sans_periode_lisible():
+    tables = _factures_et_comptes()
+    tables["t"].loc[3, "periode_export"] = "2026-13"
+    ecarts, bilan = _controler_tables(tables, NATURES_TOTAUX, [_totaux()])
+    assert ecarts.empty
+    resume = _bilan(bilan)
+    assert (resume["non_evaluables"], resume["controlees"]) == (6, 0)
+    assert resume["avertissements"].startswith(
+        "1 ligne sans période d'export lisible dans t : aucun total évaluable; "
+    )
+    # Une table liée sans aucune période lisible est refusée, comme la table de la règle.
+    tables = _factures_et_comptes()
+    tables["l"]["periode_export"] = None
+    tables["t"]["periode_export"] = "toujours"
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(tables, NATURES_TOTAUX, [_totaux()])
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R15) : table t, la table n'est pas un export périodique (aucune "
+        "période d'export lisible dans periode_export)",
+        "règle n° 1 (R15), table_lignes : table l, la table n'est pas un export périodique "
+        "(aucune période d'export lisible dans periode_export)",
+    ]
+
+
+def test_structure_du_type_du_4g2():
+    regles = [
+        _totaux(detail="n"),
+        _totaux(tolerance=-1),
+        _totaux(termes_lignes={"cre": "1"}),
+        _totaux(termes_lignes={}),
+        _totaux(),
+        _totaux(filtre_lignes=[{"colonne": "c", "motif": "70.*"}]),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (R15) : detail et detail_lignes : les deux sont attendues, ou aucune",
+        "règle n° 2 (R15) : tolerance : un nombre positif ou nul est attendu",
+        "règle n° 3 (R15), termes_lignes : cre : un nombre est attendu comme coefficient",
+        "règle n° 4 (R15), termes_lignes : un dictionnaire non vide est attendu (colonne "
+        "vers coefficient, par exemple {total_ht: 1, total_tva: 1})",
+        "règle n° 6 (R15) : règle en double (même type, même table, mêmes paramètres et "
+        "même filtre que la règle n° 5 (R15))",
+    ]
+    # Termes de la table liée confrontés à ses colonnes et à leur nature.
+    natures = deepcopy(NATURES_TOTAUX)
+    natures["l"]["cre"] = "texte"
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(_factures_et_comptes(), natures,
+                          [_totaux(termes_lignes={"cre": 1, "z": -1})])
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (R15), termes_lignes : la nature en vigueur de l.cre est 'texte', un "
+        "nombre est attendu (à trancher dans la revue du dictionnaire, notebook "
+        "02c_dictionnaire)",
+        "règle n° 1 (R15), termes_lignes : colonne l.z absente des données chargées",
+    ]
+
+
+def _lignes_et_periodes(donnees, parametres, natures):
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    constats.iloc[0] = "constat de ligne"
+    return Constats(
+        pd.Series(True, index=donnees.index, dtype=bool),
+        gestion._ecarts(constats),
+        ecarts_periodes=pd.DataFrame(
+            {"constat": ["constat de période"] * 2, "cle": ["2025", "2026-01"],
+             "valeur": ["v1", "v2"], "issue": [ISSUE_INFORMATION, None]}
+        ),
+    )
+
+
+def test_ecarts_sans_ligne_apres_ceux_des_lignes(monkeypatch):
+    types = dict(gestion.TYPES)
+    types["essai_periodes"] = TypeRegle(
+        description="essai",
+        parametres={"colonne": gestion.GENRE_COLONNE_DATE},
+        vue=VUE_TOUTES,
+        controler=_lignes_et_periodes,
+    )
+    monkeypatch.setattr(gestion, "TYPES", types)
+    donnees = pd.concat([_table("b.csv", d=["14/03/2025"]), _table("a.csv", d=["15/03/2025"])],
+                        ignore_index=True)
+    regles = [_regle(type="essai_periodes"), _regle()]
+    ecarts, bilan = _controler(donnees, {"d": "date JJ/MM/AAAA"}, regles=regles,
+                               declarations={"t": {"cle": ["d"]}})
+    assert _lignes(ecarts, "type", "fichier_source", "issue", "constat", "cle", "valeur") == [
+        ("essai_periodes", "b.csv", "anomalie", "constat de ligne", "14/03/2025",
+         "14/03/2025"),
+        ("essai_periodes", None, ISSUE_INFORMATION, "constat de période", "2025", "v1"),
+        ("essai_periodes", None, "anomalie", "constat de période", "2026-01", "v2"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["anomalies"], resume["informations"]) == (2, 1)
+    assert _bilan(bilan, 1)["anomalies"] == 0
+
+
+def test_catalogue_et_chargement_du_4g2(tmp_path):
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["totaux_par_periode", "parametres"] == (
+        "termes (termes), detail (colonne, facultatif), table_lignes (table), filtre_lignes "
+        "(liste de conditions, facultatif), termes_lignes (termes de la table liée), "
+        "detail_lignes (colonne de la table liée, facultatif), tolerance (nombre, facultatif)"
+    )
+    assert catalogue.loc["totaux_par_periode", ["vue", "issue"]].tolist() == [
+        VUE_SANS_SURNOMBRE, "anomalie"
+    ]
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "regles:\n"
+        "  - ref: R20\n    libelle: Achats égaux au solde des comptes\n"
+        "    type: totaux_par_periode\n    table: achats_lignes\n"
+        "    termes: {montant_ht: 1}\n    detail: compte_charge\n    table_lignes: fec\n"
+        "    filtre_lignes:\n      - colonne: CompteNum\n        valeurs: ['601100', '601200']\n"
+        "    detail_lignes: CompteNum\n    termes_lignes: {Debit: 1, Credit: -1}\n"
+        "    filtre:\n      - colonne: compte_charge\n        valeurs: ['601100', '601200']\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[0]["filtre_lignes"] == [
+        {"colonne": "CompteNum", "valeurs": ["601100", "601200"]}
+    ]
+    assert regles[0]["termes_lignes"] == {"Debit": 1, "Credit": -1}
