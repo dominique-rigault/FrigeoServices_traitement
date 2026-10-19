@@ -6,13 +6,20 @@ import pytest
 from frigeo.anomalies import (
     COLONNES_ANOMALIES,
     COLONNES_BILAN_ANOMALIES,
+    COLONNES_NON_DECLAREES,
+    COLONNES_NON_QUALIFIES,
     REGLE_CLE_UNIQUE,
     REGLE_HORS_CLE,
     REGLE_LIGNES_DIFFERENTES,
     REGLE_PRESUME_UNIQUE,
     REGLE_VALEURS_UNIQUES,
     anomalies_non_masquees,
+    avertissements_qualification,
     bilan_controles,
+    charger_qualification,
+    colonnes_non_declarees,
+    problemes_qualification,
+    qualifier,
     reunir_anomalies,
 )
 from frigeo.controles import COLONNES_BILAN, COLONNES_ECARTS, VALEUR_MASQUEE
@@ -450,3 +457,366 @@ def test_lignes_distinctes_d_un_controle():
     bilan = _bilan(sources, anomalies)
     assert _lignes(bilan, "anomalies", "lignes_distinctes") == [(3, 2)]
     assert list(anomalies["periode_export"]) == ["2025", "2025", "2025"]
+
+
+# Gravité et indicateurs affectés (5c)
+
+QUALIFICATION = {
+    "indicateurs": {
+        "CA": {},
+        "heures": None,
+        "coût": {},
+        "marge": {"depend_de": ["CA", "coût"]},
+        "taux de marge": {"depend_de": ["marge"]},
+    },
+    "colonnes": {
+        "t": {"id": [], "siret": ["CA"], "nom": [], "d": ["heures", "coût"]},
+        "r": {"code": []},
+    },
+}
+TOUT_T = "CA, heures, coût, marge, taux de marge"
+DE_D = "heures, coût, marge, taux de marge"
+
+
+def _exemple_5c():
+    """Exemple du 5a, avec une règle de gestion sur une table liée et une sans indicateur."""
+    sources = _exemple()
+    sources["bilan_gestion"] = _frame(
+        [
+            _ligne_bilan_gestion(ref="R15", libelle="Totaux", type_regle="totaux_par_periode"),
+            _ligne_bilan_gestion(),
+            _ligne_bilan_gestion(ref="R02", libelle="Sans écart", colonnes="siret, r.code"),
+            _ligne_bilan_gestion(ref="R03", libelle="Identifiant", colonnes="id"),
+        ],
+        COLONNES_BILAN_GESTION,
+    )
+    return sources
+
+
+def _qualifier(qualification=QUALIFICATION, sources=None, tables=None):
+    sources = _exemple_5c() if sources is None else sources
+    anomalies = _reunir(sources)
+    bilan = _bilan(sources, anomalies)
+    return qualifier(anomalies, bilan, qualification, _tables() if tables is None else tables)
+
+
+def _par_controle(bilan):
+    return {
+        controle: (gravite, indicateurs)
+        for controle, gravite, indicateurs in _lignes(bilan, "controle", "gravite", "indicateurs")
+    }
+
+
+def _avec(**blocs):
+    return {**QUALIFICATION, **blocs}
+
+
+def test_charger_qualification(tmp_path):
+    assert charger_qualification(tmp_path / "absent.yaml") == {}
+    vide = tmp_path / "vide.yaml"
+    vide.write_text("", encoding="utf-8")
+    assert charger_qualification(vide) == {}
+    fichier = tmp_path / "anomalies.yaml"
+    fichier.write_text(
+        "indicateurs:\n  CA: {}\n  marge: {depend_de: [CA]}\n"
+        "colonnes:\n  t:\n    d: [CA]\n    nom: []\n"
+        "exceptions:\n  - motif: '.* encodage'\n    gravite: mineure\n",
+        encoding="utf-8",
+    )
+    lu = charger_qualification(fichier)
+    assert lu["colonnes"] == {"t": {"d": ["CA"], "nom": []}}
+    assert lu["exceptions"] == [{"motif": ".* encodage", "gravite": "mineure"}]
+    liste = tmp_path / "liste.yaml"
+    liste.write_text("- CA\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="seules clés"):
+        charger_qualification(liste)
+    mal_forme = tmp_path / "mal.yaml"
+    mal_forme.write_text("indicateur:\n  CA: {}\ncolonnes:\n  t:\n    d: [CB]\n", encoding="utf-8")
+    with pytest.raises(ValueError) as erreur:
+        charger_qualification(mal_forme)
+    assert "clé inconnue indicateur" in str(erreur.value)
+    assert "indicateur inconnu CB" in str(erreur.value)
+
+
+def test_problemes_qualification_tous_listes():
+    problemes = problemes_qualification(
+        {
+            "indicateurs": {
+                "CA": {"depend": ["x"]},
+                "a": {"depend_de": ["b"]},
+                "b": {"depend_de": ["a"]},
+                "c": {"depend_de": ["c", "c"]},
+                "d": [],
+            },
+            "colonnes": {"t": {"d": None, "nom": "CA", "id": ["CA", "CB", "CA"]}, "r": ["code"]},
+            "exceptions": [
+                {"gravite": "majeure"},
+                {"controle": "x", "motif": "y", "gravite": "majeure"},
+                {"motif": "(", "gravite": "majeure"},
+                {"controle": "x", "etape": "cellule", "gravite": "grave"},
+                {"controle": "x"},
+                {"controle": "x", "indicateur": ["CA"]},
+                {"controle": "x", "indicateurs": "CA"},
+                "x",
+            ],
+            "regles": {},
+        }
+    )
+    attendus = [
+        "clé inconnue regles",
+        "indicateurs, CA : clé inconnue depend",
+        "indicateurs, c, depend_de : indicateur répété c",
+        "indicateurs, d : un dictionnaire est attendu",
+        "dépendance circulaire (a, b, c)",
+        "colonnes, t.d : une liste d'indicateurs est attendue",
+        "colonnes, t.nom : une liste d'indicateurs est attendue",
+        "colonnes, t.id : indicateur inconnu CB",
+        "colonnes, t.id : indicateur répété CA",
+        "colonnes, r : un dictionnaire colonne vers indicateurs est attendu",
+        "exception n° 1 : une clé controle ou une clé motif est attendue",
+        "exception n° 2 : une clé controle ou une clé motif est attendue",
+        "exception n° 3 : expression régulière invalide",
+        "exception n° 4 : étape inconnue 'cellule'",
+        "exception n° 4 : gravité inconnue 'grave'",
+        "exception n° 5 : une gravite ou des indicateurs sont attendus",
+        "exception n° 6 : clé inconnue indicateur",
+        "exception n° 7 : une liste d'indicateurs est attendue",
+        "exception n° 8 : un dictionnaire est attendu",
+    ]
+    texte = "\n".join(problemes)
+    for attendu in attendus:
+        assert attendu in texte, attendu
+    assert problemes_qualification(QUALIFICATION) == []
+    assert problemes_qualification({}) == []
+    assert problemes_qualification({"indicateurs": None, "colonnes": None}) == []
+
+
+def test_tables_et_colonnes_confrontees_aux_donnees():
+    qualification = _avec(
+        colonnes={"t": {"d": [], "inconnue": [], "periode_export": []}, "absente": {"x": []}}
+    )
+    texte = "\n".join(problemes_qualification(qualification, _tables()))
+    assert "colonnes : colonne t.inconnue absente des données chargées" in texte
+    assert "colonnes : colonne t.periode_export absente des données chargées" in texte
+    assert "colonnes : table absente absente des données chargées" in texte
+    assert "t.d" not in texte
+    with pytest.raises(ValueError, match="t.inconnue"):
+        _qualifier(qualification)
+
+
+def test_indicateurs_et_gravite_par_defaut():
+    anomalies, bilan, non_qualifies = _qualifier()
+    assert non_qualifies.empty
+    assert list(non_qualifies.columns) == list(COLONNES_NON_QUALIFIES)
+    assert list(bilan.columns) == list(COLONNES_BILAN_ANOMALIES)
+    assert list(anomalies.columns) == list(COLONNES_ANOMALIES)
+    assert _par_controle(bilan) == {
+        "t.d nature": ("majeure", DE_D),
+        "t.d obligatoire": ("majeure", DE_D),
+        "r.code decimales": ("mineure", None),
+        # Un doublon affecte toute sa table, quelles que soient les colonnes comparées.
+        "t doublon exact (toutes)": ("majeure", TOUT_T),
+        "t valeur en double (id)": ("majeure", TOUT_T),
+        "t valeur en double (siret)": ("majeure", TOUT_T),
+        "t valeur en double (nom)": ("majeure", TOUT_T),
+        "t identique hors clé (toutes sauf id)": ("majeure", TOUT_T),
+        "R15 Totaux": ("majeure", DE_D),
+        "R01 Règle un": ("majeure", DE_D),
+        # Colonne d'une table liée : « r.code » désigne la colonne code de r.
+        "R02 Sans écart": ("majeure", "CA, marge, taux de marge"),
+        "R03 Identifiant": ("mineure", None),
+    }
+
+
+def test_doublons_d_une_table_sans_indicateur():
+    qualification = _avec(colonnes={"t": {"id": [], "siret": [], "nom": [], "d": []},
+                                     "r": {"code": ["heures"]}})
+    _, bilan, _ = _qualifier(qualification)
+    gravites = _par_controle(bilan)
+    assert gravites["t valeur en double (siret)"] == ("mineure", None)
+    assert gravites["r.code decimales"] == ("majeure", "heures")
+    assert gravites["R02 Sans écart"] == ("majeure", "heures")
+
+
+def test_lignes_des_anomalies_et_issues():
+    anomalies, _, _ = _qualifier()
+    lignes = _lignes(anomalies, "controle", "issue", "gravite", "indicateurs")
+    assert ("t.d nature", "anomalie", "majeure", DE_D) in lignes
+    assert ("r.code decimales", "anomalie", "mineure", None) in lignes
+    # Un écart à arbitrer reçoit la gravité qu'il aurait s'il était confirmé.
+    assert ("t valeur en double (nom)", "à arbitrer", "majeure", TOUT_T) in lignes
+    # Une information n'est pas une anomalie : ni gravité ni indicateurs.
+    assert ("R01 Règle un", "information", None, None) in lignes
+    assert ("R01 Règle un", "anomalie", "majeure", DE_D) in lignes
+    assert [ligne for ligne in lignes if ligne[0] == "R15 Totaux"] == [
+        ("R15 Totaux", "anomalie", "majeure", DE_D)
+    ] * 2
+
+
+def test_exceptions():
+    qualification = _avec(
+        exceptions=[
+            {"controle": "t.d nature", "gravite": "bloquante"},
+            # Les indicateurs d'une exception remplacent ceux des colonnes, et la
+            # gravité par défaut suit les nouveaux indicateurs.
+            {"motif": "t valeur en double .*", "indicateurs": []},
+            {"motif": "R0[12] .*", "indicateurs": ["CA"]},
+            # Restreinte à une étape : ne touche pas « t.d obligatoire ».
+            {"motif": ".* obligatoire", "etape": "gestion", "gravite": "mineure"},
+            # Le motif doit couvrir tout le nom du contrôle.
+            {"motif": "r.code", "gravite": "bloquante"},
+            {"motif": "R03 .*", "indicateurs": ["coût"], "gravite": "mineure"},
+        ]
+    )
+    anomalies, bilan, _ = _qualifier(qualification)
+    gravites = _par_controle(bilan)
+    assert gravites["t.d nature"] == ("bloquante", DE_D)
+    assert gravites["t.d obligatoire"] == ("majeure", DE_D)
+    assert gravites["t valeur en double (siret)"] == ("mineure", None)
+    assert gravites["t doublon exact (toutes)"] == ("majeure", TOUT_T)
+    assert gravites["R01 Règle un"] == ("majeure", "CA, marge, taux de marge")
+    assert gravites["R02 Sans écart"] == ("majeure", "CA, marge, taux de marge")
+    assert gravites["r.code decimales"] == ("mineure", None)
+    assert gravites["R03 Identifiant"] == ("mineure", "coût, marge, taux de marge")
+    assert ("t.d nature", "bloquante") in _lignes(anomalies, "controle", "gravite")
+
+
+def test_exceptions_contradictoires_refusees():
+    contradictoires = _avec(
+        exceptions=[
+            {"motif": "t.d .*", "gravite": "bloquante", "indicateurs": ["marge"]},
+            {"controle": "t.d nature", "gravite": "bloquante", "indicateurs": ["coût"]},
+        ]
+    )
+    # Mêmes indicateurs une fois complétés de leurs dépendances : pas de contradiction.
+    _, bilan, _ = _qualifier(_avec(exceptions=[
+        {"motif": "t.d .*", "indicateurs": ["coût", "marge"]},
+        {"controle": "t.d nature", "indicateurs": ["coût"]},
+    ]))
+    assert _par_controle(bilan)["t.d nature"] == ("majeure", "coût, marge, taux de marge")
+    with pytest.raises(ValueError) as erreur:
+        _qualifier(contradictoires)
+    texte = str(erreur.value)
+    assert "format : t.d nature, indicateurs différents" in texte
+    assert "gravités différentes" not in texte
+    with pytest.raises(ValueError, match="gravités différentes"):
+        _qualifier(_avec(exceptions=[
+            {"motif": "R.*", "gravite": "bloquante"},
+            {"controle": "R15 Totaux", "gravite": "mineure"},
+        ]))
+
+
+def test_controles_non_qualifies():
+    qualification = _avec(
+        colonnes={"t": {"siret": ["CA"], "d": ["heures"]}},
+        exceptions=[
+            {"controle": "R03 Identifiant", "indicateurs": []},
+            {"controle": "r.code decimales", "gravite": "bloquante"},
+        ],
+    )
+    anomalies, bilan, non_qualifies = _qualifier(qualification)
+    gravites = _par_controle(bilan)
+    assert gravites["t.d nature"] == ("majeure", "heures")
+    assert gravites["R03 Identifiant"] == ("mineure", None)
+    # Une gravité seule ne qualifie pas : les indicateurs restent inconnus.
+    assert gravites["r.code decimales"] == (None, None)
+    assert gravites["t doublon exact (toutes)"] == (None, None)
+    assert _lignes(non_qualifies, "controle", "colonnes_non_declarees") == [
+        ("r.code decimales", "r.code"),
+        ("t doublon exact (toutes)", "t.id, t.nom"),
+        ("t valeur en double (id)", "t.id, t.nom"),
+        ("t valeur en double (siret)", "t.id, t.nom"),
+        ("t valeur en double (nom)", "t.id, t.nom"),
+        ("t identique hors clé (toutes sauf id)", "t.id, t.nom"),
+        ("R02 Sans écart", "r.code"),
+    ]
+    assert ("r.code decimales", None, None) in _lignes(
+        anomalies, "controle", "gravite", "indicateurs"
+    )
+    _, bilan, non_qualifies = _qualifier({})
+    assert bilan["gravite"].isna().all() and bilan["indicateurs"].isna().all()
+    assert len(non_qualifies) == len(bilan)
+    tables = _tables()
+    del tables["r"]
+    sources = _exemple_5c()
+    sources["bilan_doublons"] = _frame(
+        [_ligne_bilan_doublons(table="r", constat="doublon exact", colonnes="toutes")],
+        COLONNES_BILAN_DOUBLONS,
+    )
+    sources["doublons"] = _frame([], COLONNES_DOUBLONS)
+    sources["ecarts"] = sources["ecarts"][sources["ecarts"]["table"] == "t"]
+    sources["bilan"] = sources["bilan"][sources["bilan"]["table"] == "t"]
+    qualification = _avec(colonnes={"t": QUALIFICATION["colonnes"]["t"]})
+    anomalies = _reunir(sources, tables=tables)
+    _, _, non_qualifies = qualifier(
+        anomalies, _bilan(sources, anomalies), qualification, tables
+    )
+    assert ("r doublon exact (toutes)", "table r absente des données") in _lignes(
+        non_qualifies, "controle", "colonnes_non_declarees"
+    )
+
+
+def test_arguments_non_modifies_et_controle_inconnu():
+    sources = _exemple_5c()
+    anomalies = _reunir(sources)
+    bilan = _bilan(sources, anomalies)
+    copie_anomalies, copie_bilan = anomalies.copy(), bilan.copy()
+    qualification = _avec(exceptions=[{"controle": "t.d nature", "gravite": "bloquante"}])
+    qualifier(anomalies, bilan, qualification, _tables())
+    pd.testing.assert_frame_equal(anomalies, copie_anomalies)
+    pd.testing.assert_frame_equal(bilan, copie_bilan)
+    assert qualification["exceptions"] == [{"controle": "t.d nature", "gravite": "bloquante"}]
+    with pytest.raises(ValueError, match="R01 Règle un"):
+        qualifier(anomalies, bilan[bilan["controle"] != "R01 Règle un"], QUALIFICATION, _tables())
+    with pytest.raises(ValueError, match="colonnes absentes gravite"):
+        qualifier(anomalies, bilan.drop(columns="gravite"), QUALIFICATION, _tables())
+
+
+def test_colonnes_non_declarees_et_avertissements():
+    qualification = _avec(
+        indicateurs={
+            **QUALIFICATION["indicateurs"], "délai": {}, "dérivé": {"depend_de": ["délai"]}
+        },
+        colonnes={"t": {"siret": ["CA"], "d": ["heures"]}},
+        exceptions=[
+            {"motif": "x.*", "gravite": "mineure"},
+            {"controle": "t.d nature", "etape": "gestion", "gravite": "mineure"},
+            {"controle": "t.d nature", "indicateurs": ["coût"]},
+        ],
+    )
+    assert _lignes(colonnes_non_declarees(_tables(), qualification), "table", "colonne") == [
+        ("t", "id"),
+        ("t", "nom"),
+        ("r", "code"),
+    ]
+    assert list(colonnes_non_declarees(_tables(), {}).columns) == list(COLONNES_NON_DECLAREES)
+    assert len(colonnes_non_declarees(_tables(), {})) == 5
+    _, bilan, _ = _qualifier(qualification)
+    messages = avertissements_qualification(bilan, qualification)
+    assert messages == [
+        "exception n° 1 (x.*) : aucun contrôle désigné",
+        "exception n° 2 (t.d nature) : aucun contrôle désigné",
+        "indicateur délai : affecté par aucune colonne ni exception",
+        "indicateur dérivé : affecté par aucune colonne ni exception",
+    ]
+    assert avertissements_qualification(bilan, QUALIFICATION) == []
+
+
+def test_dependances_declarees_avant_leurs_sources():
+    qualification = {
+        "indicateurs": {
+            "taux": {"depend_de": ["marge"]},
+            "marge": {"depend_de": ["coût"]},
+            "coût": {},
+            "CA": {},
+        },
+        "colonnes": {
+            "t": {"id": [], "siret": [], "nom": [], "d": ["coût"]},
+            "r": {"code": ["CA"]},
+        },
+    }
+    _, bilan, _ = _qualifier(qualification)
+    gravites = _par_controle(bilan)
+    # Ordre du catalogue, quel que soit l'ordre des dépendances.
+    assert gravites["t.d nature"] == ("majeure", "taux, marge, coût")
+    assert gravites["r.code decimales"] == ("majeure", "CA")

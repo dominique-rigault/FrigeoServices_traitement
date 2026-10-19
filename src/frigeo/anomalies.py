@@ -21,15 +21,23 @@ source. `bilan_controles` rend une ligne par contrôle, avec les nombres de lign
 contrôlées, d'anomalies, d'écarts à arbitrer et d'informations, le taux
 d'anomalies et le nombre de lignes sources distinctes en anomalie.
 
-La gravité et les indicateurs affectés sont des colonnes vides à ce stade (étape
-5c). Rien n'est corrigé ni écrit : l'écriture sur disque relève de l'étape 5d.
+`reunir_anomalies` et `bilan_controles` laissent vides la gravité et les
+indicateurs affectés; `qualifier` les renseigne d'après config/anomalies.yaml
+(`charger_qualification`) : indicateurs alimentés par chaque colonne, exceptions
+par contrôle. Rien n'est corrigé ni écrit : l'écriture sur disque relève de
+l'étape 5d.
 """
 
 from __future__ import annotations
 
 import hashlib
+import re
+from pathlib import Path
 
 import pandas as pd
+import yaml
+
+from . import racine_projet
 
 from .confidentialite import charger_sensibilite, est_sensible
 from .controles import (
@@ -39,6 +47,7 @@ from .controles import (
     ISSUE_A_ARBITRER,
     ISSUE_ANOMALIE,
     VALEUR_MASQUEE,
+    _colonnes_de_donnees,
 )
 from .doublons import (
     COLONNES_BILAN_DOUBLONS,
@@ -210,7 +219,8 @@ def reunir_anomalies(
     lignage, d'après la clé déclarée de sa table (vide sans clé déclarée,
     « masqué » si une colonne de la clé est sensible). `periode_export` est celle
     de la ligne source, vide pour un écart sans lignage (un total par période,
-    dont la clé porte la période). `gravite` et `indicateurs` sont vides.
+    dont la clé porte la période). `gravite` et `indicateurs` sont vides (voir
+    `qualifier`).
 
     `id_anomalie` est une empreinte de l'étape, du contrôle, de la table, du
     lignage, du champ et du constat (et de la clé pour un écart sans lignage) :
@@ -478,7 +488,7 @@ def bilan_controles(
     rapport des anomalies aux lignes contrôlées; il est vide quand rien n'est
     contrôlé, ou quand un écart du contrôle n'a pas de lignage (un total par
     période se compte en périodes, ses lignes contrôlées en lignes). `gravite` et
-    `indicateurs` sont vides.
+    `indicateurs` sont vides (voir `qualifier`).
     """
     if declarations is None:
         declarations = charger_declarations_doublons()
@@ -579,3 +589,464 @@ def anomalies_non_masquees(
         ):
             fautives.append(position)
     return anomalies.iloc[fautives]
+
+
+# Gravité et indicateurs affectés (étape 5c), déclarés dans config/anomalies.yaml.
+CLE_INDICATEURS = "indicateurs"
+CLE_COLONNES = "colonnes"
+CLE_EXCEPTIONS = "exceptions"
+CLES_FICHIER_QUALIFICATION = (CLE_INDICATEURS, CLE_COLONNES, CLE_EXCEPTIONS)
+CLE_DEPEND_DE = "depend_de"
+CLES_INDICATEUR = (CLE_DEPEND_DE,)
+CLES_EXCEPTION = ("controle", "motif", "etape", "gravite", "indicateurs")
+GRAVITE_BLOQUANTE = "bloquante"
+GRAVITE_MAJEURE = "majeure"
+GRAVITE_MINEURE = "mineure"
+GRAVITES = (GRAVITE_BLOQUANTE, GRAVITE_MAJEURE, GRAVITE_MINEURE)
+SEPARATEUR_INDICATEURS = ", "
+COLONNES_NON_QUALIFIES = ("etape", "controle", "table", "champ", "colonnes_non_declarees")
+COLONNES_NON_DECLAREES = ("table", "colonne")
+
+
+def chemin_qualification() -> Path:
+    """Emplacement par défaut de la gravité et des indicateurs : config/anomalies.yaml."""
+    return racine_projet() / "config" / "anomalies.yaml"
+
+
+def charger_qualification(chemin: str | Path | None = None) -> dict:
+    """Gravité et indicateurs affectés, lus dans config/anomalies.yaml.
+
+    Le fichier est écrit à la main, d'après ce que dit le métier, sous trois clés
+    facultatives :
+
+        indicateurs:
+          CA: {}
+          coût salarial: {}
+          marge: {depend_de: [CA, coût salarial]}
+        colonnes:
+          interventions:
+            duree_min: [coût salarial]
+            commentaire: []
+        exceptions:
+          - motif: '.* encodage'
+            gravite: mineure
+          - controle: R06 Écriture équilibrée
+            gravite: bloquante
+
+    `indicateurs` est le catalogue des indicateurs, dans l'ordre d'affichage; un
+    indicateur peut dépendre d'autres indicateurs (`depend_de`), qu'une anomalie
+    affecte alors avec eux. `colonnes` donne, par table puis par colonne, les
+    indicateurs qu'alimente la colonne (`[]` pour aucun, ce qui est une déclaration
+    et non un oubli). `exceptions` ajuste les contrôles que désigne leur nom exact
+    (`controle`) ou une expression régulière sur ce nom (`motif`), éventuellement
+    restreints à une étape (`etape`) : une `gravite`, des `indicateurs` qui
+    remplacent ceux des colonnes, ou les deux.
+
+    Un fichier absent ou vide ne déclare rien (tous les contrôles seront non
+    qualifiés). Un fichier mal formé est refusé, tous les problèmes étant listés en
+    une fois; la présence des tables et des colonnes dans les données est vérifiée
+    par `qualifier`.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_qualification()
+    if not chemin.is_file():
+        return {}
+    with open(chemin, encoding="utf-8") as flux:
+        contenu = yaml.safe_load(flux)
+    if contenu is None:
+        return {}
+    attendues = ", ".join(f"« {cle} »" for cle in CLES_FICHIER_QUALIFICATION)
+    if not isinstance(contenu, dict):
+        raise ValueError(
+            f"Fichier de gravité et d'indicateurs invalide ({chemin}) : les seules clés "
+            f"attendues sont {attendues}"
+        )
+    problemes = problemes_qualification(contenu)
+    if problemes:
+        raise ValueError(
+            f"Fichier de gravité et d'indicateurs invalide ({chemin})\n  "
+            + "\n  ".join(problemes)
+        )
+    return contenu
+
+
+def _bloc(qualification: dict, cle: str, vide):
+    """Contenu d'une clé du fichier, `vide` si elle manque ou n'a pas de valeur."""
+    valeur = qualification.get(cle)
+    return vide if valeur is None else valeur
+
+
+def _nom_attendu(valeur) -> bool:
+    return isinstance(valeur, str) and valeur.strip() != ""
+
+
+def _problemes_liste_indicateurs(valeur, catalogue, ou: str) -> list[str]:
+    """Problèmes d'une liste d'indicateurs (liste de noms du catalogue, sans répétition)."""
+    if not isinstance(valeur, list):
+        return [f"{ou} : une liste d'indicateurs est attendue ([] pour aucun)"]
+    problemes = []
+    for nom in valeur:
+        if not _nom_attendu(nom):
+            problemes.append(f"{ou} : nom d'indicateur attendu ({nom!r})")
+        elif nom not in catalogue:
+            problemes.append(f"{ou} : indicateur inconnu {nom} (absent du catalogue)")
+    noms = [n for n in valeur if isinstance(n, str)]
+    repetes = sorted({n for n in noms if noms.count(n) > 1})
+    if repetes:
+        problemes.append(f"{ou} : indicateur répété {', '.join(repetes)}")
+    return problemes
+
+
+def _cycles(dependances: dict[str, list[str]]) -> list[str]:
+    """Indicateurs pris dans une dépendance circulaire."""
+    en_cycle = []
+    for depart in dependances:
+        a_voir = list(dependances.get(depart, []))
+        vus = set()
+        while a_voir:
+            nom = a_voir.pop()
+            if nom == depart:
+                en_cycle.append(depart)
+                break
+            if nom in vus:
+                continue
+            vus.add(nom)
+            a_voir.extend(dependances.get(nom, []))
+    return en_cycle
+
+
+def problemes_qualification(qualification, tables: dict | None = None) -> list[str]:
+    """Problèmes du contenu de config/anomalies.yaml, tous listés.
+
+    Avec `tables`, vérifie aussi que chaque table et chaque colonne déclarée existe
+    dans les données (une colonne de lignage n'est pas une colonne de données).
+    """
+    if not isinstance(qualification, dict):
+        return ["un dictionnaire est attendu, de clés " + ", ".join(CLES_FICHIER_QUALIFICATION)]
+    problemes = []
+    inconnues = [str(cle) for cle in qualification if cle not in CLES_FICHIER_QUALIFICATION]
+    if inconnues:
+        problemes.append(
+            f"clé inconnue {', '.join(inconnues)} (clés attendues "
+            f"{', '.join(CLES_FICHIER_QUALIFICATION)})"
+        )
+
+    catalogue = _bloc(qualification, CLE_INDICATEURS, {})
+    dependances = {}
+    if not isinstance(catalogue, dict):
+        problemes.append(f"{CLE_INDICATEURS} : un dictionnaire nom d'indicateur vers "
+                         "ses précisions est attendu")
+        catalogue = {}
+    for nom, precisions in catalogue.items():
+        ou = f"{CLE_INDICATEURS}, {nom}"
+        if not _nom_attendu(nom):
+            problemes.append(f"{CLE_INDICATEURS} : nom d'indicateur attendu ({nom!r})")
+            continue
+        if precisions is None:
+            continue
+        if not isinstance(precisions, dict):
+            problemes.append(f"{ou} : un dictionnaire est attendu ({{}} sans précision)")
+            continue
+        inconnues = [str(c) for c in precisions if c not in CLES_INDICATEUR]
+        if inconnues:
+            problemes.append(
+                f"{ou} : clé inconnue {', '.join(inconnues)} (clé possible {CLE_DEPEND_DE})"
+            )
+        if CLE_DEPEND_DE in precisions:
+            liste = precisions[CLE_DEPEND_DE]
+            problemes += _problemes_liste_indicateurs(liste, catalogue, f"{ou}, {CLE_DEPEND_DE}")
+            if isinstance(liste, list):
+                dependances[nom] = [n for n in liste if isinstance(n, str) and n in catalogue]
+    cycles = _cycles(dependances)
+    if cycles:
+        problemes.append(f"{CLE_INDICATEURS} : dépendance circulaire ({', '.join(cycles)})")
+
+    colonnes = _bloc(qualification, CLE_COLONNES, {})
+    if not isinstance(colonnes, dict):
+        problemes.append(f"{CLE_COLONNES} : un dictionnaire table vers colonnes est attendu")
+        colonnes = {}
+    for table, par_colonne in colonnes.items():
+        if not isinstance(par_colonne, dict):
+            problemes.append(
+                f"{CLE_COLONNES}, {table} : un dictionnaire colonne vers indicateurs est attendu"
+            )
+            continue
+        if tables is not None and table not in tables:
+            problemes.append(f"{CLE_COLONNES} : table {table} absente des données chargées")
+        presentes = (
+            _colonnes_de_donnees(tables[table])
+            if tables is not None and table in tables
+            else None
+        )
+        for colonne, indicateurs in par_colonne.items():
+            ou = f"{CLE_COLONNES}, {table}.{colonne}"
+            problemes += _problemes_liste_indicateurs(indicateurs, catalogue, ou)
+            if presentes is not None and colonne not in presentes:
+                problemes.append(
+                    f"{CLE_COLONNES} : colonne {table}.{colonne} absente des données chargées"
+                )
+
+    exceptions = _bloc(qualification, CLE_EXCEPTIONS, [])
+    if not isinstance(exceptions, list):
+        problemes.append(f"{CLE_EXCEPTIONS} : une liste est attendue")
+        exceptions = []
+    for rang, exception in enumerate(exceptions, start=1):
+        ou = f"{CLE_EXCEPTIONS}, exception n° {rang}"
+        if not isinstance(exception, dict):
+            problemes.append(f"{ou} : un dictionnaire est attendu")
+            continue
+        inconnues = [str(c) for c in exception if c not in CLES_EXCEPTION]
+        if inconnues:
+            problemes.append(
+                f"{ou} : clé inconnue {', '.join(inconnues)} (clés possibles "
+                f"{', '.join(CLES_EXCEPTION)})"
+            )
+        designations = [c for c in ("controle", "motif") if c in exception]
+        if len(designations) != 1:
+            problemes.append(f"{ou} : une clé controle ou une clé motif est attendue, pas les deux")
+        if "controle" in exception and not _nom_attendu(exception["controle"]):
+            problemes.append(f"{ou} : nom de contrôle attendu")
+        if "motif" in exception:
+            motif = exception["motif"]
+            if not _nom_attendu(motif):
+                problemes.append(f"{ou} : expression régulière attendue")
+            else:
+                try:
+                    re.compile(motif)
+                except re.error as erreur:
+                    problemes.append(f"{ou} : expression régulière invalide ({erreur})")
+        if "etape" in exception and exception["etape"] not in ETAPES:
+            problemes.append(
+                f"{ou} : étape inconnue {exception['etape']!r} (étapes possibles "
+                f"{', '.join(ETAPES)})"
+            )
+        if "gravite" not in exception and "indicateurs" not in exception:
+            problemes.append(f"{ou} : une gravite ou des indicateurs sont attendus")
+        if "gravite" in exception and exception["gravite"] not in GRAVITES:
+            problemes.append(
+                f"{ou} : gravité inconnue {exception['gravite']!r} (gravités possibles "
+                f"{', '.join(GRAVITES)})"
+            )
+        if "indicateurs" in exception:
+            problemes += _problemes_liste_indicateurs(exception["indicateurs"], catalogue, ou)
+    return problemes
+
+
+def _designe(exception: dict, etape: str, controle: str) -> bool:
+    """Vrai si l'exception désigne ce contrôle."""
+    if "etape" in exception and exception["etape"] != etape:
+        return False
+    if "controle" in exception:
+        return exception["controle"] == controle
+    return re.fullmatch(exception["motif"], controle) is not None
+
+
+def _affectes(base, catalogue: dict) -> list[str]:
+    """Indicateurs affectés : ceux de la base et ceux qui en dépendent, dans l'ordre
+    du catalogue."""
+    affectes = set(base)
+    change = True
+    while change:
+        change = False
+        for nom, precisions in catalogue.items():
+            depend = (precisions or {}).get(CLE_DEPEND_DE) or []
+            if nom not in affectes and any(d in affectes for d in depend):
+                affectes.add(nom)
+                change = True
+    return [nom for nom in catalogue if nom in affectes]
+
+
+def _colonnes_du_controle(etape, table, champ, tables) -> list[tuple[str, str]] | None:
+    """Colonnes dont un contrôle tire ses indicateurs.
+
+    Un doublon compte deux fois dans tous les agrégats de sa table : un contrôle de
+    doublons a les colonnes de toute sa table (None si la table est absente des
+    données). Les autres contrôles ont les colonnes de leur champ.
+    """
+    if etape == ETAPE_DOUBLONS:
+        if table not in tables:
+            return None
+        return [(table, colonne) for colonne in _colonnes_de_donnees(tables[table])]
+    return _colonnes_du_champ(table, champ)
+
+
+def qualifier(
+    anomalies: pd.DataFrame,
+    bilan: pd.DataFrame,
+    qualification: dict,
+    tables: dict[str, pd.DataFrame],
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Renseigne la gravité et les indicateurs affectés de chaque contrôle.
+
+    `anomalies` vient de `reunir_anomalies`, `bilan` de `bilan_controles`,
+    `qualification` de `charger_qualification`. Rend `(anomalies, bilan,
+    non_qualifies)`, les arguments n'étant pas modifiés.
+
+    Les indicateurs d'un contrôle sont ceux des colonnes de son champ (« t.c » pour
+    une colonne d'une table liée), ou de toutes les colonnes de sa table pour un
+    contrôle de doublons, complétés des indicateurs qui en dépendent, dans l'ordre
+    du catalogue et reliés par « , ». Une exception qui donne des indicateurs les
+    remplace. La gravité est celle d'une exception, sinon « majeure » si le contrôle
+    affecte au moins un indicateur, « mineure » sinon.
+
+    Un contrôle est qualifié si une exception lui donne ses indicateurs ou si toutes
+    ses colonnes sont déclarées; sinon sa gravité et ses indicateurs restent vides,
+    et il figure dans `non_qualifies` (`COLONNES_NON_QUALIFIES`) avec ses colonnes
+    non déclarées. Dans la table des anomalies, chaque ligne reçoit la gravité et
+    les indicateurs de son contrôle, sauf les informations, qui ne sont pas des
+    anomalies (gravité et indicateurs vides).
+
+    Refuse (`ValueError`, tous les problèmes listés) : un fichier mal formé, une
+    table ou une colonne déclarée absente des données, deux exceptions qui donnent
+    à un même contrôle des gravités ou des indicateurs différents, une ligne de la
+    table des anomalies dont le contrôle est absent du bilan.
+    """
+    problemes = (
+        _verifier_colonnes("table des anomalies", anomalies, COLONNES_ANOMALIES)
+        + _verifier_colonnes("bilan par contrôle", bilan, COLONNES_BILAN_ANOMALIES)
+    )
+    if problemes:
+        raise ValueError("Tables inattendues\n  " + "\n  ".join(problemes))
+    problemes = problemes_qualification(qualification, tables)
+    if problemes:
+        raise ValueError(
+            "Fichier de gravité et d'indicateurs invalide\n  " + "\n  ".join(problemes)
+        )
+    catalogue = _bloc(qualification, CLE_INDICATEURS, {})
+    declarees = _bloc(qualification, CLE_COLONNES, {})
+    exceptions = _bloc(qualification, CLE_EXCEPTIONS, [])
+
+    resultats = {}
+    non_qualifies = []
+    conflits = []
+    for ligne in bilan.itertuples(index=False):
+        designantes = [e for e in exceptions if _designe(e, ligne.etape, ligne.controle)]
+        gravites = {e["gravite"] for e in designantes if "gravite" in e}
+        listes = {
+            tuple(_affectes(e["indicateurs"], catalogue))
+            for e in designantes
+            if "indicateurs" in e
+        }
+        if len(gravites) > 1:
+            conflits.append(
+                f"{ligne.etape} : {ligne.controle}, gravités différentes "
+                f"({', '.join(sorted(gravites))})"
+            )
+        if len(listes) > 1:
+            textes = [SEPARATEUR_INDICATEURS.join(liste) or "aucun" for liste in sorted(listes)]
+            conflits.append(
+                f"{ligne.etape} : {ligne.controle}, indicateurs différents "
+                f"({'; '.join(textes)})"
+            )
+        if listes:
+            indicateurs = list(next(iter(listes)))
+        else:
+            colonnes = _colonnes_du_controle(ligne.etape, ligne.table, ligne.champ, tables)
+            if colonnes is None:
+                manquantes = [f"table {ligne.table} absente des données"]
+            else:
+                manquantes = [
+                    f"{t}.{c}" for t, c in colonnes if c not in (declarees.get(t) or {})
+                ]
+            if manquantes:
+                non_qualifies.append(
+                    {
+                        "etape": ligne.etape,
+                        "controle": ligne.controle,
+                        "table": ligne.table,
+                        "champ": ligne.champ,
+                        "colonnes_non_declarees": SEPARATEUR_INDICATEURS.join(manquantes),
+                    }
+                )
+                resultats[(ligne.etape, ligne.controle)] = (None, None)
+                continue
+            base = [nom for t, c in colonnes for nom in declarees[t][c]]
+            indicateurs = _affectes(base, catalogue)
+        if gravites:
+            gravite = next(iter(gravites))
+        else:
+            gravite = GRAVITE_MAJEURE if indicateurs else GRAVITE_MINEURE
+        texte = SEPARATEUR_INDICATEURS.join(indicateurs) or None
+        resultats[(ligne.etape, ligne.controle)] = (gravite, texte)
+    if conflits:
+        raise ValueError(
+            "Exceptions contradictoires sur un même contrôle\n  " + "\n  ".join(conflits)
+        )
+
+    inconnus = sorted(
+        {
+            f"{etape} : {controle}"
+            for etape, controle in zip(anomalies["etape"], anomalies["controle"])
+            if (etape, controle) not in resultats
+        }
+    )
+    if inconnus:
+        raise ValueError(
+            "Lignes de la table des anomalies dont le contrôle est absent du bilan\n  "
+            + "\n  ".join(inconnus)
+        )
+
+    bilan = bilan.copy()
+    cles = list(zip(bilan["etape"], bilan["controle"]))
+    bilan["gravite"] = pd.Series([resultats[c][0] for c in cles], index=bilan.index, dtype=object)
+    bilan["indicateurs"] = pd.Series(
+        [resultats[c][1] for c in cles], index=bilan.index, dtype=object
+    )
+    anomalies = anomalies.copy()
+    valeurs = [
+        (None, None) if issue == ISSUE_INFORMATION else resultats[(etape, controle)]
+        for etape, controle, issue in zip(
+            anomalies["etape"], anomalies["controle"], anomalies["issue"]
+        )
+    ]
+    anomalies["gravite"] = pd.Series([v[0] for v in valeurs], index=anomalies.index, dtype=object)
+    anomalies["indicateurs"] = pd.Series(
+        [v[1] for v in valeurs], index=anomalies.index, dtype=object
+    )
+    return anomalies, bilan, pd.DataFrame(non_qualifies, columns=list(COLONNES_NON_QUALIFIES))
+
+
+def colonnes_non_declarees(tables: dict[str, pd.DataFrame], qualification: dict) -> pd.DataFrame:
+    """Colonnes des données absentes du bloc `colonnes` (`COLONNES_NON_DECLAREES`).
+
+    Dans l'ordre des tables et de leurs colonnes, sans les colonnes de lignage :
+    c'est la liste à compléter pour qualifier tous les contrôles.
+    """
+    declarees = _bloc(qualification, CLE_COLONNES, {})
+    if not isinstance(declarees, dict):
+        declarees = {}
+    lignes = [
+        {"table": table, "colonne": colonne}
+        for table, donnees in tables.items()
+        for colonne in _colonnes_de_donnees(donnees)
+        if not isinstance(declarees.get(table), dict) or colonne not in declarees[table]
+    ]
+    return pd.DataFrame(lignes, columns=list(COLONNES_NON_DECLAREES))
+
+
+def avertissements_qualification(bilan: pd.DataFrame, qualification: dict) -> list[str]:
+    """Déclarations sans effet : exception qui ne désigne aucun contrôle du bilan,
+    indicateur du catalogue qu'aucune colonne ni aucune exception n'affecte.
+
+    Ce ne sont pas des erreurs (certains contrôles n'existent que selon les données),
+    mais elles peuvent cacher une faute de frappe.
+    """
+    catalogue = _bloc(qualification, CLE_INDICATEURS, {})
+    declarees = _bloc(qualification, CLE_COLONNES, {})
+    exceptions = _bloc(qualification, CLE_EXCEPTIONS, [])
+    messages = []
+    controles = list(zip(bilan["etape"], bilan["controle"]))
+    for rang, exception in enumerate(exceptions, start=1):
+        if not any(_designe(exception, etape, controle) for etape, controle in controles):
+            designation = exception.get("controle", exception.get("motif"))
+            messages.append(f"exception n° {rang} ({designation}) : aucun contrôle désigné")
+    utilises = set()
+    for par_colonne in declarees.values():
+        for indicateurs in (par_colonne or {}).values():
+            utilises.update(indicateurs or [])
+    for exception in exceptions:
+        utilises.update(exception.get("indicateurs") or [])
+    utilises = set(_affectes(utilises, catalogue))
+    for nom in catalogue:
+        if nom not in utilises:
+            messages.append(f"indicateur {nom} : affecté par aucune colonne ni exception")
+    return messages
