@@ -17,7 +17,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | 01 | Fait sur le cas Frigéo, à rendre générique |
 | 2 | Profilage de chaque fichier | Python, Jupyter | 02 | Fait sur le cas Frigéo, à rendre générique |
 | 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | aucun | Terminé |
-02c | Terminé, sauf une cellule propre au cas (comparaison avec le chapitre 4) |
+| 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 02c | Terminé, sauf une cellule propre au cas (comparaison avec le chapitre 4) |
 | 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 02c | Terminé |
 | 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 03 | Terminé |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 04 | Terminé |
