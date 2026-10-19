@@ -1,8 +1,13 @@
 """Tests de la table des anomalies (frigeo.anomalies)."""
 
+import builtins
+import os
+from pathlib import Path
+
 import pandas as pd
 import pytest
 
+import frigeo.anomalies as module_anomalies
 from frigeo.anomalies import (
     COLONNES_ANOMALIES,
     COLONNES_BILAN_ANOMALIES,
@@ -17,7 +22,10 @@ from frigeo.anomalies import (
     avertissements_qualification,
     bilan_controles,
     charger_qualification,
+    chemins_anomalies,
     colonnes_non_declarees,
+    dossier_anomalies,
+    ecrire_anomalies,
     problemes_qualification,
     qualifier,
     reunir_anomalies,
@@ -820,3 +828,183 @@ def test_dependances_declarees_avant_leurs_sources():
     # Ordre du catalogue, quel que soit l'ordre des dépendances.
     assert gravites["t.d nature"] == ("majeure", "taux, marge, coût")
     assert gravites["r.code decimales"] == ("majeure", "CA")
+
+
+# Écriture des CSV (5d).
+
+
+def _qualifiees():
+    anomalies, bilan, _ = _qualifier()
+    return anomalies, bilan
+
+
+def _ecrire(anomalies, bilan, dossier, periode="2026-03", sensibles=AUCUNE_SENSIBLE):
+    return ecrire_anomalies(anomalies, bilan, periode, dossier, sensibles, DECLARATIONS)
+
+
+def _relire(chemin):
+    return pd.read_csv(chemin, sep=";", encoding="utf-8-sig", dtype=str, keep_default_na=False)
+
+
+def _textes(table):
+    return [
+        ["" if v is None or pd.isna(v) else str(v) for v in ligne]
+        for ligne in table.itertuples(index=False)
+    ]
+
+
+def _etat(dossier):
+    return {f.name: f.read_bytes() for f in sorted(dossier.iterdir())}
+
+
+def test_ecriture_et_relecture(tmp_path):
+    anomalies, bilan = _qualifiees()
+    chemins = _ecrire(anomalies, bilan, tmp_path)
+    assert [c.name for c in chemins] == ["anomalies_2026-03.csv", "bilan_2026-03.csv"]
+    assert sorted(f.name for f in tmp_path.iterdir()) == [c.name for c in chemins]
+    for chemin, colonnes, lignes in zip(
+        chemins, (COLONNES_ANOMALIES, COLONNES_BILAN_ANOMALIES), (len(anomalies), len(bilan))
+    ):
+        octets = chemin.read_bytes()
+        assert octets.startswith(b"\xef\xbb\xbf" + ";".join(colonnes).encode("utf-8") + b"\r\n")
+        assert octets.count(b"\r\n") == lignes + 1 and octets.count(b"\n") == lignes + 1
+    relue = _relire(chemins[0])
+    assert list(relue.columns) == list(COLONNES_ANOMALIES)
+    assert relue.values.tolist() == _textes(anomalies)
+    # Numéro de ligne entier, vide pour un écart de période.
+    numeros = relue.loc[relue["controle"] == "R15 Totaux", "num_ligne_source"].tolist()
+    assert numeros == ["", ""]
+    assert "3" in relue["num_ligne_source"].tolist()
+    assert not any(n.endswith(".0") for n in relue["num_ligne_source"])
+    # Un numéro lu en flottant (2.0) est écrit en entier, et les décomptes du bilan aussi.
+    flottants = anomalies.assign(num_ligne_source=anomalies["num_ligne_source"].astype(float))
+    bilan_flottant = bilan.assign(controlees=bilan["controlees"].astype(float))
+    chemins = _ecrire(flottants, bilan_flottant, tmp_path / "flottants")
+    assert _relire(chemins[0])["num_ligne_source"].tolist() == relue["num_ligne_source"].tolist()
+    assert _relire(chemins[1])["controlees"].tolist() == [str(int(n)) for n in bilan["controlees"]]
+    # Bilan : décomptes entiers, taux à 4 décimales avec une virgule, vide sans taux.
+    bilan_relu = _relire(chemins[1])
+    assert list(bilan_relu.columns) == list(COLONNES_BILAN_ANOMALIES)
+    attendus = [
+        "" if t is None or pd.isna(t) else f"{t:.4f}".replace(".", ",") for t in bilan["taux"]
+    ]
+    assert bilan_relu["taux"].tolist() == attendus
+    assert "0,2500" in attendus and "" in attendus
+    assert bilan_relu["controlees"].tolist() == [str(int(n)) for n in bilan["controlees"]]
+    autres = [c for c in COLONNES_BILAN_ANOMALIES if c != "taux"]
+    assert bilan_relu[autres].values.tolist() == _textes(bilan[autres])
+
+
+def test_valeurs_ecrites_telles_quelles(tmp_path):
+    anomalies, bilan = _qualifiees()
+    piegees = ['a;b "c"\r\nd', "00123", "=1+1", "-12,5", "x" + chr(160) + ":", "é à ç"]
+    anomalies = anomalies.copy()
+    anomalies.loc[anomalies.index[: len(piegees)], "valeur"] = piegees
+    chemin, _ = _ecrire(anomalies, bilan, tmp_path)
+    assert b'"a;b ""c""\r\nd"' in chemin.read_bytes()
+    relue = _relire(chemin)
+    assert len(relue) == len(anomalies)
+    assert relue["valeur"].tolist()[: len(piegees)] == piegees
+
+
+def test_ecriture_refusee_sans_rien_toucher(tmp_path):
+    anomalies, bilan = _qualifiees()
+    dossier = tmp_path / "sortie"
+
+    def refus(*morceaux, table=anomalies, bilan_=bilan, periode="2026-03", sensibles=None):
+        with pytest.raises(ValueError) as erreur:
+            _ecrire(table, bilan_, dossier, periode,
+                    AUCUNE_SENSIBLE if sensibles is None else sensibles)
+        for morceau in morceaux:
+            assert morceau in str(erreur.value)
+        assert not dossier.exists()
+
+    for periode in ("2026-3", "2026-13", "2026-00", "26-03", 202603, " 2026-03", "2026-031"):
+        refus("forme AAAA-MM", periode=periode)
+    refus("table des anomalies", table=anomalies[list(COLONNES_ANOMALIES)[::-1]])
+    refus("bilan par contrôle", bilan_=bilan.drop(columns="taux"))
+    double = anomalies.copy()
+    double.loc[double.index[1], "id_anomalie"] = double.loc[double.index[0], "id_anomalie"]
+    double.loc[double.index[2], "id_anomalie"] = None
+    refus("1 identifiants en double", "1 lignes sans identifiant", table=double)
+    refus("absents du bilan", "gestion : R01 Règle un",
+          bilan_=bilan[bilan["controle"] != "R01 Règle un"].reset_index(drop=True))
+    # Table et bilan qui ne sont pas passés par qualifier.
+    sources = _exemple_5c()
+    brutes = _reunir(sources)
+    refus("appeler qualifier", table=brutes, bilan_=_bilan(sources, brutes))
+    refus("même appel à qualifier", "t.d nature", table=brutes)
+    # Valeur ou clé sensible visible.
+    refus("lignes dont la valeur ou la clé", "t.d nature",
+          sensibles={"t": frozenset({"d"})})
+    # Tous les problèmes en une fois.
+    refus("identifiants en double", "absents du bilan", "pas masquée",
+          table=double, bilan_=bilan[bilan["controle"] != "R01 Règle un"],
+          sensibles={"t": frozenset({"d"})})
+    # Les anciens fichiers restent intacts après un refus.
+    _ecrire(anomalies, bilan, dossier)
+    avant = _etat(dossier)
+    with pytest.raises(ValueError):
+        _ecrire(double, bilan, dossier)
+    assert _etat(dossier) == avant
+
+
+def test_reecriture_dossier_cree_et_table_vide(tmp_path):
+    anomalies, bilan = _qualifiees()
+    dossier = tmp_path / "data" / "anomalies"
+    _ecrire(anomalies, bilan, dossier)
+    chemin, chemin_bilan = _ecrire(anomalies.iloc[:3], bilan, dossier)
+    assert len(_relire(chemin)) == 3
+    assert sorted(f.name for f in dossier.iterdir()) == [chemin.name, chemin_bilan.name]
+    # Rien à qualifier : la table vide s'écrit, avec son en-tête.
+    sources = _sources(bilan=[_ligne_bilan()])
+    vides = _reunir(sources)
+    chemin, _ = _ecrire(vides, _bilan(sources, vides), dossier, "2026-04")
+    assert _relire(chemin).empty and list(_relire(chemin).columns) == list(COLONNES_ANOMALIES)
+    # Un contrôle non qualifié n'empêche pas l'écriture : sa gravité reste vide.
+    qualification = _avec(colonnes={"t": QUALIFICATION["colonnes"]["t"]})
+    partielles, bilan_partiel, non_qualifies = _qualifier(qualification)
+    assert non_qualifies["controle"].tolist() == ["r.code decimales", "R02 Sans écart"]
+    chemin, chemin_bilan = _ecrire(partielles, bilan_partiel, dossier, "2026-05")
+    ligne = _relire(chemin_bilan).set_index("controle").loc["r.code decimales"]
+    assert (ligne["gravite"], ligne["indicateurs"]) == ("", "")
+    assert _relire(chemin_bilan)["gravite"].tolist().count("majeure") > 0
+    assert chemins_anomalies("2026-03")[0] == dossier_anomalies() / "anomalies_2026-03.csv"
+    assert dossier_anomalies().parts[-2:] == ("data", "anomalies")
+
+
+def test_fichier_ouvert_dans_excel(tmp_path, monkeypatch):
+    anomalies, bilan = _qualifiees()
+    chemin, chemin_bilan = _ecrire(anomalies, bilan, tmp_path)
+    avant = _etat(tmp_path)
+    ouvert = builtins.open
+
+    def ouvrir(fichier, mode="r", *args, **kwargs):
+        if mode == "r+b" and Path(fichier) == chemin_bilan:
+            raise PermissionError(13, "Permission denied")
+        return ouvert(fichier, mode, *args, **kwargs)
+
+    monkeypatch.setattr(module_anomalies, "open", ouvrir, raising=False)
+    with pytest.raises(PermissionError) as erreur:
+        _ecrire(anomalies.iloc[:2], bilan, tmp_path)
+    assert str(chemin_bilan) in str(erreur.value) and str(chemin) not in str(erreur.value)
+    assert "Rien n'a été modifié" in str(erreur.value)
+    assert _etat(tmp_path) == avant
+    monkeypatch.undo()
+
+    # Fichier verrouillé entre la vérification et le remplacement.
+    remplacer = os.replace
+    appels = []
+
+    def remplacer_puis_refuser(source, cible):
+        appels.append(Path(cible).name)
+        if len(appels) == 2:
+            raise PermissionError(13, "Permission denied")
+        remplacer(source, cible)
+
+    monkeypatch.setattr(module_anomalies.os, "replace", remplacer_puis_refuser)
+    with pytest.raises(PermissionError) as erreur:
+        _ecrire(anomalies.iloc[:2], bilan, tmp_path)
+    assert "a déjà été remplacé" in str(erreur.value) and chemin_bilan.name in str(erreur.value)
+    assert sorted(f.name for f in tmp_path.iterdir()) == [chemin.name, chemin_bilan.name]
+    assert len(_relire(chemin)) == 2

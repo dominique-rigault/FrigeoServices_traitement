@@ -24,13 +24,19 @@ d'anomalies et le nombre de lignes sources distinctes en anomalie.
 `reunir_anomalies` et `bilan_controles` laissent vides la gravité et les
 indicateurs affectés; `qualifier` les renseigne d'après config/anomalies.yaml
 (`charger_qualification`) : indicateurs alimentés par chaque colonne, exceptions
-par contrôle. Rien n'est corrigé ni écrit : l'écriture sur disque relève de
-l'étape 5d.
+par contrôle. Rien n'est corrigé.
+
+`ecrire_anomalies` écrit la table qualifiée et son bilan en CSV dans
+data/anomalies/ (`anomalies_AAAA-MM.csv`, `bilan_AAAA-MM.csv`), après avoir vérifié
+qu'aucune valeur sensible n'y est visible; c'est la seule fonction du module qui
+écrit sur disque.
 """
 
 from __future__ import annotations
 
+import csv
 import hashlib
+import os
 import re
 from pathlib import Path
 
@@ -1050,3 +1056,241 @@ def avertissements_qualification(bilan: pd.DataFrame, qualification: dict) -> li
         if nom not in utilises:
             messages.append(f"indicateur {nom} : affecté par aucune colonne ni exception")
     return messages
+
+
+# Écriture de la table des anomalies et du bilan par contrôle (étape 5d).
+SEPARATEUR_CSV = ";"
+SEPARATEUR_DECIMAL_CSV = ","
+DECIMALES_TAUX = 4
+ENCODAGE_CSV = "utf-8-sig"
+FIN_DE_LIGNE_CSV = "\r\n"
+PREFIXE_FICHIER_ANOMALIES = "anomalies_"
+PREFIXE_FICHIER_BILAN = "bilan_"
+SUFFIXE_PROVISOIRE = ".tmp"
+_MOTIF_PERIODE_FIN = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
+_COLONNES_ENTIERES_BILAN = (
+    "controlees",
+    "anomalies",
+    "a_arbitrer",
+    "informations",
+    "lignes_distinctes",
+)
+
+
+def dossier_anomalies() -> Path:
+    """Emplacement par défaut des fichiers écrits : data/anomalies/, hors du dépôt."""
+    return racine_projet() / "data" / "anomalies"
+
+
+def chemins_anomalies(periode_fin: str, dossier: str | Path | None = None) -> tuple[Path, Path]:
+    """Chemins de la table des anomalies et du bilan d'une période (AAAA-MM)."""
+    dossier = dossier_anomalies() if dossier is None else Path(dossier)
+    return (
+        dossier / f"{PREFIXE_FICHIER_ANOMALIES}{periode_fin}.csv",
+        dossier / f"{PREFIXE_FICHIER_BILAN}{periode_fin}.csv",
+    )
+
+
+def _problemes_ecriture(anomalies, bilan, periode_fin, sensibles, declarations) -> list[str]:
+    """Tous les problèmes qui empêchent d'écrire la table et le bilan."""
+    if not isinstance(periode_fin, str) or not _MOTIF_PERIODE_FIN.fullmatch(periode_fin):
+        return [f"période {periode_fin!r} : forme AAAA-MM attendue (par exemple 2026-03)"]
+    problemes = []
+    for nom, donnees, attendues in (
+        ("table des anomalies", anomalies, COLONNES_ANOMALIES),
+        ("bilan par contrôle", bilan, COLONNES_BILAN_ANOMALIES),
+    ):
+        if list(donnees.columns) != list(attendues):
+            problemes.append(
+                f"{nom} : colonnes attendues, dans cet ordre, {', '.join(attendues)}"
+            )
+    if problemes:
+        return problemes
+
+    identifiants = anomalies["id_anomalie"].map(_texte)
+    vides = int((identifiants == "").sum())
+    if vides:
+        problemes.append(f"{vides} lignes sans identifiant (id_anomalie)")
+    repetes = sorted(set(identifiants[identifiants.duplicated() & (identifiants != "")]))
+    if repetes:
+        problemes.append(
+            f"{len(repetes)} identifiants en double ({', '.join(repetes[:5])}"
+            + (", ..." if len(repetes) > 5 else "")
+            + ")"
+        )
+
+    au_bilan = {
+        (etape, controle): (_texte(gravite), _texte(indicateurs))
+        for etape, controle, gravite, indicateurs in zip(
+            bilan["etape"], bilan["controle"], bilan["gravite"], bilan["indicateurs"]
+        )
+    }
+    absents = set()
+    discordants = set()
+    for etape, controle, issue, gravite, indicateurs in zip(
+        anomalies["etape"],
+        anomalies["controle"],
+        anomalies["issue"],
+        anomalies["gravite"],
+        anomalies["indicateurs"],
+    ):
+        if (etape, controle) not in au_bilan:
+            absents.add(f"{etape} : {controle}")
+        elif issue != ISSUE_INFORMATION and au_bilan[(etape, controle)] != (
+            _texte(gravite),
+            _texte(indicateurs),
+        ):
+            discordants.add(f"{etape} : {controle}")
+    if absents:
+        problemes.append(
+            "contrôles de la table des anomalies absents du bilan : " + ", ".join(sorted(absents))
+        )
+
+    a_qualifier = bool((anomalies["issue"] != ISSUE_INFORMATION).any())
+    if a_qualifier and (bilan["gravite"].map(_texte) == "").all():
+        problemes.append(
+            "aucune gravité au bilan : appeler qualifier (cellule GRAVITE ET INDICATEURS) "
+            "avant l'écriture"
+        )
+    elif discordants:
+        problemes.append(
+            "gravité ou indicateurs différents entre la table des anomalies et le bilan "
+            "(les deux doivent venir du même appel à qualifier) : "
+            + ", ".join(sorted(discordants))
+        )
+
+    fautives = anomalies_non_masquees(anomalies, sensibles, declarations)
+    if not fautives.empty:
+        controles = sorted(set(fautives["controle"]))
+        problemes.append(
+            f"{len(fautives)} lignes dont la valeur ou la clé d'une colonne sensible n'est "
+            f"pas masquée (contrôles : {', '.join(controles)})"
+        )
+    return problemes
+
+
+def _table_ecrite(anomalies: pd.DataFrame) -> pd.DataFrame:
+    """Table des anomalies telle qu'écrite : numéro de ligne entier, sans `2.0`."""
+    sortie = anomalies.copy()
+    sortie["num_ligne_source"] = pd.array(
+        [_numero(v) for v in sortie["num_ligne_source"]], dtype="Int64"
+    )
+    return sortie
+
+
+def _bilan_ecrit(bilan: pd.DataFrame) -> pd.DataFrame:
+    """Bilan tel qu'écrit : décomptes entiers, taux à 4 décimales et virgule décimale."""
+    sortie = bilan.copy()
+    for colonne in _COLONNES_ENTIERES_BILAN:
+        sortie[colonne] = pd.array([_numero(v) for v in sortie[colonne]], dtype="Int64")
+
+    def taux(valeur):
+        if valeur is None or pd.isna(valeur):
+            return None
+        texte = f"{float(valeur):.{DECIMALES_TAUX}f}"
+        return texte.replace(".", SEPARATEUR_DECIMAL_CSV)
+
+    sortie["taux"] = pd.Series([taux(v) for v in sortie["taux"]], index=sortie.index, dtype=object)
+    return sortie
+
+
+def _ecrire_csv(donnees: pd.DataFrame, chemin: Path) -> None:
+    donnees.to_csv(
+        chemin,
+        sep=SEPARATEUR_CSV,
+        index=False,
+        encoding=ENCODAGE_CSV,
+        lineterminator=FIN_DE_LIGNE_CSV,
+        quoting=csv.QUOTE_MINIMAL,
+    )
+    relu = pd.read_csv(
+        chemin,
+        sep=SEPARATEUR_CSV,
+        encoding=ENCODAGE_CSV,
+        dtype=str,
+        keep_default_na=False,
+    )
+    if list(relu.columns) != list(donnees.columns) or len(relu) != len(donnees):
+        raise RuntimeError(f"La relecture de {chemin.name} diffère de la table écrite")
+
+
+def _verrouille(chemin: Path) -> bool:
+    """Vrai si un fichier existant ne peut pas être ouvert en écriture (ouvert dans Excel)."""
+    if not chemin.exists():
+        return False
+    try:
+        with open(chemin, "r+b"):
+            pass
+    except PermissionError:
+        return True
+    return False
+
+
+def ecrire_anomalies(
+    anomalies: pd.DataFrame,
+    bilan: pd.DataFrame,
+    periode_fin: str,
+    dossier: str | Path | None = None,
+    sensibles: dict[str, frozenset[str]] | None = None,
+    declarations: dict | None = None,
+) -> tuple[Path, Path]:
+    """Écrit la table des anomalies et le bilan par contrôle en CSV.
+
+    `anomalies` et `bilan` viennent de `qualifier`. Les fichiers sont
+    `anomalies_AAAA-MM.csv` et `bilan_AAAA-MM.csv`, dans `dossier`
+    (par défaut data/anomalies/, créé s'il manque), réécrits à chaque exécution,
+    sans copie de sauvegarde (ils se régénèrent à partir des données et de la
+    configuration). Rend les deux chemins.
+
+    Format : UTF-8 avec BOM, séparateur « ; », fins de ligne CRLF, valeurs écrites
+    telles quelles (entre guillemets si elles contiennent le séparateur, des
+    guillemets ou un retour à la ligne), cellule vide pour une valeur absente,
+    numéro de ligne entier; au bilan, taux à 4 décimales avec une virgule.
+
+    Refuse (`ValueError`, tous les problèmes listés, sans créer ni toucher aucun
+    fichier) : une période qui n'est pas de la forme AAAA-MM, des colonnes autres
+    que `COLONNES_ANOMALIES` et `COLONNES_BILAN_ANOMALIES` (dans cet ordre), un
+    identifiant vide ou en double, un contrôle absent du bilan, une table qui n'est
+    pas passée par `qualifier` (aucune gravité au bilan alors qu'il y a des
+    anomalies ou des écarts à arbitrer) ou dont la gravité diffère de celle du
+    bilan, une valeur ou une clé d'une colonne sensible non masquée
+    (`anomalies_non_masquees`).
+
+    Écriture tout ou rien : les deux fichiers sont écrits et relus en provisoire,
+    puis remplacent les anciens. Si l'un des anciens fichiers est ouvert (dans
+    Excel), `PermissionError` dit lequel fermer, et les deux anciens fichiers
+    restent intacts.
+    """
+    problemes = _problemes_ecriture(anomalies, bilan, periode_fin, sensibles, declarations)
+    if problemes:
+        raise ValueError("Écriture refusée\n  " + "\n  ".join(problemes))
+
+    chemins = chemins_anomalies(periode_fin, dossier)
+    provisoires = [c.with_name(c.name + SUFFIXE_PROVISOIRE) for c in chemins]
+    chemins[0].parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _ecrire_csv(_table_ecrite(anomalies), provisoires[0])
+        _ecrire_csv(_bilan_ecrit(bilan), provisoires[1])
+        ouverts = [c for c in chemins if _verrouille(c)]
+        if ouverts:
+            raise PermissionError(
+                "Fichier ouvert, sans doute dans Excel : le fermer, puis relancer l'écriture. "
+                "Rien n'a été modifié.\n  " + "\n  ".join(str(c) for c in ouverts)
+            )
+        for rang, (provisoire, chemin) in enumerate(zip(provisoires, chemins)):
+            try:
+                os.replace(provisoire, chemin)
+            except PermissionError as erreur:
+                deja = (
+                    f" {chemins[0].name} a déjà été remplacé, {chemin.name} ne l'a pas été : "
+                    "relancer l'écriture une fois le fichier fermé."
+                    if rang
+                    else " Rien n'a été modifié."
+                )
+                raise PermissionError(
+                    f"Fichier ouvert, sans doute dans Excel : {chemin}.{deja}"
+                ) from erreur
+    finally:
+        for provisoire in provisoires:
+            provisoire.unlink(missing_ok=True)
+    return chemins
