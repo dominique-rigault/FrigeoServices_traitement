@@ -1,6 +1,6 @@
 # Mode opératoire d'un cycle de traitement
 
-Document à l'usage du consultant. Il décrit, dans l'ordre chronologique, ce que font le consultant, le métier du client et l'assistant LLM pour traiter les exports d'un client avec cet outil, jusqu'à l'étape 4 comprise. Il sera complété avec les étapes 5 et suivantes.
+Document à l'usage du consultant. Il décrit, dans l'ordre chronologique, ce que font le consultant, le métier du client et l'assistant LLM pour traiter les exports d'un client avec cet outil, jusqu'à l'étape 5 comprise. Il sera complété avec les étapes 6 et suivantes.
 
 ## Rôles et règles communes
 
@@ -111,17 +111,39 @@ Une forme fixe (code postal, SIRET, téléphone) ne va pas dans ce formulaire :
 
 Le code d'un type nouveau va dans `src/`, jamais dans le notebook ni dans une fonction propre au client. `config/controles.yaml` doit exister avant le notebook 04 : sa clé `doublons` donne la clé affichée et les doublons écartés des rapprochements.
 
+### Phase 7, table des anomalies (notebook 05)
+
+| N° | Action | Qui | Outil | État |
+| --- | --- | --- | --- | --- |
+| 7.1 | Arrêter avec le métier les indicateurs que suivra le client et, pour chaque colonne, les indicateurs qu'elle alimente; désigner les contrôles dont une anomalie est bloquante | M avec C | formulaire | à créer |
+| 7.2 | Rédiger `config/anomalies.yaml` (clés `indicateurs`, `colonnes`, `exceptions`) et le vérifier par `charger_qualification` puis `problemes_qualification` | A, puis C (dépôt dans `config/`) | formulaire 7.1, liste des colonnes | opérationnel |
+| 7.3 | Exécuter le notebook en entier (il relance les contrôles des notebooks 03 et 04, environ 45 secondes) et vérifier : 0 ligne dont la valeur ou la clé sensible n'est pas masquée, nombres d'indicateurs, de colonnes déclarées et d'exceptions lus (emplacement attendu), avertissements, contrôles non qualifiés, colonnes non déclarées | C | notebook 05 | opérationnel |
+| 7.4 | Déclarer les colonnes non déclarées et qualifier les contrôles non qualifiés dans `config/anomalies.yaml`, puis relancer la cellule `# GRAVITE ET INDICATEURS` et les suivantes | A, puis C | liste de la cellule `# GRAVITE ET INDICATEURS` | opérationnel |
+| 7.5 | Lire le bilan avec le métier (anomalies par étape et par gravité, contrôles aux plus forts taux) et nuancer par des exceptions une gravité par défaut trop grossière | M avec C | bilan, `config/anomalies.yaml` | opérationnel |
+| 7.6 | Écrire la table et le bilan en CSV dans `data/anomalies/` (cellule `# ECRITURE`); un CSV ouvert dans Excel bloque l'écriture sans rien modifier : le fermer et relancer la cellule | C | notebook 05 | opérationnel |
+| 7.7 | Ouvrir les CSV dans Excel par Données, À partir d'un fichier texte/CSV, détection du type de données réglée sur « Ne pas détecter les types de données » | C, M | Excel | opérationnel |
+
+Repères pour la phase 7 :
+
+- la liste des colonnes à déclarer (`colonnes_non_declarees`) ne contient que des noms de tables et de colonnes : elle peut être transmise à l'assistant;
+- les indicateurs affectés sont une déclaration du consultant, validée par le métier, et non un calcul; la gravité par défaut est « majeure » dès qu'une colonne alimente un indicateur, « mineure » sinon, et « bloquante » seulement par exception;
+- les CSV portent des valeurs du client (valeurs constatées, clés) : ils restent hors dépôt et ne se collent pas dans la conversation; seuls les décomptes du bilan se transmettent;
+- ouvert par double-clic, Excel retire les zéros en tête, écrit un SIRET en notation scientifique, lit `2026-03` comme une date et une valeur commençant par `=` comme une formule, d'où l'étape 7.7;
+- l'écriture refuse une table où une valeur sensible serait visible, ou qui n'est pas passée par `qualifier`; les deux fichiers sont réécrits à chaque exécution, sans copie de sauvegarde.
+
 ## Cycle mensuel (un mois de plus)
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
 | M.1 | Déposer les exports du mois (période dans le nom, par exemple dans `data/raw/2026/2026-04/`), et les référentiels s'ils ont changé | M, C | Explorateur | opérationnel |
-| M.2 | Mettre `PERIODE_FIN` à jour dans chaque notebook exécuté | C | notebooks 01, 02c, 03, 04 | opérationnel |
+| M.2 | Mettre `PERIODE_FIN` à jour dans chaque notebook exécuté | C | notebooks 01, 02c, 03, 04, 05 | opérationnel |
 | M.3 | Exécuter le notebook 01 (fichiers attendus, en-têtes, lignes chargées) | C | notebook 01 | à adapter |
 | M.4 | Exécuter le notebook 02 seulement si un format nouveau est soupçonné | C | notebook 02 | à adapter |
 | M.5 | Régénérer le dictionnaire : cellules jusqu'à `# ECRITURE APRES FUSION`, lire le rapport de `# FUSION` (événements « à regarder ») | C | notebook 02c | opérationnel |
 | M.6 | Revue si de nouvelles valeurs ou formes sont à arbitrer (phase 4, étapes 4.4 à 4.6) | M avec C | Excel, notebook 02c | opérationnel |
 | M.7 | Exécuter les notebooks 03 puis 04 en entier | C | notebooks 03, 04 | opérationnel |
+| M.8 | Exécuter le notebook 05 en entier : il relance les contrôles et réécrit les deux CSV de la période dans `data/anomalies/` | C | notebook 05 | opérationnel |
+| M.9 | Revoir `config/anomalies.yaml` quand une colonne ou un indicateur change (le notebook 05 liste les colonnes non déclarées et les contrôles non qualifiés) | A, puis C | `config/anomalies.yaml` | opérationnel |
 
 Une fois par an : compléter les jours fériés de l'année suivante dans `config/gestion.yaml` (le notebook 04 avertit quand une année manque) et vérifier que les paramètres annuels du client couvrent la nouvelle année.
 
@@ -131,3 +153,4 @@ Une fois par an : compléter les jours fériés de l'année suivante dans `conf
 - **Formulaires.** Les formulaires des règles de contrôle et des règles de gestion restent à concevoir (forme, et passage du formulaire au YAML).
 - **Rapport.** Le rapport au client (plan, destinataire, format) n'est pas encore défini; les parties 2.5 et 3.3 en sont les premières briques.
 - **Découverte des encodages et séparateurs.** Ils sont déclarés à la main dans `config/sources.yaml`; l'étape qui les proposerait n'est pas faite.
+- **Décisions du métier ligne par ligne.** Les décisions sur les écarts à arbitrer (dates à corriger, doublons) ne sont pas encore retenues d'un mois à l'autre; l'identifiant `id_anomalie` de la table des anomalies servira de repère au mécanisme qui les conservera.
