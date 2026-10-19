@@ -1,0 +1,385 @@
+"""Règles de nettoyage (étape 6).
+
+Ce module ne contient rien de propre à un client. Il applique aux tables chargées
+des règles de nettoyage explicites, dans un ordre fixé ici, sans jamais modifier les
+tables reçues : `nettoyer` travaille sur une copie, et chaque ligne garde son
+lignage. Chaque règle tire ses paramètres de ce qui existe déjà (règle générique,
+dictionnaire, déclarations de doublons, décisions du métier) : aucun fichier de
+configuration ne lui est propre.
+
+La représentation de la source est conservée : une date en texte reste un texte,
+un nombre natif reste un nombre, seule la valeur change. Les contrôles des étapes 3
+à 5 s'appliquent donc sans changement aux tables nettoyées; la conversion des types
+relève du chargement en base (voir `typage.lire`).
+
+Une valeur que la règle ne sait pas corriger sans ambiguïté reste telle quelle : elle
+reste une anomalie, et le bilan dit pourquoi elle n'a pas été corrigée. Rien n'est
+deviné.
+
+Règles, dans l'ordre (voir `catalogue_nettoyage`) :
+
+- `encodage` : réparation des textes UTF-8 relus dans un encodage d'un octet
+  (Windows-1252, ISO-8859-15 ou Latin-1), repérés comme à l'étape 3 par
+  `controles.constats_encodage` (voir `reparer_encodage`).
+
+`nettoyer` rend les tables nettoyées, le journal des corrections (une ligne par
+cellule modifiée, avec sa valeur avant et après) et un bilan par règle et par
+colonne. Rien n'est écrit sur disque.
+"""
+
+from __future__ import annotations
+
+from collections import Counter, namedtuple
+
+import pandas as pd
+
+from .confidentialite import charger_sensibilite, est_sensible, verifier_sensibilite
+from .controles import (
+    CARACTERE_REMPLACEMENT,
+    COLONNES_LIGNAGE_ECART,
+    ENCODAGES_SUSPECTS,
+    VALEUR_MASQUEE,
+    _REPERTOIRE,
+    _SEQUENCE_UTF8,
+    _colonnes_de_donnees,
+    _octets,
+    _problemes_de_correspondance,
+    _valeur_constatee,
+    constats_encodage,
+)
+from .dictionnaire import _valeurs_renseignees, est_masquee, problemes_dictionnaire
+from .doublons import SEPARATEUR, _texte, charger_declarations_doublons
+
+REGLE_ENCODAGE = "encodage"
+REGLES_NETTOYAGE = (REGLE_ENCODAGE,)
+
+ACTION_MODIFIEE = "valeur modifiée"
+SOURCE_GENERIQUE = "règle générique"
+
+RAISON_REMPLACEMENT = "caractère de remplacement"
+RAISON_DESACCORD = "encodages en désaccord"
+MAX_PASSES = 5
+RAISON_PASSES = f"séquence toujours présente après {MAX_PASSES} passes"
+RAISONS_ENCODAGE = (RAISON_REMPLACEMENT, RAISON_DESACCORD, RAISON_PASSES)
+
+COLONNE_PERIODE = "periode_export"
+COLONNES_JOURNAL = (
+    "regle_nettoyage",
+    "table",
+    *COLONNES_LIGNAGE_ECART,
+    COLONNE_PERIODE,
+    "cle",
+    "colonne",
+    "action",
+    "source",
+    "valeur_avant",
+    "valeur_apres",
+    "detail",
+)
+COLONNES_BILAN_NETTOYAGE = (
+    "regle_nettoyage",
+    "table",
+    "colonne",
+    "visees",
+    "corrigees",
+    "non_corrigees",
+    "raisons",
+)
+COLONNES_CATALOGUE_NETTOYAGE = ("rang", "regle_nettoyage", "source", "corrige", "ne_corrige_jamais")
+
+_CATALOGUE = {
+    REGLE_ENCODAGE: (
+        SOURCE_GENERIQUE,
+        "toute cellule de texte signalée par la règle encodage de l'étape 3 : chaque "
+        "séquence d'un texte UTF-8 relu en Windows-1252, ISO-8859-15 ou Latin-1 est "
+        f"remplacée par son caractère, passe après passe, au plus {MAX_PASSES} passes",
+        "une cellule qui contient le caractère de remplacement (information perdue); "
+        "une portion de texte que deux encodages réparent en deux caractères "
+        f"différents; une séquence encore présente après {MAX_PASSES} passes",
+    ),
+}
+
+Nettoyage = namedtuple("Nettoyage", ["tables", "journal", "bilan"])
+Nettoyage.__doc__ = """Résultat de `nettoyer` : tables nettoyées, journal et bilan."""
+
+Reparation = namedtuple("Reparation", ["texte", "raison", "passes", "encodages"])
+Reparation.__doc__ = """Résultat de `reparer_encodage`.
+
+`texte` est le texte réparé (le texte reçu s'il n'y avait rien à réparer), None si
+la réparation est refusée; `raison` dit pourquoi elle l'est (None sinon);
+`passes` est le nombre de passes qui ont modifié le texte; `encodages` les encodages
+qui ont repéré au moins une séquence, dans l'ordre de `ENCODAGES_SUSPECTS`.
+"""
+
+
+def catalogue_nettoyage() -> pd.DataFrame:
+    """Règles de nettoyage dans leur ordre d'application, avec leur source, ce
+    qu'elles corrigent et ce qu'elles ne corrigent jamais."""
+    return pd.DataFrame(
+        [
+            {
+                "rang": rang,
+                "regle_nettoyage": regle,
+                "source": _CATALOGUE[regle][0],
+                "corrige": _CATALOGUE[regle][1],
+                "ne_corrige_jamais": _CATALOGUE[regle][2],
+            }
+            for rang, regle in enumerate(REGLES_NETTOYAGE, start=1)
+        ],
+        columns=list(COLONNES_CATALOGUE_NETTOYAGE),
+    )
+
+
+def _portions(texte: str, encodage: str) -> dict[tuple[int, int], str]:
+    """Portions du texte à remplacer pour un encodage : {(début, fin): caractère}.
+
+    Le texte est réécrit dans l'encodage comme pour le contrôle (`_octets`); ces
+    encodages étant d'un octet, la position d'un octet est celle de son caractère.
+    Seules comptent les séquences dont le caractère appartient au répertoire des
+    encodages suspects, comme pour le contrôle.
+    """
+    portions = {}
+    for trouve in _SEQUENCE_UTF8.finditer(_octets(texte, encodage)):
+        caractere = trouve.group().decode("utf-8")
+        if caractere in _REPERTOIRE:
+            portions[(trouve.start(), trouve.end())] = caractere
+    return portions
+
+
+def _appliquer(texte: str, portions: dict[tuple[int, int], str]) -> str:
+    morceaux, fin = [], 0
+    for (debut, suite), caractere in sorted(portions.items()):
+        morceaux.append(texte[fin:debut])
+        morceaux.append(caractere)
+        fin = suite
+    morceaux.append(texte[fin:])
+    return "".join(morceaux)
+
+
+def _reunir(par_encodage: list[dict]) -> dict | None:
+    """Réparations de tous les encodages, None si deux d'entre elles se contredisent
+    (portions qui se chevauchent sans être la même portion réparée par le même
+    caractère)."""
+    reunies: dict[tuple[int, int], str] = {}
+    for portions in par_encodage:
+        for portion, caractere in portions.items():
+            for autre, sien in reunies.items():
+                chevauche = portion[0] < autre[1] and autre[0] < portion[1]
+                if chevauche and (portion, caractere) != (autre, sien):
+                    return None
+            reunies[portion] = caractere
+    return reunies
+
+
+def reparer_encodage(texte: str) -> Reparation:
+    """Répare un texte UTF-8 relu dans un encodage d'un octet.
+
+    À chaque passe, chaque encodage de `ENCODAGES_SUSPECTS` donne les séquences
+    qu'il repère (comme `controles.constats_encodage`), chacune remplacée par son
+    caractère, le reste du texte étant gardé tel quel. Les réparations des
+    encodages sont réunies : elles ne sont refusées que si une même portion de texte
+    est réparée en deux caractères différents (`Ã€` donne `À` en Windows-1252 et
+    `ä` en ISO-8859-15). Les passes se répètent tant qu'une séquence reste (texte
+    mal décodé plusieurs fois), au plus `MAX_PASSES`.
+
+    Réparation refusée, avec sa raison : texte qui contient le caractère de
+    remplacement (non touché, l'information est perdue), réparations en désaccord,
+    séquence encore présente après `MAX_PASSES` passes. Un texte sans séquence est
+    rendu tel quel, avec 0 passe.
+    """
+    if CARACTERE_REMPLACEMENT in texte:
+        return Reparation(None, RAISON_REMPLACEMENT, 0, ())
+    reperent: set[str] = set()
+
+    def encodages() -> tuple[str, ...]:
+        return tuple(e for e in ENCODAGES_SUSPECTS if e in reperent)
+
+    for passe in range(MAX_PASSES):
+        par_encodage = {e: _portions(texte, e) for e in ENCODAGES_SUSPECTS}
+        par_encodage = {e: p for e, p in par_encodage.items() if p}
+        if not par_encodage:
+            return Reparation(texte, None, passe, encodages())
+        reperent.update(par_encodage)
+        reunies = _reunir(list(par_encodage.values()))
+        if reunies is None:
+            return Reparation(None, RAISON_DESACCORD, passe + 1, encodages())
+        texte = _appliquer(texte, reunies)
+    if any(_portions(texte, e) for e in ENCODAGES_SUSPECTS):
+        return Reparation(None, RAISON_PASSES, MAX_PASSES, encodages())
+    return Reparation(texte, None, MAX_PASSES, encodages())
+
+
+def _detail_encodage(reparation: Reparation) -> str:
+    passes = "1 passe" if reparation.passes == 1 else f"{reparation.passes} passes"
+    return f"repéré en {', '.join(reparation.encodages)}; {passes}"
+
+
+def _encodage(serie: pd.Series):
+    """Règle `encodage` sur une colonne : cellules visées, corrections et raisons.
+
+    Rend None si aucune cellule n'est visée, sinon (positions visées, {position:
+    réparation acceptée}, Counter des raisons). Les cellules visées sont celles que
+    la règle `encodage` de l'étape 3 signale (séquence d'un mauvais décodage ou
+    caractère de remplacement).
+    """
+    presentes = _valeurs_renseignees(serie.reset_index(drop=True))
+    textes = presentes[[isinstance(v, str) for v in presentes]]
+    suspects = {v for v in textes.unique() if constats_encodage(v)}
+    if not suspects:
+        return None
+    visees = textes[textes.isin(suspects)]
+    reparations = {v: reparer_encodage(v) for v in suspects}
+    acceptees, raisons = {}, Counter()
+    for position, valeur in visees.items():
+        reparation = reparations[valeur]
+        if reparation.texte is None:
+            raisons[reparation.raison] += 1
+        elif reparation.texte != valeur:
+            acceptees[position] = reparation
+        else:
+            # Hors caractère de remplacement, une cellule signalée a toujours une
+            # séquence à réparer : ce cas ne se produit pas, il serait compté plutôt
+            # que passé sous silence.
+            raisons[RAISON_PASSES] += 1
+    return list(visees.index), acceptees, raisons
+
+
+def _texte_raisons(raisons: Counter, ordre) -> str | None:
+    morceaux = [f"{raison} {raisons[raison]}" for raison in ordre if raisons[raison]]
+    return "; ".join(morceaux) or None
+
+
+def nettoyer(
+    tables: dict[str, pd.DataFrame],
+    dictionnaire: dict,
+    sensibles: dict[str, frozenset[str]] | None = None,
+    declarations: dict | None = None,
+) -> Nettoyage:
+    """Applique les règles de nettoyage et rend les tables nettoyées, le journal des
+    corrections et le bilan.
+
+    `dictionnaire` est le dictionnaire enregistré : il doit décrire exactement les
+    tables et colonnes chargées (sinon `ValueError`, comme pour les contrôles); il
+    marque aussi des colonnes sensibles. `sensibles` (config/sensibilite.yaml par
+    défaut) est vérifiée avant tout (`RuntimeError` si elle est incohérente).
+    `declarations` (bloc `doublons` de config/controles.yaml par défaut) donne la clé
+    de chaque table, reprise dans le journal.
+
+    Tables nettoyées : copies des tables reçues, mêmes colonnes, même index, mêmes
+    types de colonnes, lignage compris; seules les cellules corrigées changent. Les
+    tables reçues ne sont pas modifiées.
+
+    Journal (`COLONNES_JOURNAL`) : une ligne par cellule modifiée, dans l'ordre des
+    règles, puis des tables, puis des lignes, puis des colonnes. `cle` est la clé
+    déclarée de la ligne, lue dans la table reçue (vide sans clé déclarée, « masqué »
+    si une colonne de la clé est sensible); `valeur_avant` et `valeur_apres` valent
+    « masqué » pour une colonne sensible, la valeur brute restant retrouvable par le
+    lignage; `detail` précise la correction (pour l'encodage, les encodages qui ont
+    repéré une séquence et le nombre de passes).
+
+    Bilan (`COLONNES_BILAN_NETTOYAGE`) : une ligne par règle et par colonne qui a au
+    moins une cellule visée, avec les cellules visées, corrigées, non corrigées, et
+    le décompte des raisons de non-correction (textes séparés par « ; »).
+    """
+    if sensibles is None:
+        sensibles = charger_sensibilite()
+    problemes = verifier_sensibilite(tables, sensibles)
+    if problemes:
+        raise RuntimeError(
+            "Classification de sensibilité incohérente\n  " + "\n  ".join(problemes)
+        )
+    problemes = problemes_dictionnaire(dictionnaire)
+    if problemes:
+        raise ValueError("Dictionnaire invalide\n  " + "\n  ".join(problemes))
+    problemes = _problemes_de_correspondance(tables, dictionnaire)
+    if problemes:
+        raise ValueError(
+            "Le dictionnaire ne décrit pas les données chargées : il est à régénérer "
+            "(notebook 02c_dictionnaire)\n  " + "\n  ".join(problemes)
+        )
+    if declarations is None:
+        declarations = charger_declarations_doublons()
+
+    nettoyees = {table: donnees.copy() for table, donnees in tables.items()}
+    journal, bilan = [], []
+    for rang_table, (table, donnees) in enumerate(tables.items()):
+        brutes = donnees.reset_index(drop=True)
+        cle = [c for c in declarations.get(table, {}).get("cle", []) if c in brutes.columns]
+        cle_masquee = any(est_sensible(sensibles, table, c) for c in cle)
+        for rang_colonne, colonne in enumerate(_colonnes_de_donnees(brutes)):
+            regles = dictionnaire[table][colonne]
+            masquee = (
+                est_sensible(sensibles, table, colonne)
+                or est_masquee(regles["valeurs"])
+                or est_masquee(regles["format"])
+            )
+            resultat = _encodage(brutes[colonne])
+            if resultat is None:
+                continue
+            visees, acceptees, raisons = resultat
+            bilan.append(
+                {
+                    "regle_nettoyage": REGLE_ENCODAGE,
+                    "table": table,
+                    "colonne": colonne,
+                    "visees": len(visees),
+                    "corrigees": len(acceptees),
+                    "non_corrigees": len(visees) - len(acceptees),
+                    "raisons": _texte_raisons(raisons, RAISONS_ENCODAGE),
+                }
+            )
+            if not acceptees:
+                continue
+            positions = sorted(acceptees)
+            nouvelle = nettoyees[table][colonne].copy()
+            rang = nettoyees[table].columns.get_loc(colonne)
+            for position in positions:
+                nouvelle.iloc[position] = acceptees[position].texte
+            nettoyees[table].isetitem(rang, nouvelle)
+            for position in positions:
+                ligne = brutes.iloc[position]
+                if not cle:
+                    texte_cle = None
+                elif cle_masquee:
+                    texte_cle = VALEUR_MASQUEE
+                else:
+                    texte_cle = SEPARATEUR.join(_texte(ligne[c]) for c in cle)
+                periode = _texte(ligne[COLONNE_PERIODE]) if COLONNE_PERIODE in brutes else ""
+                journal.append(
+                    {
+                        "regle_nettoyage": REGLE_ENCODAGE,
+                        "table": table,
+                        **{
+                            c: (ligne[c] if c in brutes.columns else None)
+                            for c in COLONNES_LIGNAGE_ECART
+                        },
+                        COLONNE_PERIODE: periode or None,
+                        "cle": texte_cle,
+                        "colonne": colonne,
+                        "action": ACTION_MODIFIEE,
+                        "source": SOURCE_GENERIQUE,
+                        "valeur_avant": (
+                            VALEUR_MASQUEE if masquee else _valeur_constatee(ligne[colonne])
+                        ),
+                        "valeur_apres": (
+                            VALEUR_MASQUEE if masquee else acceptees[position].texte
+                        ),
+                        "detail": _detail_encodage(acceptees[position]),
+                        "_table": rang_table,
+                        "_position": position,
+                        "_colonne": rang_colonne,
+                    }
+                )
+
+    if journal:
+        # Colonnes de type objet : une cellule vide reste None, quelle que soit la
+        # version de pandas.
+        journal = pd.DataFrame(journal, dtype=object).sort_values(
+            ["_table", "_position", "_colonne"], kind="stable"
+        )
+        journal = journal[list(COLONNES_JOURNAL)].reset_index(drop=True)
+    else:
+        journal = pd.DataFrame(columns=list(COLONNES_JOURNAL), dtype=object)
+    bilan = pd.DataFrame(bilan, columns=list(COLONNES_BILAN_NETTOYAGE), dtype=object)
+    bilan = bilan.astype({"visees": int, "corrigees": int, "non_corrigees": int})
+    return Nettoyage(nettoyees, journal, bilan)
