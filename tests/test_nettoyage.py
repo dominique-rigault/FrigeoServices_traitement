@@ -2,7 +2,7 @@
 
 from collections import Counter
 from copy import deepcopy
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 import pytest
@@ -354,9 +354,11 @@ def test_catalogue_nettoyage():
     assert _lignes(catalogue, "rang", "regle_nettoyage", "source") == [
         (1, "encodage", "règle générique"),
         (2, "remplacement", "dictionnaire"),
+        (3, "nature", "règle générique"),
     ]
     assert "caractère de remplacement" in catalogue.at[0, "ne_corrige_jamais"]
     assert "hors liste" in catalogue.at[1, "ne_corrige_jamais"]
+    assert "date impossible" in catalogue.at[2, "ne_corrige_jamais"]
 
 
 # --- remplacement -------------------------------------------------------------
@@ -488,3 +490,182 @@ def test_remplacement_sur_colonne_sensible_masque():
     assert _lignes(resultat.journal, "cle", "valeur_avant", "valeur_apres", "detail") == [
         ("a", VALEUR_MASQUEE, VALEUR_MASQUEE, "valeur invalidée le 2026-10-08"),
     ]
+
+
+# --- nature -------------------------------------------------------------------
+
+COUPURE = date(2026, 3, 31)
+
+
+def _nature(valeurs, nature, sensibles=AUCUNE_SENSIBLE, date_coupure=COUPURE):
+    """Nettoie une colonne « v » de la nature donnée; rend (valeurs nettoyées,
+    journal, bilan)."""
+    tables = {"t": _table(v=list(valeurs))}
+    dictionnaire = _dictionnaire(tables, **{"t.v": _colonne(nature)})
+    resultat = nettoyer(tables, dictionnaire, sensibles, AUCUNE_DECLARATION, date_coupure)
+    return list(resultat.tables["t"]["v"]), resultat.journal, resultat.bilan, (
+        tables, dictionnaire, resultat.tables
+    )
+
+
+def test_nature_dates_en_texte():
+    valeurs, journal, bilan, _ = _nature(
+        [
+            "14/03/2025",
+            "2025-03-14",
+            "14.03.2025",
+            "14-03-2025",
+            "20250314",
+            "14/03/25",
+            "14.03.25",
+            datetime(2025, 3, 14),
+            "31/02/2025",
+            "15/06/98",
+            datetime(2025, 3, 14, 10, 30),
+            45,
+            "1h30",
+            "14/3/2025",
+            "10:30",
+            "14/03-2025",
+        ],
+        "date JJ/MM/AAAA",
+    )
+    assert valeurs[:8] == ["14/03/2025"] * 8
+    assert valeurs[8:] == [
+        "31/02/2025", "15/06/98", datetime(2025, 3, 14, 10, 30), 45, "1h30", "14/3/2025",
+        "10:30", "14/03-2025",
+    ]
+    assert set(journal["source"]) == {"règle générique"}
+    assert _lignes(journal, "regle_nettoyage", "num_ligne_source", "valeur_avant", "detail") == [
+        ("nature", 3, "2025-03-14", "forme lue 9999-99-99"),
+        ("nature", 4, "14.03.2025", "forme lue 99.99.9999"),
+        ("nature", 5, "14-03-2025", "forme lue 99-99-9999"),
+        ("nature", 6, "20250314", "forme lue 99999999"),
+        ("nature", 7, "14/03/25", "forme lue 99/99/99, siècle 20 ajouté"),
+        ("nature", 8, "14.03.25", "forme lue 99.99.99, siècle 20 ajouté"),
+        ("nature", 9, "2025-03-14 00:00:00", "forme lue 9999-99-99 99:99:99"),
+    ]
+    assert _lignes(bilan, *COLONNES_BILAN_NETTOYAGE) == [
+        ("nature", "t", "v", 15, 7, 8,
+         "date impossible 1; année sur deux chiffres, date future 1; date avec une heure 1; "
+         "autre famille de nature 2; forme non reconnue 3"),
+    ]
+
+
+def test_nature_date_native_et_date_de_coupure():
+    valeurs, journal, bilan, _ = _nature(
+        ["04/09/2019", "2019-09-04", "04-09-19", "31/03/26", "01/04/26", datetime(2020, 1, 1)],
+        "date native",
+    )
+    assert valeurs == [
+        datetime(2019, 9, 4), datetime(2019, 9, 4), datetime(2019, 9, 4), datetime(2026, 3, 31),
+        "01/04/26", datetime(2020, 1, 1),
+    ]
+    assert all(type(v) is datetime for v in valeurs if not isinstance(v, str))
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (5, 4, "année sur deux chiffres, date future 1")
+    ]
+    # Sans date de coupure, une année sur deux chiffres n'est jamais complétée.
+    valeurs, journal, bilan, _ = _nature(["04-09-19", "2019-09-04"], "date native",
+                                         date_coupure=None)
+    assert valeurs == ["04-09-19", datetime(2019, 9, 4)]
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (2, 1, "année sur deux chiffres, date de coupure non fournie 1")
+    ]
+
+
+def test_nature_nombre_natif():
+    valeurs, journal, bilan, _ = _nature(
+        [
+            1.5,
+            "181,45 €",
+            "181.45",
+            "1 234,50",
+            "1" + INSECABLE + "234,50 €",
+            "1" + chr(0x202F) + "234",
+            "-12,5",
+            "95",
+            "1.234",
+            "45 min",
+            "1h30",
+            "14/03/2025",
+            "12 $",
+            "12,5€",
+            "abc",
+        ],
+        "nombre natif",
+    )
+    assert valeurs == [
+        1.5, 181.45, 181.45, 1234.5, 1234.5, 1234.0, -12.5, 95.0, "1.234", "45 min", "1h30",
+        "14/03/2025", "12 $", 12.5, "abc",
+    ]
+    assert all(type(v) is float for v in valeurs if not isinstance(v, str))
+    assert _lignes(journal, "num_ligne_source", "detail") == [
+        (3, "forme lue 999,99 €"),
+        (4, "forme lue 999.99"),
+        (5, "forme lue 9 999,99"),
+        (6, "forme lue 9" + INSECABLE + "999,99 €"),
+        (7, "forme lue 9" + chr(0x202F) + "999"),
+        (8, "forme lue -99,9"),
+        (9, "forme lue 99"),
+        (15, "forme lue 99,9€"),
+    ]
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (14, 8, "valeur avec une unité 2; séparateur ambigu 1; autre famille de nature 1; "
+                "forme non reconnue 2"),
+    ]
+
+
+def test_nature_nombres_en_texte():
+    valeurs, *_ = _nature(
+        ["12,30", "999.99", "9 999,99", "95", 95.5, "12,30 €", "-0.50", 7],
+        "décimal virgule (texte)",
+    )
+    assert valeurs == ["12,30", "999,99", "9999,99", "95,0", "95,5", "12,30", "-0,50", "7,0"]
+    valeurs, *_ = _nature(["12.30", "12,30", "95"], "décimal point (texte)")
+    assert valeurs == ["12.30", "12.30", "95.0"]
+    valeurs, _, bilan, _ = _nature(
+        ["12", "99 999", "12,0", "12,00 €", "12,5", 7.0, 7.5, "1h30"], "entier (texte)"
+    )
+    assert valeurs == ["12", "99999", "12", "12", "12,5", "7", 7.5, "1h30"]
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (7, 4, "valeur avec une unité 1; partie décimale non nulle 2"),
+    ]
+
+
+def test_nature_heure_et_colonne_texte():
+    valeurs, journal, bilan, _ = _nature(["08:00", "7:30", "45", "07h30"], "heure HH:MM")
+    assert valeurs == ["08:00", "7:30", "45", "07h30"]
+    assert journal.empty
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (3, 0, "autre famille de nature 1; forme non reconnue 2"),
+    ]
+    # Une colonne de texte n'a pas de contrôle de nature : rien n'est visé.
+    valeurs, journal, bilan, _ = _nature(["2025-03-14", "1 234,50"], "texte")
+    assert valeurs == ["2025-03-14", "1 234,50"] and journal.empty and bilan.empty
+
+
+def test_nature_coherente_avec_le_controle():
+    # Après nettoyage, seules les cellules non converties restent hors nature.
+    for valeurs, nature in (
+        (["14.03.2025", "31/02/2025", "14/03/25", datetime(2025, 3, 14), "x"], "date JJ/MM/AAAA"),
+        (["181,45 €", "1.234", 3, "9 999,99"], "nombre natif"),
+        (["999.99", "9 999,99", "1h30"], "décimal virgule (texte)"),
+        (["99 999", "12,5", "12,0"], "entier (texte)"),
+    ):
+        _, _, bilan, (tables, dictionnaire, nettoyees) = _nature(valeurs, nature)
+        avant, _ = controler(tables, dictionnaire, AUCUNE_SENSIBLE, {})
+        apres, _ = controler(nettoyees, dictionnaire, AUCUNE_SENSIBLE, {})
+        hors = (avant["regle"] == "nature").sum()
+        assert hors == bilan.at[0, "visees"], nature
+        assert (apres["regle"] == "nature").sum() == bilan.at[0, "non_corrigees"], nature
+
+
+def test_nature_colonne_sensible_masquee():
+    valeurs, journal, _, _ = _nature(["14.03.2025"], "date JJ/MM/AAAA", {"t": frozenset({"v"})})
+    assert valeurs == ["14/03/2025"]
+    assert _lignes(journal, "valeur_avant", "valeur_apres", "detail") == [
+        (VALEUR_MASQUEE, VALEUR_MASQUEE, "forme masquée")
+    ]
+    _, journal, _, _ = _nature(["14.03.25"], "date JJ/MM/AAAA", {"t": frozenset({"v"})})
+    assert list(journal["detail"]) == ["forme masquée, siècle 20 ajouté"]
