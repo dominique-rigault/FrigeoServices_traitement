@@ -7,7 +7,7 @@ from datetime import datetime
 import pandas as pd
 import pytest
 
-from frigeo.controles import _REPERTOIRE, VALEUR_MASQUEE, constats_encodage
+from frigeo.controles import _REPERTOIRE, VALEUR_MASQUEE, constats_encodage, controler
 from frigeo.dictionnaire import MOTIF_SENSIBLE
 from frigeo.nettoyage import (
     COLONNES_BILAN_NETTOYAGE,
@@ -352,6 +352,139 @@ def test_catalogue_nettoyage():
     catalogue = catalogue_nettoyage()
     assert list(catalogue.columns) == list(COLONNES_CATALOGUE_NETTOYAGE)
     assert _lignes(catalogue, "rang", "regle_nettoyage", "source") == [
-        (1, "encodage", "règle générique")
+        (1, "encodage", "règle générique"),
+        (2, "remplacement", "dictionnaire"),
     ]
     assert "caractère de remplacement" in catalogue.at[0, "ne_corrige_jamais"]
+    assert "hors liste" in catalogue.at[1, "ne_corrige_jamais"]
+
+
+# --- remplacement -------------------------------------------------------------
+
+
+def _valeur(valeur, statut="valide", origine="liste proposée", effectif=1, remplacement=None,
+            revu_le="2026-10-08 13:05:11"):
+    return {
+        "valeur": valeur,
+        "origine": origine,
+        "effectif": effectif,
+        "statut": statut,
+        "commentaire": "",
+        "revu_le": None if statut == "observé" else revu_le,
+        "remplacement": remplacement,
+    }
+
+
+def _liste(*elements, regle="liste fermée", motif="motif fictif"):
+    """Colonne dont la règle `valeurs` porte la liste donnée, revue par le métier."""
+    colonne = _colonne()
+    colonne["valeurs"] = {
+        **_regle(regle, motif),
+        "statut": "valide",
+        "revu_le": "2026-10-08 13:05:11",
+        "liste": list(elements),
+    }
+    return colonne
+
+
+LISTE_CATEGORIES = (
+    _valeur("Dépannage"),
+    _valeur("Maintenance"),
+    _valeur("depannage", "invalide", remplacement="Dépannage"),
+    _valeur("Dépanage", "invalide", remplacement="Dépannage", revu_le="2026-10-09 18:50:53"),
+    _valeur("DEP", "invalide"),
+    _valeur("12", "invalide", remplacement="Maintenance"),
+    _valeur("Maint", "observé", origine="à arbitrer"),
+)
+
+
+def test_remplacement_des_valeurs_invalidees():
+    tables = {
+        "t": _table(
+            code=["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"],
+            categorie=["Dépannage", "depannage", "DEP", "Autre", "Maint", None, "  ", 12,
+                       "Dépanage", "depannage"],
+        )
+    }
+    dictionnaire = _dictionnaire(tables, **{"t.categorie": _liste(*LISTE_CATEGORIES)})
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {"t": {"cle": ["code"]}})
+    assert list(resultat.tables["t"]["categorie"]) == [
+        "Dépannage", "Dépannage", "DEP", "Autre", "Maint", None, "  ", 12, "Dépannage",
+        "Dépannage",
+    ]
+    assert list(tables["t"]["categorie"])[1] == "depannage"
+    assert _lignes(
+        resultat.journal, "regle_nettoyage", "num_ligne_source", "cle", "colonne", "action",
+        "source", "valeur_avant", "valeur_apres", "detail",
+    ) == [
+        ("remplacement", 3, "b", "categorie", "valeur modifiée", "dictionnaire", "depannage",
+         "Dépannage", "valeur invalidée le 2026-10-08"),
+        ("remplacement", 10, "i", "categorie", "valeur modifiée", "dictionnaire", "Dépanage",
+         "Dépannage", "valeur invalidée le 2026-10-09"),
+        ("remplacement", 11, "j", "categorie", "valeur modifiée", "dictionnaire", "depannage",
+         "Dépannage", "valeur invalidée le 2026-10-08"),
+    ]
+    # Valeurs visées : invalides ou hors liste; « Maint », à arbitrer, ne l'est pas,
+    # ni les cellules vides. La cellule 12 (nombre) n'est pas remplacée par un texte.
+    assert _lignes(resultat.bilan, *COLONNES_BILAN_NETTOYAGE) == [
+        ("remplacement", "t", "categorie", 6, 3, 3,
+         "valeur invalidée sans remplacement 1; valeur hors liste 1; valeur non textuelle 1"),
+    ]
+    # Mêmes cellules que les anomalies de la règle valeurs à l'étape 3.
+    ecarts, _ = controler(tables, dictionnaire, AUCUNE_SENSIBLE, {})
+    visees = ecarts[(ecarts["regle"] == "valeurs") & (ecarts["issue"] == "anomalie")]
+    assert len(visees) == 6
+    # Après nettoyage, il ne reste que les trois non corrigées.
+    ecarts, _ = controler(resultat.tables, dictionnaire, AUCUNE_SENSIBLE, {})
+    restantes = ecarts[(ecarts["regle"] == "valeurs") & (ecarts["issue"] == "anomalie")]
+    assert list(restantes["num_ligne_source"]) == [4, 5, 9]
+
+
+def test_remplacement_seulement_pour_une_liste_fermee():
+    # Une liste écartée (règle « aucune ») ne donne ni contrôle ni remplacement, même
+    # si elle garde des valeurs invalidées avec leur remplacement.
+    tables = {"t": _table(categorie=["depannage", "Autre"])}
+    colonne = _liste(*LISTE_CATEGORIES, regle="aucune")
+    colonne["valeurs"]["statut"] = "observé"
+    colonne["valeurs"]["revu_le"] = None
+    dictionnaire = _dictionnaire(tables, **{"t.categorie": colonne})
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, AUCUNE_DECLARATION)
+    assert resultat.journal.empty and resultat.bilan.empty
+    assert list(resultat.tables["t"]["categorie"]) == ["depannage", "Autre"]
+
+
+def test_remplacement_apres_reparation_de_l_encodage():
+    # La règle remplacement s'applique à la valeur laissée par la règle encodage.
+    # Le journal suit l'ordre des règles, puis des lignes.
+    tables = {"t": _table(categorie=["depannage", _mal("Dépanage"), "Dépannage"])}
+    dictionnaire = _dictionnaire(tables, **{"t.categorie": _liste(*LISTE_CATEGORIES)})
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, AUCUNE_DECLARATION)
+    assert list(resultat.tables["t"]["categorie"]) == ["Dépannage"] * 3
+    assert _lignes(
+        resultat.journal, "regle_nettoyage", "num_ligne_source", "source", "valeur_avant",
+        "valeur_apres",
+    ) == [
+        ("encodage", 3, "règle générique", _mal("Dépanage"), "Dépanage"),
+        ("remplacement", 2, "dictionnaire", "depannage", "Dépannage"),
+        ("remplacement", 3, "dictionnaire", "Dépanage", "Dépannage"),
+    ]
+    assert _lignes(resultat.bilan, "regle_nettoyage", "visees", "corrigees") == [
+        ("encodage", 1, 1),
+        ("remplacement", 2, 2),
+    ]
+
+
+def test_remplacement_sur_colonne_sensible_masque():
+    sensibles_liste = [
+        _valeur("Démission", "documenté", effectif=None, origine="ajoutée"),
+        _valeur("demission", "invalide", effectif=None, origine="observée",
+                remplacement="Démission"),
+    ]
+    tables = {"t": _table(code=["a", "b"], motif=["demission", "Démission"])}
+    colonne = _liste(*sensibles_liste, motif=MOTIF_SENSIBLE)
+    dictionnaire = _dictionnaire(tables, **{"t.motif": colonne})
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {"t": {"cle": ["code"]}})
+    assert list(resultat.tables["t"]["motif"]) == ["Démission", "Démission"]
+    assert _lignes(resultat.journal, "cle", "valeur_avant", "valeur_apres", "detail") == [
+        ("a", VALEUR_MASQUEE, VALEUR_MASQUEE, "valeur invalidée le 2026-10-08"),
+    ]

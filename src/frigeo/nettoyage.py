@@ -20,7 +20,11 @@ Règles, dans l'ordre (voir `catalogue_nettoyage`) :
 
 - `encodage` : réparation des textes UTF-8 relus dans un encodage d'un octet
   (Windows-1252, ISO-8859-15 ou Latin-1), repérés comme à l'étape 3 par
-  `controles.constats_encodage` (voir `reparer_encodage`).
+  `controles.constats_encodage` (voir `reparer_encodage`);
+- `remplacement` : une valeur invalidée par le métier dans la liste fermée de sa
+  colonne et qui porte un remplacement au dictionnaire reçoit ce remplacement.
+
+Chaque règle s'applique aux valeurs laissées par les règles précédentes.
 
 `nettoyer` rend les tables nettoyées, le journal des corrections (une ligne par
 cellule modifiée, avec sa valeur avant et après) et un bilan par règle et par
@@ -42,25 +46,38 @@ from .controles import (
     _REPERTOIRE,
     _SEQUENCE_UTF8,
     _colonnes_de_donnees,
+    _issue_element,
     _octets,
     _problemes_de_correspondance,
     _valeur_constatee,
     constats_encodage,
 )
-from .dictionnaire import _valeurs_renseignees, est_masquee, problemes_dictionnaire
+from .dictionnaire import (
+    LISTE_FERMEE,
+    _valeurs_renseignees,
+    est_masquee,
+    problemes_dictionnaire,
+)
 from .doublons import SEPARATEUR, _texte, charger_declarations_doublons
 
 REGLE_ENCODAGE = "encodage"
-REGLES_NETTOYAGE = (REGLE_ENCODAGE,)
+REGLE_REMPLACEMENT = "remplacement"
+REGLES_NETTOYAGE = (REGLE_ENCODAGE, REGLE_REMPLACEMENT)
 
 ACTION_MODIFIEE = "valeur modifiée"
 SOURCE_GENERIQUE = "règle générique"
+SOURCE_DICTIONNAIRE = "dictionnaire"
 
 RAISON_REMPLACEMENT = "caractère de remplacement"
 RAISON_DESACCORD = "encodages en désaccord"
 MAX_PASSES = 5
 RAISON_PASSES = f"séquence toujours présente après {MAX_PASSES} passes"
 RAISONS_ENCODAGE = (RAISON_REMPLACEMENT, RAISON_DESACCORD, RAISON_PASSES)
+
+RAISON_SANS_REMPLACEMENT = "valeur invalidée sans remplacement"
+RAISON_HORS_LISTE = "valeur hors liste"
+RAISON_NON_TEXTUELLE = "valeur non textuelle"
+RAISONS_REMPLACEMENT = (RAISON_SANS_REMPLACEMENT, RAISON_HORS_LISTE, RAISON_NON_TEXTUELLE)
 
 COLONNE_PERIODE = "periode_export"
 COLONNES_JOURNAL = (
@@ -96,6 +113,14 @@ _CATALOGUE = {
         "une cellule qui contient le caractère de remplacement (information perdue); "
         "une portion de texte que deux encodages réparent en deux caractères "
         f"différents; une séquence encore présente après {MAX_PASSES} passes",
+    ),
+    REGLE_REMPLACEMENT: (
+        SOURCE_DICTIONNAIRE,
+        "toute cellule de texte dont la valeur, invalidée par le métier dans la liste "
+        "fermée de sa colonne, porte un remplacement au dictionnaire : elle reçoit ce "
+        "remplacement (valeur comparée telle quelle, comme au contrôle)",
+        "une valeur hors liste ou à arbitrer; une valeur invalidée sans remplacement; "
+        "une cellule qui n'est pas un texte",
     ),
 }
 
@@ -214,15 +239,16 @@ def _detail_encodage(reparation: Reparation) -> str:
     return f"repéré en {', '.join(reparation.encodages)}; {passes}"
 
 
-def _encodage(serie: pd.Series):
-    """Règle `encodage` sur une colonne : cellules visées, corrections et raisons.
+def _encodage(serie: pd.Series, regles: dict):
+    """Règle `encodage` sur une colonne indexée par la position des lignes.
 
     Rend None si aucune cellule n'est visée, sinon (positions visées, {position:
-    réparation acceptée}, Counter des raisons). Les cellules visées sont celles que
-    la règle `encodage` de l'étape 3 signale (séquence d'un mauvais décodage ou
-    caractère de remplacement).
+    (valeur corrigée, détail)}, Counter des raisons). Les cellules visées sont
+    celles que la règle `encodage` de l'étape 3 signale (séquence d'un mauvais
+    décodage ou caractère de remplacement). `regles` (règles de la colonne au
+    dictionnaire) ne sert pas à cette règle.
     """
-    presentes = _valeurs_renseignees(serie.reset_index(drop=True))
+    presentes = _valeurs_renseignees(serie)
     textes = presentes[[isinstance(v, str) for v in presentes]]
     suspects = {v for v in textes.unique() if constats_encodage(v)}
     if not suspects:
@@ -235,13 +261,61 @@ def _encodage(serie: pd.Series):
         if reparation.texte is None:
             raisons[reparation.raison] += 1
         elif reparation.texte != valeur:
-            acceptees[position] = reparation
+            acceptees[position] = (reparation.texte, _detail_encodage(reparation))
         else:
             # Hors caractère de remplacement, une cellule signalée a toujours une
             # séquence à réparer : ce cas ne se produit pas, il serait compté plutôt
             # que passé sous silence.
             raisons[RAISON_PASSES] += 1
     return list(visees.index), acceptees, raisons
+
+
+def _remplacement(serie: pd.Series, regles: dict):
+    """Règle `remplacement` sur une colonne indexée par la position des lignes.
+
+    Rendu comme `_encodage`. Les cellules visées sont celles que la règle
+    `valeurs` de l'étape 3 met en anomalie (valeur invalide ou hors liste d'une
+    liste fermée), la valeur étant comparée telle quelle, comme au contrôle. Une
+    valeur invalide qui porte un remplacement est remplacée si la cellule est un
+    texte.
+    """
+    regle = regles["valeurs"]
+    if regle["regle"] != LISTE_FERMEE:
+        return None
+    presentes = _valeurs_renseignees(serie)
+    if presentes.empty:
+        return None
+    connus = {element["valeur"]: element for element in regle["liste"]}
+    textes = presentes.astype(str)
+    issues = textes.map({t: _issue_element(connus.get(t)) for t in textes.unique()})
+    visees = issues[issues.isin(("invalide", "hors liste"))]
+    if visees.empty:
+        return None
+    acceptees, raisons = {}, Counter()
+    for position, issue in visees.items():
+        if issue == "hors liste":
+            raisons[RAISON_HORS_LISTE] += 1
+            continue
+        element = connus[textes[position]]
+        if element.get("remplacement") is None:
+            raisons[RAISON_SANS_REMPLACEMENT] += 1
+        elif not isinstance(presentes[position], str):
+            raisons[RAISON_NON_TEXTUELLE] += 1
+        else:
+            acceptees[position] = (element["remplacement"], _detail_remplacement(element))
+    return list(visees.index), acceptees, raisons
+
+
+def _detail_remplacement(element: dict) -> str:
+    """Date de la revue qui a invalidé la valeur (le dictionnaire validé exige
+    `revu_le` pour une valeur invalide)."""
+    return f"valeur invalidée le {str(element['revu_le'])[:10]}"
+
+
+_REGLES = {
+    REGLE_ENCODAGE: (_encodage, SOURCE_GENERIQUE, RAISONS_ENCODAGE),
+    REGLE_REMPLACEMENT: (_remplacement, SOURCE_DICTIONNAIRE, RAISONS_REMPLACEMENT),
+}
 
 
 def _texte_raisons(raisons: Counter, ordre) -> str | None:
@@ -274,8 +348,10 @@ def nettoyer(
     déclarée de la ligne, lue dans la table reçue (vide sans clé déclarée, « masqué »
     si une colonne de la clé est sensible); `valeur_avant` et `valeur_apres` valent
     « masqué » pour une colonne sensible, la valeur brute restant retrouvable par le
-    lignage; `detail` précise la correction (pour l'encodage, les encodages qui ont
-    repéré une séquence et le nombre de passes).
+    lignage; `valeur_avant` est la valeur laissée par les règles précédentes;
+    `detail` précise la correction (pour l'encodage, les encodages qui ont repéré
+    une séquence et le nombre de passes; pour un remplacement, la date de la revue
+    qui a invalidé la valeur).
 
     Bilan (`COLONNES_BILAN_NETTOYAGE`) : une ligne par règle et par colonne qui a au
     moins une cellule visée, avec les cellules visées, corrigées, non corrigées, et
@@ -302,80 +378,87 @@ def nettoyer(
 
     nettoyees = {table: donnees.copy() for table, donnees in tables.items()}
     journal, bilan = [], []
-    for rang_table, (table, donnees) in enumerate(tables.items()):
-        brutes = donnees.reset_index(drop=True)
-        cle = [c for c in declarations.get(table, {}).get("cle", []) if c in brutes.columns]
-        cle_masquee = any(est_sensible(sensibles, table, c) for c in cle)
-        for rang_colonne, colonne in enumerate(_colonnes_de_donnees(brutes)):
-            regles = dictionnaire[table][colonne]
-            masquee = (
-                est_sensible(sensibles, table, colonne)
-                or est_masquee(regles["valeurs"])
-                or est_masquee(regles["format"])
-            )
-            resultat = _encodage(brutes[colonne])
-            if resultat is None:
-                continue
-            visees, acceptees, raisons = resultat
-            bilan.append(
-                {
-                    "regle_nettoyage": REGLE_ENCODAGE,
-                    "table": table,
-                    "colonne": colonne,
-                    "visees": len(visees),
-                    "corrigees": len(acceptees),
-                    "non_corrigees": len(visees) - len(acceptees),
-                    "raisons": _texte_raisons(raisons, RAISONS_ENCODAGE),
-                }
-            )
-            if not acceptees:
-                continue
-            positions = sorted(acceptees)
-            nouvelle = nettoyees[table][colonne].copy()
-            rang = nettoyees[table].columns.get_loc(colonne)
-            for position in positions:
-                nouvelle.iloc[position] = acceptees[position].texte
-            nettoyees[table].isetitem(rang, nouvelle)
-            for position in positions:
-                ligne = brutes.iloc[position]
-                if not cle:
-                    texte_cle = None
-                elif cle_masquee:
-                    texte_cle = VALEUR_MASQUEE
-                else:
-                    texte_cle = SEPARATEUR.join(_texte(ligne[c]) for c in cle)
-                periode = _texte(ligne[COLONNE_PERIODE]) if COLONNE_PERIODE in brutes else ""
-                journal.append(
+    for rang_regle, regle_nettoyage in enumerate(REGLES_NETTOYAGE):
+        appliquer_regle, source, ordre_raisons = _REGLES[regle_nettoyage]
+        for rang_table, (table, donnees) in enumerate(tables.items()):
+            brutes = donnees.reset_index(drop=True)
+            cle = [c for c in declarations.get(table, {}).get("cle", []) if c in brutes.columns]
+            cle_masquee = any(est_sensible(sensibles, table, c) for c in cle)
+            for rang_colonne, colonne in enumerate(_colonnes_de_donnees(brutes)):
+                regles = dictionnaire[table][colonne]
+                masquee = (
+                    est_sensible(sensibles, table, colonne)
+                    or est_masquee(regles["valeurs"])
+                    or est_masquee(regles["format"])
+                )
+                # La règle s'applique aux valeurs laissées par les règles précédentes.
+                courante = nettoyees[table][colonne].reset_index(drop=True)
+                resultat = appliquer_regle(courante, regles)
+                if resultat is None:
+                    continue
+                visees, acceptees, raisons = resultat
+                bilan.append(
                     {
-                        "regle_nettoyage": REGLE_ENCODAGE,
+                        "regle_nettoyage": regle_nettoyage,
                         "table": table,
-                        **{
-                            c: (ligne[c] if c in brutes.columns else None)
-                            for c in COLONNES_LIGNAGE_ECART
-                        },
-                        COLONNE_PERIODE: periode or None,
-                        "cle": texte_cle,
                         "colonne": colonne,
-                        "action": ACTION_MODIFIEE,
-                        "source": SOURCE_GENERIQUE,
-                        "valeur_avant": (
-                            VALEUR_MASQUEE if masquee else _valeur_constatee(ligne[colonne])
-                        ),
-                        "valeur_apres": (
-                            VALEUR_MASQUEE if masquee else acceptees[position].texte
-                        ),
-                        "detail": _detail_encodage(acceptees[position]),
-                        "_table": rang_table,
-                        "_position": position,
-                        "_colonne": rang_colonne,
+                        "visees": len(visees),
+                        "corrigees": len(acceptees),
+                        "non_corrigees": len(visees) - len(acceptees),
+                        "raisons": _texte_raisons(raisons, ordre_raisons),
                     }
                 )
+                if not acceptees:
+                    continue
+                positions = sorted(acceptees)
+                nouvelle = nettoyees[table][colonne].copy()
+                for position in positions:
+                    nouvelle.iloc[position] = acceptees[position][0]
+                nettoyees[table].isetitem(nettoyees[table].columns.get_loc(colonne), nouvelle)
+                for position in positions:
+                    ligne = brutes.iloc[position]
+                    if not cle:
+                        texte_cle = None
+                    elif cle_masquee:
+                        texte_cle = VALEUR_MASQUEE
+                    else:
+                        texte_cle = SEPARATEUR.join(_texte(ligne[c]) for c in cle)
+                    periode = (
+                        _texte(ligne[COLONNE_PERIODE]) if COLONNE_PERIODE in brutes else ""
+                    )
+                    valeur_apres, detail = acceptees[position]
+                    journal.append(
+                        {
+                            "regle_nettoyage": regle_nettoyage,
+                            "table": table,
+                            **{
+                                c: (ligne[c] if c in brutes.columns else None)
+                                for c in COLONNES_LIGNAGE_ECART
+                            },
+                            COLONNE_PERIODE: periode or None,
+                            "cle": texte_cle,
+                            "colonne": colonne,
+                            "action": ACTION_MODIFIEE,
+                            "source": source,
+                            "valeur_avant": (
+                                VALEUR_MASQUEE
+                                if masquee
+                                else _valeur_constatee(courante.iloc[position])
+                            ),
+                            "valeur_apres": VALEUR_MASQUEE if masquee else valeur_apres,
+                            "detail": detail,
+                            "_regle": rang_regle,
+                            "_table": rang_table,
+                            "_position": position,
+                            "_colonne": rang_colonne,
+                        }
+                    )
 
     if journal:
         # Colonnes de type objet : une cellule vide reste None, quelle que soit la
         # version de pandas.
         journal = pd.DataFrame(journal, dtype=object).sort_values(
-            ["_table", "_position", "_colonne"], kind="stable"
+            ["_regle", "_table", "_position", "_colonne"], kind="stable"
         )
         journal = journal[list(COLONNES_JOURNAL)].reset_index(drop=True)
     else:
