@@ -1,0 +1,181 @@
+indicateurs:
+  CA: {}
+  nombre d'interventions: {}
+  heures réalisées: {}
+  clients actifs: {}
+  CA par intervention: {depend_de: [CA, nombre d'interventions]}
+  CA par heure: {depend_de: [CA, heures réalisées]}
+  durée moyenne: {depend_de: [heures réalisées, nombre d'interventions]}
+  taux d'annulation: {}
+  part non facturable: {}
+  délai de facturation: {}
+  coût salarial: {}
+  coût de déplacement: {}
+  coût des pièces: {}
+  marge opérationnelle: {depend_de: [CA, coût salarial, coût de déplacement, coût des pièces]}
+  taux de marge: {depend_de: [marge opérationnelle]}
+  répartition de la marge: {depend_de: [marge opérationnelle]}
+  factures non rapprochées: {}
+  interventions non facturées: {}
+  interventions à marge négative: {depend_de: [marge opérationnelle]}
+  achats par fournisseur: {}
+
+colonnes:
+  interventions:
+    id_intervention: [nombre d'interventions, marge opérationnelle, interventions non facturées]
+    date_debut: [nombre d'interventions, heures réalisées, délai de facturation, coût salarial, coût de déplacement, coût des pièces, interventions non facturées]
+    heure_debut: []
+    duree_min: [heures réalisées, coût salarial]
+    duree_trajet_min: [coût salarial]
+    distance_km: [coût de déplacement]
+    intervenant: [coût salarial, répartition de la marge]
+    code_client: [clients actifs, répartition de la marge]
+    client: []
+    lieu_adresse: []
+    lieu_cp: []
+    lieu_ville: []
+    categorie: [durée moyenne, répartition de la marge]
+    statut: [nombre d'interventions, heures réalisées, clients actifs, taux d'annulation, part non facturable, interventions non facturées]
+    facturable: [part non facturable, interventions non facturées, interventions à marge négative]
+    commentaire: []
+  pieces_interventions:
+    id_consommation: []
+    id_intervention: [coût des pièces]
+    date_sortie: [coût des pièces]
+    ref_piece: [coût des pièces]
+    libelle: []
+    quantite: [coût des pièces]
+    unite: []
+  factures_entetes:
+    num_facture: [CA, factures non rapprochées]
+    type_piece: [CA]
+    date_facture: [CA, délai de facturation, factures non rapprochées, interventions non facturées]
+    code_client: []
+    nom_client: []
+    total_ht: [CA, factures non rapprochées]
+    total_tva: []
+    total_ttc: []
+    date_echeance: []
+    mode_reglement: []
+    facture_origine: []
+  factures_lignes:
+    num_facture: [CA, factures non rapprochées]
+    num_ligne: []
+    id_intervention: [marge opérationnelle, délai de facturation, factures non rapprochées, interventions non facturées]
+    code_article: []
+    ref_piece: []
+    libelle: []
+    quantite: []
+    unite: []
+    pu_ht: []
+    remise_pct: []
+    montant_ht: [CA]
+    taux_tva: []
+  fec:
+    JournalCode: [factures non rapprochées]
+    JournalLib: []
+    EcritureNum: []
+    EcritureDate: [factures non rapprochées]
+    CompteNum: [factures non rapprochées]
+    CompteLib: []
+    CompAuxNum: []
+    CompAuxLib: []
+    PieceRef: [factures non rapprochées]
+    PieceDate: []
+    EcritureLib: []
+    Debit: [factures non rapprochées]
+    Credit: [factures non rapprochées]
+    EcritureLet: []
+    DateLet: []
+    ValidDate: []
+    Montantdevise: []
+    Idevise: []
+  intervenants:
+    matricule: [coût salarial]
+    nom: [coût salarial]
+    prenom: [coût salarial]
+    poste: []
+    type_contrat: [coût salarial]
+    date_entree: [coût salarial]
+    date_sortie: [coût salarial]
+    motif_sortie: []
+    secteur: []
+  remunerations:
+    matricule: [coût salarial]
+    date_effet: [coût salarial]
+    salaire_brut_mensuel: [coût salarial]
+    taux_activite: [coût salarial]
+  clients:
+    code_client: [clients actifs, répartition de la marge]
+    raison_sociale: [clients actifs]
+    type_commerce: [répartition de la marge]
+    siret: [clients actifs]
+    adresse: []
+    cp: []
+    ville: []
+    telephone: []
+    email: []
+    contrat_maintenance: [interventions non facturées]
+    date_creation: []
+    date_fin_relation: []
+    statut: []
+  fournisseurs:
+    code_fournisseur: [achats par fournisseur]
+    raison_sociale: [achats par fournisseur]
+    categorie: [achats par fournisseur]
+    siret: [achats par fournisseur]
+    adresse: []
+    cp: []
+    ville: []
+    delai_paiement: []
+    statut: []
+  achats_entetes:
+    num_piece_achat: [coût des pièces, achats par fournisseur]
+    ref_facture_fournisseur: []
+    type_piece: [coût des pièces, achats par fournisseur]
+    code_fournisseur: [achats par fournisseur]
+    nom_fournisseur: []
+    date_facture: [coût des pièces, achats par fournisseur]
+    date_echeance: []
+    total_ht: [achats par fournisseur]
+    total_tva: []
+    total_ttc: []
+  achats_lignes:
+    num_piece_achat: [coût des pièces]
+    num_ligne: []
+    ref_piece: [coût des pièces]
+    libelle: []
+    quantite: [coût des pièces]
+    unite: []
+    pu_achat_ht: [coût des pièces]
+    montant_ht: [coût des pièces]
+    compte_charge: []
+  catalogue_pieces:
+    ref_piece: [coût des pièces]
+    libelle: []
+    famille: []
+    unite: []
+    fournisseur_principal: []
+    prix_vente_ht_2025: []
+    stock_initial: [coût des pièces]
+    cump_initial: [coût des pièces]
+  parametres_couts:
+    annee: [coût salarial, coût de déplacement]
+    cout_km: [coût de déplacement]
+    taux_charges_cdi_cdd: [coût salarial]
+    taux_charges_apprenti: [coût salarial]
+    heures_annuelles: [coût salarial]
+
+exceptions:
+  - motif: 'interventions\.(date_debut|duree_min|duree_trajet_min|distance_km|intervenant|statut|facturable) (obligatoire|nature)'
+    etape: format
+    gravite: bloquante
+  - motif: 'factures_(entetes\.(date_facture|total_ht)|lignes\.(id_intervention|montant_ht)) (obligatoire|nature)'
+    etape: format
+    gravite: bloquante
+  - motif: 'pieces_interventions\.(id_intervention|date_sortie|ref_piece|quantite) (obligatoire|nature)'
+    etape: format
+    gravite: bloquante
+  - motif: '(intervenants\.date_entree|remunerations\.[a-z_]+|parametres_couts\.[a-z_]+) (obligatoire|nature)'
+    etape: format
+    gravite: bloquante

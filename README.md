@@ -17,11 +17,11 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | 01 | Fait sur le cas Frigéo, à rendre générique |
 | 2 | Profilage de chaque fichier | Python, Jupyter | 02 | Fait sur le cas Frigéo, à rendre générique |
 | 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | aucun | Terminé |
-02c | Terminé, sauf une cellule propre au cas (comparaison avec le chapitre 4) |
+| 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 02c | Terminé, sauf une cellule propre au cas (comparaison avec le chapitre 4) |
 | 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 02c | Terminé |
 | 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 03 | Terminé |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 04 | Terminé |
-| 5 | Table des anomalies | Python, Jupyter | 05 | À venir |
+| 5 | Table des anomalies, gravité et indicateurs affectés, export CSV | Python, Jupyter | 05 | Terminé |
 | 6 | Règles de nettoyage explicites et jeu de données nettoyé | Python, Jupyter | 06 | À venir |
 | 7 | Modèle en étoile, indicateurs et marge opérationnelle | SQL Server, Azure SQL Database | aucun | À venir |
 | 8 | Tableaux de bord direction et qualité | Power BI | aucun | À venir |
@@ -40,7 +40,7 @@ Le mode opératoire d'un cycle de traitement (qui fait quoi et dans quel ordre, 
 
 ## Limites et adaptation à un autre client
 
-Les notebooks 03 et 04 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services, et le notebook 02c une seule cellule, la comparaison avec le chapitre 4, à retirer chez un autre client. Les notebooks 01 et 02 en contiennent encore (formats des fichiers texte déclarés dans le notebook, colonnes examinées une à une, valeurs affichées), et sont à rendre génériques avant un cas réel. Hors de ces notebooks, tout ce qui est propre au client tient dans les quatre fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`) et dans le dictionnaire revu par le métier. Le code porte cependant l'empreinte des données rencontrées sur quelques points :
+Les notebooks 03, 04 et 05 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services, et le notebook 02c une seule cellule, la comparaison avec le chapitre 4, à retirer chez un autre client. Les notebooks 01 et 02 en contiennent encore (formats des fichiers texte déclarés dans le notebook, colonnes examinées une à une, valeurs affichées), et sont à rendre génériques avant un cas réel. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`) et dans le dictionnaire revu par le métier. Le code porte cependant l'empreinte des données rencontrées sur quelques points :
 
 - **Types de règles de gestion.** Le catalogue de l'étape 4 (28 types génériques) ne couvre que les règles de ce cas. Un autre client demandera des types nouveaux, ajoutés au catalogue sans reprendre les autres.
 - **Natures reconnues.** Trois formes de date, l'heure HH:MM, les décimaux à virgule ou à point. Des heures HH:MM:SS, des milliers séparés par une espace ou des dates MM/JJ/AAAA demanderaient d'étendre `profilage.py` et `typage.py`.
@@ -50,11 +50,14 @@ Les notebooks 03 et 04 ne contiennent aucun nom de table, de colonne ni de valeu
 - **Stock théorique.** Les entrées sont lues dans une seule table, et les sorties dans une seule table. Un client qui exporte ses retours ou ses ventes au comptoir dans un fichier à part demanderait d'étendre le type, ou de déclarer une seconde règle.
 - **Lieux de stockage.** Un seul lieu. Un stock par référence et par lieu est possible si chaque table porte un code de lieu, mais pas les transferts entre lieux.
 - **Stock rendu négatif par un avoir.** Il n'est signalé qu'à la sortie suivante. Le stock n'est contrôlé qu'à partir de la date du stock initial, qu'il vaut mieux lire dans le fichier du client que déclarer dans la configuration.
+- **Encodages suspects.** La règle `encodage` essaie les trois encodages d'Europe occidentale (Windows-1252, ISO-8859-15, Latin-1). Des fichiers venus d'un autre jeu de caractères (Europe centrale, cyrillique) demanderaient d'étendre `ENCODAGES_SUSPECTS`. Un `à` mal décodé n'est plus reconnaissable si un logiciel a remplacé l'espace insécable qui le suit par une espace ordinaire, et un double encodage n'est signalé qu'une fois.
+- **Gravité et indicateurs affectés.** Ils sont déclarés par le consultant dans `config/anomalies.yaml`, à faire valider par le métier, et non calculés. La gravité par défaut est grossière (« majeure » dès qu'une colonne alimente un indicateur) et se nuance par des exceptions, sans code. Le fichier est à revoir quand un indicateur ou une colonne change.
+- **Export CSV.** Séparateur point-virgule et virgule décimale, pour Excel en paramètres français. Ouvert par double-clic, Excel retire les zéros en tête, écrit un SIRET en notation scientifique, lit `2026-03` comme une date et une valeur commençant par `=` comme une formule. Il faut donc ouvrir le fichier par Données, À partir d'un fichier texte/CSV, sans détection des types. Les identifiants d'anomalie changent si un fichier est réexporté avec des lignes décalées.
 
 ## Structure du dépôt
 
 ```
-config/      configuration propre au client (sources, sensibilité, contrôles, doublons et règles de gestion)
+config/      configuration propre au client (sources, sensibilité, contrôles, doublons, règles de gestion, gravité et indicateurs)
 data/        données locales, ignorées par Git
 docs/        documentation
 notebooks/   un notebook par étape (01 à 06)
@@ -90,6 +93,7 @@ data/
   referentiels/     intervenants, clients, fournisseurs, catalogue, paramètres
   config/           dictionnaire généré (contient des valeurs observées)
   revue/            classeur de revue du dictionnaire (étape 2d)
+  anomalies/        table des anomalies et bilan par contrôle en CSV (étape 5)
 ```
 
 ## Conventions de travail

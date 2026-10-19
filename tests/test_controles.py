@@ -10,9 +10,13 @@ from frigeo.controles import (
     COLONNES_BILAN,
     COLONNES_ECARTS,
     COLONNES_SANS_CONTROLE,
+    CONSTAT_DECODAGE,
+    CONSTAT_REMPLACEMENT,
+    REGLE_ENCODAGE,
     VALEUR_MASQUEE,
     charger_dictionnaire_enregistre,
     charger_regles_complementaires,
+    constats_encodage,
     controler,
     problemes_regles_complementaires,
     regles_sans_controle,
@@ -85,14 +89,23 @@ def _table(fichier="t.csv", premiere_ligne=2, **colonnes) -> pd.DataFrame:
     return donnees
 
 
-def _controler(donnees, colonnes, sensibles=AUCUNE_SENSIBLE, complementaires=None):
-    """Contrôle d'une table « t », sans règle complémentaire sauf celles de la table."""
-    return controler(
+def _controler(
+    donnees, colonnes, sensibles=AUCUNE_SENSIBLE, complementaires=None, avec_encodage=False
+):
+    """Contrôle d'une table « t », sans règle complémentaire sauf celles de la table.
+
+    Sauf demande, le bilan est rendu sans les lignes de la règle `encodage`, qui
+    s'applique à toute colonne de texte et a ses propres tests.
+    """
+    ecarts, bilan = controler(
         {"t": donnees},
         {"t": colonnes},
         sensibles,
         {"t": complementaires} if complementaires else {},
     )
+    if not avec_encodage:
+        bilan = bilan[bilan["regle"] != REGLE_ENCODAGE].reset_index(drop=True)
+    return ecarts, bilan
 
 
 def _lignes(ecarts, *colonnes):
@@ -510,6 +523,7 @@ def test_regles_complementaires_apres_celles_du_dictionnaire_et_masquage():
         colonnes,
         {"t": frozenset({"salaire"})},
         {"salaire": {"cle_luhn": True, "bornes": {"max": 2000}, "decimales": 2}},
+        avec_encodage=True,
     )
     assert _lignes(ecarts, "num_ligne_source", "regle", "valeur") == [
         (2, "decimales", VALEUR_MASQUEE),
@@ -517,9 +531,12 @@ def test_regles_complementaires_apres_celles_du_dictionnaire_et_masquage():
         (3, "obligatoire", VALEUR_MASQUEE),
         (4, "nature", VALEUR_MASQUEE),
     ]
-    # Ordre du bilan : règles du dictionnaire, puis décimales, bornes, motif, clé de Luhn.
-    assert list(bilan["regle"]) == ["obligatoire", "nature", "decimales", "bornes", "cle_luhn"]
-    assert list(bilan["controlees"]) == [3, 2, 1, 1, 0]
+    # Ordre du bilan : règles du dictionnaire, puis décimales, bornes, motif, clé de
+    # Luhn, puis la règle d'encodage.
+    assert list(bilan["regle"]) == [
+        "obligatoire", "nature", "decimales", "bornes", "cle_luhn", "encodage"
+    ]
+    assert list(bilan["controlees"]) == [3, 2, 1, 1, 0, 2]
 
 
 def test_regles_complementaires_sur_une_table_ou_une_colonne_inconnue():
@@ -598,3 +615,136 @@ def test_lecture_des_regles_complementaires(tmp_path):
     chemin.write_text("regles:\n  clients:\n    siret: {luhn: true}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="règle inconnue 'luhn'"):
         charger_regles_complementaires(chemin)
+
+
+# Règle d'encodage (étape 5, morceau 5b)
+
+INSECABLE = chr(160)
+REMPLACEMENT = chr(0xFFFD)
+
+
+def test_constats_encodage_vrais_et_faux_amis():
+    suspects = [
+        "CafÃ©",  # é relu en Windows-1252
+        "Ã‰TÉ",  # É, une capitale correcte plus loin
+        "Câ€™est",  # apostrophe typographique, Windows-1252 seulement
+        "Å“uvre",
+        "â‚¬ 12",
+        "Ã" + INSECABLE + "demain",  # à, dont le second octet est l'espace insécable
+        "l’Ã©cole",  # une vraie apostrophe typographique à côté
+        "ÃƒÂ©",  # double encodage
+        "20 Â°C",
+        "Ã" + chr(0x89) + "TÉ",  # É relu en Latin-1
+        "â" + chr(0x84) + "¢",  # ™ relu en ISO-8859-15 ou en Latin-1
+        "â" + chr(0x80) + "¦",  # … relu en Latin-1, que seul Latin-1 repère
+    ]
+    for texte in suspects:
+        assert constats_encodage(texte) == (CONSTAT_DECODAGE,), texte
+    corrects = [
+        "Café",
+        "CHÂTEAU",
+        "ÂGE",
+        "SÃO PAULO",
+        "naïve",
+        "CAFÉ" + INSECABLE + ":",  # capitale accentuée et espace insécable
+        "café" + INSECABLE + "»",
+        "Ã et Â",
+        "Ã" + chr(0x2192) + "©",  # un caractère étranger aux trois encodages coupe la suite
+        "Â…",  # redonnerait un caractère de contrôle (U+0085)
+        "abc",
+        "",
+    ]
+    for texte in corrects:
+        assert constats_encodage(texte) == (), texte
+    assert constats_encodage("perdu " + REMPLACEMENT) == (CONSTAT_REMPLACEMENT,)
+    assert constats_encodage("CafÃ© " + REMPLACEMENT) == (
+        CONSTAT_DECODAGE,
+        CONSTAT_REMPLACEMENT,
+    )
+
+
+def test_tout_caractere_mal_decode_est_repere():
+    # Chaque caractère non ASCII des trois encodages (hors caractères de contrôle),
+    # écrit en UTF-8 puis relu dans chacun d'eux, est repéré.
+    caracteres = set()
+    for encodage in ("cp1252", "iso8859_15", "latin_1"):
+        for octet in range(0xA0, 0x100):
+            caracteres.add(bytes([octet]).decode(encodage))
+    caracteres |= {"€", "‚", "ƒ", "„", "…", "†", "‡", "ˆ", "‰", "Š", "‹", "Œ", "Ž",
+                   "‘", "’", "“", "”", "•", "–", "—", "˜", "™", "š", "›", "œ", "ž", "Ÿ"}
+    assert len(caracteres) == 123
+    for caractere in caracteres:
+        for encodage in ("cp1252", "iso8859_15", "latin_1"):
+            try:
+                relu = caractere.encode("utf-8").decode(encodage)
+            except UnicodeDecodeError:
+                continue
+            assert constats_encodage("a" + relu + "b") == (CONSTAT_DECODAGE,), (
+                caractere, encodage
+            )
+
+
+def test_encodage_sur_toutes_les_cellules_de_texte():
+    donnees = _table(
+        nom=[
+            "Café",
+            "CafÃ©",
+            None,
+            "",
+            "  ",
+            12,
+            datetime(2025, 3, 14),
+            "perdu " + REMPLACEMENT,
+            "CafÃ© " + REMPLACEMENT,
+            "Ã©cole",
+        ],
+        quantite=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    )
+    colonnes = {"nom": _colonne(), "quantite": _colonne(nature="nombre natif")}
+    ecarts, bilan = _controler(donnees, colonnes, avec_encodage=True)
+    assert _lignes(
+        ecarts, "num_ligne_source", "colonne", "regle", "regle_en_vigueur", "statut_regle",
+        "issue", "constat", "valeur",
+    ) == [
+        (3, "nom", "encodage", "sans séquence suspecte", None, "anomalie",
+         "séquence d'un mauvais décodage", "CafÃ©"),
+        (9, "nom", "encodage", "sans séquence suspecte", None, "anomalie",
+         "caractère de remplacement", "perdu " + REMPLACEMENT),
+        (10, "nom", "encodage", "sans séquence suspecte", None, "anomalie",
+         "séquence d'un mauvais décodage", "CafÃ© " + REMPLACEMENT),
+        (10, "nom", "encodage", "sans séquence suspecte", None, "anomalie",
+         "caractère de remplacement", "CafÃ© " + REMPLACEMENT),
+        (11, "nom", "encodage", "sans séquence suspecte", None, "anomalie",
+         "séquence d'un mauvais décodage", "Ã©cole"),
+    ]
+    # Seules les cellules renseignées dont la valeur est un texte sont contrôlées,
+    # et une colonne sans aucun texte n'a pas de ligne au bilan.
+    assert _lignes(bilan, "colonne", "regle", "controlees", "anomalies", "a_arbitrer") == [
+        ("nom", "encodage", 5, 5, 0),
+        ("quantite", "nature", 10, 0, 0),
+    ]
+
+
+def test_encodage_apres_les_autres_regles_et_colonne_sensible_masquee():
+    donnees = _table(client=["A", "CafÃ©", "CHÂTEAU"], code=["X1", "CafÃ©", "X3"])
+    colonnes = {
+        "client": _colonne(obligatoire="obligatoire"),
+        "code": _colonne(formes=[_forme("A9")]),
+    }
+    ecarts, bilan = _controler(
+        donnees, colonnes, {"t": frozenset({"client"})}, {"code": {"motif": "[A-Z][0-9]"}},
+        avec_encodage=True,
+    )
+    assert _lignes(ecarts, "num_ligne_source", "colonne", "regle", "valeur") == [
+        (3, "client", "encodage", VALEUR_MASQUEE),
+        (3, "code", "format", "CafÃ©"),
+        (3, "code", "motif", "CafÃ©"),
+        (3, "code", "encodage", "CafÃ©"),
+    ]
+    assert _lignes(bilan, "colonne", "regle", "controlees", "anomalies") == [
+        ("client", "obligatoire", 3, 0),
+        ("client", "encodage", 3, 1),
+        ("code", "format", 3, 1),
+        ("code", "motif", 3, 1),
+        ("code", "encodage", 3, 1),
+    ]

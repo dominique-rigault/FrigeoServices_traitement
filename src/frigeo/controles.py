@@ -29,6 +29,12 @@ données et que le métier donne dans `config/controles.yaml` (voir
 Une forme fixe (code postal, numéro à longueur fixe) n'en fait pas partie : elle
 relève de la règle `format` du dictionnaire.
 
+Enfin, la règle `encodage` s'applique à toute cellule dont la valeur chargée est un
+texte, dans toutes les colonnes, sans déclaration (voir `constats_encodage`) : elle
+repère un texte UTF-8 relu avec un encodage d'un octet (Windows-1252, ISO-8859-15
+ou Latin-1), et le caractère de remplacement laissé par un décodage qui a perdu
+l'information. Elle ne propose aucune correction (étape 6).
+
 Rien n'est corrigé ni écrit : `controler` rend la table des écarts et un bilan.
 """
 
@@ -126,6 +132,46 @@ CLES_FICHIER_CONTROLES = (CLE_REGLES_COMPLEMENTAIRES, CLE_DOUBLONS)
 # tableur laisse parfois une imprécision (181.45000000000002).
 TOLERANCE_DECIMALES = 1e-9
 _MOTIF_NOMBRE = re.compile(r"-?\d+(?:[.,]\d+)?")
+
+# Règle d'encodage, appliquée sans déclaration à toutes les cellules de texte, après
+# les règles complémentaires. Elle ne vient ni du dictionnaire ni du métier : son
+# statut est vide.
+REGLE_ENCODAGE = "encodage"
+ENCODAGE_EN_VIGUEUR = "sans séquence suspecte"
+CONSTAT_DECODAGE = "séquence d'un mauvais décodage"
+CONSTAT_REMPLACEMENT = "caractère de remplacement"
+# Encodages d'un octet dans lesquels un texte UTF-8 a pu être relu (Europe
+# occidentale). Un client dont les fichiers viennent d'un autre jeu de caractères
+# demanderait d'étendre cette liste.
+ENCODAGES_SUSPECTS = ("cp1252", "iso8859_15", "latin_1")
+CARACTERE_REMPLACEMENT = chr(0xFFFD)
+
+
+def _repertoire(encodages) -> frozenset[str]:
+    """Caractères non ASCII des encodages, sans les caractères de contrôle U+0080 à
+    U+009F qu'ISO-8859-15 et Latin-1 placent sur les octets 0x80 à 0x9F (Windows-1252
+    y place des signes, comme € ou l'apostrophe typographique)."""
+    caracteres = set()
+    for encodage in encodages:
+        for octet in range(0x80 if encodage == "cp1252" else 0xA0, 0x100):
+            try:
+                caracteres.add(bytes([octet]).decode(encodage))
+            except UnicodeDecodeError:
+                continue
+    return frozenset(caracteres)
+
+
+_REPERTOIRE = _repertoire(ENCODAGES_SUSPECTS[:2])
+# Caractère UTF-8 valide de deux à quatre octets.
+_SEQUENCE_UTF8 = re.compile(
+    rb"[\xc2-\xdf][\x80-\xbf]"
+    rb"|\xe0[\xa0-\xbf][\x80-\xbf]"
+    rb"|[\xe1-\xec\xee\xef][\x80-\xbf]{2}"
+    rb"|\xed[\x80-\x9f][\x80-\xbf]"
+    rb"|\xf0[\x90-\xbf][\x80-\xbf]{2}"
+    rb"|[\xf1-\xf3][\x80-\xbf]{3}"
+    rb"|\xf4[\x80-\x8f][\x80-\xbf]{2}"
+)
 
 
 def chemin_regles_complementaires() -> Path:
@@ -433,6 +479,73 @@ def _verdict_complementaire(type_regle: str, parametre, valeur) -> bool | None:
     return not _cle_luhn_valide(texte)
 
 
+def _octets(texte: str, encodage: str) -> bytes:
+    """Octets du texte dans l'encodage, un caractère non encodable devenant l'octet 0.
+
+    L'octet 0 interrompt toute séquence, si bien qu'un caractère étranger à
+    l'encodage (une apostrophe typographique correcte en Latin-1, par exemple)
+    n'empêche pas de repérer une séquence ailleurs dans le texte.
+    """
+    morceaux = []
+    for caractere in texte:
+        try:
+            morceaux.append(caractere.encode(encodage))
+        except UnicodeEncodeError:
+            morceaux.append(b"\x00")
+    return b"".join(morceaux)
+
+
+def _mal_decode(texte: str, encodage: str) -> bool:
+    """Vrai si le texte, réécrit dans l'encodage, contient un caractère UTF-8 de
+    plusieurs octets qui appartient lui-même à l'un des encodages suspects (hors
+    caractères de contrôle).
+
+    La seconde condition écarte des suites légitimes : une capitale accentuée suivie
+    d'une espace insécable, en typographie française, forme aussi un caractère UTF-8
+    valide, mais un caractère phonétique, étranger à ces encodages. Un texte
+    d'Europe occidentale mal décodé redonne un caractère d'Europe occidentale.
+    """
+    return any(
+        trouve.group().decode("utf-8") in _REPERTOIRE
+        for trouve in _SEQUENCE_UTF8.finditer(_octets(texte, encodage))
+    )
+
+
+def constats_encodage(texte: str) -> tuple[str, ...]:
+    """Constats de la règle `encodage` pour un texte, vide s'il n'est pas suspect.
+
+    « séquence d'un mauvais décodage » : le texte porte la trace d'un texte UTF-8
+    relu dans l'un des encodages de `ENCODAGES_SUSPECTS` (`CafÃ©` pour `Café`,
+    `â€™` pour une apostrophe typographique). « caractère de remplacement » : le
+    texte contient U+FFFD, laissé par un décodage qui a perdu l'information. Un
+    texte peut porter les deux. Un texte fait de caractères ASCII n'est jamais
+    suspect, ni un texte correct comme `CHÂTEAU` ou `SÃO PAULO`.
+    """
+    if texte.isascii():
+        return ()
+    constats = []
+    if any(_mal_decode(texte, encodage) for encodage in ENCODAGES_SUSPECTS):
+        constats.append(CONSTAT_DECODAGE)
+    if CARACTERE_REMPLACEMENT in texte:
+        constats.append(CONSTAT_REMPLACEMENT)
+    return tuple(constats)
+
+
+def _controler_encodage(presentes: pd.Series):
+    """Contrôle de la règle `encodage` sur les textes d'une colonne, rendu comme
+    `_controler_regle` : None si la colonne n'a aucune cellule de texte."""
+    textes = presentes[[isinstance(valeur, str) for valeur in presentes]]
+    if textes.empty:
+        return None
+    verdicts = {texte: constats_encodage(texte) for texte in textes.unique()}
+    constats = textes.map(verdicts)
+    ecarts = [
+        (constats.index[[constat in c for c in constats]], constat, ISSUE_ANOMALIE)
+        for constat in (CONSTAT_DECODAGE, CONSTAT_REMPLACEMENT)
+    ]
+    return len(textes), 0, ecarts
+
+
 def _parametre_en_texte(type_regle: str, parametre) -> str:
     """Texte du paramètre d'une règle complémentaire, pour la table des écarts."""
     if type_regle == "bornes":
@@ -506,6 +619,14 @@ def controler(
     évaluables sont comptées comme contrôlées. Une table ou une colonne inconnue des
     données arrête le traitement (faute de frappe probable).
 
+    Règle d'encodage : elle est contrôlée en dernier, sur toute colonne qui a au
+    moins une cellule renseignée dont la valeur chargée est un texte (les autres
+    cellules ne sont pas comptées comme contrôlées). La colonne `regle` vaut
+    « encodage », `regle_en_vigueur` « sans séquence suspecte » et `statut_regle`
+    est vide, la règle ne venant ni du dictionnaire ni du métier. Les constats sont
+    ceux de `constats_encodage`, tous deux des anomalies. Une colonne sensible est
+    contrôlée comme les autres, sa valeur constatée étant « masqué ».
+
     La classification de sensibilité (config/sensibilite.yaml par défaut) est
     vérifiée avant le calcul. Une colonne est aussi tenue pour sensible quand le
     dictionnaire la marque comme telle. Les arguments ne sont pas modifiés.
@@ -537,7 +658,10 @@ def controler(
     if problemes:
         raise ValueError("Règles inconnues des contrôles\n  " + "\n  ".join(problemes))
 
-    rang_regles = {nom: rang for rang, nom in enumerate((*REGLES, *REGLES_COMPLEMENTAIRES))}
+    rang_regles = {
+        nom: rang
+        for rang, nom in enumerate((*REGLES, *REGLES_COMPLEMENTAIRES, REGLE_ENCODAGE))
+    }
     bilan, morceaux = [], []
     for rang_table, (table, colonnes) in enumerate(dictionnaire.items()):
         donnees = tables[table].reset_index(drop=True)
@@ -571,6 +695,9 @@ def controler(
                 for type_regle in REGLES_COMPLEMENTAIRES
                 if type_regle in en_plus
             ]
+            encodage = _controler_encodage(presentes)
+            if encodage is not None:
+                a_faire.append((REGLE_ENCODAGE, ENCODAGE_EN_VIGUEUR, None, encodage))
             for nom, en_vigueur, statut, (controlees, non_revues, ecarts) in a_faire:
                 commun = {
                     "table": table,
