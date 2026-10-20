@@ -1,13 +1,13 @@
 # Mode opératoire d'un cycle de traitement
 
-Document à l'usage du consultant. Il décrit, dans l'ordre chronologique, ce que font le consultant, le métier du client et l'assistant LLM pour traiter les exports d'un client avec cet outil, jusqu'à l'étape 5 comprise. Il sera complété avec les étapes 6 et suivantes.
+Document à l'usage du consultant. Il décrit, dans l'ordre chronologique, ce que font le consultant, le métier du client et l'assistant LLM pour traiter les exports d'un client avec cet outil, jusqu'à l'étape 6 comprise. Il sera complété avec les étapes 7 et suivantes.
 
 ## Rôles et règles communes
 
 | Code | Rôle | Ce qu'il fait |
 | --- | --- | --- |
 | C | Consultant | Dépose les fichiers de configuration, exécute les notebooks, commite, anime la revue avec le métier. |
-| M | Métier du client | Fournit les exports, valide ou corrige les propositions (classeur de revue, formulaires de règles). |
+| M | Métier du client | Fournit les exports, valide ou corrige les propositions (classeur de revue, formulaires de règles), tranche les éléments du classeur d'arbitrage. |
 | A | Assistant LLM | Rédige les fichiers de configuration, le code générique et ses tests, les parties du rapport. |
 
 Règles valables à chaque étape :
@@ -131,12 +131,33 @@ Repères pour la phase 7 :
 - ouvert par double-clic, Excel retire les zéros en tête, écrit un SIRET en notation scientifique, lit `2026-03` comme une date et une valeur commençant par `=` comme une formule, d'où l'étape 7.7;
 - l'écriture refuse une table où une valeur sensible serait visible, ou qui n'est pas passée par `qualifier`; les deux fichiers sont réécrits à chaque exécution, sans copie de sauvegarde.
 
+### Phase 8, nettoyage et décisions du métier (notebook 06)
+
+| N° | Action | Qui | Outil | État |
+| --- | --- | --- | --- | --- |
+| 8.1 | Mettre `PERIODE_FIN` à jour et exécuter le notebook en entier (environ trois minutes : nettoyage, puis contrôles avant et après nettoyage); vérifier le nombre de décisions du métier lues (emplacement attendu), les corrections sur une colonne sensible toutes masquées, 0 ligne dont la valeur ou la clé sensible n'est pas masquée | C | notebook 06 | opérationnel |
+| 8.2 | Lire le bilan du nettoyage (cellules corrigées, lignes retirées, raisons de non-correction) et la comparaison avant et après; regarder un par un les contrôles aux anomalies apparues (une valeur devenue lisible rend une règle évaluable) | C, A (décomptes seulement) | cellules `# NETTOYAGE` et `# COMPARAISON` | opérationnel |
+| 8.3 | Exporter le classeur d'arbitrage dans `data/decisions/` (cellule `# EXPORT ARBITRAGE`) | C | notebook 06 | opérationnel |
+| 8.4 | Trancher les lignes du classeur dans la colonne `decision` (corriger avec la valeur retenue, garder ou retirer, selon la sorte), mode d'emploi dans la première feuille; une ligne sans décision sera proposée de nouveau | M avec C | Excel | opérationnel |
+| 8.5 | Enregistrer et fermer le classeur, puis `# IMPORT ARBITRAGE` (tous les problèmes listés en une fois, décisions enregistrées dans `data/config/decisions.yaml` avec une copie datée); supprimer le classeur importé de `data/decisions/` | C | notebook 06 | opérationnel |
+| 8.6 | Relancer le notebook en entier : `# NETTOYAGE` applique les décisions, et le classeur suivant ne propose que les éléments restants | C | notebook 06 | opérationnel |
+| 8.7 | Écrire le journal et le bilan du nettoyage dans `data/nettoyage/`, et la table des anomalies après nettoyage avec la décision du métier, et son bilan, dans `data/anomalies/` (cellule `# ECRITURE`); un CSV ouvert dans Excel bloque l'écriture sans rien modifier | C | notebook 06 | opérationnel |
+
+Repères pour la phase 8 :
+
+- les règles automatiques ne corrigent que ce qui se lit sans ambiguïté; tout le reste passe par une décision du métier, gardée d'un mois à l'autre tant que la donnée ne change pas;
+- une décision dont la donnée a changé (source corrigée, ou réexportée avec des lignes décalées) devient caduque : le nettoyage ne l'applique pas, son bilan le dit, et l'élément revient au classeur suivant;
+- une anomalie de règle de gestion (issue « anomalie ») n'entre pas dans le classeur : sa correction se fait dans le logiciel source;
+- le classeur porte des valeurs du client, colonnes sensibles comprises : il reste dans `data/decisions/` et ne se colle pas dans la conversation; le journal du nettoyage masque les colonnes sensibles;
+- une année écrite sur deux chiffres est complétée en 20AA si la date ne dépasse pas la date de coupure; ces conversions sont visibles au journal (« siècle 20 ajouté ») et sont à faire vérifier par le métier quand une règle de gestion les signale;
+- le jeu nettoyé n'est pas écrit : il se recalcule à chaque exécution à partir des fichiers bruts, des règles et des décisions.
+
 ## Cycle mensuel (un mois de plus)
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
 | M.1 | Déposer les exports du mois (période dans le nom, par exemple dans `data/raw/2026/2026-04/`), et les référentiels s'ils ont changé | M, C | Explorateur | opérationnel |
-| M.2 | Mettre `PERIODE_FIN` à jour dans chaque notebook exécuté | C | notebooks 01, 02c, 03, 04, 05 | opérationnel |
+| M.2 | Mettre `PERIODE_FIN` à jour dans chaque notebook exécuté | C | notebooks 01, 02c, 03, 04, 05, 06 | opérationnel |
 | M.3 | Exécuter le notebook 01 (fichiers attendus, en-têtes, lignes chargées) | C | notebook 01 | à adapter |
 | M.4 | Exécuter le notebook 02 seulement si un format nouveau est soupçonné | C | notebook 02 | à adapter |
 | M.5 | Régénérer le dictionnaire : cellules jusqu'à `# ECRITURE APRES FUSION`, lire le rapport de `# FUSION` (événements « à regarder ») | C | notebook 02c | opérationnel |
@@ -144,6 +165,7 @@ Repères pour la phase 7 :
 | M.7 | Exécuter les notebooks 03 puis 04 en entier | C | notebooks 03, 04 | opérationnel |
 | M.8 | Exécuter le notebook 05 en entier : il relance les contrôles et réécrit les deux CSV de la période dans `data/anomalies/` | C | notebook 05 | opérationnel |
 | M.9 | Revoir `config/anomalies.yaml` quand une colonne ou un indicateur change (le notebook 05 liste les colonnes non déclarées et les contrôles non qualifiés) | A, puis C | `config/anomalies.yaml` | opérationnel |
+| M.10 | Exécuter le notebook 06 en entier, puis l'arbitrage si des éléments sont à trancher (phase 8, étapes 8.3 à 8.7) | C, M | notebook 06, Excel | opérationnel |
 
 Une fois par an : compléter les jours fériés de l'année suivante dans `config/gestion.yaml` (le notebook 04 avertit quand une année manque) et vérifier que les paramètres annuels du client couvrent la nouvelle année.
 
@@ -153,4 +175,4 @@ Une fois par an : compléter les jours fériés de l'année suivante dans `conf
 - **Formulaires.** Les formulaires des règles de contrôle et des règles de gestion restent à concevoir (forme, et passage du formulaire au YAML).
 - **Rapport.** Le rapport au client (plan, destinataire, format) n'est pas encore défini; les parties 2.5 et 3.3 en sont les premières briques.
 - **Découverte des encodages et séparateurs.** Ils sont déclarés à la main dans `config/sources.yaml`; l'étape qui les proposerait n'est pas faite.
-- **Décisions du métier ligne par ligne.** Les décisions sur les écarts à arbitrer (dates à corriger, doublons) ne sont pas encore retenues d'un mois à l'autre; l'identifiant `id_anomalie` de la table des anomalies servira de repère au mécanisme qui les conservera.
+- **Dates dont le siècle a été ajouté.** Elles ne sont pas soumises à la confirmation du métier; les faire confirmer dans le classeur d'arbitrage serait une amélioration possible.
