@@ -1182,3 +1182,98 @@ def test_comparer_sur_des_controles_reels():
     assert int(comparaison["resolues"].sum()) == len(avant) > 0
     assert int(comparaison["apparues"].sum()) == 0
     assert set(comparaison["etape"]) == {"format", "doublons"}
+
+
+
+# --- ecrire_nettoyage ----------------------------------------------------------
+
+
+def _journal_exemple():
+    tables = {"t": _table(code=["a", "b", "b"], nom=[_mal("Café"), "x", "x"],
+                          adresse=[_mal("Rue Été"), "r", "r"])}
+    tables["t"]["j"] = pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-02"])
+    dictionnaire = _dictionnaire(tables, **{"t.j": _colonne("date native")})
+    decisions = _decisions(
+        a1=_decision(2, "j", "corriger", _empreinte_cellule(pd.Timestamp(2025, 1, 1)),
+                     datetime(2025, 2, 1), "date native"),
+    )
+    sensibles = {"t": frozenset({"adresse"})}
+    return nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}}, None, decisions)
+
+
+def test_ecrire_nettoyage(tmp_path):
+    from frigeo.nettoyage import chemins_nettoyage, dossier_nettoyage, ecrire_nettoyage
+
+    resultat = _journal_exemple()
+    sensibles = {"t": frozenset({"adresse"})}
+    chemins = ecrire_nettoyage(resultat.journal, resultat.bilan, "2026-03", tmp_path, sensibles,
+                               {"t": {"cle": ["code"]}})
+    assert [c.name for c in chemins] == ["journal_2026-03.csv", "bilan_nettoyage_2026-03.csv"]
+    assert chemins == chemins_nettoyage("2026-03", tmp_path)
+    assert dossier_nettoyage().parts[-2:] == ("data", "nettoyage")
+    octets = chemins[0].read_bytes()
+    assert octets.startswith(b"\xef\xbb\xbf" + ";".join(COLONNES_JOURNAL).encode() + b"\r\n")
+    journal = pd.read_csv(chemins[0], sep=";", encoding="utf-8-sig", dtype=str,
+                          keep_default_na=False)
+    assert journal[["regle_nettoyage", "num_ligne_source", "colonne", "valeur_avant",
+                    "valeur_apres"]].values.tolist() == [
+        ["encodage", "2", "nom", "Café".encode().decode("cp1252"), "Café"],
+        ["encodage", "2", "adresse", "masqué", "masqué"],
+        ["doublons", "4", "", "", ""],
+        ["decision", "2", "j", "2025-01-01 00:00:00", "2025-02-01 00:00:00"],
+    ]
+    # Un numéro de ligne lu 2.0 (classeur Excel) s'écrit 2.
+    flottants = resultat.journal.copy()
+    flottants["num_ligne_source"] = [float(n) for n in flottants["num_ligne_source"]]
+    ecrire_nettoyage(flottants, resultat.bilan, "2026-03", tmp_path, sensibles,
+                     {"t": {"cle": ["code"]}})
+    relu = pd.read_csv(chemins[0], sep=";", encoding="utf-8-sig", dtype=str, keep_default_na=False)
+    assert relu["num_ligne_source"].tolist() == ["2", "2", "4", "2"]
+    bilan = pd.read_csv(chemins[1], sep=";", encoding="utf-8-sig", dtype=str,
+                        keep_default_na=False)
+    assert list(bilan.columns) == list(COLONNES_BILAN_NETTOYAGE)
+    assert bilan["corrigees"].tolist() == ["1", "1", "1", "1"]
+
+
+def test_ecrire_nettoyage_refusee(tmp_path, monkeypatch):
+    import builtins
+    from pathlib import Path
+
+    import frigeo.anomalies as module_anomalies
+    from frigeo.nettoyage import ecrire_nettoyage
+
+    resultat = _journal_exemple()
+    sensibles = {"t": frozenset({"adresse"})}
+    declarations = {"t": {"cle": ["code"]}}
+    visible = resultat.journal.copy()
+    visible.loc[1, "valeur_apres"] = "Rue Été"
+    with pytest.raises(ValueError) as erreur:
+        ecrire_nettoyage(visible, resultat.bilan.drop(columns="raisons"), "2026-3", tmp_path,
+                         sensibles, declarations)
+    message = str(erreur.value)
+    assert "période '2026-3'" in message
+    assert "bilan du nettoyage : colonnes attendues" in message
+    with pytest.raises(ValueError, match="1 lignes du journal dont une valeur ou la clé"):
+        ecrire_nettoyage(visible, resultat.bilan, "2026-03", tmp_path, sensibles, declarations)
+    # Clé d'une table dont une colonne de la clé est sensible.
+    cle_visible = resultat.journal.copy()
+    with pytest.raises(ValueError, match="4 lignes du journal"):
+        ecrire_nettoyage(cle_visible, resultat.bilan, "2026-03", tmp_path,
+                         {"t": frozenset({"adresse", "code"})}, declarations)
+    assert not any(tmp_path.iterdir())
+
+    chemins = ecrire_nettoyage(resultat.journal, resultat.bilan, "2026-03", tmp_path, sensibles,
+                               declarations)
+    avant = {f.name: f.read_bytes() for f in tmp_path.iterdir()}
+    ouvert = builtins.open
+
+    def ouvrir(fichier, mode="r", *args, **kwargs):
+        if mode == "r+b" and Path(fichier) == chemins[0]:
+            raise PermissionError(13, "Permission denied")
+        return ouvert(fichier, mode, *args, **kwargs)
+
+    monkeypatch.setattr(module_anomalies, "open", ouvrir, raising=False)
+    with pytest.raises(PermissionError, match="Rien n'a été modifié"):
+        ecrire_nettoyage(resultat.journal.iloc[:1], resultat.bilan, "2026-03", tmp_path,
+                         sensibles, declarations)
+    assert {f.name: f.read_bytes() for f in tmp_path.iterdir()} == avant

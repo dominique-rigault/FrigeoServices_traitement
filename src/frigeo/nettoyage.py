@@ -39,8 +39,9 @@ Chaque règle s'applique aux valeurs laissées par les règles précédentes.
 `nettoyer` rend les tables nettoyées, le journal des corrections (une ligne par
 cellule modifiée, avec sa valeur avant et après) et un bilan par règle et par
 colonne. `comparer_anomalies` compare, contrôle par contrôle, la table des
-anomalies des tables brutes et celle des tables nettoyées. Rien n'est écrit sur
-disque.
+anomalies des tables brutes et celle des tables nettoyées. `ecrire_nettoyage`
+écrit le journal et le bilan en CSV dans data/nettoyage/; c'est la seule fonction
+du module qui écrit sur disque.
 """
 
 from __future__ import annotations
@@ -51,8 +52,11 @@ import re
 from collections import Counter, namedtuple
 from decimal import Decimal
 
+from pathlib import Path
+
 import pandas as pd
 
+from . import racine_projet
 from .confidentialite import charger_sensibilite, est_sensible, verifier_sensibilite
 from .controles import (
     CARACTERE_REMPLACEMENT,
@@ -76,7 +80,12 @@ from .dictionnaire import (
     est_masquee,
     problemes_dictionnaire,
 )
-from .anomalies import _index_lignage
+from .anomalies import (
+    _MOTIF_PERIODE_FIN,
+    _ecrire_fichiers,
+    _index_lignage,
+)
+from .anomalies import _numero as _numero_entier
 from .gestion import ISSUE_INFORMATION
 from .anomalies import _repere as _repere_anomalie
 from .doublons import (
@@ -1147,3 +1156,107 @@ def comparer_anomalies(avant: pd.DataFrame, apres: pd.DataFrame) -> pd.DataFrame
     ]
     comparaison = pd.DataFrame(lignes, columns=list(COLONNES_COMPARAISON), dtype=object)
     return comparaison.astype({c: int for c in COLONNES_COMPARAISON[4:]})
+
+
+PREFIXE_FICHIER_JOURNAL = "journal_"
+PREFIXE_FICHIER_BILAN_NETTOYAGE = "bilan_nettoyage_"
+
+
+def dossier_nettoyage() -> Path:
+    """Emplacement par défaut des fichiers du nettoyage : data/nettoyage/, hors du dépôt."""
+    return racine_projet() / "data" / "nettoyage"
+
+
+def chemins_nettoyage(periode_fin: str, dossier: str | Path | None = None) -> tuple[Path, Path]:
+    """Chemins du journal et du bilan du nettoyage d'une période (AAAA-MM)."""
+    dossier = dossier_nettoyage() if dossier is None else Path(dossier)
+    return (
+        dossier / f"{PREFIXE_FICHIER_JOURNAL}{periode_fin}.csv",
+        dossier / f"{PREFIXE_FICHIER_BILAN_NETTOYAGE}{periode_fin}.csv",
+    )
+
+
+def journal_non_masque(
+    journal: pd.DataFrame,
+    sensibles: dict[str, frozenset[str]] | None = None,
+    declarations: dict | None = None,
+) -> pd.DataFrame:
+    """Lignes du journal dont une valeur ou la clé vient d'une colonne sensible
+    sans être masquée (`sensibles` : config/sensibilite.yaml par défaut,
+    `declarations` : clés du bloc doublons de config/controles.yaml). Une table
+    vide est attendue."""
+    if sensibles is None:
+        sensibles = charger_sensibilite()
+    if declarations is None:
+        declarations = charger_declarations_doublons()
+
+    def visible(valeur) -> bool:
+        return _texte(valeur) not in ("", VALEUR_MASQUEE)
+
+    fautives = []
+    for position, ligne in enumerate(journal.itertuples(index=False)):
+        colonne_sensible = not pd.isna(ligne.colonne) and est_sensible(
+            sensibles, ligne.table, ligne.colonne
+        )
+        cle = declarations.get(ligne.table, {}).get("cle", [])
+        cle_sensible = any(est_sensible(sensibles, ligne.table, c) for c in cle)
+        if (colonne_sensible and (visible(ligne.valeur_avant) or visible(ligne.valeur_apres))) or (
+            cle_sensible and visible(ligne.cle)
+        ):
+            fautives.append(position)
+    return journal.iloc[fautives]
+
+
+def ecrire_nettoyage(
+    journal: pd.DataFrame,
+    bilan: pd.DataFrame,
+    periode_fin: str,
+    dossier: str | Path | None = None,
+    sensibles: dict[str, frozenset[str]] | None = None,
+    declarations: dict | None = None,
+) -> tuple[Path, Path]:
+    """Écrit le journal et le bilan du nettoyage en CSV et rend leurs chemins.
+
+    `journal` et `bilan` viennent de `nettoyer`. Les fichiers sont
+    `journal_AAAA-MM.csv` et `bilan_nettoyage_AAAA-MM.csv`, dans `dossier` (par
+    défaut data/nettoyage/, créé s'il manque), réécrits à chaque exécution, sans
+    copie (ils se régénèrent à partir des données, de la configuration et des
+    décisions). Mêmes conventions que les fichiers de l'étape 5
+    (`anomalies.ecrire_anomalies`) : UTF-8 avec BOM, séparateur « ; », fins de
+    ligne CRLF, numéro de ligne entier (sans « 2.0 »); les valeurs avant et après
+    sont écrites telles quelles (un nombre avec un point décimal, une date native
+    « AAAA-MM-JJ HH:MM:SS »).
+
+    Refuse (`ValueError`, tous les problèmes listés, sans rien écrire) : une période
+    qui n'est pas de la forme AAAA-MM, des colonnes autres que `COLONNES_JOURNAL`
+    et `COLONNES_BILAN_NETTOYAGE` (dans cet ordre), une valeur ou une clé d'une
+    colonne sensible non masquée (`journal_non_masque`). Écriture tout ou rien;
+    un fichier ouvert dans Excel arrête l'écriture sans rien modifier.
+    """
+    problemes = []
+    if not isinstance(periode_fin, str) or not _MOTIF_PERIODE_FIN.fullmatch(periode_fin):
+        problemes.append(f"période {periode_fin!r} : forme AAAA-MM attendue (par exemple 2026-03)")
+    for nom, donnees, attendues in (
+        ("journal", journal, COLONNES_JOURNAL),
+        ("bilan du nettoyage", bilan, COLONNES_BILAN_NETTOYAGE),
+    ):
+        if list(donnees.columns) != list(attendues):
+            problemes.append(f"{nom} : colonnes attendues, dans cet ordre, {', '.join(attendues)}")
+    if not problemes:
+        fautives = journal_non_masque(journal, sensibles, declarations)
+        if not fautives.empty:
+            colonnes = sorted({f"{t}.{c}" for t, c in zip(fautives["table"], fautives["colonne"])})
+            problemes.append(
+                f"{len(fautives)} lignes du journal dont une valeur ou la clé d'une colonne "
+                f"sensible n'est pas masquée ({', '.join(colonnes)})"
+            )
+    if problemes:
+        raise ValueError("Écriture refusée\n  " + "\n  ".join(problemes))
+
+    sortie = journal.copy()
+    sortie["num_ligne_source"] = pd.array(
+        [_numero_entier(v) for v in sortie["num_ligne_source"]], dtype="Int64"
+    )
+    chemins = chemins_nettoyage(periode_fin, dossier)
+    _ecrire_fichiers([(sortie, chemins[0]), (bilan, chemins[1])])
+    return chemins

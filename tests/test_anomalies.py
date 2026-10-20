@@ -1008,3 +1008,29 @@ def test_fichier_ouvert_dans_excel(tmp_path, monkeypatch):
     assert "a déjà été remplacé" in str(erreur.value) and chemin_bilan.name in str(erreur.value)
     assert sorted(f.name for f in tmp_path.iterdir()) == [chemin.name, chemin_bilan.name]
     assert len(_relire(chemin)) == 2
+
+
+def test_ecriture_des_anomalies_nettoyees(tmp_path):
+    from frigeo.anomalies import COLONNE_DECISION_METIER, COLONNES_ANOMALIES_NETTOYEES
+
+    anomalies, bilan = _qualifiees()
+    marquees = anomalies.copy()
+    marquees[COLONNE_DECISION_METIER] = ["garder le 2026-10-20"] + [None] * (len(anomalies) - 1)
+    chemins = ecrire_anomalies(
+        marquees, bilan, "2026-03", tmp_path, AUCUNE_SENSIBLE, DECLARATIONS, nettoyees=True
+    )
+    assert [c.name for c in chemins] == [
+        "anomalies_nettoyees_2026-03.csv", "bilan_nettoyees_2026-03.csv"
+    ]
+    assert chemins == chemins_anomalies("2026-03", tmp_path, nettoyees=True)
+    relue = _relire(chemins[0])
+    assert list(relue.columns) == list(COLONNES_ANOMALIES_NETTOYEES)
+    assert relue[COLONNE_DECISION_METIER].tolist()[:2] == ["garder le 2026-10-20", ""]
+    # Chaque table avec ses colonnes : sans la colonne des décisions, ou avec elle
+    # pour la table des données brutes, l'écriture est refusée.
+    with pytest.raises(ValueError, match="colonnes attendues"):
+        ecrire_anomalies(anomalies, bilan, "2026-03", tmp_path, AUCUNE_SENSIBLE, DECLARATIONS,
+                         nettoyees=True)
+    with pytest.raises(ValueError, match="colonnes attendues"):
+        _ecrire(marquees, bilan, tmp_path)
+    assert sorted(f.name for f in tmp_path.iterdir()) == [c.name for c in chemins]

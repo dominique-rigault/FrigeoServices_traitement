@@ -52,6 +52,7 @@ from openpyxl.utils import get_column_letter
 
 from . import racine_projet
 from .anomalies import (
+    COLONNE_DECISION_METIER,
     COLONNES_ANOMALIES,
     ETAPE_DOUBLONS,
     ETAPE_FORMAT,
@@ -473,9 +474,6 @@ def elements_a_arbitrer(
         [None if pd.isna(n) else int(n) for n in elements["num_ligne_source"]], dtype="Int64"
     )
     return elements
-
-
-COLONNE_DECISION_METIER = "decision_metier"
 
 
 def ajouter_decisions(
