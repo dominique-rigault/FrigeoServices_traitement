@@ -25,7 +25,10 @@ Règles, dans l'ordre (voir `catalogue_nettoyage`) :
   colonne et qui porte un remplacement au dictionnaire reçoit ce remplacement;
 - `nature` : une valeur hors de la nature de date, d'heure ou de nombre de sa
   colonne est lue dans une forme élargie de la même famille, sans ambiguïté et
-  sans perte, puis écrite dans la représentation de cette nature.
+  sans perte, puis écrite dans la représentation de cette nature;
+- `doublons` : les lignes en surnombre des doublons exacts sont retirées, la
+  première occurrence de chaque groupe étant gardée (comme la vue « sans les
+  doublons exacts en surnombre » des règles de gestion).
 
 Chaque règle s'applique aux valeurs laissées par les règles précédentes.
 
@@ -65,16 +68,25 @@ from .dictionnaire import (
     est_masquee,
     problemes_dictionnaire,
 )
-from .doublons import SEPARATEUR, _texte, charger_declarations_doublons
+from .doublons import (
+    COMPARAISON_NORMALISEE,
+    CONSTAT_EXACT,
+    SEPARATEUR,
+    _texte,
+    charger_declarations_doublons,
+    detecter_doublons,
+)
 from .profilage import _interpretations, signature
 from .typage import NATURES_DATE, NATURES_HEURE, NATURES_LISIBLES, ecrire_date
 
 REGLE_ENCODAGE = "encodage"
 REGLE_REMPLACEMENT = "remplacement"
 REGLE_NATURE = "nature"
-REGLES_NETTOYAGE = (REGLE_ENCODAGE, REGLE_REMPLACEMENT, REGLE_NATURE)
+REGLE_DOUBLONS = "doublons"
+REGLES_NETTOYAGE = (REGLE_ENCODAGE, REGLE_REMPLACEMENT, REGLE_NATURE, REGLE_DOUBLONS)
 
 ACTION_MODIFIEE = "valeur modifiée"
+ACTION_RETIREE = "ligne retirée"
 SOURCE_GENERIQUE = "règle générique"
 SOURCE_DICTIONNAIRE = "dictionnaire"
 
@@ -109,6 +121,9 @@ RAISONS_NATURE = (
     RAISON_AUTRE_FAMILLE,
     RAISON_NON_RECONNUE,
 )
+
+RAISON_LIGNAGE_AMBIGU = "lignage ambigu"
+RAISONS_DOUBLONS = (RAISON_LIGNAGE_AMBIGU,)
 
 COLONNE_PERIODE = "periode_export"
 COLONNES_JOURNAL = (
@@ -167,6 +182,15 @@ _CATALOGUE = {
         "suivi de trois chiffres (séparateur ambigu); une partie décimale non nulle "
         "vers un entier; une valeur d'une autre famille (nombre dans une colonne de "
         "dates); une heure hors de la forme HH:MM",
+    ),
+    REGLE_DOUBLONS: (
+        SOURCE_GENERIQUE,
+        "toute ligne en surnombre d'un groupe de doublons exacts (lignes identiques "
+        "hors lignage, telles quelles ou après normalisation), cherchés sur les tables "
+        "issues des règles précédentes : la ligne est retirée, la première occurrence "
+        "du groupe est gardée",
+        "une valeur en double (clé répétée sur des lignes différentes); des lignes "
+        "identiques hors clé; une ligne dont le lignage désigne plusieurs lignes",
     ),
 }
 
@@ -544,6 +568,58 @@ _REGLES = {
 }
 
 
+def _numero(valeur) -> str:
+    """Numéro de ligne écrit en entier (un numéro lu 2.0 vaut 2)."""
+    texte = _texte(valeur)
+    try:
+        nombre = float(texte)
+    except ValueError:
+        return texte
+    return str(int(nombre)) if nombre.is_integer() else texte
+
+
+def _repere(ligne) -> tuple[str, str, str]:
+    """Repère d'une ligne par son lignage, en textes comparables."""
+    return tuple(
+        _numero(ligne[c]) if c == "num_ligne_source" else _texte(ligne[c])
+        for c in COLONNES_LIGNAGE_ECART
+    )
+
+
+def _doublons_en_surnombre(doublons: pd.DataFrame, table: str, donnees: pd.DataFrame):
+    """Règle `doublons` sur une table : lignes en surnombre des doublons exacts.
+
+    Rend None si la table n'a aucun doublon exact, sinon (nombre de lignes en
+    surnombre, {position: détail}, Counter des raisons). Les lignes d'un groupe se
+    suivent dans la table des doublons, dans l'ordre de la table : la première est
+    gardée, les autres sont retirées. Une ligne est retrouvée par son lignage; un
+    lignage qui désigne plusieurs lignes de la table n'est pas retiré.
+    """
+    exacts = doublons[(doublons["table"] == table) & (doublons["constat"] == CONSTAT_EXACT)]
+    if exacts.empty:
+        return None
+    positions: dict[tuple, list[int]] = {}
+    lignage = donnees.reindex(columns=list(COLONNES_LIGNAGE_ECART)).reset_index(drop=True)
+    for position, ligne in lignage.iterrows():
+        positions.setdefault(_repere(ligne), []).append(position)
+    visees, retirees, raisons = 0, {}, Counter()
+    for _, groupe in exacts.groupby("groupe", sort=False):
+        premiere = groupe.iloc[0]
+        for _, ligne in groupe.iloc[1:].iterrows():
+            visees += 1
+            trouvees = positions.get(_repere(ligne), [])
+            if len(trouvees) != 1:
+                raisons[RAISON_LIGNAGE_AMBIGU] += 1
+                continue
+            feuille = _texte(premiere["feuille_source"])
+            ou = _texte(premiere["fichier_source"]) + (f", {feuille}" if feuille else "")
+            detail = f"doublon exact de la ligne {_numero(premiere['num_ligne_source'])} ({ou})"
+            if ligne["comparaison"] == COMPARAISON_NORMALISEE:
+                detail += ", après normalisation"
+            retirees[trouvees[0]] = detail
+    return visees, retirees, raisons
+
+
 def _texte_raisons(raisons: Counter, ordre) -> str | None:
     morceaux = [f"{raison} {raisons[raison]}" for raison in ordre if raisons[raison]]
     return "; ".join(morceaux) or None
@@ -569,12 +645,14 @@ def nettoyer(
     sur deux chiffres n'est complétée en 20AA que si la date obtenue ne la dépasse
     pas; sans elle, ces dates ne sont pas converties, et le bilan le dit.
 
-    Tables nettoyées : copies des tables reçues, mêmes colonnes, même index, mêmes
-    types de colonnes, lignage compris; seules les cellules corrigées changent. Les
+    Tables nettoyées : copies des tables reçues, mêmes colonnes, mêmes types de
+    colonnes, lignage compris; seules les cellules corrigées changent, et les lignes
+    retirées comme doublons disparaissent (les autres gardent leur index). Les
     tables reçues ne sont pas modifiées.
 
-    Journal (`COLONNES_JOURNAL`) : une ligne par cellule modifiée, dans l'ordre des
-    règles, puis des tables, puis des lignes, puis des colonnes. `cle` est la clé
+    Journal (`COLONNES_JOURNAL`) : une ligne par cellule modifiée ou par ligne
+    retirée, dans l'ordre des règles, puis des tables, puis des lignes, puis des
+    colonnes. `cle` est la clé
     déclarée de la ligne, lue dans la table reçue (vide sans clé déclarée, « masqué »
     si une colonne de la clé est sensible); `valeur_avant` et `valeur_apres` valent
     « masqué » pour une colonne sensible, la valeur brute restant retrouvable par le
@@ -582,11 +660,13 @@ def nettoyer(
     `detail` précise la correction (pour l'encodage, les encodages qui ont repéré
     une séquence et le nombre de passes; pour un remplacement, la date de la revue
     qui a invalidé la valeur; pour la nature, la forme lue, « forme masquée » pour
-    une colonne sensible, et l'ajout du siècle).
+    une colonne sensible, et l'ajout du siècle; pour une ligne retirée, la ligne
+    gardée du même groupe). Une ligne retirée n'a ni colonne ni valeur.
 
     Bilan (`COLONNES_BILAN_NETTOYAGE`) : une ligne par règle et par colonne qui a au
-    moins une cellule visée, avec les cellules visées, corrigées, non corrigées, et
-    le décompte des raisons de non-correction (textes séparés par « ; »).
+    moins une cellule visée (par table, sans colonne, pour les doublons), avec les
+    cellules (ou lignes) visées, corrigées, non corrigées, et le décompte des raisons
+    de non-correction (textes séparés par « ; »).
     """
     if sensibles is None:
         sensibles = charger_sensibilite()
@@ -608,14 +688,80 @@ def nettoyer(
         declarations = charger_declarations_doublons()
 
     nettoyees = {table: donnees.copy() for table, donnees in tables.items()}
+    brutes = {table: donnees.reset_index(drop=True) for table, donnees in tables.items()}
+    cles = {}
+    for table, donnees in brutes.items():
+        cle = [c for c in declarations.get(table, {}).get("cle", []) if c in donnees.columns]
+        cles[table] = (cle, any(est_sensible(sensibles, table, c) for c in cle))
     journal, bilan = [], []
+
+    def ligne_du_journal(rang_regle, rang_table, table, position, **champs) -> dict:
+        """Ligne du journal pour la ligne source de la table reçue à cette position."""
+        ligne = brutes[table].iloc[position]
+        cle, cle_masquee = cles[table]
+        if not cle:
+            texte_cle = None
+        elif cle_masquee:
+            texte_cle = VALEUR_MASQUEE
+        else:
+            texte_cle = SEPARATEUR.join(_texte(ligne[c]) for c in cle)
+        colonnes = brutes[table].columns
+        periode = _texte(ligne[COLONNE_PERIODE]) if COLONNE_PERIODE in colonnes else ""
+        return {
+            "regle_nettoyage": REGLES_NETTOYAGE[rang_regle],
+            "table": table,
+            **{c: (ligne[c] if c in colonnes else None) for c in COLONNES_LIGNAGE_ECART},
+            COLONNE_PERIODE: periode or None,
+            "cle": texte_cle,
+            **champs,
+            "_regle": rang_regle,
+            "_table": rang_table,
+            "_position": position,
+        }
+
     for rang_regle, regle_nettoyage in enumerate(REGLES_NETTOYAGE):
+        if regle_nettoyage == REGLE_DOUBLONS:
+            # Doublons cherchés une fois, sur toutes les tables nettoyées.
+            doublons, _ = detecter_doublons(nettoyees, declarations, sensibles)
+            for rang_table, table in enumerate(tables):
+                resultat = _doublons_en_surnombre(doublons, table, nettoyees[table])
+                if resultat is None:
+                    continue
+                visees, retirees, raisons = resultat
+                bilan.append(
+                    {
+                        "regle_nettoyage": regle_nettoyage,
+                        "table": table,
+                        "colonne": None,
+                        "visees": visees,
+                        "corrigees": len(retirees),
+                        "non_corrigees": visees - len(retirees),
+                        "raisons": _texte_raisons(raisons, RAISONS_DOUBLONS),
+                    }
+                )
+                for position, detail in sorted(retirees.items()):
+                    journal.append(
+                        ligne_du_journal(
+                            rang_regle,
+                            rang_table,
+                            table,
+                            position,
+                            colonne=None,
+                            action=ACTION_RETIREE,
+                            source=SOURCE_GENERIQUE,
+                            valeur_avant=None,
+                            valeur_apres=None,
+                            detail=detail,
+                            _colonne=-1,
+                        )
+                    )
+                donnees = nettoyees[table]
+                nettoyees[table] = donnees.drop(index=donnees.index[sorted(retirees)])
+            continue
+
         appliquer_regle, source, ordre_raisons = _REGLES[regle_nettoyage]
-        for rang_table, (table, donnees) in enumerate(tables.items()):
-            brutes = donnees.reset_index(drop=True)
-            cle = [c for c in declarations.get(table, {}).get("cle", []) if c in brutes.columns]
-            cle_masquee = any(est_sensible(sensibles, table, c) for c in cle)
-            for rang_colonne, colonne in enumerate(_colonnes_de_donnees(brutes)):
+        for rang_table, table in enumerate(tables):
+            for rang_colonne, colonne in enumerate(_colonnes_de_donnees(brutes[table])):
                 regles = dictionnaire[table][colonne]
                 masquee = (
                     est_sensible(sensibles, table, colonne)
@@ -648,42 +794,22 @@ def nettoyer(
                     nouvelle.iloc[position] = acceptees[position][0]
                 nettoyees[table].isetitem(nettoyees[table].columns.get_loc(colonne), nouvelle)
                 for position in positions:
-                    ligne = brutes.iloc[position]
-                    if not cle:
-                        texte_cle = None
-                    elif cle_masquee:
-                        texte_cle = VALEUR_MASQUEE
-                    else:
-                        texte_cle = SEPARATEUR.join(_texte(ligne[c]) for c in cle)
-                    periode = (
-                        _texte(ligne[COLONNE_PERIODE]) if COLONNE_PERIODE in brutes else ""
-                    )
                     valeur_apres, detail = acceptees[position]
+                    avant = _valeur_constatee(courante.iloc[position])
                     journal.append(
-                        {
-                            "regle_nettoyage": regle_nettoyage,
-                            "table": table,
-                            **{
-                                c: (ligne[c] if c in brutes.columns else None)
-                                for c in COLONNES_LIGNAGE_ECART
-                            },
-                            COLONNE_PERIODE: periode or None,
-                            "cle": texte_cle,
-                            "colonne": colonne,
-                            "action": ACTION_MODIFIEE,
-                            "source": source,
-                            "valeur_avant": (
-                                VALEUR_MASQUEE
-                                if masquee
-                                else _valeur_constatee(courante.iloc[position])
-                            ),
-                            "valeur_apres": VALEUR_MASQUEE if masquee else valeur_apres,
-                            "detail": detail,
-                            "_regle": rang_regle,
-                            "_table": rang_table,
-                            "_position": position,
-                            "_colonne": rang_colonne,
-                        }
+                        ligne_du_journal(
+                            rang_regle,
+                            rang_table,
+                            table,
+                            position,
+                            colonne=colonne,
+                            action=ACTION_MODIFIEE,
+                            source=source,
+                            valeur_avant=VALEUR_MASQUEE if masquee else avant,
+                            valeur_apres=VALEUR_MASQUEE if masquee else valeur_apres,
+                            detail=detail,
+                            _colonne=rang_colonne,
+                        )
                     )
 
     if journal:

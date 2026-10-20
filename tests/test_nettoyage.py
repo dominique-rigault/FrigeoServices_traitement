@@ -9,6 +9,7 @@ import pytest
 
 from frigeo.controles import _REPERTOIRE, VALEUR_MASQUEE, constats_encodage, controler
 from frigeo.dictionnaire import MOTIF_SENSIBLE
+from frigeo.doublons import detecter_doublons
 from frigeo.nettoyage import (
     COLONNES_BILAN_NETTOYAGE,
     COLONNES_CATALOGUE_NETTOYAGE,
@@ -355,10 +356,12 @@ def test_catalogue_nettoyage():
         (1, "encodage", "règle générique"),
         (2, "remplacement", "dictionnaire"),
         (3, "nature", "règle générique"),
+        (4, "doublons", "règle générique"),
     ]
     assert "caractère de remplacement" in catalogue.at[0, "ne_corrige_jamais"]
     assert "hors liste" in catalogue.at[1, "ne_corrige_jamais"]
     assert "date impossible" in catalogue.at[2, "ne_corrige_jamais"]
+    assert "identiques hors clé" in catalogue.at[3, "ne_corrige_jamais"]
 
 
 # --- remplacement -------------------------------------------------------------
@@ -458,7 +461,7 @@ def test_remplacement_seulement_pour_une_liste_fermee():
 def test_remplacement_apres_reparation_de_l_encodage():
     # La règle remplacement s'applique à la valeur laissée par la règle encodage.
     # Le journal suit l'ordre des règles, puis des lignes.
-    tables = {"t": _table(categorie=["depannage", _mal("Dépanage"), "Dépannage"])}
+    tables = {"t": _table(categorie=["depannage", _mal("Dépanage"), "Dépannage"], n=[1, 2, 3])}
     dictionnaire = _dictionnaire(tables, **{"t.categorie": _liste(*LISTE_CATEGORIES)})
     resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, AUCUNE_DECLARATION)
     assert list(resultat.tables["t"]["categorie"]) == ["Dépannage"] * 3
@@ -499,8 +502,9 @@ COUPURE = date(2026, 3, 31)
 
 def _nature(valeurs, nature, sensibles=AUCUNE_SENSIBLE, date_coupure=COUPURE):
     """Nettoie une colonne « v » de la nature donnée; rend (valeurs nettoyées,
-    journal, bilan)."""
-    tables = {"t": _table(v=list(valeurs))}
+    journal, bilan). La colonne « n » rend les lignes toutes différentes : sans
+    elle, deux valeurs converties en la même deviendraient des doublons exacts."""
+    tables = {"t": _table(v=list(valeurs), n=list(range(len(valeurs))))}
     dictionnaire = _dictionnaire(tables, **{"t.v": _colonne(nature)})
     resultat = nettoyer(tables, dictionnaire, sensibles, AUCUNE_DECLARATION, date_coupure)
     return list(resultat.tables["t"]["v"]), resultat.journal, resultat.bilan, (
@@ -669,3 +673,87 @@ def test_nature_colonne_sensible_masquee():
     ]
     _, journal, _, _ = _nature(["14.03.25"], "date JJ/MM/AAAA", {"t": frozenset({"v"})})
     assert list(journal["detail"]) == ["forme masquée, siècle 20 ajouté"]
+
+
+# --- doublons -----------------------------------------------------------------
+
+
+def test_doublons_exacts_retires_premiere_occurrence_gardee():
+    clients = _table(
+        "clients.csv",
+        code=["C1", "C2", "C1", "C3", "C3", "C4", "C5", "C1"],
+        nom=["Café", "Bar", "Café", "Épicerie", "Epicerie ", "Bar", "Bar", "Café"],
+        ville=["Rouen", "Évreux", "Rouen", "Vernon", "vernon", "Évreux", "Évreux", "Rouen"],
+    )
+    clients.index = range(10, 18)
+    factures = pd.concat(
+        [
+            _table("factures_2025.xlsx", periode="2025", num=["F1", "F2"], total=[10, 20]),
+            _table("factures_2026-01.xlsx", periode="2026-01", num=["F2"], total=[20]),
+        ],
+        ignore_index=True,
+    )
+    factures["feuille_source"] = "Entetes"
+    tables = {"clients": clients, "factures": factures}
+    declarations = {"clients": {"cle": ["code"]}, "factures": {"cle": ["num"]}}
+    resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, declarations)
+    # Lignes 4 et 9 : copies de la ligne 2; ligne 6 : copie de la ligne 5 après
+    # normalisation (casse, accents, espaces). C4 et C5 sont identiques à C2 hors clé :
+    # à arbitrer, gardées. La facture F2 est en double entre deux exports.
+    assert list(resultat.tables["clients"].index) == [10, 11, 13, 15, 16]
+    assert list(resultat.tables["clients"]["num_ligne_source"]) == [2, 3, 5, 7, 8]
+    assert list(resultat.tables["factures"]["fichier_source"]) == [
+        "factures_2025.xlsx", "factures_2025.xlsx"
+    ]
+    assert _lignes(
+        resultat.journal, "regle_nettoyage", "table", "fichier_source", "num_ligne_source",
+        "periode_export", "cle", "colonne", "action", "source", "valeur_avant",
+        "valeur_apres", "detail",
+    ) == [
+        ("doublons", "clients", "clients.csv", 4, None, "C1", None, "ligne retirée",
+         "règle générique", None, None, "doublon exact de la ligne 2 (clients.csv)"),
+        ("doublons", "clients", "clients.csv", 6, None, "C3", None, "ligne retirée",
+         "règle générique", None, None,
+         "doublon exact de la ligne 5 (clients.csv), après normalisation"),
+        ("doublons", "clients", "clients.csv", 9, None, "C1", None, "ligne retirée",
+         "règle générique", None, None, "doublon exact de la ligne 2 (clients.csv)"),
+        ("doublons", "factures", "factures_2026-01.xlsx", 2, "2026-01", "F2", None,
+         "ligne retirée", "règle générique", None, None,
+         "doublon exact de la ligne 3 (factures_2025.xlsx, Entetes)"),
+    ]
+    assert _lignes(resultat.bilan, *COLONNES_BILAN_NETTOYAGE) == [
+        ("doublons", "clients", None, 3, 3, 0, None),
+        ("doublons", "factures", None, 1, 1, 0, None),
+    ]
+    # Les tables reçues ne sont pas modifiées.
+    assert len(tables["clients"]) == 8 and len(tables["factures"]) == 3
+
+
+def test_doublons_cherches_apres_les_autres_regles():
+    # Deux lignes qui ne deviennent identiques qu'après réparation de l'encodage.
+    tables = {"t": _table(code=["a", "a"], nom=["Café", _mal("Café")])}
+    resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, {"t": {"cle": ["code"]}})
+    assert list(resultat.tables["t"]["num_ligne_source"]) == [2]
+    assert _lignes(resultat.journal, "regle_nettoyage", "num_ligne_source", "action") == [
+        ("encodage", 3, "valeur modifiée"),
+        ("doublons", 3, "ligne retirée"),
+    ]
+    # Après nettoyage, plus aucun doublon exact; une clé répétée sur des lignes
+    # différentes reste (décision du métier).
+    tables = {"t": _table(code=["a", "a", "b", "b"], nom=["x", "y", "z", "z"])}
+    resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, {"t": {"cle": ["code"]}})
+    doublons, _ = detecter_doublons(resultat.tables, {"t": {"cle": ["code"]}}, AUCUNE_SENSIBLE)
+    assert set(doublons["constat"]) == {"valeur en double"}
+    assert list(resultat.tables["t"]["code"]) == ["a", "a", "b"]
+
+
+def test_doublons_lignage_ambigu_non_retire():
+    # Deux lignes identiques qui portent le même lignage ne sont pas retirées.
+    donnees = _table(nom=["x", "x", "y", "y"])
+    donnees["num_ligne_source"] = [2, 2, 3, 4]
+    tables = {"t": donnees}
+    resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, AUCUNE_DECLARATION)
+    assert list(resultat.tables["t"]["num_ligne_source"]) == [2, 2, 3]
+    assert _lignes(resultat.bilan, "visees", "corrigees", "non_corrigees", "raisons") == [
+        (2, 1, 1, "lignage ambigu 1")
+    ]
