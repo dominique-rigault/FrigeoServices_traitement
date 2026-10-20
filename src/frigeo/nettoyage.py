@@ -38,7 +38,9 @@ Chaque règle s'applique aux valeurs laissées par les règles précédentes.
 
 `nettoyer` rend les tables nettoyées, le journal des corrections (une ligne par
 cellule modifiée, avec sa valeur avant et après) et un bilan par règle et par
-colonne. Rien n'est écrit sur disque.
+colonne. `comparer_anomalies` compare, contrôle par contrôle, la table des
+anomalies des tables brutes et celle des tables nettoyées. Rien n'est écrit sur
+disque.
 """
 
 from __future__ import annotations
@@ -56,6 +58,8 @@ from .controles import (
     CARACTERE_REMPLACEMENT,
     COLONNES_LIGNAGE_ECART,
     ENCODAGES_SUSPECTS,
+    ISSUE_A_ARBITRER,
+    ISSUE_ANOMALIE,
     VALEUR_MASQUEE,
     _REPERTOIRE,
     _SEQUENCE_UTF8,
@@ -73,6 +77,7 @@ from .dictionnaire import (
     problemes_dictionnaire,
 )
 from .anomalies import _index_lignage
+from .gestion import ISSUE_INFORMATION
 from .anomalies import _repere as _repere_anomalie
 from .doublons import (
     COMPARAISON_NORMALISEE,
@@ -1053,3 +1058,92 @@ def nettoyer(
     bilan = pd.DataFrame(bilan, columns=list(COLONNES_BILAN_NETTOYAGE), dtype=object)
     bilan = bilan.astype({"visees": int, "corrigees": int, "non_corrigees": int})
     return Nettoyage(nettoyees, journal, bilan)
+
+
+COLONNES_COMPARAISON = (
+    "etape",
+    "controle",
+    "table",
+    "champ",
+    "anomalies_avant",
+    "anomalies_apres",
+    "a_arbitrer_avant",
+    "a_arbitrer_apres",
+    "informations_avant",
+    "informations_apres",
+    "resolues",
+    "apparues",
+    "issue_changee",
+)
+_NOMS_ISSUES = {
+    ISSUE_ANOMALIE: "anomalies",
+    ISSUE_A_ARBITRER: "a_arbitrer",
+    ISSUE_INFORMATION: "informations",
+}
+_COLONNES_COMPAREES = ("id_anomalie", "etape", "controle", "table", "champ", "issue")
+
+
+def comparer_anomalies(avant: pd.DataFrame, apres: pd.DataFrame) -> pd.DataFrame:
+    """Compare, contrôle par contrôle, la table des anomalies avant et après nettoyage.
+
+    `avant` et `apres` sont rendues par `anomalies.reunir_anomalies` (ou
+    `qualifier`), l'une sur les tables brutes, l'autre sur les tables nettoyées.
+    Rend une ligne par contrôle (étape, contrôle, table, champ) présent dans l'une
+    ou l'autre, dans l'ordre de `avant` puis, pour les contrôles nouveaux, de
+    `apres` (`COLONNES_COMPARAISON`) : les anomalies, écarts à arbitrer et
+    informations avant et après, puis trois décomptes tirés des identifiants :
+    `resolues` (identifiant présent avant, absent après), `apparues` (absent
+    avant, présent après), `issue_changee` (même identifiant, autre issue).
+
+    Une apparition n'est pas forcément un défaut : une valeur devenue lisible rend
+    évaluable une règle qui ne l'était pas. Aucune valeur n'est rendue. Lève une
+    ValueError pour une colonne absente, une issue inconnue ou un identifiant en
+    double.
+    """
+    problemes = []
+    for nom, table in (("avant", avant), ("après", apres)):
+        manquantes = [c for c in _COLONNES_COMPAREES if c not in table.columns]
+        if manquantes:
+            problemes.append(f"table {nom} : colonnes absentes {', '.join(manquantes)}")
+            continue
+        inconnues = sorted(set(table["issue"]) - set(_NOMS_ISSUES), key=str)
+        if inconnues:
+            problemes.append(f"table {nom} : issues inconnues {', '.join(map(str, inconnues))}")
+        if table["id_anomalie"].duplicated().any():
+            problemes.append(f"table {nom} : identifiants en double")
+    if problemes:
+        raise ValueError("Tables des anomalies inattendues\n  " + "\n  ".join(problemes))
+
+    issues_avant = dict(zip(avant["id_anomalie"], avant["issue"]))
+    issues_apres = dict(zip(apres["id_anomalie"], apres["issue"]))
+    comptes: dict[tuple, Counter] = {}
+
+    def compter(ligne) -> Counter:
+        champ = None if pd.isna(ligne.champ) else ligne.champ
+        cle = (ligne.etape, ligne.controle, ligne.table, champ)
+        return comptes.setdefault(cle, Counter())
+
+    for ligne in avant.itertuples(index=False):
+        compte = compter(ligne)
+        compte[_NOMS_ISSUES[ligne.issue] + "_avant"] += 1
+        if ligne.id_anomalie not in issues_apres:
+            compte["resolues"] += 1
+        elif issues_apres[ligne.id_anomalie] != ligne.issue:
+            compte["issue_changee"] += 1
+    for ligne in apres.itertuples(index=False):
+        compte = compter(ligne)
+        compte[_NOMS_ISSUES[ligne.issue] + "_apres"] += 1
+        if ligne.id_anomalie not in issues_avant:
+            compte["apparues"] += 1
+    lignes = [
+        {
+            "etape": etape,
+            "controle": controle,
+            "table": table,
+            "champ": champ,
+            **{c: int(compte[c]) for c in COLONNES_COMPARAISON[4:]},
+        }
+        for (etape, controle, table, champ), compte in comptes.items()
+    ]
+    comparaison = pd.DataFrame(lignes, columns=list(COLONNES_COMPARAISON), dtype=object)
+    return comparaison.astype({c: int for c in COLONNES_COMPARAISON[4:]})

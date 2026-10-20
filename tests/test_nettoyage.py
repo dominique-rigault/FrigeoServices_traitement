@@ -1091,3 +1091,94 @@ def test_decision_index_des_tables_non_continu():
         ("doublons", 3, "a"),
         ("decision", 4, "b"),
     ]
+
+
+# --- comparer_anomalies ------------------------------------------------------
+
+
+def _anomalies_fictives(*lignes):
+    from frigeo.anomalies import COLONNES_ANOMALIES
+
+    colonnes = ("id_anomalie", "etape", "controle", "table", "champ", "issue")
+    return pd.DataFrame(
+        [dict(zip(colonnes, ligne)) for ligne in lignes],
+        columns=list(COLONNES_ANOMALIES),
+        dtype=object,
+    )
+
+
+def test_comparer_anomalies():
+    from frigeo.nettoyage import COLONNES_COMPARAISON, comparer_anomalies
+
+    avant = _anomalies_fictives(
+        ("a1", "format", "c1", "t", "x", "anomalie"),
+        ("a2", "format", "c1", "t", "x", "anomalie"),
+        ("a3", "gestion", "c2", "t", None, "à arbitrer"),
+        ("a4", "gestion", "c3", "t", "y", "information"),
+    )
+    apres = _anomalies_fictives(
+        ("a4", "gestion", "c3", "t", "y", "information"),
+        ("a5", "doublons", "c4", "u", "id", "anomalie"),
+        ("a2", "format", "c1", "t", "x", "anomalie"),
+        # Un champ vide se lit NaN ou None selon la table : même contrôle.
+        ("a3", "gestion", "c2", "t", float("nan"), "anomalie"),
+    )
+    comparaison = comparer_anomalies(avant, apres)
+    assert list(comparaison.columns) == list(COLONNES_COMPARAISON)
+    assert _lignes(comparaison, *COLONNES_COMPARAISON) == [
+        ("format", "c1", "t", "x", 2, 1, 0, 0, 0, 0, 1, 0, 0),
+        ("gestion", "c2", "t", None, 0, 1, 1, 0, 0, 0, 0, 0, 1),
+        ("gestion", "c3", "t", "y", 0, 0, 0, 0, 1, 1, 0, 0, 0),
+        ("doublons", "c4", "u", "id", 0, 1, 0, 0, 0, 0, 0, 1, 0),
+    ]
+    assert all(comparaison[c].dtype == "int64" for c in COLONNES_COMPARAISON[4:])
+    vide = comparer_anomalies(_anomalies_fictives(), _anomalies_fictives())
+    assert vide.empty and list(vide.columns) == list(COLONNES_COMPARAISON)
+
+
+def test_comparer_anomalies_tables_inattendues():
+    from frigeo.nettoyage import comparer_anomalies
+
+    bonne = _anomalies_fictives(("a1", "format", "c1", "t", "x", "anomalie"))
+    with pytest.raises(ValueError) as erreur:
+        comparer_anomalies(
+            bonne.drop(columns="issue"),
+            _anomalies_fictives(
+                ("a1", "format", "c1", "t", "x", "grave"),
+                ("a1", "format", "c1", "t", "x", "anomalie"),
+            ),
+        )
+    message = str(erreur.value)
+    assert "table avant : colonnes absentes issue" in message
+    assert "table après : issues inconnues grave" in message
+    assert "table après : identifiants en double" in message
+
+
+def test_comparer_sur_des_controles_reels():
+    """Encodage réparé et doublon exact retiré : résolus, rien n'apparaît."""
+    from frigeo.anomalies import reunir_anomalies
+    from frigeo.gestion import controler_gestion
+    from frigeo.nettoyage import comparer_anomalies
+
+    tables = {"t": _table(code=["a", "b", "b"], nom=[_mal("Café"), "x", "x"])}
+    dictionnaire = _dictionnaire(tables)
+    declarations = {"t": {"cle": ["code"]}}
+
+    def anomalies_de(donnees):
+        ecarts, bilan = controler(donnees, dictionnaire, AUCUNE_SENSIBLE, {})
+        doublons, bilan_doublons = detecter_doublons(donnees, declarations, AUCUNE_SENSIBLE)
+        ecarts_g, bilan_g = controler_gestion(
+            donnees, dictionnaire, [], declarations, doublons, AUCUNE_SENSIBLE
+        )
+        return reunir_anomalies(donnees, ecarts, doublons, ecarts_g, bilan, bilan_doublons,
+                                bilan_g, declarations, AUCUNE_SENSIBLE)
+
+    avant = anomalies_de(tables)
+    apres = anomalies_de(
+        nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, declarations, None, AUCUNE_DECISION).tables
+    )
+    comparaison = comparer_anomalies(avant, apres)
+    assert len(apres) == 0
+    assert int(comparaison["resolues"].sum()) == len(avant) > 0
+    assert int(comparaison["apparues"].sum()) == 0
+    assert set(comparaison["etape"]) == {"format", "doublons"}

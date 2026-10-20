@@ -475,6 +475,40 @@ def elements_a_arbitrer(
     return elements
 
 
+COLONNE_DECISION_METIER = "decision_metier"
+
+
+def ajouter_decisions(
+    anomalies: pd.DataFrame, elements: pd.DataFrame, decisions: dict | None = None
+) -> pd.DataFrame:
+    """Table des anomalies avec, en dernière colonne, la décision du métier.
+
+    `elements` est le tableau rendu par `elements_a_arbitrer` sur la même table des
+    anomalies, `decisions` le contenu rendu par `charger_decisions` (fichier par
+    défaut). `decision_metier` vaut, pour une anomalie dont l'élément a une décision
+    enregistrée, la décision et sa date (« garder le 2026-10-20 »), suivies de
+    « , caduque » si la donnée a changé depuis (l'élément sera proposé de nouveau
+    au métier); elle est vide sinon. Une anomalie gardée reste une anomalie. La
+    table reçue n'est pas modifiée.
+    """
+    if decisions is None:
+        decisions = charger_decisions()
+    enregistrees = decisions["decisions"]
+    etats = dict(zip(elements["id_anomalie"], elements["etat_decision"]))
+    textes = []
+    for identifiant in anomalies["id_anomalie"]:
+        etat = etats.get(identifiant)
+        decision = enregistrees.get(identifiant)
+        if decision is None or etat not in (ETAT_VALABLE, ETAT_CADUQUE):
+            textes.append(None)
+            continue
+        texte = f"{decision['decision']} le {str(decision['decide_le'])[:10]}"
+        textes.append(texte + (", caduque" if etat == ETAT_CADUQUE else ""))
+    resultat = anomalies.copy()
+    resultat[COLONNE_DECISION_METIER] = pd.Series(textes, index=anomalies.index, dtype=object)
+    return resultat
+
+
 # --------------------------------------------------------------------------------
 # Classeur d'arbitrage : export
 

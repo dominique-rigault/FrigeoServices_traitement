@@ -10,6 +10,7 @@ import frigeo.dictionnaire as module_dictionnaire
 from frigeo.anomalies import COLONNES_ANOMALIES, reunir_anomalies
 from frigeo.controles import controler
 from frigeo.decisions import (
+    COLONNE_DECISION_METIER,
     COLONNES_ARBITRAGE,
     COLONNES_DECISIONS_LUES,
     COLONNES_ELEMENTS,
@@ -21,6 +22,7 @@ from frigeo.decisions import (
     SORTE_CELLULE,
     SORTE_ECART,
     SORTE_LIGNE,
+    ajouter_decisions,
     charger_decisions,
     ecrire_decisions,
     elements_a_arbitrer,
@@ -681,3 +683,31 @@ def test_date_et_nombre_natifs_enregistres(tmp_path):
     assert lue["valeur_retenue"] == datetime(2025, 2, 28)
     assert type(lue["valeur_retenue"]) is datetime
     assert lue["nature"] == "date native"
+
+
+def test_ajouter_decisions():
+    elements = elements_a_arbitrer(_tables(), _exemple(), AUCUNE_DECISION).set_index("id_anomalie")
+
+    def decision(choix, empreinte, sorte=SORTE_CELLULE):
+        return {"sorte": sorte, "empreinte": empreinte, "decision": choix,
+                "decide_le": "2026-10-20 10:00:00"}
+
+    decisions = {
+        "meta": {"structure": 1, "imports": []},
+        "decisions": {
+            "f1": decision("garder", elements.at["f1", "empreinte"]),
+            "d1": decision("retirer", "autre", SORTE_LIGNE),
+            "g5": decision("garder", "x"),
+        },
+    }
+    anomalies = _exemple()
+    elements = elements_a_arbitrer(_tables(), anomalies, decisions)
+    marquees = ajouter_decisions(anomalies, elements, decisions)
+    assert list(marquees.columns) == [*COLONNES_ANOMALIES, COLONNE_DECISION_METIER]
+    par_id = marquees.set_index("id_anomalie")[COLONNE_DECISION_METIER]
+    assert par_id["f1"] == "garder le 2026-10-20"
+    assert par_id["d1"] == "retirer le 2026-10-20, caduque"
+    # Une décision dont l'anomalie n'est pas un élément à arbitrer n'est pas reprise.
+    assert par_id["g5"] is None
+    assert par_id.drop(["f1", "d1"]).isna().all()
+    assert list(anomalies.columns) == list(COLONNES_ANOMALIES)
