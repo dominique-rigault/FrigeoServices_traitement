@@ -28,7 +28,11 @@ Règles, dans l'ordre (voir `catalogue_nettoyage`) :
   sans perte, puis écrite dans la représentation de cette nature;
 - `doublons` : les lignes en surnombre des doublons exacts sont retirées, la
   première occurrence de chaque groupe étant gardée (comme la vue « sans les
-  doublons exacts en surnombre » des règles de gestion).
+  doublons exacts en surnombre » des règles de gestion);
+- `decision` : les décisions du métier prises dans le classeur d'arbitrage
+  (`decisions.py`, data/config/decisions.yaml) : une cellule reçoit la valeur
+  retenue par le métier, une ligne est retirée, à condition que la donnée n'ait
+  pas changé depuis la décision.
 
 Chaque règle s'applique aux valeurs laissées par les règles précédentes.
 
@@ -68,6 +72,8 @@ from .dictionnaire import (
     est_masquee,
     problemes_dictionnaire,
 )
+from .anomalies import _index_lignage
+from .anomalies import _repere as _repere_anomalie
 from .doublons import (
     COMPARAISON_NORMALISEE,
     CONSTAT_EXACT,
@@ -83,12 +89,16 @@ REGLE_ENCODAGE = "encodage"
 REGLE_REMPLACEMENT = "remplacement"
 REGLE_NATURE = "nature"
 REGLE_DOUBLONS = "doublons"
-REGLES_NETTOYAGE = (REGLE_ENCODAGE, REGLE_REMPLACEMENT, REGLE_NATURE, REGLE_DOUBLONS)
+REGLE_DECISION = "decision"
+REGLES_NETTOYAGE = (
+    REGLE_ENCODAGE, REGLE_REMPLACEMENT, REGLE_NATURE, REGLE_DOUBLONS, REGLE_DECISION
+)
 
 ACTION_MODIFIEE = "valeur modifiée"
 ACTION_RETIREE = "ligne retirée"
 SOURCE_GENERIQUE = "règle générique"
 SOURCE_DICTIONNAIRE = "dictionnaire"
+SOURCE_DECISION = "décision du métier"
 
 RAISON_REMPLACEMENT = "caractère de remplacement"
 RAISON_DESACCORD = "encodages en désaccord"
@@ -124,6 +134,11 @@ RAISONS_NATURE = (
 
 RAISON_LIGNAGE_AMBIGU = "lignage ambigu"
 RAISONS_DOUBLONS = (RAISON_LIGNAGE_AMBIGU,)
+
+RAISON_SOURCE_MODIFIEE = "source modifiée depuis la décision"
+RAISON_INTROUVABLE = "ligne source introuvable"
+RAISON_ILLISIBLE = "valeur retenue illisible dans la nature en vigueur"
+RAISONS_DECISION = (RAISON_SOURCE_MODIFIEE, RAISON_INTROUVABLE, RAISON_ILLISIBLE)
 
 COLONNE_PERIODE = "periode_export"
 COLONNES_JOURNAL = (
@@ -191,6 +206,17 @@ _CATALOGUE = {
         "du groupe est gardée",
         "une valeur en double (clé répétée sur des lignes différentes); des lignes "
         "identiques hors clé; une ligne dont le lignage désigne plusieurs lignes",
+    ),
+    REGLE_DECISION: (
+        SOURCE_DECISION,
+        "toute cellule que le métier a décidé de corriger, et toute ligne qu'il a "
+        "décidé de retirer, dans le classeur d'arbitrage (data/config/decisions.yaml) : "
+        "la cellule reçoit la valeur retenue, écrite dans la représentation de la "
+        "nature de sa colonne, ou la ligne est retirée, si la donnée n'a pas changé "
+        "depuis la décision (même empreinte); corrections d'abord, retraits ensuite",
+        "une donnée modifiée depuis la décision (source corrigée ou réexportée); une "
+        "ligne source introuvable; une valeur retenue illisible dans la nature en "
+        "vigueur de sa colonne; un élément que le métier a décidé de garder",
     ),
 }
 
@@ -620,6 +646,143 @@ def _doublons_en_surnombre(doublons: pd.DataFrame, table: str, donnees: pd.DataF
     return visees, retirees, raisons
 
 
+def _detail_decision(identifiant: str, decision: dict) -> str:
+    return (
+        f"décision du {str(decision['decide_le'])[:10]}, classeur {decision['classeur']}, "
+        f"anomalie {identifiant}"
+    )
+
+
+def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_tables: list):
+    """Règle `decision` : applique aux tables nettoyées (modifiées sur place) les
+    décisions « corriger » puis « retirer » du métier.
+
+    Rend (corrections, retraits, lignes du bilan) : une correction est (table,
+    étiquette de la ligne, colonne, valeur avant, valeur après, détail), un retrait
+    (table, étiquette, détail). Les décisions sont prises de la plus ancienne à la
+    plus récente. Une décision ne s'applique que si sa ligne est retrouvée par son
+    lignage et si l'empreinte calculée comme à l'export (`decisions.elements_a_arbitrer`)
+    est la sienne : valeur de la cellule pour une correction, ligne entière hors
+    lignage, après les corrections, pour un retrait. Une valeur retenue est écrite
+    telle qu'enregistrée si la nature de la colonne n'a pas changé depuis la
+    décision, sinon relue dans la nature en vigueur (`decisions.lire_valeur_retenue`).
+    Une décision « garder » ne change rien.
+    """
+    from .decisions import (
+        DECISION_CORRIGER,
+        DECISION_RETIRER,
+        _empreinte,
+        _forme,
+        lire_valeur_retenue,
+    )
+
+    ordonnees = sorted(decisions.items(), key=lambda e: (str(e[1]["decide_le"]), e[0]))
+    comptes: dict[tuple, list] = {}
+
+    def compter(table, colonne):
+        return comptes.setdefault((table, colonne), [0, 0, Counter()])
+
+    def situer(table, decision):
+        """Position de la ligne dans la table nettoyée, None si introuvable."""
+        donnees = nettoyees.get(table)
+        if donnees is None:
+            return None
+        reperes = _index_lignage(donnees.reset_index(drop=True))
+        return reperes.get(
+            _repere_anomalie(
+                decision["fichier_source"], decision["feuille_source"],
+                decision["num_ligne_source"],
+            )
+        )
+
+    corrections = []
+    for identifiant, decision in ordonnees:
+        if decision["decision"] != DECISION_CORRIGER:
+            continue
+        table, colonne = decision["table"], decision["champ"]
+        compte = compter(table, colonne)
+        compte[0] += 1
+        position = situer(table, decision)
+        donnees = nettoyees.get(table)
+        if position is None or colonne not in _colonnes_de_donnees(donnees):
+            compte[2][RAISON_INTROUVABLE] += 1
+            continue
+        rang = donnees.columns.get_loc(colonne)
+        avant = donnees.iat[position, rang]
+        if _empreinte([_forme(avant)]) != decision["empreinte"]:
+            compte[2][RAISON_SOURCE_MODIFIEE] += 1
+            continue
+        valeur = decision["valeur_retenue"]
+        nature = dictionnaire[table][colonne]["nature"]["regle"]
+        if nature != decision["nature"]:
+            valeur, raison = lire_valeur_retenue(valeur, nature)
+            if raison is not None:
+                compte[2][RAISON_ILLISIBLE] += 1
+                continue
+        nouvelle = donnees[colonne].copy()
+        nouvelle.iloc[position] = valeur
+        donnees.isetitem(rang, nouvelle)
+        compte[1] += 1
+        corrections.append(
+            (table, donnees.index[position], colonne, avant, valeur,
+             _detail_decision(identifiant, decision))
+        )
+
+    retraits, a_retirer = [], {}
+    for identifiant, decision in ordonnees:
+        if decision["decision"] != DECISION_RETIRER:
+            continue
+        table = decision["table"]
+        compte = compter(table, None)
+        compte[0] += 1
+        position = situer(table, decision)
+        if position is None:
+            compte[2][RAISON_INTROUVABLE] += 1
+            continue
+        donnees = nettoyees[table]
+        ligne = donnees.iloc[position]
+        empreinte = _empreinte(
+            f"{c}={_forme(ligne[c])}" for c in _colonnes_de_donnees(donnees)
+        )
+        if empreinte != decision["empreinte"]:
+            compte[2][RAISON_SOURCE_MODIFIEE] += 1
+            continue
+        compte[1] += 1
+        etiquette = donnees.index[position]
+        # Deux décisions peuvent viser la même ligne (deux contrôles de doublons) :
+        # elle n'est retirée, et inscrite au journal, qu'une fois.
+        if etiquette not in a_retirer.setdefault(table, set()):
+            a_retirer[table].add(etiquette)
+            retraits.append((table, etiquette, _detail_decision(identifiant, decision)))
+    for table, etiquettes in a_retirer.items():
+        nettoyees[table] = nettoyees[table].drop(index=sorted(etiquettes))
+
+    def rang_bilan(cle):
+        table, colonne = cle
+        if table not in nettoyees:
+            return (len(ordre_tables), table, 0)
+        colonnes = list(_colonnes_de_donnees(nettoyees[table]))
+        # Une colonne inconnue, et les retraits (sans colonne), après les colonnes.
+        rang_colonne = colonnes.index(colonne) if colonne in colonnes else len(colonnes)
+        return (ordre_tables.index(table), "", rang_colonne)
+
+    lignes = []
+    for (table, colonne) in sorted(comptes, key=rang_bilan):
+        visees, corrigees, raisons = comptes[(table, colonne)]
+        lignes.append(
+            {
+                "regle_nettoyage": REGLE_DECISION,
+                "table": table,
+                "colonne": colonne,
+                "visees": visees,
+                "corrigees": corrigees,
+                "non_corrigees": visees - corrigees,
+                "raisons": _texte_raisons(raisons, RAISONS_DECISION),
+            }
+        )
+    return corrections, retraits, lignes
+
+
 def _texte_raisons(raisons: Counter, ordre) -> str | None:
     morceaux = [f"{raison} {raisons[raison]}" for raison in ordre if raisons[raison]]
     return "; ".join(morceaux) or None
@@ -631,6 +794,7 @@ def nettoyer(
     sensibles: dict[str, frozenset[str]] | None = None,
     declarations: dict | None = None,
     date_coupure=None,
+    decisions: dict | None = None,
 ) -> Nettoyage:
     """Applique les règles de nettoyage et rend les tables nettoyées, le journal des
     corrections et le bilan.
@@ -644,10 +808,14 @@ def nettoyer(
     extraite, `perimetre.date_coupure`) sert à la règle `nature` : une année écrite
     sur deux chiffres n'est complétée en 20AA que si la date obtenue ne la dépasse
     pas; sans elle, ces dates ne sont pas converties, et le bilan le dit.
+    `decisions` (contenu rendu par `decisions.charger_decisions`, fichier
+    data/config/decisions.yaml par défaut, aucune décision s'il est absent) sert à
+    la règle `decision`.
 
     Tables nettoyées : copies des tables reçues, mêmes colonnes, mêmes types de
     colonnes, lignage compris; seules les cellules corrigées changent, et les lignes
-    retirées comme doublons disparaissent (les autres gardent leur index). Les
+    retirées comme doublons ou par décision disparaissent (les autres gardent leur
+    index). Les
     tables reçues ne sont pas modifiées.
 
     Journal (`COLONNES_JOURNAL`) : une ligne par cellule modifiée ou par ligne
@@ -660,11 +828,14 @@ def nettoyer(
     `detail` précise la correction (pour l'encodage, les encodages qui ont repéré
     une séquence et le nombre de passes; pour un remplacement, la date de la revue
     qui a invalidé la valeur; pour la nature, la forme lue, « forme masquée » pour
-    une colonne sensible, et l'ajout du siècle; pour une ligne retirée, la ligne
-    gardée du même groupe). Une ligne retirée n'a ni colonne ni valeur.
+    une colonne sensible, et l'ajout du siècle; pour une ligne retirée comme
+    doublon, la ligne gardée du même groupe; pour une décision, sa date, son
+    classeur et l'identifiant de l'anomalie). Une ligne retirée n'a ni colonne ni
+    valeur.
 
     Bilan (`COLONNES_BILAN_NETTOYAGE`) : une ligne par règle et par colonne qui a au
-    moins une cellule visée (par table, sans colonne, pour les doublons), avec les
+    moins une cellule visée (par table, sans colonne, pour les doublons et les
+    retraits décidés par le métier), avec les
     cellules (ou lignes) visées, corrigées, non corrigées, et le décompte des raisons
     de non-correction (textes séparés par « ; »).
     """
@@ -686,6 +857,14 @@ def nettoyer(
         )
     if declarations is None:
         declarations = charger_declarations_doublons()
+    # Import local : decisions.py importe ce module.
+    from .decisions import charger_decisions, problemes_decisions
+
+    if decisions is None:
+        decisions = charger_decisions()
+    problemes = problemes_decisions(decisions)
+    if problemes:
+        raise ValueError("Décisions invalides\n  " + "\n  ".join(problemes))
 
     nettoyees = {table: donnees.copy() for table, donnees in tables.items()}
     brutes = {table: donnees.reset_index(drop=True) for table, donnees in tables.items()}
@@ -720,6 +899,56 @@ def nettoyer(
         }
 
     for rang_regle, regle_nettoyage in enumerate(REGLES_NETTOYAGE):
+        if regle_nettoyage == REGLE_DECISION:
+            corrections, retraits, lignes_bilan = _regle_decision(
+                nettoyees, decisions["decisions"], dictionnaire, list(tables)
+            )
+            bilan.extend(lignes_bilan)
+            rangs_tables = {table: rang for rang, table in enumerate(tables)}
+            positions_brutes = {
+                table: {etiquette: i for i, etiquette in enumerate(donnees.index)}
+                for table, donnees in tables.items()
+            }
+            for table, etiquette, colonne, avant, apres, detail in corrections:
+                regles = dictionnaire[table][colonne]
+                masquee = (
+                    est_sensible(sensibles, table, colonne)
+                    or est_masquee(regles["valeurs"])
+                    or est_masquee(regles["format"])
+                )
+                avant = _valeur_constatee(avant)
+                journal.append(
+                    ligne_du_journal(
+                        rang_regle,
+                        rangs_tables[table],
+                        table,
+                        positions_brutes[table][etiquette],
+                        colonne=colonne,
+                        action=ACTION_MODIFIEE,
+                        source=SOURCE_DECISION,
+                        valeur_avant=VALEUR_MASQUEE if masquee else avant,
+                        valeur_apres=VALEUR_MASQUEE if masquee else apres,
+                        detail=detail,
+                        _colonne=list(_colonnes_de_donnees(brutes[table])).index(colonne),
+                    )
+                )
+            for table, etiquette, detail in retraits:
+                journal.append(
+                    ligne_du_journal(
+                        rang_regle,
+                        rangs_tables[table],
+                        table,
+                        positions_brutes[table][etiquette],
+                        colonne=None,
+                        action=ACTION_RETIREE,
+                        source=SOURCE_DECISION,
+                        valeur_avant=None,
+                        valeur_apres=None,
+                        detail=detail,
+                        _colonne=len(brutes[table].columns),
+                    )
+                )
+            continue
         if regle_nettoyage == REGLE_DOUBLONS:
             # Doublons cherchés une fois, sur toutes les tables nettoyées.
             doublons, _ = detecter_doublons(nettoyees, declarations, sensibles)

@@ -7,6 +7,8 @@ from datetime import date, datetime
 import pandas as pd
 import pytest
 
+import frigeo.decisions as module_decisions
+
 from frigeo.controles import _REPERTOIRE, VALEUR_MASQUEE, constats_encodage, controler
 from frigeo.dictionnaire import MOTIF_SENSIBLE
 from frigeo.doublons import detecter_doublons
@@ -29,6 +31,14 @@ AUCUNE_DECLARATION = {}
 INSECABLE = chr(160)
 REMPLACEMENT = chr(0xFFFD)
 TOUS = ("cp1252", "iso8859_15", "latin_1")
+
+
+@pytest.fixture(autouse=True)
+def sans_fichier_de_decisions(tmp_path, monkeypatch):
+    """Les décisions enregistrées sur le poste ne sont jamais lues par ces tests."""
+    monkeypatch.setattr(
+        module_decisions, "chemin_decisions", lambda: tmp_path / "decisions_absent.yaml"
+    )
 
 
 def _mal(texte, encodage="cp1252", fois=1):
@@ -357,11 +367,13 @@ def test_catalogue_nettoyage():
         (2, "remplacement", "dictionnaire"),
         (3, "nature", "règle générique"),
         (4, "doublons", "règle générique"),
+        (5, "decision", "décision du métier"),
     ]
     assert "caractère de remplacement" in catalogue.at[0, "ne_corrige_jamais"]
     assert "hors liste" in catalogue.at[1, "ne_corrige_jamais"]
     assert "date impossible" in catalogue.at[2, "ne_corrige_jamais"]
     assert "identiques hors clé" in catalogue.at[3, "ne_corrige_jamais"]
+    assert "décidé de garder" in catalogue.at[4, "ne_corrige_jamais"]
 
 
 # --- remplacement -------------------------------------------------------------
@@ -756,4 +768,326 @@ def test_doublons_lignage_ambigu_non_retire():
     assert list(resultat.tables["t"]["num_ligne_source"]) == [2, 2, 3]
     assert _lignes(resultat.bilan, "visees", "corrigees", "non_corrigees", "raisons") == [
         (2, 1, 1, "lignage ambigu 1")
+    ]
+
+
+
+# --- règle decision -----------------------------------------------------------
+
+AUCUNE_DECISION = {"meta": {"structure": 1, "imports": []}, "decisions": {}}
+
+
+def _empreinte_cellule(valeur):
+    return module_decisions._empreinte([module_decisions._forme(valeur)])
+
+
+def _empreinte_ligne(**valeurs):
+    return module_decisions._empreinte(
+        f"{c}={module_decisions._forme(v)}" for c, v in valeurs.items()
+    )
+
+
+def _decision(ligne, champ, choix, empreinte, valeur=None, nature=None, table="t",
+              decide_le="2026-10-20 10:00:00", fichier="t.csv"):
+    return {
+        "sorte": "ligne" if choix == "retirer" else "cellule",
+        "table": table,
+        "fichier_source": fichier,
+        "feuille_source": None,
+        "num_ligne_source": ligne,
+        "champ": champ,
+        "constat": "constat",
+        "empreinte": empreinte,
+        "decision": choix,
+        "valeur_retenue": valeur,
+        "nature": nature,
+        "commentaire": None,
+        "decide_le": decide_le,
+        "classeur": "arbitrage_2026-03.xlsx",
+    }
+
+
+def _decisions(**par_id):
+    return {"meta": {"structure": 1, "imports": []}, "decisions": par_id}
+
+
+def _nettoyer_avec(tables, decisions, dictionnaire=None, sensibles=AUCUNE_SENSIBLE,
+                   declarations=AUCUNE_DECLARATION):
+    dictionnaire = dictionnaire or _dictionnaire(tables)
+    return nettoyer(tables, dictionnaire, sensibles, declarations, None, decisions)
+
+
+def _du_regle(tableau, regle="decision"):
+    return tableau[tableau["regle_nettoyage"] == regle]
+
+
+def test_decision_corriger():
+    tables = {"t": _table(code=["a", "b", "c"], d=["01/01/2025", "31/02/2025", "x"])}
+    dictionnaire = _dictionnaire(tables, **{"t.d": _colonne("date JJ/MM/AAAA")})
+    decisions = _decisions(
+        a1=_decision(3, "d", "corriger", _empreinte_cellule("31/02/2025"), "28/02/2025",
+                     "date JJ/MM/AAAA"),
+    )
+    resultat = _nettoyer_avec(tables, decisions, dictionnaire)
+    assert list(resultat.tables["t"]["d"]) == ["01/01/2025", "28/02/2025", "x"]
+    assert tables["t"].at[1, "d"] == "31/02/2025"
+    assert _lignes(_du_regle(resultat.journal), "table", "num_ligne_source", "colonne",
+                   "action", "source", "valeur_avant", "valeur_apres", "detail") == [
+        ("t", 3, "d", "valeur modifiée", "décision du métier", "31/02/2025", "28/02/2025",
+         "décision du 2026-10-20, classeur arbitrage_2026-03.xlsx, anomalie a1"),
+    ]
+    assert _lignes(_du_regle(resultat.bilan), "table", "colonne", "visees", "corrigees",
+                   "non_corrigees", "raisons") == [("t", "d", 1, 1, 0, None)]
+    # Sans décision, rien.
+    resultat = _nettoyer_avec(tables, AUCUNE_DECISION, dictionnaire)
+    assert _du_regle(resultat.bilan).empty and _du_regle(resultat.journal).empty
+
+
+def test_decision_apres_les_regles_automatiques():
+    # L'empreinte est celle de la valeur laissée par les règles 1 à 4 (encodage réparé).
+    tables = {"t": _table(code=["a", "b"], nom=[_mal("Café"), "Thé"])}
+    decisions = _decisions(
+        a1=_decision(2, "nom", "corriger", _empreinte_cellule("Café"), "Café du Port", "texte"),
+        a2=_decision(3, "nom", "corriger", _empreinte_cellule("Thé vert"), "Thé noir", "texte"),
+    )
+    resultat = _nettoyer_avec(tables, decisions)
+    assert list(resultat.tables["t"]["nom"]) == ["Café du Port", "Thé"]
+    assert _lignes(resultat.journal, "regle_nettoyage", "num_ligne_source", "valeur_apres") == [
+        ("encodage", 2, "Café"),
+        ("decision", 2, "Café du Port"),
+    ]
+    assert _lignes(_du_regle(resultat.bilan), "visees", "corrigees", "non_corrigees",
+                   "raisons") == [(2, 1, 1, "source modifiée depuis la décision 1")]
+
+
+def test_decision_nature_changee():
+    tables = {"t": _table(code=["a", "b"], d=["x", "y"], n=[1.5, "z"])}
+    dictionnaire = _dictionnaire(
+        tables, **{"t.d": _colonne("date JJ/MM/AAAA"), "t.n": _colonne("nombre natif")}
+    )
+    decisions = _decisions(
+        # Enregistrée dans la nature AAAAMMJJ, relue en JJ/MM/AAAA.
+        a1=_decision(2, "d", "corriger", _empreinte_cellule("x"), "20250228", "date AAAAMMJJ"),
+        a2=_decision(3, "n", "corriger", _empreinte_cellule("z"), "abc", "texte"),
+    )
+    resultat = _nettoyer_avec(tables, decisions, dictionnaire)
+    assert list(resultat.tables["t"]["d"]) == ["28/02/2025", "y"]
+    assert list(resultat.tables["t"]["n"]) == [1.5, "z"]
+    assert _lignes(_du_regle(resultat.bilan), "colonne", "corrigees", "raisons") == [
+        ("d", 1, None),
+        ("n", 0, "valeur retenue illisible dans la nature en vigueur 1"),
+    ]
+
+
+def test_decision_type_de_la_colonne_garde():
+    tables = {"t": _table(code=["a", "b"])}
+    tables["t"]["m"] = [1.5, 2.5]
+    tables["t"]["j"] = pd.to_datetime(["2025-01-01", "2025-01-02"])
+    dictionnaire = _dictionnaire(
+        tables, **{"t.m": _colonne("nombre natif"), "t.j": _colonne("date native")}
+    )
+    decisions = _decisions(
+        a1=_decision(2, "m", "corriger", _empreinte_cellule(1.5), 3.0, "nombre natif"),
+        a2=_decision(3, "j", "corriger", _empreinte_cellule(pd.Timestamp(2025, 1, 2)),
+                     datetime(2025, 2, 1), "date native"),
+    )
+    resultat = _nettoyer_avec(tables, decisions, dictionnaire)
+    assert list(resultat.tables["t"]["m"]) == [3.0, 2.5]
+    assert resultat.tables["t"]["m"].dtype == "float64"
+    assert resultat.tables["t"].at[1, "j"] == pd.Timestamp(2025, 2, 1)
+    assert resultat.tables["t"]["j"].dtype == tables["t"]["j"].dtype
+
+
+def test_decision_retirer_apres_les_corrections():
+    tables = {"t": _table(code=["a", "a", "b"], nom=["x", "y", "z"])}
+    decisions = _decisions(
+        c1=_decision(3, "nom", "corriger", _empreinte_cellule("y"), "w", "texte"),
+        # Empreinte de la ligne corrigée, comme à l'export.
+        r1=_decision(3, "code", "retirer", _empreinte_ligne(code="a", nom="w")),
+        # Empreinte d'une ligne qui a changé depuis.
+        r2=_decision(4, "code", "retirer", _empreinte_ligne(code="b", nom="autre")),
+    )
+    resultat = _nettoyer_avec(tables, decisions)
+    assert list(resultat.tables["t"]["num_ligne_source"]) == [2, 4]
+    assert list(resultat.tables["t"].index) == [0, 2]
+    assert _lignes(_du_regle(resultat.journal), "num_ligne_source", "colonne", "action") == [
+        (3, "nom", "valeur modifiée"),
+        (3, None, "ligne retirée"),
+    ]
+    assert _lignes(_du_regle(resultat.bilan), "table", "colonne", "visees", "corrigees",
+                   "raisons") == [
+        ("t", "nom", 1, 1, None),
+        ("t", None, 2, 1, "source modifiée depuis la décision 1"),
+    ]
+
+
+def test_decision_retirer_apres_les_doublons_et_deux_fois_la_meme_ligne():
+    # Une ligne retirée comme doublon exact ne l'est pas une seconde fois; une ligne
+    # visée par deux décisions n'est retirée qu'une fois.
+    tables = {"t": _table(code=["a", "a", "b"], nom=["x", "x", "z"])}
+    decisions = _decisions(
+        r1=_decision(3, "code", "retirer", _empreinte_ligne(code="a", nom="x")),
+        r2=_decision(4, "code", "retirer", _empreinte_ligne(code="b", nom="z")),
+        r3=_decision(4, "nom", "retirer", _empreinte_ligne(code="b", nom="z")),
+    )
+    resultat = _nettoyer_avec(tables, decisions)
+    assert list(resultat.tables["t"]["num_ligne_source"]) == [2]
+    assert _lignes(resultat.journal, "regle_nettoyage", "num_ligne_source", "detail") == [
+        ("doublons", 3, "doublon exact de la ligne 2 (t.csv)"),
+        ("decision", 4, "décision du 2026-10-20, classeur arbitrage_2026-03.xlsx, anomalie r2"),
+    ]
+    assert _lignes(_du_regle(resultat.bilan), "visees", "corrigees", "raisons") == [
+        (3, 2, "ligne source introuvable 1")
+    ]
+
+
+def test_decision_introuvable_et_garder():
+    donnees = _table(code=["a", "b", "c"], nom=["x", "y", "z"])
+    donnees["num_ligne_source"] = [2, 3, 3]
+    tables = {"t": donnees}
+    decisions = _decisions(
+        a1=_decision(9, "nom", "corriger", _empreinte_cellule("x"), "v", "texte"),
+        a2=_decision(3, "nom", "corriger", _empreinte_cellule("y"), "v", "texte"),
+        a3=_decision(2, "absente", "corriger", _empreinte_cellule("x"), "v", "texte"),
+        a4=_decision(2, "nom", "corriger", _empreinte_cellule("x"), "v", "texte", table="u"),
+        a5=_decision(2, "nom", "garder", _empreinte_cellule("x")),
+        a6=_decision(2, "code", "corriger", _empreinte_cellule("a"), "v", "texte",
+                     fichier="autre.csv"),
+    )
+    resultat = _nettoyer_avec(tables, decisions)
+    assert resultat.tables["t"].equals(tables["t"])
+    assert _du_regle(resultat.journal).empty
+    assert _lignes(_du_regle(resultat.bilan), "table", "colonne", "visees", "corrigees",
+                   "raisons") == [
+        ("t", "code", 1, 0, "ligne source introuvable 1"),
+        ("t", "nom", 2, 0, "ligne source introuvable 2"),
+        ("t", "absente", 1, 0, "ligne source introuvable 1"),
+        ("u", "nom", 1, 0, "ligne source introuvable 1"),
+    ]
+
+
+def test_decision_la_plus_ancienne_d_abord():
+    tables = {"t": _table(code=["a"], nom=["x"])}
+    decisions = _decisions(
+        b=_decision(2, "nom", "corriger", _empreinte_cellule("x"), "récente", "texte",
+                    decide_le="2026-11-20 10:00:00"),
+        a=_decision(2, "nom", "corriger", _empreinte_cellule("x"), "ancienne", "texte",
+                    decide_le="2026-10-20 10:00:00"),
+    )
+    resultat = _nettoyer_avec(tables, decisions)
+    assert list(resultat.tables["t"]["nom"]) == ["ancienne"]
+    assert _lignes(_du_regle(resultat.bilan), "visees", "corrigees", "raisons") == [
+        (2, 1, "source modifiée depuis la décision 1")
+    ]
+
+
+def test_decision_colonne_sensible_masquee():
+    tables = {"t": _table(code=["a"], adresse=["1 rue"])}
+    decisions = _decisions(
+        a1=_decision(2, "adresse", "corriger", _empreinte_cellule("1 rue"), "2 rue", "texte"),
+    )
+    resultat = _nettoyer_avec(tables, decisions, sensibles={"t": frozenset({"adresse"})},
+                              declarations={"t": {"cle": ["adresse"]}})
+    assert list(resultat.tables["t"]["adresse"]) == ["2 rue"]
+    assert _lignes(resultat.journal, "cle", "valeur_avant", "valeur_apres") == [
+        (VALEUR_MASQUEE, VALEUR_MASQUEE, VALEUR_MASQUEE)
+    ]
+
+
+def test_decisions_lues_par_defaut_et_invalides(tmp_path, monkeypatch):
+    tables = {"t": _table(code=["a"], nom=["x"])}
+    fichier = tmp_path / "decisions.yaml"
+    monkeypatch.setattr(module_decisions, "chemin_decisions", lambda: fichier)
+    # Fichier absent : aucune décision.
+    resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, AUCUNE_DECLARATION)
+    assert _du_regle(resultat.bilan).empty
+    import yaml
+
+    contenu = _decisions(
+        a1=_decision(2, "nom", "corriger", _empreinte_cellule("x"), "y", "texte")
+    )
+    fichier.write_text(yaml.safe_dump(contenu, allow_unicode=True), encoding="utf-8")
+    resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, AUCUNE_DECLARATION)
+    assert list(resultat.tables["t"]["nom"]) == ["y"]
+    contenu["decisions"]["a1"]["decision"] = "retirer"
+    with pytest.raises(ValueError, match="Décisions invalides"):
+        _nettoyer_avec(tables, contenu)
+
+
+def test_cycle_complet_d_arbitrage(tmp_path):
+    """Export, décisions du métier, import, puis nettoyage avec les décisions : ce
+    qui est corrigé ou retiré disparaît, ce qui est gardé n'est plus proposé."""
+    from openpyxl import load_workbook
+
+    from frigeo.anomalies import reunir_anomalies
+    from frigeo.decisions import (
+        COLONNES_ARBITRAGE,
+        ETAT_VALABLE,
+        charger_decisions,
+        ecrire_decisions,
+        elements_a_arbitrer,
+        exporter_arbitrage,
+        importer_arbitrage,
+    )
+    from frigeo.gestion import controler_gestion
+
+    tables = {
+        "t": _table(code=["a", "a", "b", "c"], nom=["x", "y", "z", "w"],
+                    d=["31/02/2025", "01/01/2025", "32/01/2025", "02/01/2025"])
+    }
+    dictionnaire = _dictionnaire(tables, **{"t.d": _colonne("date JJ/MM/AAAA")})
+    declarations = {"t": {"cle": ["code"]}}
+    fichier = tmp_path / "decisions.yaml"
+
+    def nettoyer_et_controler():
+        nettoyees = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, declarations, None,
+                             charger_decisions(fichier)).tables
+        ecarts, bilan = controler(nettoyees, dictionnaire, AUCUNE_SENSIBLE, {})
+        doublons, bilan_doublons = detecter_doublons(nettoyees, declarations, AUCUNE_SENSIBLE)
+        ecarts_g, bilan_g = controler_gestion(
+            nettoyees, dictionnaire, [], declarations, doublons, AUCUNE_SENSIBLE
+        )
+        anomalies = reunir_anomalies(nettoyees, ecarts, doublons, ecarts_g, bilan,
+                                     bilan_doublons, bilan_g, declarations, AUCUNE_SENSIBLE)
+        return nettoyees, elements_a_arbitrer(nettoyees, anomalies, charger_decisions(fichier))
+
+    _, elements = nettoyer_et_controler()
+    assert _lignes(elements, "sorte", "num_ligne_source") == [
+        ("cellule", 2), ("cellule", 4), ("ligne", 2), ("ligne", 3)
+    ]
+    chemin = exporter_arbitrage(elements, "2026-03", tmp_path / "a.xlsx", nb_imports=0)
+    classeur = load_workbook(chemin)
+    feuille = classeur["arbitrage"]
+    colonnes = {nom: i for i, nom in enumerate(COLONNES_ARBITRAGE, start=1)}
+    choix = {2: ("corriger", "28.02.2025"), 3: ("garder", None), 5: ("retirer", None)}
+    for numero, (decision, valeur) in choix.items():
+        feuille.cell(row=numero, column=colonnes["decision"]).value = decision
+        feuille.cell(row=numero, column=colonnes["valeur_retenue"]).value = valeur
+    classeur.save(chemin)
+    ecrire_decisions(importer_arbitrage(chemin, dictionnaire, nb_imports=0), "2026-03", fichier)
+
+    nettoyees, elements = nettoyer_et_controler()
+    assert list(nettoyees["t"]["num_ligne_source"]) == [2, 4, 5]
+    assert list(nettoyees["t"]["d"]) == ["28/02/2025", "32/01/2025", "02/01/2025"]
+    # Il ne reste que la date gardée, dont la décision est valable : rien à exporter.
+    assert _lignes(elements, "sorte", "num_ligne_source", "etat_decision") == [
+        ("cellule", 4, ETAT_VALABLE)
+    ]
+
+
+def test_decision_index_des_tables_non_continu():
+    # Le journal retrouve la ligne de la table reçue par son étiquette, pas par sa
+    # position dans la table nettoyée.
+    donnees = _table(code=["a", "a", "b"], nom=["x", "x", "y"])
+    donnees.index = [10, 11, 12]
+    tables = {"t": donnees}
+    decisions = _decisions(
+        a1=_decision(4, "nom", "corriger", _empreinte_cellule("y"), "z", "texte"),
+    )
+    resultat = _nettoyer_avec(tables, decisions, declarations={"t": {"cle": ["code"]}})
+    assert list(resultat.tables["t"].index) == [10, 12]
+    assert list(resultat.tables["t"]["nom"]) == ["x", "z"]
+    assert _lignes(resultat.journal, "regle_nettoyage", "num_ligne_source", "cle") == [
+        ("doublons", 3, "a"),
+        ("decision", 4, "b"),
     ]
