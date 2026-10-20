@@ -102,6 +102,10 @@ COLONNES_ANOMALIES = (
     "gravite",
     "indicateurs",
 )
+# Table des anomalies des tables nettoyées (étape 6), avec la décision du métier
+# (voir `decisions.ajouter_decisions`).
+COLONNE_DECISION_METIER = "decision_metier"
+COLONNES_ANOMALIES_NETTOYEES = (*COLONNES_ANOMALIES, COLONNE_DECISION_METIER)
 COLONNES_BILAN_ANOMALIES = (
     "etape",
     "controle",
@@ -1066,6 +1070,8 @@ ENCODAGE_CSV = "utf-8-sig"
 FIN_DE_LIGNE_CSV = "\r\n"
 PREFIXE_FICHIER_ANOMALIES = "anomalies_"
 PREFIXE_FICHIER_BILAN = "bilan_"
+PREFIXE_FICHIER_ANOMALIES_NETTOYEES = "anomalies_nettoyees_"
+PREFIXE_FICHIER_BILAN_NETTOYEES = "bilan_nettoyees_"
 SUFFIXE_PROVISOIRE = ".tmp"
 _MOTIF_PERIODE_FIN = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
 _COLONNES_ENTIERES_BILAN = (
@@ -1082,22 +1088,35 @@ def dossier_anomalies() -> Path:
     return racine_projet() / "data" / "anomalies"
 
 
-def chemins_anomalies(periode_fin: str, dossier: str | Path | None = None) -> tuple[Path, Path]:
-    """Chemins de la table des anomalies et du bilan d'une période (AAAA-MM)."""
+def chemins_anomalies(
+    periode_fin: str, dossier: str | Path | None = None, nettoyees: bool = False
+) -> tuple[Path, Path]:
+    """Chemins de la table des anomalies et du bilan d'une période (AAAA-MM).
+
+    Avec `nettoyees=True`, ceux de la table des anomalies des tables nettoyées
+    (étape 6) : `anomalies_nettoyees_AAAA-MM.csv` et `bilan_nettoyees_AAAA-MM.csv`.
+    """
     dossier = dossier_anomalies() if dossier is None else Path(dossier)
-    return (
-        dossier / f"{PREFIXE_FICHIER_ANOMALIES}{periode_fin}.csv",
-        dossier / f"{PREFIXE_FICHIER_BILAN}{periode_fin}.csv",
-    )
+    if nettoyees:
+        prefixes = (PREFIXE_FICHIER_ANOMALIES_NETTOYEES, PREFIXE_FICHIER_BILAN_NETTOYEES)
+    else:
+        prefixes = (PREFIXE_FICHIER_ANOMALIES, PREFIXE_FICHIER_BILAN)
+    return tuple(dossier / f"{prefixe}{periode_fin}.csv" for prefixe in prefixes)
 
 
-def _problemes_ecriture(anomalies, bilan, periode_fin, sensibles, declarations) -> list[str]:
+def _problemes_ecriture(
+    anomalies, bilan, periode_fin, sensibles, declarations, nettoyees=False
+) -> list[str]:
     """Tous les problèmes qui empêchent d'écrire la table et le bilan."""
     if not isinstance(periode_fin, str) or not _MOTIF_PERIODE_FIN.fullmatch(periode_fin):
         return [f"période {periode_fin!r} : forme AAAA-MM attendue (par exemple 2026-03)"]
     problemes = []
     for nom, donnees, attendues in (
-        ("table des anomalies", anomalies, COLONNES_ANOMALIES),
+        (
+            "table des anomalies",
+            anomalies,
+            COLONNES_ANOMALIES_NETTOYEES if nettoyees else COLONNES_ANOMALIES,
+        ),
         ("bilan par contrôle", bilan, COLONNES_BILAN_ANOMALIES),
     ):
         if list(donnees.columns) != list(attendues):
@@ -1214,6 +1233,44 @@ def _ecrire_csv(donnees: pd.DataFrame, chemin: Path) -> None:
         raise RuntimeError(f"La relecture de {chemin.name} diffère de la table écrite")
 
 
+def _ecrire_fichiers(sorties: list[tuple[pd.DataFrame, Path]]) -> None:
+    """Écrit des tables en CSV, tout ou rien.
+
+    Chaque table est écrite et relue dans un fichier provisoire, puis les fichiers
+    provisoires remplacent les anciens. Si l'un des anciens fichiers est ouvert
+    (dans Excel), `PermissionError` dit lequel fermer, et les anciens fichiers
+    restent intacts.
+    """
+    chemins = [chemin for _, chemin in sorties]
+    provisoires = [c.with_name(c.name + SUFFIXE_PROVISOIRE) for c in chemins]
+    chemins[0].parent.mkdir(parents=True, exist_ok=True)
+    try:
+        for (donnees, _), provisoire in zip(sorties, provisoires):
+            _ecrire_csv(donnees, provisoire)
+        ouverts = [c for c in chemins if _verrouille(c)]
+        if ouverts:
+            raise PermissionError(
+                "Fichier ouvert, sans doute dans Excel : le fermer, puis relancer l'écriture. "
+                "Rien n'a été modifié.\n  " + "\n  ".join(str(c) for c in ouverts)
+            )
+        for rang, (provisoire, chemin) in enumerate(zip(provisoires, chemins)):
+            try:
+                os.replace(provisoire, chemin)
+            except PermissionError as erreur:
+                deja = (
+                    f" {chemins[0].name} a déjà été remplacé, {chemin.name} ne l'a pas été : "
+                    "relancer l'écriture une fois le fichier fermé."
+                    if rang
+                    else " Rien n'a été modifié."
+                )
+                raise PermissionError(
+                    f"Fichier ouvert, sans doute dans Excel : {chemin}.{deja}"
+                ) from erreur
+    finally:
+        for provisoire in provisoires:
+            provisoire.unlink(missing_ok=True)
+
+
 def _verrouille(chemin: Path) -> bool:
     """Vrai si un fichier existant ne peut pas être ouvert en écriture (ouvert dans Excel)."""
     if not chemin.exists():
@@ -1233,6 +1290,8 @@ def ecrire_anomalies(
     dossier: str | Path | None = None,
     sensibles: dict[str, frozenset[str]] | None = None,
     declarations: dict | None = None,
+    *,
+    nettoyees: bool = False,
 ) -> tuple[Path, Path]:
     """Écrit la table des anomalies et le bilan par contrôle en CSV.
 
@@ -1260,37 +1319,20 @@ def ecrire_anomalies(
     puis remplacent les anciens. Si l'un des anciens fichiers est ouvert (dans
     Excel), `PermissionError` dit lequel fermer, et les deux anciens fichiers
     restent intacts.
+
+    Avec `nettoyees=True` (étape 6), la table est celle des tables nettoyées, avec
+    la colonne `decision_metier` en dernier (`COLONNES_ANOMALIES_NETTOYEES`), et les
+    fichiers sont `anomalies_nettoyees_AAAA-MM.csv` et `bilan_nettoyees_AAAA-MM.csv`,
+    à côté de ceux des données brutes.
     """
-    problemes = _problemes_ecriture(anomalies, bilan, periode_fin, sensibles, declarations)
+    problemes = _problemes_ecriture(
+        anomalies, bilan, periode_fin, sensibles, declarations, nettoyees
+    )
     if problemes:
         raise ValueError("Écriture refusée\n  " + "\n  ".join(problemes))
 
-    chemins = chemins_anomalies(periode_fin, dossier)
-    provisoires = [c.with_name(c.name + SUFFIXE_PROVISOIRE) for c in chemins]
-    chemins[0].parent.mkdir(parents=True, exist_ok=True)
-    try:
-        _ecrire_csv(_table_ecrite(anomalies), provisoires[0])
-        _ecrire_csv(_bilan_ecrit(bilan), provisoires[1])
-        ouverts = [c for c in chemins if _verrouille(c)]
-        if ouverts:
-            raise PermissionError(
-                "Fichier ouvert, sans doute dans Excel : le fermer, puis relancer l'écriture. "
-                "Rien n'a été modifié.\n  " + "\n  ".join(str(c) for c in ouverts)
-            )
-        for rang, (provisoire, chemin) in enumerate(zip(provisoires, chemins)):
-            try:
-                os.replace(provisoire, chemin)
-            except PermissionError as erreur:
-                deja = (
-                    f" {chemins[0].name} a déjà été remplacé, {chemin.name} ne l'a pas été : "
-                    "relancer l'écriture une fois le fichier fermé."
-                    if rang
-                    else " Rien n'a été modifié."
-                )
-                raise PermissionError(
-                    f"Fichier ouvert, sans doute dans Excel : {chemin}.{deja}"
-                ) from erreur
-    finally:
-        for provisoire in provisoires:
-            provisoire.unlink(missing_ok=True)
+    chemins = chemins_anomalies(periode_fin, dossier, nettoyees)
+    _ecrire_fichiers(
+        [(_table_ecrite(anomalies), chemins[0]), (_bilan_ecrit(bilan), chemins[1])]
+    )
     return chemins

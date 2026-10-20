@@ -22,7 +22,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 03 | Terminé |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 04 | Terminé |
 | 5 | Table des anomalies, gravité et indicateurs affectés, export CSV | Python, Jupyter | 05 | Terminé |
-| 6 | Règles de nettoyage explicites et jeu de données nettoyé | Python, Jupyter | 06 | À venir |
+| 6 | Règles de nettoyage explicites, décisions du métier ligne par ligne, journal des corrections | Python, Excel, Jupyter | 06 | Terminé |
 | 7 | Modèle en étoile, indicateurs et marge opérationnelle | SQL Server, Azure SQL Database | aucun | À venir |
 | 8 | Tableaux de bord direction et qualité | Power BI | aucun | À venir |
 | 9 | Documentation de la méthode, des choix et des limites | Markdown | aucun | À venir |
@@ -40,7 +40,7 @@ Le mode opératoire d'un cycle de traitement (qui fait quoi et dans quel ordre, 
 
 ## Limites et adaptation à un autre client
 
-Les notebooks 03, 04 et 05 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services, et le notebook 02c une seule cellule, la comparaison avec le chapitre 4, à retirer chez un autre client. Les notebooks 01 et 02 en contiennent encore (formats des fichiers texte déclarés dans le notebook, colonnes examinées une à une, valeurs affichées), et sont à rendre génériques avant un cas réel. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`) et dans le dictionnaire revu par le métier. Le code porte cependant l'empreinte des données rencontrées sur quelques points :
+Les notebooks 03, 04, 05 et 06 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services, et le notebook 02c une seule cellule, la comparaison avec le chapitre 4, à retirer chez un autre client. Les notebooks 01 et 02 en contiennent encore (formats des fichiers texte déclarés dans le notebook, colonnes examinées une à une, valeurs affichées), et sont à rendre génériques avant un cas réel. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`), dans le dictionnaire revu par le métier et dans ses décisions ligne par ligne (`data/config/decisions.yaml`). Le code porte cependant l'empreinte des données rencontrées sur quelques points :
 
 - **Types de règles de gestion.** Le catalogue de l'étape 4 (28 types génériques) ne couvre que les règles de ce cas. Un autre client demandera des types nouveaux, ajoutés au catalogue sans reprendre les autres.
 - **Natures reconnues.** Trois formes de date, l'heure HH:MM, les décimaux à virgule ou à point. Des heures HH:MM:SS, des milliers séparés par une espace ou des dates MM/JJ/AAAA demanderaient d'étendre `profilage.py` et `typage.py`.
@@ -53,6 +53,9 @@ Les notebooks 03, 04 et 05 ne contiennent aucun nom de table, de colonne ni de v
 - **Encodages suspects.** La règle `encodage` essaie les trois encodages d'Europe occidentale (Windows-1252, ISO-8859-15, Latin-1). Des fichiers venus d'un autre jeu de caractères (Europe centrale, cyrillique) demanderaient d'étendre `ENCODAGES_SUSPECTS`. Un `à` mal décodé n'est plus reconnaissable si un logiciel a remplacé l'espace insécable qui le suit par une espace ordinaire, et un double encodage n'est signalé qu'une fois.
 - **Gravité et indicateurs affectés.** Ils sont déclarés par le consultant dans `config/anomalies.yaml`, à faire valider par le métier, et non calculés. La gravité par défaut est grossière (« majeure » dès qu'une colonne alimente un indicateur) et se nuance par des exceptions, sans code. Le fichier est à revoir quand un indicateur ou une colonne change.
 - **Export CSV.** Séparateur point-virgule et virgule décimale, pour Excel en paramètres français. Ouvert par double-clic, Excel retire les zéros en tête, écrit un SIRET en notation scientifique, lit `2026-03` comme une date et une valeur commençant par `=` comme une formule. Il faut donc ouvrir le fichier par Données, À partir d'un fichier texte/CSV, sans détection des types. Les identifiants d'anomalie changent si un fichier est réexporté avec des lignes décalées.
+- **Nettoyage automatique.** Les règles ne corrigent que ce qui se lit sans ambiguïté : encodages, remplacements décidés au dictionnaire, formes élargies de date et de nombre, doublons exacts. Une durée avec unité (1h30) n'est jamais convertie. Une année écrite sur deux chiffres est complétée en 20AA si la date ne dépasse pas la date de coupure : une date ancienne mal saisie peut ainsi devenir fausse, et la conversion n'est visible qu'au journal du nettoyage (« siècle 20 ajouté »).
+- **Décisions du métier.** Le classeur d'arbitrage porte des valeurs du client, colonnes sensibles comprises, et reste dans `data/decisions/`. Une décision est rattachée à l'identifiant de l'anomalie et à une empreinte de la donnée : un fichier réexporté avec des lignes décalées rend les décisions caduques, et les éléments reviennent au classeur suivant. On ne peut pas corriger une cellule vers une valeur vide, et une anomalie de règle de gestion (hors écart à arbitrer) ne se tranche pas dans le classeur : sa correction se fait dans le logiciel source.
+- **Jeu nettoyé.** Il n'est pas écrit sur disque : il se recalcule à chaque exécution à partir des fichiers bruts, des règles et des décisions, la source brute restant la seule référence. La représentation de la source est conservée (une date en texte reste un texte); la conversion des types se fera au chargement en base (étape 7).
 
 ## Structure du dépôt
 
@@ -91,9 +94,11 @@ data/
   raw/2025/         exports annuels 2025
   raw/2026/         exports mensuels 2026
   referentiels/     intervenants, clients, fournisseurs, catalogue, paramètres
-  config/           dictionnaire généré (contient des valeurs observées)
+  config/           dictionnaire généré (contient des valeurs observées) et décisions du métier
   revue/            classeur de revue du dictionnaire (étape 2d)
-  anomalies/        table des anomalies et bilan par contrôle en CSV (étape 5)
+  anomalies/        table des anomalies et bilan par contrôle en CSV (étape 5, et après nettoyage à l'étape 6)
+  decisions/        classeur d'arbitrage des anomalies par le métier (étape 6)
+  nettoyage/        journal et bilan du nettoyage en CSV (étape 6)
 ```
 
 ## Conventions de travail
