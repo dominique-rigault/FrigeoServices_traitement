@@ -40,7 +40,7 @@ Cette phase précède le notebook 01 : `decouvrir` lit `config/sources.yaml` d�
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
 | 1.1 | Déposer les exports selon la convention de nommage : exports périodiques n'importe où sous `data/raw/`, la période dans le nom (`interventions_2025.csv`, `interventions_2026-01.csv`); référentiels dans `data/referentiels/` (à côté de `data/raw/`, pas dedans) | M, C | Explorateur | opérationnel |
-| 1.2 | Rédiger `config/sources.yaml` : périodes (`annuelle`, `premier_mois`), puis par flux le motif de nom avec `{p}` (ou le nom du référentiel), l'emplacement, le format, l'encodage, le séparateur, la ligne d'en-tête et les tables (feuille pour Excel) | A, puis C | inventaire 0.3, noms des fichiers | opérationnel |
+| 1.2 | Rédiger `config/sources.yaml` : périodes (`annuelle`, `premier_mois`), puis par flux le motif de nom avec `{p}` (ou le nom du référentiel), l'emplacement, le format, l'encodage, le séparateur, la ligne d'en-tête et les tables (feuille pour Excel); `{p}` n'est pas une expression régulière mais un emplacement remplacé par chaque période du périmètre (`2025`, `2026-01`, etc.), et `motif_annuel` donne au besoin un autre nom à l'export annuel | A, puis C | inventaire 0.3, noms des fichiers | opérationnel |
 | 1.3 | Rédiger `config/sensibilite.yaml` : colonnes sensibles par table, proposées d'après les noms de colonnes | A, validé par C et M | en-têtes des fichiers | opérationnel |
 | 1.4 | Modifier `perimetre.py` seulement si le client ne suit pas le modèle « une période annuelle puis des mois » (mois seuls, trimestres) | A | code et tests | à créer si nécessaire |
 
@@ -50,13 +50,17 @@ Les périodes ne s'ajoutent pas dans `perimetre.py` : elles se déduisent de `p
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
-| 2.1 | Mettre `PERIODE_FIN` au dernier mois déposé | C | notebook 01, cellule 1 | opérationnel |
-| 2.2 | Exécuter le notebook en entier; un fichier manquant ou présent à deux endroits arrête la cellule 2 avec la liste des problèmes | C | notebook 01 | à adapter |
+| 2.1 | Mettre `PERIODE_FIN` au dernier mois déposé | C | notebook 01, première cellule de code | opérationnel |
+| 2.2 | Exécuter le notebook en entier; un fichier manquant ou présent à deux endroits arrête la cellule `# PERIMETRE` avec la liste des problèmes; lire les décomptes de `# SONDAGE` (échecs de décodage, feuilles non déclarées), `# EN-TETES` (en-têtes qui changent d'un export à l'autre) et `# COMPARAISON` (lignes perdues), avec le guide de lecture en fin de notebook | C | notebook 01 | opérationnel |
 | 2.3 | En cas d'échec de décodage, d'en-têtes différents entre deux exports d'un même flux ou de lignes perdues : corriger `config/sources.yaml` (encodage, séparateur, ligne d'en-tête), ou demander un réexport, puis relancer le notebook | C, A, M | notebook 01 | opérationnel |
-| 2.4 | Exporter les décomptes des cellules à l'encodage suspect (table, colonne, nombre de cellules, mécanisme), sans les valeurs | C | cellule d'export | à créer |
+| 2.4 | Exporter les décomptes des cellules à l'encodage suspect (table, colonne, constat, mécanisme, nombre de cellules, cellules réparables), sans les valeurs | C | cellule `# EXPORT` | opérationnel |
 | 2.5 | Rédiger la partie « cellules à l'encodage suspect » du rapport | A | export 2.4 | opérationnel |
 
-Pourquoi « à adapter » : la cellule de sondage des fichiers texte déclare les flux, encodages et séparateurs de Frigéo dans une fonction `format_declare` au lieu de les lire dans `config/sources.yaml`; les cellules d'encodage suspect visent trois colonnes de Frigéo et affichent les valeurs (des noms de clients); la synthèse en Markdown porte les chiffres de Frigéo.
+Repères pour la phase 2 :
+
+- le notebook n'affiche aucune valeur des données, seulement des noms de fichiers, de feuilles, de tables et de colonnes et des décomptes; le texte de la cellule `# EXPORT` peut être transmis à l'assistant;
+- les formats sont lus dans `config/sources.yaml` (module `src/frigeo/inventaire.py`); une feuille d'un classeur absente de ce fichier est signalée mais pas chargée;
+- le mécanisme d'une cellule à l'encodage suspect est déduit du format déclaré de la source, sans regarder les valeurs; la réparation relève du nettoyage (phase 8).
 
 ### Phase 3, profilage (notebook 02)
 
@@ -158,7 +162,7 @@ Repères pour la phase 8 :
 | --- | --- | --- | --- | --- |
 | M.1 | Déposer les exports du mois (période dans le nom, par exemple dans `data/raw/2026/2026-04/`), et les référentiels s'ils ont changé | M, C | Explorateur | opérationnel |
 | M.2 | Mettre `PERIODE_FIN` à jour dans chaque notebook exécuté | C | notebooks 01, 02c, 03, 04, 05, 06 | opérationnel |
-| M.3 | Exécuter le notebook 01 (fichiers attendus, en-têtes, lignes chargées) | C | notebook 01 | à adapter |
+| M.3 | Exécuter le notebook 01 (fichiers attendus, en-têtes, lignes chargées) | C | notebook 01 | opérationnel |
 | M.4 | Exécuter le notebook 02 seulement si un format nouveau est soupçonné | C | notebook 02 | à adapter |
 | M.5 | Régénérer le dictionnaire : cellules jusqu'à `# ECRITURE APRES FUSION`, lire le rapport de `# FUSION` (événements « à regarder ») | C | notebook 02c | opérationnel |
 | M.6 | Revue si de nouvelles valeurs ou formes sont à arbitrer (phase 4, étapes 4.4 à 4.6) | M avec C | Excel, notebook 02c | opérationnel |
