@@ -15,7 +15,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | Étape | Contenu | Outil | Notebook | Avancement |
 | --- | --- | --- | --- | --- |
 | 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | 01 | Terminé |
-| 2 | Profilage de chaque fichier | Python, Jupyter | 02 | Fait sur le cas Frigéo, à rendre générique |
+| 2 | Profilage de chaque fichier | Python, Jupyter | 02 | Terminé |
 | 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | aucun | Terminé |
 | 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 02c | Terminé, sauf une cellule propre au cas (comparaison avec le chapitre 4) |
 | 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 02c | Terminé |
@@ -40,7 +40,7 @@ Le mode opératoire d'un cycle de traitement (qui fait quoi et dans quel ordre, 
 
 ## Limites et adaptation à un autre client
 
-Les notebooks 01, 03, 04, 05 et 06 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services, et le notebook 02c une seule cellule, la comparaison avec le chapitre 4, à retirer chez un autre client. Le notebook 02 en contient encore (colonnes examinées une à une, valeurs affichées), et est à rendre générique avant un cas réel. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`), dans le dictionnaire revu par le métier et dans ses décisions ligne par ligne (`data/config/decisions.yaml`). Le code porte cependant l'empreinte des données rencontrées sur quelques points :
+Les notebooks 01, 02, 03, 04, 05 et 06 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services, et le notebook 02c une seule cellule, la comparaison avec le chapitre 4, à retirer chez un autre client. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`), dans le dictionnaire revu par le métier et dans ses décisions ligne par ligne (`data/config/decisions.yaml`). Le code porte cependant l'empreinte des données rencontrées sur quelques points :
 
 - **Types de règles de gestion.** Le catalogue de l'étape 4 (28 types génériques) ne couvre que les règles de ce cas. Un autre client demandera des types nouveaux, ajoutés au catalogue sans reprendre les autres.
 - **Natures reconnues.** Trois formes de date, l'heure HH:MM, les décimaux à virgule ou à point. Des heures HH:MM:SS, des milliers séparés par une espace ou des dates MM/JJ/AAAA demanderaient d'étendre `profilage.py` et `typage.py`.

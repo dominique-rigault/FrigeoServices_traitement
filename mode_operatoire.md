@@ -66,14 +66,20 @@ Repères pour la phase 2 :
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
-| 3.1 | Mettre `PERIODE_FIN` à jour et exécuter le notebook | C | notebook 02 | à adapter |
-| 3.2 | Exporter le profil agrégé (natures, taux de vides, nombre de valeurs distinctes, formes principales), exemples masqués et colonnes sensibles masquées | C | cellule `# EXPORT` | à créer |
+| 3.1 | Mettre `PERIODE_FIN` à jour et exécuter le notebook en entier; lire la synthèse par table, les colonnes dont la nature change d'un export à l'autre et les points à regarder, et examiner au besoin une colonne dans `# DETAIL D'UNE COLONNE` (guide de lecture en fin de notebook) | C | notebook 02 | opérationnel |
+| 3.2 | Exporter le profil agrégé (synthèse par table; par colonne la nature, les parts de la nature et des vides, le nombre de valeurs distinctes et de formes, les formes principales; les points à regarder), sans bornes ni valeurs, formes des colonnes sensibles masquées | C | cellule `# EXPORT` | opérationnel |
 | 3.3 | Rédiger la partie « synthèse du profilage » du rapport | A | export 3.2 | opérationnel |
-| 3.4 | Si le profil montre une forme de date, d'heure ou de nombre non reconnue (HH:MM:SS, MM/JJ/AAAA, milliers séparés par une espace) : étendre les natures de `profilage.py` et de `typage.py`, avec leurs tests | A, puis C (tests et commit) | `src`, `tests` | à créer si nécessaire |
+| 3.4 | Si le profil montre une forme de date, d'heure ou de nombre non reconnue (point « forme numérique non reconnue » : HH:MM:SS, MM/JJ/AAAA, milliers séparés par une espace) : étendre les natures de `profilage.py` et de `typage.py`, avec leurs tests | A, puis C (tests et commit) | `src`, `tests` | à créer si nécessaire |
 
 L'étape 3.4 précède le notebook 02c : la nature proposée au dictionnaire, puis la lecture typée de l'étape 4, reposent sur ces natures.
 
-Pourquoi « à adapter » : les cellules 3 à 15 nomment des tables et des colonnes de Frigéo, il n'existe pas de cellule d'export, et la synthèse en Markdown est celle de Frigéo.
+Repères pour la phase 3 :
+
+- le notebook ne nomme aucune table ni colonne; la synthèse et les points à regarder viennent de `src/frigeo/profilage.py`;
+- les bornes des colonnes sensibles sont masquées dans le notebook; le texte de `# EXPORT` ne porte ni borne ni valeur, et les formes des colonnes sensibles y sont masquées : il peut être transmis à l'assistant;
+- `# DETAIL D'UNE COLONNE` affiche une valeur d'exemple par forme (sauf colonne sensible) : sa sortie reste sur le poste;
+- le point « forme numérique non reconnue » ne retient que les formes que ni le profil ni le nettoyage ne savent lire; il signale aussi des codes formatés (téléphone, référence de pièce), qui relèvent de la règle `format` du dictionnaire et non de l'étape 3.4;
+- le point « forme élargie lue par le nettoyage » (JJ.MM.AAAA, JJ/MM/AA, milliers séparés par une espace) ne demande pas d'étendre les natures : ces valeurs sont converties par la règle `nature` du nettoyage (phase 8).
 
 ### Phase 4, dictionnaire et revue (notebook 02c)
 
@@ -163,7 +169,7 @@ Repères pour la phase 8 :
 | M.1 | Déposer les exports du mois (période dans le nom, par exemple dans `data/raw/2026/2026-04/`), et les référentiels s'ils ont changé | M, C | Explorateur | opérationnel |
 | M.2 | Mettre `PERIODE_FIN` à jour dans chaque notebook exécuté | C | notebooks 01, 02c, 03, 04, 05, 06 | opérationnel |
 | M.3 | Exécuter le notebook 01 (fichiers attendus, en-têtes, lignes chargées) | C | notebook 01 | opérationnel |
-| M.4 | Exécuter le notebook 02 seulement si un format nouveau est soupçonné | C | notebook 02 | à adapter |
+| M.4 | Exécuter le notebook 02 seulement si un format nouveau est soupçonné (points « nature différente selon l'export » et « forme numérique non reconnue ») | C | notebook 02 | opérationnel |
 | M.5 | Régénérer le dictionnaire : cellules jusqu'à `# ECRITURE APRES FUSION`, lire le rapport de `# FUSION` (événements « à regarder ») | C | notebook 02c | opérationnel |
 | M.6 | Revue si de nouvelles valeurs ou formes sont à arbitrer (phase 4, étapes 4.4 à 4.6) | M avec C | Excel, notebook 02c | opérationnel |
 | M.7 | Exécuter les notebooks 03 puis 04 en entier | C | notebooks 03, 04 | opérationnel |
