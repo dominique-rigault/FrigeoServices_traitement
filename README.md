@@ -17,12 +17,12 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 1 | Inventaire et chargement des fichiers bruts sans modification, avec lignage | Python, Jupyter | 01 | Terminé |
 | 2 | Profilage de chaque fichier | Python, Jupyter | 02 | Terminé |
 | 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | aucun | Terminé |
-| 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 02c | Terminé, sauf une cellule propre au cas (comparaison avec le chapitre 4) |
-| 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 02c | Terminé |
-| 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 03 | Terminé |
-| 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 04 | Terminé |
-| 5 | Table des anomalies, gravité et indicateurs affectés, export CSV | Python, Jupyter | 05 | Terminé |
-| 6 | Règles de nettoyage explicites, décisions du métier ligne par ligne, journal des corrections | Python, Excel, Jupyter | 06 | Terminé |
+| 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 03 | Terminé |
+| 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 03 | Terminé |
+| 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 04 | Terminé |
+| 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 05 | Terminé |
+| 5 | Table des anomalies, gravité et indicateurs affectés, export CSV | Python, Jupyter | 06 | Terminé |
+| 6 | Règles de nettoyage explicites, décisions du métier ligne par ligne, journal des corrections | Python, Excel, Jupyter | 07 | Terminé |
 | 7 | Modèle en étoile, indicateurs et marge opérationnelle | SQL Server, Azure SQL Database | aucun | À venir |
 | 8 | Tableaux de bord direction et qualité | Power BI | aucun | À venir |
 | 9 | Documentation de la méthode, des choix et des limites | Markdown | aucun | À venir |
@@ -40,7 +40,7 @@ Le mode opératoire d'un cycle de traitement (qui fait quoi et dans quel ordre, 
 
 ## Limites et adaptation à un autre client
 
-Les notebooks 01, 02, 03, 04, 05 et 06 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services, et le notebook 02c une seule cellule, la comparaison avec le chapitre 4, à retirer chez un autre client. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`), dans le dictionnaire revu par le métier et dans ses décisions ligne par ligne (`data/config/decisions.yaml`). Le code porte cependant l'empreinte des données rencontrées sur quelques points :
+Les notebooks 01 à 07 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`), dans le dictionnaire revu par le métier et dans ses décisions ligne par ligne (`data/config/decisions.yaml`). Le code porte cependant l'empreinte des données rencontrées sur quelques points :
 
 - **Types de règles de gestion.** Le catalogue de l'étape 4 (28 types génériques) ne couvre que les règles de ce cas. Un autre client demandera des types nouveaux, ajoutés au catalogue sans reprendre les autres.
 - **Natures reconnues.** Trois formes de date, l'heure HH:MM, les décimaux à virgule ou à point. Des heures HH:MM:SS, des milliers séparés par une espace ou des dates MM/JJ/AAAA demanderaient d'étendre `profilage.py` et `typage.py`.
@@ -63,7 +63,7 @@ Les notebooks 01, 02, 03, 04, 05 et 06 ne contiennent aucun nom de table, de col
 config/      configuration propre au client (sources, sensibilité, contrôles, doublons, règles de gestion, gravité et indicateurs)
 data/        données locales, ignorées par Git
 docs/        documentation
-notebooks/   un notebook par étape (01 à 06)
+notebooks/   un notebook par étape, numérotés dans l'ordre d'exécution (01 à 07)
 sql/         scripts T-SQL (étape 7)
 src/         fonctions Python réutilisables (lecture, lignage, contrôles)
 tests/       tests automatisés sur données fictives

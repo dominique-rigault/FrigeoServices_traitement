@@ -1419,7 +1419,7 @@ def test_table_et_colonnes_liees_confrontees_aux_donnees():
         "règle n° 1 (R05), cle : colonne l.num absente des données chargées",
         "règle n° 1 (R05), colonne_lignes : la nature en vigueur de l.montant est 'texte', "
         "un nombre est attendu (à trancher dans la revue du dictionnaire, notebook "
-        "02c_dictionnaire)",
+        "03_dictionnaire)",
         "règle n° 2 (R5b), cle : colonne l.num absente des données chargées",
         "règle n° 2 (R5b), colonne_lignes : colonne l.autre absente des données chargées",
     ]
@@ -1756,7 +1756,7 @@ def test_referentiel_confronte_aux_donnees():
     assert str(erreur.value).split("\n  ")[1:] == [
         "règle n° 1 (R10), cle_reference : colonne r.i absente des données chargées",
         "règle n° 1 (R10), debut : la nature en vigueur de r.e est 'texte', une date est "
-        "attendue (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "attendue (à trancher dans la revue du dictionnaire, notebook 03_dictionnaire)",
         "règle n° 2 (existence), cle_reference : colonne r.x absente des données chargées",
     ]
 
@@ -2560,7 +2560,7 @@ def test_tables_et_natures_du_4f1_confrontees_aux_donnees():
             hors_horaires=[{"colonne": "z", "valeurs": ["URG"]}])])
     assert str(erreur.value).split("\n  ")[1:] == [
         "règle n° 1 (R04), heure : la nature en vigueur de r.h est 'texte', une heure est "
-        "attendue (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "attendue (à trancher dans la revue du dictionnaire, notebook 03_dictionnaire)",
         "règle n° 1 (R04), hors_horaires : colonne t.z absente des données chargées",
     ]
     tables = _poses_et_factures()
@@ -2876,9 +2876,9 @@ def test_colonnes_du_4f2_confrontees_aux_donnees():
     assert str(erreur.value).split("\n  ")[1:] == [
         "règle n° 1 (calcul), facteurs : colonne t.z absente des données chargées",
         "règle n° 1 (calcul), facteurs : la nature en vigueur de t.r est 'texte', un nombre "
-        "est attendu (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "est attendu (à trancher dans la revue du dictionnaire, notebook 03_dictionnaire)",
         "règle n° 2 (fec), colonnes : la nature en vigueur de t.credit est 'texte', un nombre "
-        "est attendu (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "est attendu (à trancher dans la revue du dictionnaire, notebook 03_dictionnaire)",
     ]
     tables = _interventions_et_main_d_oeuvre()
     with pytest.raises(ValueError) as erreur:
@@ -2886,7 +2886,7 @@ def test_colonnes_du_4f2_confrontees_aux_donnees():
     assert str(erreur.value).split("\n  ")[1:] == [
         "règle n° 1 (grille), colonne_lignes : la nature en vigueur de l.a est 'texte', un "
         "nombre est attendu (à trancher dans la revue du dictionnaire, notebook "
-        "02c_dictionnaire)",
+        "03_dictionnaire)",
     ]
 
 
@@ -3147,9 +3147,9 @@ def test_colonnes_du_4g1_confrontees_aux_donnees():
         _controler_tables(tables, natures, [_concordantes(montants=montants)])
     assert str(erreur.value).split("\n  ")[1:] == [
         "règle n° 1 (R14), montants : la nature en vigueur de l.cre est 'texte', un nombre "
-        "est attendu (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "est attendu (à trancher dans la revue du dictionnaire, notebook 03_dictionnaire)",
         "règle n° 1 (R14), montants : la nature en vigueur de t.ht est 'texte', un nombre "
-        "est attendu (à trancher dans la revue du dictionnaire, notebook 02c_dictionnaire)",
+        "est attendu (à trancher dans la revue du dictionnaire, notebook 03_dictionnaire)",
         "règle n° 1 (R14), montants : colonne l.z absente des données chargées",
     ]
 
@@ -3399,7 +3399,7 @@ def test_structure_du_type_du_4g2():
     assert str(erreur.value).split("\n  ")[1:] == [
         "règle n° 1 (R15), termes_lignes : la nature en vigueur de l.cre est 'texte', un "
         "nombre est attendu (à trancher dans la revue du dictionnaire, notebook "
-        "02c_dictionnaire)",
+        "03_dictionnaire)",
         "règle n° 1 (R15), termes_lignes : colonne l.z absente des données chargées",
     ]
 
