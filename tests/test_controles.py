@@ -410,7 +410,7 @@ def test_dictionnaire_qui_ne_decrit_pas_les_donnees():
     with pytest.raises(ValueError) as erreur:
         controler(tables, dictionnaire, AUCUNE_SENSIBLE, {})
     message = str(erreur.value)
-    assert "02c_dictionnaire" in message
+    assert "03_dictionnaire" in message
     for attendu in (
         "table inconnue absente du dictionnaire",
         "table absente absente des données chargées",
@@ -434,7 +434,7 @@ def test_classification_de_sensibilite_incoherente():
 
 
 def test_dictionnaire_absent_renvoie_au_notebook(tmp_path):
-    with pytest.raises(FileNotFoundError, match="02c_dictionnaire"):
+    with pytest.raises(FileNotFoundError, match="03_dictionnaire"):
         charger_dictionnaire_enregistre(tmp_path / "dictionnaire.yaml")
 
 

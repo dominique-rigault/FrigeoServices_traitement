@@ -4001,7 +4001,7 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
             if regles_colonne is None:
                 problemes.append(
                     f"{nom}, {parametre} : colonne {nom_table}.{colonne} absente du "
-                    "dictionnaire, à régénérer (notebook 02c_dictionnaire)"
+                    "dictionnaire, à régénérer (notebook 03_dictionnaire)"
                 )
                 continue
             nature = regles_colonne["nature"]["regle"]
@@ -4011,7 +4011,7 @@ def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> lis
                     problemes.append(
                         f"{nom}, {parametre} : la nature en vigueur de {nom_table}.{colonne} "
                         f"est {nature!r}, {attendu} (à trancher dans la revue du "
-                        "dictionnaire, notebook 02c_dictionnaire)"
+                        "dictionnaire, notebook 03_dictionnaire)"
                     )
         for condition in instance.get(CLE_FILTRE) or []:
             if condition["colonne"] not in presentes:

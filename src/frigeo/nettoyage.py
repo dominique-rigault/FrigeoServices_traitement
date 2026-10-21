@@ -867,7 +867,7 @@ def nettoyer(
     if problemes:
         raise ValueError(
             "Le dictionnaire ne décrit pas les données chargées : il est à régénérer "
-            "(notebook 02c_dictionnaire)\n  " + "\n  ".join(problemes)
+            "(notebook 03_dictionnaire)\n  " + "\n  ".join(problemes)
         )
     if declarations is None:
         declarations = charger_declarations_doublons()

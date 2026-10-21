@@ -295,13 +295,13 @@ def charger_dictionnaire_enregistre(chemin: str | Path | None = None) -> dict:
     """Tables du dictionnaire enregistré, avec un message clair s'il n'existe pas.
 
     Le dictionnaire est hors du dépôt : un clone neuf n'en a pas. Il est généré puis
-    revu par le métier dans le notebook 02c_dictionnaire.
+    revu par le métier dans le notebook 03_dictionnaire.
     """
     chemin = Path(chemin) if chemin is not None else chemin_dictionnaire()
     if not chemin.exists():
         raise FileNotFoundError(
             f"Dictionnaire introuvable ({chemin}) : les contrôles appliquent ses "
-            "règles. Il est généré puis revu dans le notebook 02c_dictionnaire, à "
+            "règles. Il est généré puis revu dans le notebook 03_dictionnaire, à "
             "exécuter d'abord."
         )
     return charger_dictionnaire(chemin)
@@ -652,7 +652,7 @@ def controler(
     if problemes:
         raise ValueError(
             "Le dictionnaire ne décrit pas les données chargées : il est à régénérer "
-            "(notebook 02c_dictionnaire)\n  " + "\n  ".join(problemes)
+            "(notebook 03_dictionnaire)\n  " + "\n  ".join(problemes)
         )
     problemes = _problemes_de_regles(dictionnaire)
     if problemes:
