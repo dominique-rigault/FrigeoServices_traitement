@@ -4,7 +4,8 @@
 #
 # Règles possibles pour une colonne
 #   decimales  nombre maximal de décimales
-#   bornes     minimum et maximum admis, bornes incluses (min, max ou les deux)
+#   bornes     minimum et maximum admis, bornes incluses (min, max ou les deux);
+#              min_exclu: true ou max_exclu: true exclut la borne
 #   motif      expression régulière que la valeur entière doit respecter
 #   cle_luhn   clé de contrôle de Luhn valide (true)
 
@@ -40,7 +41,7 @@ regles:
     nom: {motif: '[^a-zà-ÿ]+'}
   remunerations:
     salaire_brut_mensuel: {decimales: 2}
-    taux_activite: {bornes: {min: 0, max: 1}}
+    taux_activite: {bornes: {min: 0, max: 1, min_exclu: true}}
   catalogue_pieces:
     prix_vente_ht_2025: {decimales: 2}
     stock_initial: {decimales: 2}
