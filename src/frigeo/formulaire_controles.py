@@ -10,13 +10,18 @@ déclarations de doublons sont écrites dans config/controles.yaml. Plutôt que 
   l'état effectif des règles;
 - le métier choisit un statut par ligne, comme dans la revue du dictionnaire, et
   saisit au besoin ses propres valeurs;
-- le classeur relu réécrit config/controles.yaml (morceau suivant).
+- le classeur relu est contrôlé (`importer_formulaire`), puis réécrit
+  config/controles.yaml (`ecrire_controles`), après une copie datée de l'ancien
+  fichier.
 
 Le fichier YAML ne garde pas de statut : une règle présente a été donnée par le
 métier, elle sort au statut « documenté » avec ses valeurs. Une proposition refusée
 (statut « invalide ») est retenue sous la clé `ecartees`, pour ne pas revenir à
 chaque cycle; les commentaires du métier le sont sous la clé `commentaires`. Ces deux
-clés sont sans effet sur les contrôles.
+clés sont sans effet sur les contrôles. Le fichier réécrit garde l'ordre du
+dictionnaire; les commentaires écrits à la main dans le fichier ne sont pas gardés,
+mais les motifs (expressions régulières) et les règles sur des colonnes que le
+formulaire ne présente pas sont repris tels quels.
 
 Le classeur porte des valeurs observées (minimum, maximum) : il est rangé hors du
 dépôt, dans data/formulaires/. Les minimums et maximums d'une colonne sensible y sont
@@ -25,16 +30,21 @@ masqués, sans proposition de bornes.
 
 from __future__ import annotations
 
+import copy
 import hashlib
+import unicodedata
 from datetime import date
 from decimal import Decimal
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
-from openpyxl import Workbook
+import yaml
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, Protection
 from openpyxl.utils import get_column_letter, quote_sheetname
 
+from . import dictionnaire as module_dictionnaire
 from . import racine_projet
 from .confidentialite import est_sensible
 from .controles import (
@@ -42,14 +52,19 @@ from .controles import (
     CLE_DOUBLONS,
     CLE_ECARTEES,
     CLE_REGLES_COMPLEMENTAIRES,
+    CLES_FICHIER_CONTROLES,
     EXCLUSIONS,
+    REGLES_COMPLEMENTAIRES,
     _cle_luhn_valide,
     _nombre,
     _parametre_en_texte,
+    _probleme_parametre,
     _trop_de_decimales,
     chemin_regles_complementaires,
+    problemes_regles_complementaires,
 )
-from .dictionnaire import STATUTS, _valeurs_renseignees
+from .dictionnaire import STATUTS, _valeurs_renseignees, dossier_sauvegardes
+from .doublons import problemes_declarations_doublons
 from .revue import _ecrire_texte, _menu
 from .typage import NATURES_NOMBRE
 
@@ -770,3 +785,725 @@ def exporter_formulaire(
     chemin.parent.mkdir(parents=True, exist_ok=True)
     classeur.save(chemin)
     return chemin
+
+
+# --- Import ---------------------------------------------------------------------
+
+# Rapport des changements : une ligne par règle qui change, avec son état avant et
+# après, en texte (« 2 », « 0 exclu à 1 », « clé », « écartée »; vide sans règle).
+COLONNES_CHANGEMENTS = ("table", "colonne", "regle", "avant", "apres")
+ETAT_ECARTEE = "écartée"
+REGLE_DOUBLONS = "doublons"
+REGLE_IDENTIQUES = "identique_hors_cle"
+# Type d'un groupe de doublons : nom affiché, puis nom dans config/controles.yaml.
+TYPES_DOUBLONS = {affiche: nom for nom, affiche in GROUPES_DOUBLONS.items()}
+ORIGINES = (ORIGINE_EN_VIGUEUR, ORIGINE_PROPOSEE, ORIGINE_ECARTEE)
+STATUTS_RETENUS = (STATUT_VALIDE, STATUT_DOCUMENTE)
+
+
+class Formulaire(NamedTuple):
+    """Règles lues dans un formulaire, contrôlées mais pas encore écrites.
+
+    `contenu` est le nouveau contenu de config/controles.yaml, `changements` le
+    rapport des règles qui changent (`COLONNES_CHANGEMENTS`).
+    """
+
+    contenu: dict
+    changements: pd.DataFrame
+    avertissements: list[str]
+
+
+def _texte(valeur) -> str:
+    """Texte d'une cellule, normalisé (NFC, espaces en bord ôtés), vide sans valeur."""
+    if valeur is None:
+        return ""
+    return unicodedata.normalize("NFC", str(valeur)).strip()
+
+
+def _vide(valeur) -> bool:
+    return _texte(valeur) == ""
+
+
+def _lire_feuille(classeur, nom: str, colonnes: tuple[str, ...]) -> list[tuple[int, dict]]:
+    """Lignes non vides d'une feuille, avec leur numéro de ligne Excel.
+
+    Lève une ValueError si la feuille manque ou si son en-tête n'est pas celui exporté.
+    """
+    if nom not in classeur.sheetnames:
+        raise ValueError(
+            f"feuille « {nom} » absente (feuille renommée, ou formulaire exporté par une "
+            "version antérieure : à réexporter)"
+        )
+    lignes = classeur[nom].iter_rows(values_only=True)
+    entete = tuple(next(lignes, ()))
+    while entete and entete[-1] is None:
+        entete = entete[:-1]
+    if entete != colonnes:
+        raise ValueError(
+            f"feuille « {nom} » : en-tête modifié, attendu {', '.join(colonnes)} "
+            "(formulaire exporté par une version antérieure : à réexporter)"
+        )
+    resultat = []
+    for numero, valeurs in enumerate(lignes, start=2):
+        valeurs = tuple(valeurs[: len(colonnes)]) + (None,) * (len(colonnes) - len(valeurs))
+        if all(_vide(valeur) for valeur in valeurs):
+            continue
+        resultat.append((numero, dict(zip(colonnes, valeurs))))
+    return resultat
+
+
+def _lire_empreinte(classeur) -> str:
+    """Empreinte de config/controles.yaml inscrite dans le formulaire à l'export."""
+    if FEUILLE_MODE_EMPLOI not in classeur.sheetnames:
+        raise ValueError(f"feuille « {FEUILLE_MODE_EMPLOI} » absente")
+    for ligne in classeur[FEUILLE_MODE_EMPLOI].iter_rows(max_col=2, values_only=True):
+        if ligne and ligne[0] == REPERE_EMPREINTE:
+            empreinte = _texte(ligne[1] if len(ligne) > 1 else None)
+            if empreinte:
+                return empreinte
+            break
+    raise ValueError(
+        f"feuille « {FEUILLE_MODE_EMPLOI} » : repère de l'empreinte absent ou modifié, "
+        "formulaire à réexporter"
+    )
+
+
+def _nombre_saisi(valeur):
+    """Nombre d'une cellule (natif, ou texte à virgule ou point décimal), écrit comme
+    dans config/controles.yaml (entier si possible); None s'il n'y en a pas."""
+    if isinstance(valeur, str):
+        valeur = valeur.strip()
+    nombre = _nombre(valeur)
+    return None if nombre is None else _arrondi(nombre)
+
+
+def _saisie(nom: str, ligne: dict) -> tuple[object, str | None]:
+    """Paramètre donné dans les colonnes à saisir d'une ligne (None si rien n'y est
+    écrit), et le problème de la saisie (None si elle est correcte)."""
+    if nom == "decimales":
+        if _vide(ligne["décimales"]):
+            return None, None
+        nombre = _nombre_saisi(ligne["décimales"])
+        if not isinstance(nombre, int) or nombre < 0:
+            return None, "décimales : un nombre entier positif ou nul est attendu"
+        return nombre, None
+    if nom == "bornes":
+        parametre = {}
+        for borne in EXCLUSIONS:
+            if not _vide(ligne[borne]):
+                nombre = _nombre_saisi(ligne[borne])
+                if nombre is None:
+                    return None, f"{borne} : un nombre est attendu"
+                parametre[borne] = nombre
+        for exclusion in EXCLUSIONS.values():
+            choix = _texte(ligne[exclusion])
+            if choix == OUI:
+                parametre[exclusion] = True
+            elif choix not in ("", NON):
+                return None, f"{exclusion} : {OUI} ou {NON} est attendu"
+        return parametre or None, None
+    return None, None
+
+
+def _sans_exclusion_fausse(parametre):
+    """Paramètre comparable à une saisie : une exclusion à false équivaut à son absence."""
+    if isinstance(parametre, dict):
+        return {cle: valeur for cle, valeur in parametre.items() if valeur is not False}
+    return parametre
+
+
+def _proposition(nom: str, ligne: dict):
+    """Règle proposée par l'outil sur une ligne, None si la proposition est « aucune »."""
+    if _texte(ligne["proposition"]) in ("", AUCUNE):
+        return None
+    if nom == "decimales":
+        nombre = _nombre_saisi(ligne["proposition"])
+        return nombre if isinstance(nombre, int) and nombre >= 0 else None
+    if nom == "bornes":
+        mini = _nombre_saisi(ligne["proposition_min"])
+        maxi = _nombre_saisi(ligne["proposition_max"])
+        return None if mini is None or maxi is None else {"min": mini, "max": maxi}
+    return True if _texte(ligne["proposition"]) == OUI else None
+
+
+def _importer_type(
+    nom: str, lignes: list[tuple[int, dict]], dictionnaire: dict, nouveau: dict
+) -> tuple[list[str], list[str]]:
+    """Applique les lignes d'une feuille de règles (décimales, bornes ou clé de Luhn)
+    au nouveau contenu, et rend les problèmes et les avertissements."""
+    feuille = FEUILLES_TYPE[nom]
+    regles = nouveau.setdefault(CLE_REGLES_COMPLEMENTAIRES, {})
+    ecartees = nouveau.setdefault(CLE_ECARTEES, {}).setdefault(nom, {})
+    commentaires = nouveau.setdefault(CLE_COMMENTAIRES, {}).setdefault(nom, {})
+    problemes, avertissements, vues = [], [], {}
+    for numero, ligne in lignes:
+        table, colonne = _texte(ligne["table"]), _texte(ligne["colonne"])
+        ou = f"feuille « {feuille} », ligne {numero} ({table}.{colonne})"
+        if colonne not in dictionnaire.get(table, {}):
+            problemes.append(f"{ou} : colonne inconnue du dictionnaire, formulaire à réexporter")
+            continue
+        if (table, colonne) in vues:
+            problemes.append(f"{ou} : colonne déjà présente ligne {vues[(table, colonne)]}")
+            continue
+        vues[(table, colonne)] = numero
+        statut = _texte(ligne["statut"])
+        if statut not in STATUTS:
+            problemes.append(f"{ou} : statut {statut!r} inconnu (choisir dans le menu)")
+            continue
+        saisie, probleme = _saisie(nom, ligne)
+        actuelle = regles.get(table, {}).get(colonne, {}).get(nom)
+        if statut != STATUT_DOCUMENTE and (probleme or (
+            saisie is not None and saisie != _sans_exclusion_fausse(actuelle)
+        )):
+            avertissements.append(
+                f"{ou} : valeurs saisies ignorées (statut {statut}, seul le statut "
+                f"{STATUT_DOCUMENTE} prend les valeurs saisies)"
+            )
+        parametre = None
+        if statut == STATUT_DOCUMENTE:
+            if probleme:
+                problemes.append(f"{ou} : {probleme}")
+                continue
+            parametre = True if nom == "cle_luhn" else saisie
+            if parametre is None:
+                problemes.append(f"{ou} : statut {STATUT_DOCUMENTE} sans règle saisie")
+                continue
+        elif statut == STATUT_VALIDE:
+            parametre = _proposition(nom, ligne)
+            if parametre is None:
+                problemes.append(
+                    f"{ou} : statut {STATUT_VALIDE} impossible, aucune proposition (choisir "
+                    f"{STATUT_DOCUMENTE} et donner la règle, ou {STATUT_INVALIDE})"
+                )
+                continue
+        if parametre is not None:
+            probleme = _probleme_parametre(nom, parametre)
+            if probleme:
+                problemes.append(f"{ou} : {probleme}")
+                continue
+        # Nouvel état de la ligne : la règle, le refus mémorisé, le commentaire.
+        regles_colonne = regles.setdefault(table, {}).setdefault(colonne, {})
+        if parametre is None:
+            regles_colonne.pop(nom, None)
+        else:
+            regles_colonne[nom] = parametre
+        refus = [c for c in ecartees.get(table, []) if c != colonne]
+        if statut == STATUT_INVALIDE:
+            refus.append(colonne)
+        ecartees[table] = refus
+        commentaire = _texte(ligne["commentaire"])
+        if commentaire:
+            commentaires.setdefault(table, {})[colonne] = commentaire
+        else:
+            commentaires.get(table, {}).pop(colonne, None)
+    return problemes, avertissements
+
+
+def _colonnes_groupe(texte: str) -> list[str]:
+    return [colonne.strip() for colonne in texte.split(",")]
+
+
+def _importer_doublons(
+    lignes: list[tuple[int, dict]],
+    lignes_tables: list[tuple[int, dict]],
+    dictionnaire: dict,
+    contenu: dict,
+    nouveau: dict,
+) -> list[str]:
+    """Applique les feuilles des doublons et des tables au nouveau contenu, et rend
+    les problèmes.
+
+    Les déclarations d'une table du dictionnaire sont refaites d'après le
+    formulaire; celles d'une table hors du dictionnaire restent telles quelles.
+    """
+    problemes = []
+    declarations = _section(contenu, CLE_DOUBLONS)
+    retenus = {table: [] for table in dictionnaire}
+    refuses = {table: [] for table in dictionnaire}
+    commentaires = {table: {} for table in dictionnaire}
+    en_vigueur_vus = {table: set() for table in dictionnaire}
+    for numero, ligne in lignes:
+        ou = f"feuille « {FEUILLE_DOUBLONS} », ligne {numero}"
+        table, origine = _texte(ligne["table"]), _texte(ligne["origine"])
+        statut, type_affiche = _texte(ligne["statut"]), _texte(ligne["type"])
+        if table not in dictionnaire:
+            problemes.append(f"{ou} : table {table!r} inconnue du dictionnaire")
+            continue
+        colonnes = _colonnes_groupe(_texte(ligne["colonnes"]))
+        ou = f"{ou} ({table}, {texte_groupe(colonnes)})"
+        avant = len(problemes)
+        if origine and origine not in ORIGINES:
+            problemes.append(f"{ou} : origine {origine!r} modifiée, formulaire à réexporter")
+        if type_affiche not in TYPES_DOUBLONS:
+            problemes.append(f"{ou} : type {type_affiche!r} inconnu (choisir dans le menu)")
+        if statut not in STATUTS:
+            problemes.append(f"{ou} : statut {statut!r} inconnu (choisir dans le menu)")
+        elif not origine and statut != STATUT_DOCUMENTE:
+            problemes.append(
+                f"{ou} : une ligne ajoutée prend le statut {STATUT_DOCUMENTE} (statut {statut})"
+            )
+        if "" in colonnes:
+            problemes.append(
+                f"{ou} : colonnes attendues, séparées par une virgule (par exemple « a, b »)"
+            )
+        else:
+            inconnues = [c for c in colonnes if c not in dictionnaire[table]]
+            if inconnues:
+                problemes.append(f"{ou} : colonnes inconnues de la table ({', '.join(inconnues)})")
+            if len(set(colonnes)) < len(colonnes):
+                problemes.append(f"{ou} : une colonne est répétée dans le groupe")
+        if len(problemes) > avant:
+            continue
+        if origine == ORIGINE_EN_VIGUEUR:
+            en_vigueur_vus[table].add(frozenset(colonnes))
+        if statut in STATUTS_RETENUS:
+            retenus[table].append((TYPES_DOUBLONS[type_affiche], colonnes, numero))
+        elif statut == STATUT_INVALIDE:
+            refuses[table].append((colonnes, numero))
+        commentaire = _texte(ligne["commentaire"])
+        if commentaire:
+            commentaires[table][texte_groupe(colonnes)] = commentaire
+
+    # Un groupe en vigueur sans sa ligne serait retiré sans que le métier l'ait dit.
+    for table in dictionnaire:
+        for nom, groupe in _groupes_en_vigueur(declarations.get(table, {})):
+            if frozenset(groupe) not in en_vigueur_vus[table]:
+                problemes.append(
+                    f"feuille « {FEUILLE_DOUBLONS} » : la ligne du groupe en vigueur "
+                    f"{table}, {texte_groupe(groupe)} manque (ligne supprimée ?), formulaire "
+                    "à réexporter"
+                )
+
+    identiques = {}
+    for numero, ligne in lignes_tables:
+        ou = f"feuille « {FEUILLE_TABLES} », ligne {numero}"
+        table, choix = _texte(ligne["table"]), _texte(ligne["identiques_hors_clé"])
+        if table not in dictionnaire:
+            problemes.append(f"{ou} : table {table!r} inconnue du dictionnaire")
+        elif choix not in (OUI, NON):
+            problemes.append(f"{ou} ({table}) : {OUI} ou {NON} est attendu")
+        else:
+            identiques[table] = choix
+
+    nouvelles = {}
+    for table in dictionnaire:
+        vus = {}
+        for nom, groupe, numero in retenus[table]:
+            vus.setdefault(frozenset(groupe), []).append(numero)
+        for groupe, numero in refuses[table]:
+            vus.setdefault(frozenset(groupe), []).append(numero)
+        for groupe, numeros in vus.items():
+            if len(numeros) > 1:
+                problemes.append(
+                    f"feuille « {FEUILLE_DOUBLONS} » : {table}, colonnes "
+                    f"{', '.join(sorted(groupe))} présentes sur plusieurs lignes "
+                    f"({', '.join(map(str, numeros))})"
+                )
+        cles = [(groupe, numero) for nom, groupe, numero in retenus[table] if nom == "cle"]
+        if len(cles) > 1:
+            problemes.append(
+                f"feuille « {FEUILLE_DOUBLONS} » : {table}, une seule clé par table (lignes "
+                f"{', '.join(str(numero) for _, numero in cles)})"
+            )
+        declaration = {}
+        if cles:
+            declaration["cle"] = cles[0][0]
+        for nom in ("unique", "presume_unique"):
+            groupes = [groupe for n, groupe, _ in retenus[table] if n == nom]
+            if groupes:
+                declaration[nom] = groupes
+        ancienne = declarations.get(table, {})
+        choix = identiques.get(
+            table, NON if ancienne.get(REGLE_IDENTIQUES) is False else OUI
+        )
+        if choix == NON:
+            if "cle" not in declaration:
+                problemes.append(
+                    f"feuille « {FEUILLE_TABLES} » ({table}) : {NON} sans clé déclarée "
+                    f"(déclarer une clé, ou choisir {OUI})"
+                )
+            declaration[REGLE_IDENTIQUES] = False
+        if declaration:
+            nouvelles[table] = declaration
+    for table, declaration in declarations.items():
+        if table not in dictionnaire:
+            nouvelles[table] = declaration
+    nouveau[CLE_DOUBLONS] = nouvelles
+    nouveau.setdefault(CLE_ECARTEES, {})[REGLE_DOUBLONS] = {
+        **_ecartees(contenu, REGLE_DOUBLONS),
+        **{table: [groupe for groupe, _ in refuses[table]] for table in dictionnaire},
+    }
+    nouveau.setdefault(CLE_COMMENTAIRES, {})[REGLE_DOUBLONS] = {
+        **_commentaires(contenu, REGLE_DOUBLONS),
+        **commentaires,
+    }
+    return problemes
+
+
+def _rangs(dictionnaire: dict) -> tuple[dict, dict]:
+    tables = {table: rang for rang, table in enumerate(dictionnaire)}
+    colonnes = {
+        (table, colonne): rang
+        for table, cols in dictionnaire.items()
+        for rang, colonne in enumerate(cols)
+    }
+    return tables, colonnes
+
+
+def _trier(section: dict, ordre: dict) -> dict:
+    """Clés connues dans l'ordre donné, puis les autres dans leur ordre."""
+    connues = sorted((cle for cle in section if cle in ordre), key=ordre.get)
+    return {cle: section[cle] for cle in connues + [c for c in section if c not in ordre]}
+
+
+def _ordonner(contenu: dict, dictionnaire: dict) -> dict:
+    """Contenu dans l'ordre du dictionnaire (tables puis colonnes), sans section,
+    table ni colonne vide."""
+    rang_tables, rang_colonnes = _rangs(dictionnaire)
+
+    def colonnes_triees(table, section):
+        ordre = {c: rang for (t, c), rang in rang_colonnes.items() if t == table}
+        return _trier(section, ordre)
+
+    ordre_types = {nom: rang for rang, nom in enumerate(REGLES_COMPLEMENTAIRES)}
+    resultat = {}
+    regles = {}
+    complementaires = _trier(_section(contenu, CLE_REGLES_COMPLEMENTAIRES), rang_tables)
+    for table, colonnes in complementaires.items():
+        triees = {
+            colonne: _trier(types, ordre_types)
+            for colonne, types in colonnes_triees(table, colonnes or {}).items()
+            if types
+        }
+        if triees:
+            regles[table] = triees
+    if regles:
+        resultat[CLE_REGLES_COMPLEMENTAIRES] = regles
+    doublons = _trier(_section(contenu, CLE_DOUBLONS), rang_tables)
+    if doublons:
+        resultat[CLE_DOUBLONS] = doublons
+    ordre_sections = {nom: rang for rang, nom in enumerate(TYPES_FORMULAIRE + (REGLE_DOUBLONS,))}
+    for cle in (CLE_ECARTEES, CLE_COMMENTAIRES):
+        section = {}
+        for nom, tables in _trier(_section(contenu, cle), ordre_sections).items():
+            par_table = {}
+            for table, valeur in _trier(tables or {}, rang_tables).items():
+                if cle == CLE_ECARTEES and nom != REGLE_DOUBLONS:
+                    ordre = {c: rang for (t, c), rang in rang_colonnes.items() if t == table}
+                    valeur = sorted(valeur, key=lambda c: ordre.get(c, len(ordre)))
+                elif cle == CLE_COMMENTAIRES and nom != REGLE_DOUBLONS:
+                    valeur = colonnes_triees(table, valeur)
+                if valeur:
+                    par_table[table] = valeur
+            if par_table:
+                section[nom] = par_table
+        if section:
+            resultat[cle] = section
+    return resultat
+
+
+def _etats_regles(contenu: dict, nom: str) -> dict:
+    """État de chaque règle d'un type, en texte, par (table, colonne)."""
+    etats = {}
+    for table, colonnes in _ecartees(contenu, nom).items():
+        for colonne in colonnes:
+            etats[(table, colonne)] = ETAT_ECARTEE
+    for table, colonnes in _section(contenu, CLE_REGLES_COMPLEMENTAIRES).items():
+        for colonne, types in (colonnes or {}).items():
+            if isinstance(types, dict) and nom in types:
+                etats[(table, colonne)] = _parametre_en_texte(nom, types[nom])
+    return etats
+
+
+def _etats_doublons(contenu: dict) -> dict:
+    """État de chaque groupe de doublons (type affiché ou « écartée »), par (table,
+    colonnes en texte); et choix des lignes identiques hors clé, par (table, None)."""
+    etats = {}
+    for table, groupes in _ecartees(contenu, REGLE_DOUBLONS).items():
+        for groupe in groupes:
+            etats[(table, texte_groupe(groupe), REGLE_DOUBLONS)] = ETAT_ECARTEE
+    for table, declaration in _section(contenu, CLE_DOUBLONS).items():
+        for nom, groupe in _groupes_en_vigueur(declaration):
+            etats[(table, texte_groupe(groupe), REGLE_DOUBLONS)] = GROUPES_DOUBLONS[nom]
+        if declaration.get(REGLE_IDENTIQUES) is False:
+            etats[(table, None, REGLE_IDENTIQUES)] = NON
+    return etats
+
+
+def comparer_controles(avant: dict, apres: dict, dictionnaire: dict) -> pd.DataFrame:
+    """Rapport des règles qui changent entre deux contenus de config/controles.yaml.
+
+    Une ligne par règle (décimales, bornes, clé de Luhn), par groupe de doublons
+    (colonnes séparées par une virgule) et par table dont la recherche des lignes
+    identiques hors clé change, dans l'ordre du dictionnaire. Les motifs et les
+    commentaires n'y figurent pas.
+    """
+    rang_tables, rang_colonnes = _rangs(dictionnaire)
+    lignes = []
+    for nom in TYPES_FORMULAIRE:
+        etats_avant, etats_apres = _etats_regles(avant, nom), _etats_regles(apres, nom)
+        for table, colonne in etats_avant.keys() | etats_apres.keys():
+            ancien, nouveau = etats_avant.get((table, colonne)), etats_apres.get((table, colonne))
+            if ancien != nouveau:
+                lignes.append((table, colonne, nom, ancien, nouveau))
+    etats_avant, etats_apres = _etats_doublons(avant), _etats_doublons(apres)
+    for table, colonnes, nom in etats_avant.keys() | etats_apres.keys():
+        cle = (table, colonnes, nom)
+        defaut = OUI if nom == REGLE_IDENTIQUES else None
+        ancien, nouveau = etats_avant.get(cle, defaut), etats_apres.get(cle, defaut)
+        if ancien != nouveau:
+            lignes.append((table, colonnes, nom, ancien, nouveau))
+    ordre_regles = {nom: rang for rang, nom in enumerate(
+        TYPES_FORMULAIRE + (REGLE_DOUBLONS, REGLE_IDENTIQUES)
+    )}
+    lignes.sort(key=lambda l: (
+        rang_tables.get(l[0], len(rang_tables)),
+        l[0],
+        ordre_regles[l[2]],
+        rang_colonnes.get((l[0], l[1]), len(rang_colonnes)),
+        l[1] or "",
+    ))
+    return pd.DataFrame(lignes, columns=list(COLONNES_CHANGEMENTS))
+
+
+def importer_formulaire(
+    chemin: str | Path, dictionnaire: dict, contenu: dict, *, empreinte: str
+) -> Formulaire:
+    """Lit un formulaire revu par le métier et contrôle chaque ligne, sans rien écrire.
+
+    `contenu` est le contenu actuel de config/controles.yaml
+    (`controles.lire_fichier_controles`) et `empreinte` son empreinte
+    (`empreinte_controles`) : un formulaire exporté avant une modification du
+    fichier (dont l'application d'un autre formulaire) est refusé, il annulerait
+    des décisions prises depuis.
+
+    Statuts d'une ligne de règle : valide adopte la proposition (refusé si elle est
+    « aucune »); documenté prend les valeurs saisies; invalide retire la règle et
+    mémorise le refus sous `ecartees`; observé retire la règle sans mémoriser de
+    refus. Une valeur saisie sur une ligne qui n'est pas documentée est ignorée,
+    avec un avertissement. Les règles des colonnes que le formulaire ne présente
+    pas, et les motifs, sont repris tels quels.
+
+    Tous les problèmes bloquants sont listés en une fois dans une ValueError, avec
+    la feuille et le numéro de ligne Excel. Les avertissements ne bloquent pas
+    l'import.
+    """
+    chemin = Path(chemin)
+    classeur = load_workbook(chemin, read_only=True, data_only=True)
+    try:
+        try:
+            lignes = {
+                nom: _lire_feuille(classeur, FEUILLES_TYPE[nom], COLONNES_TYPE[nom])
+                for nom in TYPES_FORMULAIRE
+            }
+            lignes_d = _lire_feuille(classeur, FEUILLE_DOUBLONS, COLONNES_DOUBLONS)
+            lignes_t = _lire_feuille(classeur, FEUILLE_TABLES, COLONNES_TABLES)
+            repere = _lire_empreinte(classeur)
+        except ValueError as erreur:
+            raise ValueError(f"Formulaire invalide ({chemin})\n  {erreur}") from None
+    finally:
+        classeur.close()
+    if repere != empreinte:
+        raise ValueError(
+            f"Formulaire périmé ({chemin}) : config/controles.yaml a changé depuis son "
+            f"export (empreinte {repere} à l'export, {empreinte} aujourd'hui). Ce "
+            "formulaire a déjà été appliqué, ou le fichier a été modifié depuis : à "
+            "réexporter."
+        )
+
+    nouveau = copy.deepcopy(contenu)
+    problemes, avertissements = [], []
+    for nom in TYPES_FORMULAIRE:
+        problemes_type, avertissements_type = _importer_type(
+            nom, lignes[nom], dictionnaire, nouveau
+        )
+        problemes += problemes_type
+        avertissements += avertissements_type
+    problemes += _importer_doublons(lignes_d, lignes_t, dictionnaire, contenu, nouveau)
+    nouveau = _ordonner(nouveau, dictionnaire)
+    if not problemes:
+        problemes = _problemes_contenu(nouveau)
+    if problemes:
+        raise ValueError(
+            f"Formulaire invalide ({chemin}), {len(problemes)} problèmes\n  "
+            + "\n  ".join(problemes)
+        )
+    return Formulaire(nouveau, comparer_controles(contenu, nouveau, dictionnaire), avertissements)
+
+
+# --- Écriture de config/controles.yaml ------------------------------------------
+
+ENTETE_CONTROLES = """\
+# Règles de contrôle données par le métier, que le dictionnaire des données ne peut
+# pas déduire des fichiers. Une forme fixe (code postal, numéro à longueur fixe) ne
+# se déclare pas ici mais dans le classeur de revue du dictionnaire (règle format).
+# Ce fichier est réécrit en entier par le formulaire des règles de contrôle (notebook
+# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs s'écrivent à
+# la main, le formulaire les reprend tels quels.
+#
+# Règles possibles pour une colonne
+#   decimales  nombre maximal de décimales
+#   bornes     minimum et maximum admis, bornes incluses (min, max ou les deux);
+#              min_exclu: true ou max_exclu: true exclut la borne
+#   motif      expression régulière que la valeur entière doit respecter
+#   cle_luhn   clé de contrôle de Luhn valide (true)
+"""
+COMMENTAIRE_DOUBLONS = """\
+# Doublons, déclarés d'après ce que dit le métier.
+# cle = identifiant d'une ligne; unique = colonnes qui ne doivent pas se répéter;
+# presume_unique = colonnes en principe uniques, une répétition est à arbitrer;
+# identique_hors_cle false = deux lignes pareilles hors clé sont normales dans cette table.
+"""
+COMMENTAIRE_ECARTEES = """\
+# Propositions du formulaire écartées par le métier, qui ne sont plus proposées
+# (sans effet sur les contrôles).
+"""
+COMMENTAIRE_COMMENTAIRES = """\
+# Commentaires du métier saisis dans le formulaire (sans effet sur les contrôles).
+"""
+
+
+def _yaml(valeur) -> str:
+    """Valeur YAML sur une ligne : un scalaire, ou une liste ou un dictionnaire en ligne."""
+    options = {"default_flow_style": True, "allow_unicode": True, "width": 10**9,
+               "sort_keys": False}
+    texte = yaml.safe_dump(valeur, **options)
+    if "\n" in texte.removesuffix("\n...\n").removesuffix("\n") and isinstance(valeur, str):
+        texte = yaml.safe_dump(valeur, default_style='"', **options)
+    texte = texte.removesuffix("\n...\n").removesuffix("\n")
+    if "\n" in texte:
+        raise ValueError(f"valeur {valeur!r} : impossible de l'écrire sur une ligne")
+    return texte
+
+
+def texte_controles(contenu: dict) -> str:
+    """Texte de config/controles.yaml pour un contenu, dans l'ordre de ses clés.
+
+    Un en-tête de commentaires standard, puis les règles (une colonne par ligne,
+    règles en ligne), les doublons, les propositions écartées et les commentaires
+    du métier. La relecture du texte redonne exactement le contenu.
+    """
+    blocs = [ENTETE_CONTROLES]
+    regles = _section(contenu, CLE_REGLES_COMPLEMENTAIRES)
+    if regles:
+        lignes = [f"{CLE_REGLES_COMPLEMENTAIRES}:"]
+        for table, colonnes in regles.items():
+            lignes.append(f"  {_yaml(table)}:")
+            lignes += [f"    {_yaml(c)}: {_yaml(types)}" for c, types in colonnes.items()]
+        blocs.append("\n".join(lignes) + "\n")
+    doublons = _section(contenu, CLE_DOUBLONS)
+    if doublons:
+        lignes = [f"{CLE_DOUBLONS}:"]
+        for table, declaration in doublons.items():
+            lignes.append(f"  {_yaml(table)}:")
+            for cle, valeur in declaration.items():
+                if cle in ("unique", "presume_unique"):
+                    lignes.append(f"    {cle}:")
+                    lignes += [f"      - {_yaml(groupe)}" for groupe in valeur]
+                else:
+                    lignes.append(f"    {cle}: {_yaml(valeur)}")
+        blocs.append("\n" + COMMENTAIRE_DOUBLONS + "\n".join(lignes) + "\n")
+    for cle, commentaire in (
+        (CLE_ECARTEES, COMMENTAIRE_ECARTEES), (CLE_COMMENTAIRES, COMMENTAIRE_COMMENTAIRES)
+    ):
+        section = _section(contenu, cle)
+        if not section:
+            continue
+        lignes = [f"{cle}:"]
+        for nom, tables in section.items():
+            lignes.append(f"  {_yaml(nom)}:")
+            for table, valeur in tables.items():
+                if cle == CLE_ECARTEES and nom == REGLE_DOUBLONS:
+                    lignes.append(f"    {_yaml(table)}:")
+                    lignes += [f"      - {_yaml(groupe)}" for groupe in valeur]
+                elif cle == CLE_ECARTEES:
+                    lignes.append(f"    {_yaml(table)}: {_yaml(valeur)}")
+                else:
+                    lignes.append(f"    {_yaml(table)}:")
+                    lignes += [f"      {_yaml(c)}: {_yaml(t)}" for c, t in valeur.items()]
+        blocs.append("\n" + commentaire + "\n".join(lignes) + "\n")
+    texte = "\n".join(blocs)
+    if yaml.safe_load(texte) != {cle: valeur for cle, valeur in contenu.items() if valeur}:
+        raise ValueError("relecture du fichier des contrôles écrit différente du contenu")
+    return texte
+
+
+def _problemes_contenu(contenu: dict) -> list[str]:
+    """Problèmes de structure d'un contenu de config/controles.yaml."""
+    problemes = [
+        f"clé inconnue {cle!r} du fichier des contrôles"
+        for cle in contenu
+        if cle not in CLES_FICHIER_CONTROLES
+    ]
+    if CLE_REGLES_COMPLEMENTAIRES in contenu:
+        problemes += [
+            f"règles complémentaires, {probleme}"
+            for probleme in problemes_regles_complementaires(contenu[CLE_REGLES_COMPLEMENTAIRES])
+        ]
+    if CLE_DOUBLONS in contenu:
+        problemes += [
+            f"doublons, {probleme}"
+            for probleme in problemes_declarations_doublons(contenu[CLE_DOUBLONS])
+        ]
+    return problemes
+
+
+class EcritureControles(NamedTuple):
+    """Résultat de `ecrire_controles` : le fichier, sa copie datée (None s'il n'y
+    avait pas de fichier ou si rien n'a changé), et s'il a été réécrit."""
+
+    chemin: Path
+    sauvegarde: Path | None
+    ecrit: bool
+
+
+def ecrire_controles(
+    contenu: dict,
+    chemin: str | Path | None = None,
+    *,
+    empreinte: str,
+    dossier: str | Path | None = None,
+) -> EcritureControles:
+    """Réécrit config/controles.yaml avec le contenu donné (`Formulaire.contenu`).
+
+    `empreinte` est celle du fichier lue avant l'import du formulaire : si le
+    fichier a changé depuis, rien n'est écrit. L'ancien fichier est d'abord copié
+    dans `dossier` (par défaut data/config/sauvegardes, hors du dépôt), sous le nom
+    `controles_<AAAA-MM-JJ>_<HHMMSS>.yaml`; une copie déjà présente sous ce nom
+    n'est jamais remplacée, et rien n'est alors écrit. Un contenu identique au
+    fichier ne le réécrit pas. Le fichier est écrit en UTF-8 avec des fins de
+    ligne LF.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_regles_complementaires()
+    actuelle = empreinte_controles(chemin)
+    if actuelle != empreinte:
+        raise ValueError(
+            f"{chemin} a changé depuis la lecture du formulaire (empreinte {empreinte}, "
+            f"{actuelle} aujourd'hui) : écriture refusée, formulaire à réexporter"
+        )
+    problemes = _problemes_contenu(contenu)
+    if problemes:
+        raise ValueError(
+            "Contenu du fichier des contrôles invalide\n  " + "\n  ".join(problemes)
+        )
+    texte = texte_controles(contenu)
+    if chemin.is_file() and chemin.read_bytes().replace(b"\r\n", b"\n") == texte.encode():
+        return EcritureControles(chemin, None, False)
+    sauvegarde = None
+    if chemin.is_file():
+        dossier = Path(dossier) if dossier is not None else dossier_sauvegardes()
+        instant = module_dictionnaire._maintenant()
+        sauvegarde = dossier / f"{chemin.stem}_{instant:%Y-%m-%d_%H%M%S}{chemin.suffix}"
+        dossier.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(sauvegarde, "xb") as flux:
+                flux.write(chemin.read_bytes())
+        except FileExistsError:
+            raise FileExistsError(
+                f"{sauvegarde} existe déjà : écriture refusée, rien n'a été modifié "
+                "(relancer dans une seconde)"
+            ) from None
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    with open(chemin, "w", encoding="utf-8", newline="\n") as flux:
+        flux.write(texte)
+    return EcritureControles(chemin, sauvegarde, True)

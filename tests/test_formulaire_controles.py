@@ -2,19 +2,25 @@
 
 import pandas as pd
 import pytest
+import yaml
 from openpyxl import load_workbook
 
+from frigeo.controles import lire_fichier_controles
 from frigeo.formulaire_controles import (
     COLONNES_BORNES,
+    COLONNES_CHANGEMENTS,
     COLONNES_DECIMALES,
     COLONNES_DOUBLONS,
     COLONNES_LUHN,
     COLONNES_MOTIFS,
     COLONNES_TABLES,
+    ENTETE_CONTROLES,
     LIGNES_AJOUT,
     REPERE_EMPREINTE,
+    ecrire_controles,
     empreinte_controles,
     exporter_formulaire,
+    importer_formulaire,
     lignes_bornes,
     lignes_decimales,
     lignes_doublons,
@@ -24,6 +30,7 @@ from frigeo.formulaire_controles import (
     observer_groupe,
     observer_luhn,
     observer_nombres,
+    texte_controles,
     texte_nombre,
 )
 
@@ -333,4 +340,428 @@ def test_cles_du_formulaire_admises_dans_le_fichier_des_controles(tmp_path):
     assert (
         "les seules clés attendues sont « regles », « doublons », « ecartees » et "
         "« commentaires » (clé inconnue\u00a0: regle)"
+    ) in str(erreur.value)
+
+
+# --- Import du formulaire et écriture de config/controles.yaml (morceau c) ---------
+
+
+def _modifier(chemin, feuille, cle, **valeurs):
+    """Modifie une ligne d'une feuille repérée par ses premières cellules (`cle`),
+    comme le ferait le métier dans Excel; avec `cle=None`, écrit la première ligne
+    vide (ligne d'ajout)."""
+    classeur = load_workbook(chemin)
+    page = classeur[feuille]
+    entete = [c.value for c in page[1]]
+    for numero in range(2, page.max_row + 2):
+        cellules = [page.cell(row=numero, column=i + 1).value for i in range(len(entete))]
+        if cle is None and all(v is None for v in cellules) or (
+            cle is not None and tuple(cellules[: len(cle)]) == tuple(cle)
+        ):
+            break
+    else:
+        raise AssertionError(f"ligne {cle} introuvable dans {feuille}")
+    for nom, valeur in valeurs.items():
+        page.cell(row=numero, column=entete.index(nom) + 1).value = valeur
+    classeur.save(chemin)
+    return numero
+
+
+def _importer(chemin, contenu=None, empreinte="abc123"):
+    tables, dictionnaire, contenu_jeu, _ = _jeu()
+    return importer_formulaire(
+        chemin, dictionnaire, contenu if contenu is not None else contenu_jeu,
+        empreinte=empreinte,
+    )
+
+
+def _changements(formulaire):
+    return [tuple(None if pd.isna(v) else v for v in ligne)
+            for ligne in formulaire.changements.itertuples(index=False)]
+
+
+def test_import_sans_modification_redonne_le_contenu(tmp_path):
+    formulaire = _importer(_exporter(tmp_path))
+    assert formulaire.contenu == _jeu()[2]
+    assert formulaire.changements.empty
+    assert list(formulaire.changements.columns) == list(COLONNES_CHANGEMENTS)
+    assert formulaire.avertissements == []
+
+
+def test_import_des_regles_selon_le_statut(tmp_path):
+    chemin = _exporter(tmp_path)
+    # Décimales : valide adopte la proposition, documenté prend la saisie (texte
+    # d'une cellule au format texte), invalide retire la règle et mémorise le
+    # refus, observé efface un refus.
+    _modifier(chemin, "décimales", ("factures", "remise"), statut="valide")
+    _modifier(chemin, "décimales", ("parametres", "taux"), statut="documenté", décimales=" 3 ")
+    _modifier(chemin, "décimales", ("factures", "montant"), statut="invalide")
+    _modifier(chemin, "décimales", ("factures", "salaire"), statut="observé")
+    # Une saisie sur une ligne qui n'est pas documentée est ignorée, avec un
+    # avertissement.
+    ligne_siret = _modifier(chemin, "décimales", ("factures", "siret"), décimales=4)
+    # Bornes : proposition observée, saisie avec une borne exclue, règle en vigueur
+    # remise à observé (retirée sans refus).
+    _modifier(chemin, "bornes", ("factures", "montant"), statut="valide")
+    _modifier(
+        chemin, "bornes", ("parametres", "taux"), statut="documenté", min="0",
+        min_exclu="oui", max=1, max_exclu="non", commentaire="taux de charges",
+    )
+    _modifier(chemin, "bornes", ("factures", "remise"), statut="observé", commentaire=None)
+    _modifier(chemin, "clé_luhn", ("factures", "siret"), statut="documenté")
+    formulaire = _importer(chemin)
+    regles = formulaire.contenu["regles"]
+    assert regles["factures"] == {
+        "montant": {"bornes": {"min": 3, "max": 181.45}},
+        "remise": {"decimales": 0},
+        "code": {"motif": "[A-Z][0-9]+"},
+        "siret": {"cle_luhn": True},
+    }
+    assert regles["parametres"] == {
+        "taux": {"decimales": 3, "bornes": {"min": 0, "max": 1, "min_exclu": True}},
+    }
+    # Ordre du dictionnaire : colonnes, puis types de règle.
+    assert list(regles["factures"]) == ["montant", "remise", "code", "siret"]
+    assert formulaire.contenu["ecartees"] == {
+        "decimales": {"factures": ["montant"]}, "doublons": {"factures": [["siret"]]},
+    }
+    assert formulaire.contenu["commentaires"] == {
+        "bornes": {"parametres": {"taux": "taux de charges"}},
+        "doublons": {"factures": {"num": "numéro de facture"}},
+    }
+    assert formulaire.avertissements == [
+        f"feuille « décimales », ligne {ligne_siret} (factures.siret)\u00a0: valeurs saisies "
+        "ignorées (statut observé, seul le statut documenté prend les valeurs saisies)"
+    ]
+    assert _changements(formulaire) == [
+        ("factures", "montant", "decimales", "2", "écartée"),
+        ("factures", "remise", "decimales", None, "0"),
+        ("factures", "salaire", "decimales", "écartée", None),
+        ("factures", "montant", "bornes", None, "3 à 181.45"),
+        ("factures", "remise", "bornes", "0 à 15 exclu", None),
+        ("factures", "siret", "cle_luhn", None, "oui"),
+        ("parametres", "taux", "decimales", None, "3"),
+        ("parametres", "taux", "bornes", None, "0 exclu à 1"),
+    ]
+
+
+def test_valeurs_saisies_egales_a_la_regle_en_vigueur_sans_avertissement(tmp_path):
+    chemin = _exporter(tmp_path)
+    # Les valeurs exportées d'une règle en vigueur restent dans les cellules quand
+    # le métier la retire : ce n'est pas une saisie.
+    _modifier(chemin, "bornes", ("factures", "remise"), statut="invalide")
+    _modifier(chemin, "décimales", ("factures", "montant"), statut="observé")
+    formulaire = _importer(chemin)
+    assert formulaire.avertissements == []
+    assert "remise" not in formulaire.contenu["regles"]["factures"]
+    assert formulaire.contenu["ecartees"]["bornes"] == {"factures": ["remise"]}
+    # Observé sur une règle en vigueur : retirée sans refus mémorisé.
+    assert formulaire.contenu["ecartees"]["decimales"] == {"factures": ["salaire"]}
+    assert "montant" not in formulaire.contenu["regles"]["factures"]
+
+
+def test_problemes_des_regles_listes_en_une_fois(tmp_path):
+    chemin = _exporter(tmp_path)
+    lignes = [
+        _modifier(chemin, "clé_luhn", ("factures", "siret"), statut="valide"),
+        _modifier(chemin, "décimales", ("factures", "remise"), statut="documenté"),
+        _modifier(chemin, "décimales", ("parametres", "taux"), statut="documenté",
+                  décimales="1,5"),
+        _modifier(chemin, "bornes", ("factures", "montant"), statut="documenté", min=10,
+                  max=2),
+        _modifier(chemin, "bornes", ("parametres", "taux"), statut="documenté",
+                  max_exclu="oui"),
+        _modifier(chemin, "bornes", ("factures", "salaire"), statut="valide"),
+        _modifier(chemin, "décimales", ("parametres", "annee"), statut="à voir"),
+    ]
+    with pytest.raises(ValueError) as erreur:
+        _importer(chemin)
+    message = str(erreur.value)
+    assert "7 problèmes" in message
+    attendus = [
+        "feuille « clé_luhn », ligne {} (factures.siret)\u00a0: statut valide impossible",
+        "feuille « décimales », ligne {} (factures.remise)\u00a0: statut documenté sans "
+        "règle saisie",
+        "feuille « décimales », ligne {} (parametres.taux)\u00a0: décimales\u00a0: un nombre "
+        "entier positif ou nul est attendu",
+        "feuille « bornes », ligne {} (factures.montant)\u00a0: le minimum dépasse le maximum",
+        "feuille « bornes », ligne {} (parametres.taux)\u00a0: un minimum (min), un "
+        "maximum (max) ou les deux sont attendus",
+        "feuille « bornes », ligne {} (factures.salaire)\u00a0: statut valide impossible",
+        "feuille « décimales », ligne {} (parametres.annee)\u00a0: statut 'à voir' inconnu",
+    ]
+    for attendu, numero in zip(attendus, lignes):
+        assert attendu.format(numero) in message
+
+
+def test_import_des_doublons(tmp_path):
+    chemin = _exporter(tmp_path)
+    # La proposition retenue avec son type, le groupe écarté repris comme présumé
+    # unique, un groupe de deux colonnes ajouté en bas, la recherche des lignes
+    # identiques hors clé rétablie.
+    _modifier(chemin, "doublons", ("factures", "unique", "code"), statut="valide")
+    _modifier(chemin, "doublons", ("factures", "unique", "siret"), statut="valide",
+              type="présumé unique", commentaire="SIRET du client")
+    _modifier(chemin, "doublons", None, table="factures", type="unique",
+              colonnes=" montant ,remise", statut="documenté", commentaire="à voir")
+    _modifier(chemin, "tables", ("factures",), identiques_hors_clé="oui")
+    formulaire = _importer(chemin)
+    assert formulaire.contenu["doublons"] == {
+        "factures": {
+            "cle": ["num"],
+            "unique": [["code"], ["montant", "remise"]],
+            "presume_unique": [["siret"]],
+        },
+    }
+    assert "ecartees" not in formulaire.contenu or "doublons" not in formulaire.contenu["ecartees"]
+    assert formulaire.contenu["commentaires"]["doublons"] == {
+        "factures": {
+            "num": "numéro de facture", "siret": "SIRET du client", "montant, remise": "à voir",
+        },
+    }
+    assert _changements(formulaire) == [
+        # Groupes d'une colonne dans l'ordre du dictionnaire, puis les autres.
+        ("factures", "code", "doublons", None, "unique"),
+        ("factures", "siret", "doublons", "écartée", "présumé unique"),
+        ("factures", "montant, remise", "doublons", None, "unique"),
+        ("factures", None, "identique_hors_cle", "non", "oui"),
+    ]
+
+
+def test_retrait_et_refus_d_un_groupe_en_vigueur(tmp_path):
+    chemin = _exporter(tmp_path)
+    _modifier(chemin, "doublons", ("factures", "clé", "num"), statut="invalide")
+    _modifier(chemin, "tables", ("factures",), identiques_hors_clé="oui")
+    formulaire = _importer(chemin)
+    assert "doublons" not in formulaire.contenu
+    assert formulaire.contenu["ecartees"]["doublons"] == {"factures": [["num"], ["siret"]]}
+
+
+def test_problemes_des_doublons(tmp_path):
+    chemin = _exporter(tmp_path)
+    deux_cles = _modifier(chemin, "doublons", ("factures", "unique", "code"), type="clé",
+                          statut="valide")
+    inconnue = _modifier(chemin, "doublons", None, table="factures", type="unique",
+                         colonnes="montant, prix", statut="documenté")
+    sans_statut = _modifier(chemin, "doublons", None, table="parametres", type="unique",
+                            colonnes="libelle", statut="valide")
+    _modifier(chemin, "tables", ("parametres",), identiques_hors_clé="non")
+    with pytest.raises(ValueError) as erreur:
+        _importer(chemin)
+    message = str(erreur.value)
+    assert "4 problèmes" in message
+    assert (
+        f"feuille « doublons »\u00a0: factures, une seule clé par table (lignes 2, {deux_cles})"
+    ) in message
+    assert (
+        f"feuille « doublons », ligne {inconnue} (factures, montant, prix)\u00a0: colonnes "
+        "inconnues de la table (prix)"
+    ) in message
+    assert (
+        f"feuille « doublons », ligne {sans_statut} (parametres, libelle)\u00a0: une ligne "
+        "ajoutée prend le statut documenté (statut valide)"
+    ) in message
+    assert "feuille « tables » (parametres)\u00a0: non sans clé déclarée" in message
+
+
+def test_ligne_en_vigueur_supprimee_et_groupe_en_double(tmp_path):
+    chemin = _exporter(tmp_path)
+    classeur = load_workbook(chemin)
+    classeur["doublons"].delete_rows(2)
+    classeur.save(chemin)
+    double = _modifier(chemin, "doublons", None, table="factures", type="unique",
+                       colonnes="code", statut="documenté")
+    with pytest.raises(ValueError) as erreur:
+        _importer(chemin)
+    message = str(erreur.value)
+    assert "la ligne du groupe en vigueur factures, num manque" in message
+    assert f"factures, colonnes code présentes sur plusieurs lignes ({double})" not in message
+    _modifier(chemin, "doublons", ("factures", "unique", "code"), statut="valide")
+    with pytest.raises(ValueError, match="colonnes code présentes sur plusieurs lignes \\(2, "):
+        _importer(chemin)
+
+
+def test_formulaire_perime_ou_modifie(tmp_path):
+    chemin = _exporter(tmp_path)
+    with pytest.raises(ValueError, match="Formulaire périmé .*empreinte abc123 à l'export, "
+                       "def456 aujourd'hui"):
+        _importer(chemin, empreinte="def456")
+    classeur = load_workbook(chemin)
+    classeur["bornes"].title = "limites"
+    classeur.save(chemin)
+    with pytest.raises(ValueError, match="feuille « bornes » absente"):
+        _importer(chemin)
+    chemin = _exporter(tmp_path, "autre.xlsx")
+    classeur = load_workbook(chemin)
+    classeur["doublons"].cell(row=1, column=2).value = "genre"
+    classeur.save(chemin)
+    with pytest.raises(ValueError, match="feuille « doublons »\u00a0: en-tête modifié"):
+        _importer(chemin)
+
+
+def test_regles_hors_formulaire_reprises_telles_quelles(tmp_path):
+    tables, dictionnaire, contenu, sensibles = _jeu()
+    contenu["regles"]["archives"] = {"montant": {"decimales": 2}}
+    contenu["regles"]["factures"]["num"] = {"motif": "F-[0-9]+", "decimales": 0}
+    contenu["doublons"]["archives"] = {"cle": ["id"]}
+    contenu["commentaires"]["decimales"] = {"archives": {"montant": "ancienne table"}}
+    chemin = exporter_formulaire(
+        tables, dictionnaire, contenu, sensibles, "2026-03", tmp_path / "f.xlsx",
+        empreinte="e",
+    )
+    _modifier(chemin, "décimales", ("factures", "remise"), statut="valide")
+    formulaire = importer_formulaire(chemin, dictionnaire, contenu, empreinte="e")
+    assert formulaire.contenu["regles"]["archives"] == {"montant": {"decimales": 2}}
+    # Une règle de décimales sur une colonne de texte n'est pas dans le formulaire.
+    assert formulaire.contenu["regles"]["factures"]["num"] == {"decimales": 0, "motif": "F-[0-9]+"}
+    assert formulaire.contenu["doublons"]["archives"] == {"cle": ["id"]}
+    assert formulaire.contenu["commentaires"]["decimales"] == {
+        "archives": {"montant": "ancienne table"}
+    }
+    # Les tables hors du dictionnaire viennent après les autres.
+    assert list(formulaire.contenu["regles"]) == ["factures", "archives"]
+
+
+def test_texte_du_fichier_des_controles():
+    contenu = {
+        "regles": {
+            "t": {"a": {"decimales": 2, "bornes": {"min": 0, "max": 1, "min_exclu": True}},
+                  "mail": {"motif": "[^@\\s]+@[^@\\s]+"}},
+        },
+        "doublons": {"t": {"cle": ["a"], "unique": [["b", "c"]], "identique_hors_cle": False}},
+        "ecartees": {"bornes": {"t": ["b"]}, "doublons": {"t": [["d"]]}},
+        "commentaires": {
+            "decimales": {"t": {"a": "deux lignes\npuis\u00a0: fin", "b": "oui"}},
+            "doublons": {"t": {"b, c": "true"}},
+        },
+    }
+    texte = texte_controles(contenu)
+    assert yaml.safe_load(texte) == contenu
+    assert texte.startswith(ENTETE_CONTROLES + "\nregles:\n  t:\n")
+    assert "    a: {decimales: 2, bornes: {min: 0, max: 1, min_exclu: true}}\n" in texte
+    assert "    cle: [a]\n    unique:\n      - [b, c]\n    identique_hors_cle: false\n" in texte
+    assert "  bornes:\n    t: [b]\n  doublons:\n    t:\n      - [d]\n" in texte
+    assert '      a: "deux lignes\\npuis\u00a0: fin"\n' in texte
+    assert "      b, c: 'true'\n" in texte
+    assert texte.endswith("\n") and "\r" not in texte
+    # Sans section vide.
+    assert texte_controles({"regles": {"t": {"a": {"decimales": 1}}}}).count(":\n") == 2
+
+
+def test_ecriture_avec_copie_datee(tmp_path, monkeypatch):
+    import frigeo.dictionnaire as module_dictionnaire
+    from datetime import datetime
+
+    monkeypatch.setattr(
+        module_dictionnaire, "_maintenant", lambda: datetime(2026, 10, 22, 9, 5, 7)
+    )
+    chemin, sauvegardes = tmp_path / "config" / "controles.yaml", tmp_path / "sauvegardes"
+    # Fichier absent : écrit, sans copie.
+    contenu = {"regles": {"t": {"a": {"decimales": 2}}}}
+    resultat = ecrire_controles(contenu, chemin, empreinte="absent", dossier=sauvegardes)
+    assert resultat == (chemin, None, True)
+    assert yaml.safe_load(chemin.read_text(encoding="utf-8")) == contenu
+    assert b"\r" not in chemin.read_bytes()
+    ancien = chemin.read_bytes()
+    # Contenu inchangé : rien n'est écrit.
+    empreinte = empreinte_controles(chemin)
+    assert ecrire_controles(contenu, chemin, empreinte=empreinte, dossier=sauvegardes) == (
+        chemin, None, False,
+    )
+    assert not sauvegardes.exists()
+    # Contenu changé : copie de l'ancien fichier, puis écriture.
+    nouveau = {"regles": {"t": {"a": {"decimales": 3}}}}
+    resultat = ecrire_controles(nouveau, chemin, empreinte=empreinte, dossier=sauvegardes)
+    copie = sauvegardes / "controles_2026-10-22_090507.yaml"
+    assert resultat == (chemin, copie, True)
+    assert copie.read_bytes() == ancien
+    assert yaml.safe_load(chemin.read_text(encoding="utf-8")) == nouveau
+    # Fichier modifié depuis la lecture du formulaire : refus.
+    with pytest.raises(ValueError, match="a changé depuis la lecture du formulaire"):
+        ecrire_controles(contenu, chemin, empreinte=empreinte, dossier=sauvegardes)
+    # Copie du même nom déjà présente : rien n'est modifié.
+    actuel = chemin.read_bytes()
+    with pytest.raises(FileExistsError, match="rien n'a été modifié"):
+        ecrire_controles(contenu, chemin, empreinte=empreinte_controles(chemin),
+                         dossier=sauvegardes)
+    assert chemin.read_bytes() == actuel and copie.read_bytes() == ancien
+    # Contenu invalide : refus, tous les problèmes listés.
+    with pytest.raises(ValueError, match="règle bornes"):
+        ecrire_controles(
+            {"regles": {"t": {"a": {"bornes": {"min": 2, "max": 1}}}}, "autre": 1}, chemin,
+            empreinte=empreinte_controles(chemin), dossier=sauvegardes,
+        )
+
+
+def test_aller_retour_complet_stable(tmp_path, monkeypatch):
+    """Exporter, revoir, écrire, puis réexporter et réimporter sans modification
+    redonne exactement le même fichier."""
+    tables, dictionnaire, contenu, sensibles = _jeu()
+    chemin_yaml = tmp_path / "controles.yaml"
+    chemin_yaml.write_text(texte_controles(contenu), encoding="utf-8")
+    empreinte = empreinte_controles(chemin_yaml)
+    chemin = exporter_formulaire(
+        tables, dictionnaire, lire_fichier_controles(chemin_yaml), sensibles, "2026-03",
+        tmp_path / "f1.xlsx", empreinte=empreinte,
+    )
+    _modifier(chemin, "bornes", ("parametres", "taux"), statut="documenté", min=0,
+              min_exclu="oui", max=1)
+    _modifier(chemin, "doublons", ("factures", "unique", "code"), statut="invalide")
+    formulaire = importer_formulaire(
+        chemin, dictionnaire, lire_fichier_controles(chemin_yaml), empreinte=empreinte
+    )
+    ecrire_controles(formulaire.contenu, chemin_yaml, empreinte=empreinte,
+                     dossier=tmp_path / "s")
+    ecrit = chemin_yaml.read_bytes()
+    empreinte = empreinte_controles(chemin_yaml)
+    # L'ancien formulaire est désormais périmé.
+    with pytest.raises(ValueError, match="périmé"):
+        importer_formulaire(chemin, dictionnaire, lire_fichier_controles(chemin_yaml),
+                            empreinte=empreinte)
+    chemin = exporter_formulaire(
+        tables, dictionnaire, lire_fichier_controles(chemin_yaml), sensibles, "2026-03",
+        tmp_path / "f2.xlsx", empreinte=empreinte,
+    )
+    doublons = _lire(load_workbook(chemin)["doublons"])
+    lignes = {(l["table"], l["colonnes"]): l["statut"] for l in doublons}
+    assert lignes[("factures", "code")] == "invalide"
+    formulaire = importer_formulaire(
+        chemin, dictionnaire, lire_fichier_controles(chemin_yaml), empreinte=empreinte
+    )
+    assert formulaire.changements.empty
+    assert ecrire_controles(formulaire.contenu, chemin_yaml, empreinte=empreinte,
+                            dossier=tmp_path / "s").ecrit is False
+    assert chemin_yaml.read_bytes() == ecrit
+
+
+def test_contenu_remis_dans_l_ordre_du_dictionnaire(tmp_path):
+    tables, dictionnaire, contenu, sensibles = _jeu()
+    contenu["regles"] = {
+        "parametres": {"taux": {"bornes": {"min": 0, "max": 1}, "decimales": 2}},
+        "factures": {"remise": {"decimales": 0}, "montant": {"decimales": 2}},
+    }
+    contenu["ecartees"]["decimales"] = {"factures": ["siret", "salaire"]}
+    chemin = exporter_formulaire(
+        tables, dictionnaire, contenu, sensibles, "2026-03", tmp_path / "f.xlsx",
+        empreinte="e",
+    )
+    formulaire = importer_formulaire(chemin, dictionnaire, contenu, empreinte="e")
+    regles = formulaire.contenu["regles"]
+    assert list(regles) == ["factures", "parametres"]
+    assert list(regles["factures"]) == ["montant", "remise"]
+    assert list(regles["parametres"]["taux"]) == ["decimales", "bornes"]
+    assert formulaire.contenu["ecartees"]["decimales"] == {"factures": ["siret", "salaire"]}
+    assert list(formulaire.contenu) == ["regles", "doublons", "ecartees", "commentaires"]
+    assert formulaire.changements.empty
+
+
+def test_nombre_de_decimales_negatif_refuse(tmp_path):
+    chemin = _exporter(tmp_path)
+    numero = _modifier(chemin, "décimales", ("factures", "remise"), statut="documenté",
+                       décimales="-1")
+    with pytest.raises(ValueError) as erreur:
+        _importer(chemin)
+    assert (
+        f"ligne {numero} (factures.remise) : décimales : un nombre entier positif "
+        "ou nul est attendu"
     ) in str(erreur.value)
