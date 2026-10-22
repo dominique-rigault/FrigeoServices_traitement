@@ -47,7 +47,7 @@ from .dictionnaire import (
 from .profilage import signature
 
 FEUILLE_MODE_EMPLOI = "mode_emploi"
-FEUILLE_REGLES = "regles"
+FEUILLE_REGLES = "règles"
 FEUILLE_VALEURS = "valeurs"
 FEUILLE_FORMES = "formes"
 # Feuille technique, masquée : une colonne par table, pour les menus des lignes d'ajout.
@@ -56,10 +56,12 @@ FEUILLE_LISTES = "listes"
 # fermée, les formes d'un format.
 FEUILLES_LISTE = {"valeurs": FEUILLE_VALEURS, "format": FEUILLE_FORMES}
 
+# Noms internes des colonnes, dans l'ordre de la feuille; l'en-tête affiché est donné
+# par `ENTETES`.
 COLONNES_REGLES = (
     "table",
-    "colonne",
     "regle",
+    "colonne",
     "proposition",
     "regle_en_vigueur",
     "motif",
@@ -92,6 +94,22 @@ COLONNES_FORMES = (
     "commentaire",
 )
 COLONNES_LISTE = {"valeurs": COLONNES_VALEURS, "format": COLONNES_FORMES}
+# En-têtes affichés dans le classeur quand ils diffèrent du nom interne de la colonne.
+ENTETES = {
+    "regle": "règle",
+    "regle_en_vigueur": "règle_en_vigueur",
+    "nb_a_arbitrer": "nb_à_arbitrer",
+    "regle_retenue": "règle_retenue",
+}
+ENTETES_REGLES = tuple(ENTETES.get(nom, nom) for nom in COLONNES_REGLES)
+# Noms de règles affichés dans la feuille des règles quand ils diffèrent du dictionnaire
+# (« obligation » se distingue ainsi de la valeur « obligatoire » de cette règle).
+NOMS_REGLES_AFFICHES = {"obligatoire": "obligation"}
+# Règles en vigueur ou retenues affichées autrement que dans le dictionnaire, par règle.
+REGLES_AFFICHEES = {"format": {FORMES_FERMEES: LISTE_FERMEE}}
+# Colonnes figées à gauche de chaque feuille, avec la ligne d'en-tête.
+GEL_REGLES = "D2"
+GEL_LISTE = "C2"
 # Colonnes que le métier peut modifier; les autres cellules sont verrouillées.
 MODIFIABLES_REGLES = ("statut", "regle_retenue", "commentaire")
 MODIFIABLES_VALEURS = ("statut", "remplacement", "commentaire")
@@ -173,29 +191,82 @@ def chemin_revue(periode_fin: str) -> Path:
 def _proposition_affichee(nom: str, regle: dict) -> str:
     """Proposition d'une règle telle que le classeur l'affiche.
 
-    Une liste proposée s'affiche « liste de N valeurs », un format proposé
-    « N formes » : N compte les éléments d'origine « liste proposée ».
+    Une liste proposée s'affiche « liste fermée (N valeurs proposées) », un format
+    proposé « liste fermée (N formes proposées) » : N compte les éléments d'origine
+    « liste proposée », les autres valeurs ou formes observées restant à arbitrer.
     """
     proposition = regle["proposition"]
     if nom not in CLES_LISTE or proposition != REGLES_FERMEES[nom]:
         return proposition
     proposees = sum(element["origine"] == ORIGINE_LISTE for element in regle["liste"])
-    if nom == "valeurs":
-        return f"liste de {proposees} valeurs"
-    return f"{proposees} forme" if proposees == 1 else f"{proposees} formes"
+    element = "valeur" if nom == "valeurs" else "forme"
+    pluriel = "s" if proposees > 1 else ""
+    return f"{LISTE_FERMEE} ({proposees} {element}{pluriel} proposée{pluriel})"
+
+
+def _regle_affichee(nom: str, regle: str | None) -> str | None:
+    """Règle en vigueur ou retenue telle que la feuille des règles l'affiche."""
+    return REGLES_AFFICHEES.get(nom, {}).get(regle, regle)
+
+
+def _regle_lue(nom: str, regle: str) -> str:
+    """Règle lue dans la feuille des règles, ramenée au nom du dictionnaire."""
+    lues = {affichee: interne for interne, affichee in REGLES_AFFICHEES.get(nom, {}).items()}
+    return lues.get(regle, regle)
+
+
+def _nom_lu(nom):
+    """Nom de règle lu dans la feuille des règles, ramené au nom du dictionnaire."""
+    lus = {affiche: interne for interne, affiche in NOMS_REGLES_AFFICHES.items()}
+    return lus.get(nom, nom)
+
+
+def _cle_affichee(cle: tuple) -> tuple:
+    """Clé (table, colonne, règle) d'une ligne de règle, avec le nom de règle affiché."""
+    table, colonne, nom = cle
+    return table, colonne, NOMS_REGLES_AFFICHES.get(nom, nom)
+
+
+def _lignes_feuille_regles(regles: list[dict], dictionnaire: dict) -> list[dict]:
+    """Lignes de la feuille des règles telles que le classeur les affiche.
+
+    Tri par table (ordre alphabétique), puis par règle dans l'ordre de traitement
+    (obligation, nature, valeurs, format), puis par colonne dans l'ordre de la
+    source. Le nom de la règle, la règle en vigueur et la règle retenue sont affichés
+    selon `NOMS_REGLES_AFFICHES` et `REGLES_AFFICHEES`.
+    """
+    rangs = {
+        (table, colonne): rang
+        for table, colonnes in dictionnaire.items()
+        for rang, colonne in enumerate(colonnes)
+    }
+    triees = sorted(
+        regles,
+        key=lambda l: (l["table"], REGLES.index(l["regle"]), rangs[(l["table"], l["colonne"])]),
+    )
+    return [
+        {
+            **ligne,
+            "regle": NOMS_REGLES_AFFICHES.get(ligne["regle"], ligne["regle"]),
+            "regle_en_vigueur": _regle_affichee(ligne["regle"], ligne["regle_en_vigueur"]),
+            "regle_retenue": _regle_affichee(ligne["regle"], ligne["regle_retenue"]),
+        }
+        for ligne in triees
+    ]
 
 
 def lignes_regles(dictionnaire: dict) -> list[dict]:
-    """Lignes de la feuille des règles, dans l'ordre du dictionnaire.
+    """Lignes de la feuille des règles, dans l'ordre et avec les noms du dictionnaire.
 
     Quatre lignes par colonne : `obligatoire`, `nature`, `valeurs` et `format`. La
     ligne `valeurs` porte la question « cette colonne est-elle une liste fermée ? » : sa
-    proposition s'affiche « liste de N valeurs », ou « aucune » quand la génération
-    ne propose pas de liste (le métier peut alors en déclarer une). La ligne `format`
-    porte la question « les valeurs de cette colonne ont-elles une forme prévue ? » :
-    sa proposition s'affiche « N formes », ou « aucune ». Chaque ligne affiche la
-    décision enregistrée : statut, règle en vigueur, règle retenue (au statut
-    « documenté ») et commentaire.
+    proposition s'affiche « liste fermée (N valeurs proposées) », ou « aucune » quand
+    la génération ne propose pas de liste (le métier peut alors en déclarer une). La
+    ligne `format` porte la question « les valeurs de cette colonne ont-elles une forme
+    prévue ? » : sa proposition s'affiche « liste fermée (N formes proposées) », ou
+    « aucune ». Chaque ligne affiche la décision enregistrée : statut, règle en
+    vigueur, règle retenue (au statut « documenté ») et commentaire. Le classeur trie
+    ces lignes et en affiche certains noms autrement (voir `_lignes_feuille_regles`).
     """
     lignes = []
     for table, colonnes in dictionnaire.items():
@@ -399,7 +470,7 @@ def _reste_a_traiter(regles: list[dict], valeurs: list[dict], formes: list[dict]
         f"ont une proposition « {A_DECIDER} » (les données ne permettent pas de "
         "proposer une règle : la donner par le statut documenté) et "
         f"{reste['regles_avec_ecarts']} ont des écarts à arbitrer (colonne "
-        "nb_a_arbitrer supérieure à 0). Ce sont les lignes à regarder en premier.",
+        "nb_à_arbitrer supérieure à 0). Ce sont les lignes à regarder en premier.",
         f"S'y ajoutent {reste['regles_sans_liste']} lignes « valeurs » et "
         f"{reste['regles_sans_format']} lignes « format » à « observé » dont la "
         f"proposition est « {REGLE_ECARTEE} » : l'outil n'y propose ni liste ni format, "
@@ -451,23 +522,32 @@ def _mode_emploi(
         "précédente.",
         "",
         f"Feuille « {FEUILLE_REGLES} » : les règles proposées pour chaque colonne",
+        "Les lignes sont triées par table, puis par règle dans l'ordre de traitement "
+        f"({', '.join(NOMS_REGLES_AFFICHES.get(nom, nom) for nom in REGLES)}), puis "
+        "par colonne dans l'ordre du fichier source.",
         "valide : la proposition est la règle. Impossible si la proposition est "
         "« à décider ».",
         "invalide : la proposition est écartée et rien ne la remplace. Dire pourquoi "
         "en commentaire.",
-        "documenté : vous donnez vous-même la règle, dans la colonne regle_retenue "
+        "documenté : vous donnez vous-même la règle, dans la colonne règle_retenue "
         "(à remplir avec ce statut, à laisser vide avec les autres).",
-        "La colonne regle_en_vigueur rappelle la règle appliquée aujourd'hui. Une "
+        "La colonne règle_en_vigueur rappelle la règle appliquée aujourd'hui. Une "
         "règle déjà revue la garde, même si la proposition a changé depuis : pour en "
-        "changer, choisir documenté et donner la règle dans regle_retenue.",
+        "changer, choisir documenté et donner la règle dans règle_retenue.",
         "Sur une ligne « valeurs », la question est : cette colonne n'accepte-t-elle "
-        "qu'une liste fermée de valeurs ? Le statut invalide écarte toute la liste, "
+        "qu'une liste fermée de valeurs ? La proposition « liste fermée (N valeurs "
+        "proposées) » compte les valeurs que l'outil met d'office dans la liste : "
+        "valide adopte la liste fermée, et son contenu se décide dans la feuille "
+        f"« {FEUILLE_VALEURS} », où toute valeur au statut valide ou documenté en fait "
+        "partie, quelle que soit son origine. Le statut invalide écarte toute la liste, "
         f"sans avoir à revoir ses valeurs dans la feuille « {FEUILLE_VALEURS} ». Quand "
         f"la proposition est « {AUCUNE_LISTE} », l'outil ne propose pas de liste : la "
         "ligne peut rester à « observé ».",
         "Sur une ligne « format », la question est : les valeurs de cette colonne "
         "s'écrivent-elles toutes selon une forme prévue, comme un code ou un "
-        "identifiant ? Le statut invalide écarte tout le format, sans avoir à revoir "
+        "identifiant ? La proposition « liste fermée (N formes proposées) » se lit "
+        f"comme pour les valeurs, avec les formes de la feuille « {FEUILLE_FORMES} ». "
+        "Le statut invalide écarte tout le format, sans avoir à revoir "
         f"ses formes dans la feuille « {FEUILLE_FORMES} ». Quand la proposition est "
         f"« {REGLE_ECARTEE} », l'outil ne propose pas de format : la ligne peut rester "
         "à « observé ».",
@@ -515,15 +595,15 @@ def _mode_emploi(
         "Statut invalide sur une règle : plus aucun contrôle de ce type ne portera "
         "sur la colonne.",
         "Changer une règle déjà validée quand la proposition a changé : choisir "
-        "documenté et donner la règle dans regle_retenue. Laisser valide conserve "
-        "l'ancienne règle, celle de la colonne regle_en_vigueur.",
+        "documenté et donner la règle dans règle_retenue. Laisser valide conserve "
+        "l'ancienne règle, celle de la colonne règle_en_vigueur.",
         "Déclarer correcte une valeur ou une forme absente des données : l'ajouter en "
         f"bas de la feuille « {FEUILLE_VALEURS} » ou « {FEUILLE_FORMES} », au statut "
         "documenté.",
         "Déclarer une liste que l'outil n'a pas proposée (proposition "
         f"« {AUCUNE_LISTE} ») : sur la ligne « valeurs » de la feuille "
         f"« {FEUILLE_REGLES} », choisir documenté et « {LISTE_FERMEE} » dans "
-        f"regle_retenue. Puis, dans la feuille « {FEUILLE_VALEURS} », revoir les "
+        f"règle_retenue. Puis, dans la feuille « {FEUILLE_VALEURS} », revoir les "
         f"valeurs d'origine « {ORIGINE_OBSERVEE} » de la colonne quand il y en a "
         "(valide, ou invalide avec son remplacement), et ajouter en bas de la feuille, "
         "au statut documenté, les valeurs correctes absentes des données. Remettre la "
@@ -531,8 +611,8 @@ def _mode_emploi(
         "restent tant qu'elles ne sont pas remises à « observé » une à une.",
         "Déclarer un format que l'outil n'a pas proposé (proposition "
         f"« {REGLE_ECARTEE} ») : sur la ligne « format » de la feuille "
-        f"« {FEUILLE_REGLES} », choisir documenté et « {FORMES_FERMEES} » dans "
-        f"regle_retenue. Puis, dans la feuille « {FEUILLE_FORMES} », revoir les formes "
+        f"« {FEUILLE_REGLES} », choisir documenté et « {LISTE_FERMEE} » dans "
+        f"règle_retenue. Puis, dans la feuille « {FEUILLE_FORMES} », revoir les formes "
         f"d'origine « {ORIGINE_OBSERVEE} » de la colonne quand il y en a (valide ou "
         "invalide), et ajouter en bas de la feuille, au statut documenté, les formes "
         "correctes absentes des données. Remettre la ligne à « observé » annule la "
@@ -555,7 +635,7 @@ def _mode_emploi(
         "Avant l'import : enregistrer puis fermer le classeur dans Excel.",
         "",
         "Règles à respecter pour que le classeur puisse être réimporté",
-        "Ne modifier que les colonnes statut, regle_retenue, remplacement et "
+        "Ne modifier que les colonnes statut, règle_retenue, remplacement et "
         "commentaire (les autres cellules sont verrouillées).",
         "Ne pas renommer, déplacer ni supprimer de feuilles, de colonnes ou de lignes "
         f"(la feuille masquée « {FEUILLE_LISTES} » alimente les menus des lignes "
@@ -634,10 +714,14 @@ def _menus_d_ajout(feuille, colonnes, nb_tables: int, premiere: int, derniere: i
     _menu(feuille, formule=choix).add(f"{col_colonne}{premiere}:{col_colonne}{derniere}")
 
 
-def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0) -> None:
-    """Écrit l'en-tête et les lignes, puis protège la feuille hors colonnes modifiables."""
+def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, gel=GEL_LISTE) -> None:
+    """Écrit l'en-tête et les lignes, puis protège la feuille hors colonnes modifiables.
+
+    `colonnes` porte les noms internes; l'en-tête affiche ceux de `ENTETES`. `gel`
+    est la première cellule non figée (ligne d'en-tête et colonnes à sa gauche).
+    """
     for indice, nom in enumerate(colonnes, start=1):
-        cellule = feuille.cell(row=1, column=indice, value=nom)
+        cellule = feuille.cell(row=1, column=indice, value=ENTETES.get(nom, nom))
         cellule.font = Font(bold=True)
         feuille.column_dimensions[cellule.column_letter].width = LARGEURS[nom]
     for numero, ligne in enumerate(lignes, start=2):
@@ -658,8 +742,7 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0) -> None:
                 cellule.number_format = "@"
                 cellule.protection = Protection(locked=False)
     derniere = feuille.cell(row=1, column=len(colonnes)).column_letter
-    # La ligne d'en-tête et les colonnes table et colonne restent visibles.
-    feuille.freeze_panes = "C2"
+    feuille.freeze_panes = gel
     feuille.auto_filter.ref = f"A1:{derniere}{max(fin + lignes_ajout, 2)}"
     feuille.protection.sheet = True
     feuille.protection.autoFilter = False
@@ -709,17 +792,22 @@ def exporter_revue(
             cellule.font = Font(bold=True)
     notice.protection.sheet = True
 
+    # Table, règle et colonne restent visibles avec la ligne d'en-tête.
     feuille = classeur.create_sheet(FEUILLE_REGLES)
-    _remplir(feuille, COLONNES_REGLES, regles, MODIFIABLES_REGLES)
+    affichees = _lignes_feuille_regles(regles, dictionnaire)
+    _remplir(feuille, COLONNES_REGLES, affichees, MODIFIABLES_REGLES, gel=GEL_REGLES)
     statut = COLONNES_REGLES.index("statut") + 1
     retenue = COLONNES_REGLES.index("regle_retenue") + 1
     menu_statut = _menu(feuille, STATUTS)
-    menus_retenue = {nom: _menu(feuille, choix) for nom, choix in REGLES_RETENUES.items()}
-    for numero, ligne in enumerate(regles, start=2):
+    menus_retenue = {
+        nom: _menu(feuille, [_regle_affichee(nom, choix) for choix in choix_possibles])
+        for nom, choix_possibles in REGLES_RETENUES.items()
+    }
+    for numero, ligne in enumerate(affichees, start=2):
         menu_statut.add(feuille.cell(row=numero, column=statut))
         # Sur une ligne « valeurs » ou « format », le menu n'a qu'un choix : déclarer
-        # une liste fermée ou des formes fermées.
-        menus_retenue[ligne["regle"]].add(feuille.cell(row=numero, column=retenue))
+        # une liste fermée de valeurs ou de formes.
+        menus_retenue[_nom_lu(ligne["regle"])].add(feuille.cell(row=numero, column=retenue))
 
     # Feuille des valeurs, puis feuille des formes : même présentation.
     for nom, lignes in elements.items():
@@ -767,6 +855,9 @@ def _est_vide(valeur) -> bool:
 def _lire_feuille(classeur, nom: str, colonnes: tuple[str, ...]) -> list[tuple[int, dict]]:
     """Lignes non vides d'une feuille, avec leur numéro de ligne Excel.
 
+    Les lignes sont rendues sous les noms internes des colonnes (`colonnes`),
+    l'en-tête attendu étant celui affiché (`ENTETES`).
+
     Lève une ValueError si la feuille manque ou si son en-tête n'est pas celui exporté.
     """
     if nom not in classeur.sheetnames:
@@ -778,9 +869,10 @@ def _lire_feuille(classeur, nom: str, colonnes: tuple[str, ...]) -> list[tuple[i
     entete = tuple(next(lignes, ()))
     while entete and entete[-1] is None:
         entete = entete[:-1]
-    if entete != colonnes:
+    attendu = tuple(ENTETES.get(colonne, colonne) for colonne in colonnes)
+    if entete != attendu:
         raise ValueError(
-            f"feuille « {nom} » : en-tête modifié, attendu {', '.join(colonnes)} "
+            f"feuille « {nom} » : en-tête modifié, attendu {', '.join(attendu)} "
             "(classeur exporté par une version antérieure : à réexporter)"
         )
     resultat = []
@@ -815,25 +907,31 @@ def _controler_regles(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
     decisions, problemes, vues = [], [], set()
     for numero, ligne in lignes:
         ou = f"{FEUILLE_REGLES}, ligne {numero}"
-        cle = (ligne["table"], ligne["colonne"], ligne["regle"])
+        regle = _nom_lu(ligne["regle"])
+        cle = (ligne["table"], ligne["colonne"], regle)
         if cle not in attendues:
-            problemes.append(f"{ou} : règle inconnue {cle} (classeur périmé ou ligne ajoutée)")
+            problemes.append(
+                f"{ou} : règle inconnue {_cle_affichee(cle)} (classeur périmé ou ligne "
+                "ajoutée)"
+            )
             continue
         if cle in vues:
-            problemes.append(f"{ou} : règle {cle} présente plusieurs fois")
+            problemes.append(f"{ou} : règle {_cle_affichee(cle)} présente plusieurs fois")
             continue
         vues.add(cle)
         for champ in ("proposition", "regle_en_vigueur"):
-            if ligne[champ] != attendues[cle][champ]:
+            attendue = attendues[cle][champ]
+            if champ == "regle_en_vigueur":
+                attendue = _regle_affichee(regle, attendue)
+            if ligne[champ] != attendue:
                 problemes.append(
-                    f"{ou} : {champ} {ligne[champ]!r} différente du dictionnaire "
-                    f"({attendues[cle][champ]!r}), classeur périmé, à réexporter"
+                    f"{ou} : {ENTETES.get(champ, champ)} {ligne[champ]!r} différente du "
+                    f"dictionnaire ({attendue!r}), classeur périmé, à réexporter"
                 )
         en_place = dictionnaire[cle[0]][cle[1]][cle[2]]
         statut = _choix(ligne["statut"])
-        retenue = _choix(ligne["regle_retenue"])
+        retenue = _regle_lue(regle, _choix(ligne["regle_retenue"]))
         commentaire = _commentaire(ligne["commentaire"])
-        regle = ligne["regle"]
         # Une règle déjà validée le reste, même si la proposition a changé depuis.
         validation = statut == "valide" and en_place["statut"] != "valide"
         if statut == "":
@@ -863,11 +961,14 @@ def _controler_regles(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
                 "(choisir valide)"
             )
         elif statut == "documenté" and retenue == "":
-            problemes.append(f"{ou} : regle_retenue obligatoire avec le statut documenté")
+            problemes.append(f"{ou} : règle_retenue obligatoire avec le statut documenté")
         elif statut == "documenté" and retenue not in REGLES_RETENUES[regle]:
-            problemes.append(f"{ou} : regle_retenue {retenue!r} hors du menu de la règle {regle}")
+            problemes.append(
+                f"{ou} : règle_retenue {_regle_affichee(regle, retenue)!r} hors du menu de "
+                f"la règle {NOMS_REGLES_AFFICHES.get(regle, regle)}"
+            )
         elif statut != "documenté" and retenue:
-            problemes.append(f"{ou} : regle_retenue réservée au statut documenté")
+            problemes.append(f"{ou} : règle_retenue réservée au statut documenté")
         decisions.append(
             {
                 "table": cle[0],
@@ -880,7 +981,7 @@ def _controler_regles(lignes, dictionnaire) -> tuple[list[dict], list[str]]:
             }
         )
     for cle in attendues.keys() - vues:
-        problemes.append(f"{FEUILLE_REGLES} : règle {cle} absente du classeur")
+        problemes.append(f"{FEUILLE_REGLES} : règle {_cle_affichee(cle)} absente du classeur")
     return decisions, problemes
 
 

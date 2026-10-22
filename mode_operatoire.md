@@ -88,7 +88,7 @@ Repères pour la phase 3 :
 | 4.1 | Ajuster si nécessaire les seuils de génération (200 valeurs, 12 valeurs principales, 95 %, 2 % de vides), par exemple pour un client aux petits référentiels | A | constantes de `dictionnaire.py` | opérationnel (dans le code, pas dans un fichier YAML) |
 | 4.2 | Mettre `PERIODE_FIN` à jour et exécuter les cellules jusqu'à `# ECRITURE APRES FUSION` (premier dictionnaire : `# FUSION` affiche « rien à fusionner ») | C | notebook 03 | opérationnel |
 | 4.3 | Exporter le classeur de revue | C | cellule `# EXPORT` | opérationnel |
-| 4.4 | Revoir le classeur (feuilles `regles`, `valeurs`, `formes`, mode d'emploi dans la première feuille); une revue partielle suffit pour avancer | M avec C | Excel | opérationnel |
+| 4.4 | Revoir le classeur (feuilles `règles`, `valeurs`, `formes`, mode d'emploi dans la première feuille); une revue partielle suffit pour avancer | M avec C | Excel | opérationnel |
 | 4.5 | Appliquer la revue : enregistrer et fermer le classeur, `# IMPORT`, `# APPLICATION`, `# ECRITURE`, supprimer le classeur périmé de `data/revue/`, puis `# EXPORT` pour la revue suivante | C | notebook 03 | opérationnel |
 
 Repères pour la phase 4 :

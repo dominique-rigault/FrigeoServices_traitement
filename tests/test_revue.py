@@ -17,7 +17,11 @@ from frigeo.revue import (
     COLONNES_RAPPORT_REVUE,
     COLONNES_REGLES,
     COLONNES_VALEURS,
+    ENTETES,
+    ENTETES_REGLES,
+    FEUILLE_REGLES,
     LIGNES_AJOUT,
+    NOMS_REGLES_AFFICHES,
     REPERE_REVUES,
     appliquer_revue,
     exporter_revue,
@@ -90,9 +94,14 @@ def _dictionnaire():
     }
 
 
+NOMS_INTERNES = {affiche: interne for interne, affiche in ENTETES.items()}
+
+
 def _lire(feuille):
+    """Lignes d'une feuille, sous les noms internes des colonnes (valeurs affichées)."""
     lignes = list(feuille.iter_rows(values_only=True))
-    return [dict(zip(lignes[0], ligne)) for ligne in lignes[1:] if any(v is not None for v in ligne)]
+    entete = [NOMS_INTERNES.get(nom, nom) for nom in lignes[0]]
+    return [dict(zip(entete, ligne)) for ligne in lignes[1:] if any(v is not None for v in ligne)]
 
 
 def test_lignes_regles():
@@ -107,7 +116,7 @@ def test_lignes_regles():
     assert (sans_liste["proposition"], sans_liste["regle_en_vigueur"]) == ("aucune", "aucune")
     assert (sans_liste["statut"], sans_liste["regle_retenue"]) == ("observé", None)
     assert par_cle[("clients", "statut", "obligatoire")]["nb_a_arbitrer"] == 5
-    assert par_cle[("clients", "statut", "valeurs")]["proposition"] == "liste de 2 valeurs"
+    assert par_cle[("clients", "statut", "valeurs")]["proposition"] == "liste fermée (2 valeurs proposées)"
     assert par_cle[("clients", "statut", "valeurs")]["nb_a_arbitrer"] == 1
     # Le nom de la nature dominante n'est pas compté comme un écart.
     assert par_cle[("interventions", "duree", "nature")]["nb_a_arbitrer"] == 40
@@ -137,16 +146,16 @@ def test_statut_propre_a_chaque_valeur():
 def test_classeur_ecrit_et_relu(tmp_path):
     chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue" / "revue.xlsx", nb_revues=0)
     classeur = load_workbook(chemin)
-    assert classeur.sheetnames == ["mode_emploi", "regles", "valeurs", "formes", "listes"]
-    regles, valeurs = classeur["regles"], classeur["valeurs"]
-    assert tuple(c.value for c in regles[1]) == COLONNES_REGLES
+    assert classeur.sheetnames == ["mode_emploi", "règles", "valeurs", "formes", "listes"]
+    regles, valeurs = classeur[FEUILLE_REGLES], classeur["valeurs"]
+    assert tuple(c.value for c in regles[1]) == ENTETES_REGLES
     assert tuple(c.value for c in valeurs[1]) == COLONNES_VALEURS
     assert tuple(c.value for c in classeur["formes"][1]) == COLONNES_FORMES
     assert len(_lire(regles)) == 16
     assert {l["statut"] for l in _lire(regles)} == {"observé"}
     notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
     assert "2026-03" in notice
-    assert "16 lignes dans la feuille « regles » (quatre par colonne" in notice
+    assert "16 lignes dans la feuille « règles » (quatre par colonne" in notice
     assert "0 lignes dans la feuille « formes »" in notice
     assert "réimporté" in notice
 
@@ -161,14 +170,14 @@ def test_valeurs_conservees_comme_texte(tmp_path):
 def test_protection_et_menus(tmp_path):
     chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
     classeur = load_workbook(chemin)
-    regles, valeurs = classeur["regles"], classeur["valeurs"]
+    regles, valeurs = classeur[FEUILLE_REGLES], classeur["valeurs"]
     assert regles.protection.sheet and valeurs.protection.sheet
     assert classeur["mode_emploi"].protection.sheet
     # Feuille des règles : seules statut, regle_retenue et commentaire sont libres.
     libres = {c.value for c, d in zip(regles[1], regles[2]) if not d.protection.locked}
-    assert libres == {"statut", "regle_retenue", "commentaire"}
-    # Sur une ligne « valeurs », regle_retenue sert à déclarer une liste fermée.
-    ligne = next(l for l in regles.iter_rows(min_row=2) if l[2].value == "valeurs")
+    assert libres == {"statut", "règle_retenue", "commentaire"}
+    # Sur une ligne « valeurs », règle_retenue sert à déclarer une liste fermée.
+    ligne = next(l for l in regles.iter_rows(min_row=2) if l[1].value == "valeurs")
     assert not ligne[COLONNES_REGLES.index("regle_retenue")].protection.locked
     libres = {c.value for c, d in zip(valeurs[1], valeurs[2]) if not d.protection.locked}
     assert libres == {"statut", "remplacement", "commentaire"}
@@ -180,16 +189,18 @@ def test_protection_et_menus(tmp_path):
     menus = [m.formula1 for m in regles.data_validations.dataValidation]
     assert '"observé,valide,invalide,documenté"' in menus
     assert '"obligatoire,facultatif,toujours vide"' in menus
-    assert '"liste fermée"' in menus
-    assert '"formes fermées"' in menus
+    # Le menu de la ligne « format » affiche « liste fermée » (formes fermées).
+    assert menus.count('"liste fermée"') == 2
+    assert '"formes fermées"' not in menus
     assert all(len(m) <= 255 for m in menus)
     # Feuille des valeurs : menu des statuts, puis menus table et colonne des ajouts.
     assert len(valeurs.data_validations.dataValidation) == 3
     # Excel refuse une valeur saisie hors d'un menu.
     for feuille in (regles, valeurs):
         assert all(m.showErrorMessage for m in feuille.data_validations.dataValidation)
-    # La ligne d'en-tête et les colonnes table et colonne restent visibles.
-    assert regles.freeze_panes == valeurs.freeze_panes == "C2"
+    # La ligne d'en-tête reste visible, avec table, règle et colonne (table et
+    # colonne dans la feuille des valeurs).
+    assert (regles.freeze_panes, valeurs.freeze_panes) == ("D2", "C2")
 
 
 def test_colonne_sans_liste_absente_de_la_feuille_des_valeurs(tmp_path):
@@ -211,7 +222,9 @@ def _exporter(tmp_path):
 
 def _ligne(feuille, **cles):
     """Numéro de la ligne Excel dont les cellules nommées ont les valeurs données."""
-    entete = [c.value for c in feuille[1]]
+    entete = [NOMS_INTERNES.get(c.value, c.value) for c in feuille[1]]
+    if "regle" in cles:
+        cles = dict(cles, regle=NOMS_REGLES_AFFICHES.get(cles["regle"], cles["regle"]))
     for ligne in feuille.iter_rows(min_row=2):
         if all(ligne[entete.index(nom)].value == valeur for nom, valeur in cles.items()):
             return ligne[0].row
@@ -221,7 +234,7 @@ def _ligne(feuille, **cles):
 def _modifier(chemin, nom_feuille, ligne, **valeurs):
     classeur = load_workbook(chemin)
     feuille = classeur[nom_feuille]
-    entete = [c.value for c in feuille[1]]
+    entete = [NOMS_INTERNES.get(c.value, c.value) for c in feuille[1]]
     numero = ligne if isinstance(ligne, int) else _ligne(feuille, **ligne)
     for nom, valeur in valeurs.items():
         feuille.cell(row=numero, column=entete.index(nom) + 1).value = valeur
@@ -247,11 +260,11 @@ def test_import_sans_modification(tmp_path):
 def test_import_des_decisions_du_metier(tmp_path):
     chemin = _exporter(tmp_path)
     regle = dict(table="clients", colonne="statut")
-    _modifier(chemin, "regles", dict(regle, regle="obligatoire"), statut="valide")
+    _modifier(chemin, FEUILLE_REGLES, dict(regle, regle="obligatoire"), statut="valide")
     # Statut saisi en forme décomposée, avec une espace en trop : il est normalisé.
-    _modifier(chemin, "regles", dict(regle, regle="nature"), statut=" documenté",
+    _modifier(chemin, FEUILLE_REGLES, dict(regle, regle="nature"), statut=" documenté",
               regle_retenue="entier (texte)")
-    _modifier(chemin, "regles", dict(regle, regle="valeurs"), statut="invalide",
+    _modifier(chemin, FEUILLE_REGLES, dict(regle, regle="valeurs"), statut="invalide",
               commentaire="clé vers un référentiel")
     _modifier(chemin, "valeurs", dict(regle, valeur="actif"), statut="invalide")
     # Ajouts : dans une colonne avec liste et dans une colonne sans liste.
@@ -279,19 +292,19 @@ def test_problemes_de_la_feuille_regles_listes_en_une_fois(tmp_path):
     chemin = _exporter(tmp_path)
     statut = dict(table="clients", colonne="statut")
     duree = dict(table="interventions", colonne="duree")
-    _modifier(chemin, "regles", dict(statut, regle="obligatoire"), statut=None)
-    _modifier(chemin, "regles", dict(statut, regle="nature"), statut="ok")
-    _modifier(chemin, "regles", dict(duree, regle="obligatoire"), statut="valide")
-    _modifier(chemin, "regles", dict(duree, regle="nature"), statut="documenté")
-    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="obligatoire"),
+    _modifier(chemin, FEUILLE_REGLES, dict(statut, regle="obligatoire"), statut=None)
+    _modifier(chemin, FEUILLE_REGLES, dict(statut, regle="nature"), statut="ok")
+    _modifier(chemin, FEUILLE_REGLES, dict(duree, regle="obligatoire"), statut="valide")
+    _modifier(chemin, FEUILLE_REGLES, dict(duree, regle="nature"), statut="documenté")
+    _modifier(chemin, FEUILLE_REGLES, dict(table="clients", colonne="code", regle="obligatoire"),
               statut="documenté", regle_retenue="presque toujours vide")
-    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="nature"),
+    _modifier(chemin, FEUILLE_REGLES, dict(table="clients", colonne="code", regle="nature"),
               statut="valide", regle_retenue="texte")
-    _modifier(chemin, "regles", dict(statut, regle="valeurs"), statut="invalide")
-    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="valeurs"),
+    _modifier(chemin, FEUILLE_REGLES, dict(statut, regle="valeurs"), statut="invalide")
+    _modifier(chemin, FEUILLE_REGLES, dict(table="clients", colonne="code", regle="valeurs"),
               statut="documenté")
     classeur = load_workbook(chemin)
-    feuille = classeur["regles"]
+    feuille = classeur[FEUILLE_REGLES]
     feuille.delete_rows(_ligne(feuille, table="clients", colonne="type_commerce", regle="nature"))
     classeur.save(chemin)
 
@@ -301,15 +314,15 @@ def test_problemes_de_la_feuille_regles_listes_en_une_fois(tmp_path):
         "statut vide",
         "statut inconnu 'ok'",
         "ne peut pas être validée",
-        "regle_retenue obligatoire avec le statut documenté",
+        "règle_retenue obligatoire avec le statut documenté",
         "'presque toujours vide' hors du menu",
-        "regle_retenue réservée au statut documenté",
+        "règle_retenue réservée au statut documenté",
         "commentaire obligatoire avec le statut invalide",
         "une liste est déjà proposée, il n'y a rien à déclarer",
         "('clients', 'type_commerce', 'nature') absente du classeur",
     ):
         assert attendu in message
-    assert "regles, ligne " in message
+    assert "règles, ligne " in message
 
 
 def test_classeur_perime_refuse(tmp_path):
@@ -362,7 +375,7 @@ def test_structure_modifiee_refusee(tmp_path, cas):
         classeur["valeurs"].title = "Valeurs"
         attendu = "feuille « valeurs » absente"
     else:
-        classeur["regles"]["D1"] = "proposée"
+        classeur[FEUILLE_REGLES]["D1"] = "proposée"
         attendu = "en-tête modifié"
     classeur.save(chemin)
     assert attendu in _erreur_import(chemin)
@@ -381,12 +394,12 @@ def _importer(chemin, dictionnaire=None, nb_revues=0):
 
 def _decisions(chemin):
     """Saisit dans le classeur un jeu de décisions couvrant tous les statuts."""
-    _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), statut="valide")
-    _modifier(chemin, "regles", dict(STATUT, regle="nature"), statut="documenté",
+    _modifier(chemin, FEUILLE_REGLES, dict(STATUT, regle="obligatoire"), statut="valide")
+    _modifier(chemin, FEUILLE_REGLES, dict(STATUT, regle="nature"), statut="documenté",
               regle_retenue="entier (texte)", commentaire="code numérique")
-    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="valeurs"),
+    _modifier(chemin, FEUILLE_REGLES, dict(table="clients", colonne="code", regle="valeurs"),
               statut="invalide", commentaire="identifiant libre")
-    _modifier(chemin, "regles", dict(table="interventions", colonne="duree", regle="obligatoire"),
+    _modifier(chemin, FEUILLE_REGLES, dict(table="interventions", colonne="duree", regle="obligatoire"),
               statut="documenté", regle_retenue="facultatif")
     _modifier(chemin, "valeurs", dict(STATUT, valeur="Actif"), statut="valide")
     _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), statut="invalide",
@@ -542,7 +555,7 @@ def test_export_affiche_les_decisions_enregistrees(tmp_path):
     lues = {(l["colonne"], l["valeur"]): l for l in _lire(classeur["valeurs"])}
     assert lues[("statut", "actif")]["remplacement"] == "Actif"
     assert lues[("statut", "En sommeil")]["statut"] == "documenté"
-    feuille = classeur["regles"]
+    feuille = classeur[FEUILLE_REGLES]
     assert feuille.cell(row=2, column=COLONNES_REGLES.index("regle_en_vigueur") + 1).protection.locked
 
 
@@ -571,13 +584,13 @@ def test_deuxieme_revue_modifie_annule_et_retire(tmp_path):
     resultat, _, _ = _apres_premiere_revue(tmp_path)
     chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
     # Retour à « observé » : la décision est annulée.
-    _modifier(chemin, "regles", dict(STATUT, regle="nature"), statut="observé",
+    _modifier(chemin, FEUILLE_REGLES, dict(STATUT, regle="nature"), statut="observé",
               regle_retenue=None, commentaire=None)
     # Règle retenue changée sans changer de statut.
-    _modifier(chemin, "regles", dict(table="interventions", colonne="duree", regle="obligatoire"),
+    _modifier(chemin, FEUILLE_REGLES, dict(table="interventions", colonne="duree", regle="obligatoire"),
               regle_retenue="obligatoire")
     # Commentaire seul modifié.
-    _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), commentaire="confirmé")
+    _modifier(chemin, FEUILLE_REGLES, dict(STATUT, regle="obligatoire"), commentaire="confirmé")
     _modifier(chemin, "valeurs", dict(STATUT, valeur="Actif"), commentaire="valeur de référence")
     # Remplacement retiré, valeur ajoutée retirée.
     _modifier(chemin, "valeurs", dict(STATUT, valeur="actif"), remplacement=None)
@@ -704,7 +717,7 @@ def test_regle_validee_conservee_quand_la_proposition_change(tmp_path):
     assert entree is None
     assert encore["clients"]["statut"]["obligatoire"]["regle"] == "obligatoire"
     # Une nouvelle validation de cette proposition reste refusée.
-    _modifier(chemin, "regles", dict(table="interventions", colonne="duree", regle="nature"),
+    _modifier(chemin, FEUILLE_REGLES, dict(table="interventions", colonne="duree", regle="nature"),
               statut="valide")
     with pytest.raises(ValueError, match="ne peut pas être validée"):
         _importer(chemin, resultat, nb_revues=1)
@@ -716,15 +729,15 @@ def test_rien_a_valider_sans_liste_proposee(tmp_path):
         statut="invalide", regle="aucune", proposition="aucune", revu_le=JOUR, commentaire="libre"
     )
     chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=1)
-    _modifier(chemin, "regles", dict(table="clients", colonne="code", regle="valeurs"), statut="valide")
+    _modifier(chemin, FEUILLE_REGLES, dict(table="clients", colonne="code", regle="valeurs"), statut="valide")
     with pytest.raises(ValueError, match="il n'y a rien à valider"):
         _importer(chemin, dictionnaire, nb_revues=1)
 
 
 def test_regle_en_vigueur_modifiee_dans_le_classeur(tmp_path):
     chemin = _exporter(tmp_path)
-    _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), regle_en_vigueur="facultatif")
-    assert "regle_en_vigueur 'facultatif' différente du dictionnaire" in _erreur_import(chemin)
+    _modifier(chemin, FEUILLE_REGLES, dict(STATUT, regle="obligatoire"), regle_en_vigueur="facultatif")
+    assert "règle_en_vigueur 'facultatif' différente du dictionnaire" in _erreur_import(chemin)
 
 
 # Horodatage des décisions et protection à l'écriture (morceau 4d).
@@ -732,7 +745,7 @@ def test_regle_en_vigueur_modifiee_dans_le_classeur(tmp_path):
 
 def test_instant_de_l_application(tmp_path):
     chemin = _exporter(tmp_path)
-    _modifier(chemin, "regles", dict(STATUT, regle="obligatoire"), statut="valide")
+    _modifier(chemin, FEUILLE_REGLES, dict(STATUT, regle="obligatoire"), statut="valide")
     revue = _importer(chemin)
     # Par défaut, l'instant présent, à la seconde.
     resultat, _, entree = appliquer_revue(_dictionnaire(), revue, chemin)
@@ -756,11 +769,11 @@ def test_deux_revues_ecrites_puis_regeneration_refusee(tmp_path):
 
     # Seconde revue : décision annulée, règle retenue changée, valeur ajoutée retirée.
     classeur = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
-    _modifier(classeur, "regles", dict(STATUT, regle="nature"), statut="observé",
+    _modifier(classeur, FEUILLE_REGLES, dict(STATUT, regle="nature"), statut="observé",
               regle_retenue=None, commentaire=None)
-    _modifier(classeur, "regles", dict(table="interventions", colonne="duree", regle="obligatoire"),
+    _modifier(classeur, FEUILLE_REGLES, dict(table="interventions", colonne="duree", regle="obligatoire"),
               regle_retenue="obligatoire")
-    _modifier(classeur, "regles", dict(STATUT, regle="obligatoire"), commentaire="confirmé")
+    _modifier(classeur, FEUILLE_REGLES, dict(STATUT, regle="obligatoire"), commentaire="confirmé")
     _modifier(classeur, "valeurs", dict(STATUT, valeur="En sommeil"), statut="observé")
     revue = _importer(classeur, resultat, nb_revues=1)
     # Un classeur appliqué à une heure antérieure à la dernière revue est refusé.
@@ -821,7 +834,7 @@ def test_mode_emploi_compte_ce_qui_reste_a_traiter(tmp_path):
 
     # Avant toute revue : tout est à « observé ».
     notice = reste(_exporter(tmp_path))
-    assert "« regles » : 10 lignes à « observé » sur 10" in notice
+    assert "« règles » : 10 lignes à « observé » sur 10" in notice
     assert "2 ont une proposition « à décider »" in notice
     assert "4 ont des écarts à arbitrer" in notice
     # Deux colonnes sans liste proposée, quatre sans format proposé : ces lignes ne
@@ -835,7 +848,7 @@ def test_mode_emploi_compte_ce_qui_reste_a_traiter(tmp_path):
     resultat, _, _ = _apres_premiere_revue(tmp_path / "premiere")
     chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
     notice = reste(chemin)
-    assert "« regles » : 6 lignes à « observé » sur 10" in notice
+    assert "« règles » : 6 lignes à « observé » sur 10" in notice
     assert "1 ont une proposition « à décider »" in notice
     assert "2 ont des écarts à arbitrer" in notice
     # Les sept valeurs de la liste écartée ne sont plus à revoir.
@@ -886,7 +899,7 @@ COMMERCE = dict(table="clients", colonne="type_commerce")
 def _declarer(chemin, valeurs=("Boulangerie", "Boucherie"), **champs):
     """Déclare dans le classeur une liste fermée sur clients.type_commerce."""
     champs = {"statut": "documenté", "regle_retenue": "liste fermée", **champs}
-    _modifier(chemin, "regles", dict(COMMERCE, regle="valeurs"), **champs)
+    _modifier(chemin, FEUILLE_REGLES, dict(COMMERCE, regle="valeurs"), **champs)
     for rang, valeur in enumerate(valeurs, start=1):
         _modifier(chemin, "valeurs", FIN + rang, **COMMERCE, valeur=valeur, statut="documenté")
 
@@ -921,7 +934,7 @@ def test_declarer_une_liste_non_proposee(tmp_path):
     ecrire_dictionnaire(resultat, "2026-03", fichier, revue=entree)
     assert charger_dictionnaire(fichier) == resultat
     chemin = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
-    lue = next(l for l in _lire(load_workbook(chemin)["regles"])
+    lue = next(l for l in _lire(load_workbook(chemin)[FEUILLE_REGLES])
                if (l["colonne"], l["regle"]) == ("type_commerce", "valeurs"))
     assert (lue["proposition"], lue["regle_en_vigueur"], lue["regle_retenue"]) == (
         "aucune", "liste fermée", "liste fermée",
@@ -937,20 +950,20 @@ def test_declarations_refusees(tmp_path):
     assert "liste déclarée sans aucune valeur au statut valide ou documenté pour " \
         "clients.type_commerce" in _erreur_import(chemin)
     _declarer(chemin, regle_retenue=None)
-    assert "regle_retenue obligatoire avec le statut documenté" in _erreur_import(chemin)
+    assert "règle_retenue obligatoire avec le statut documenté" in _erreur_import(chemin)
     _declarer(chemin, regle_retenue="aucune")
-    assert "regle_retenue 'aucune' hors du menu de la règle valeurs" in _erreur_import(chemin)
+    assert "règle_retenue 'aucune' hors du menu de la règle valeurs" in _erreur_import(chemin)
 
     # Une liste déjà proposée se valide, elle ne se déclare pas : un seul problème.
     chemin = _exporter(tmp_path / "proposee")
-    _modifier(chemin, "regles", dict(STATUT, regle="valeurs"), statut="documenté",
+    _modifier(chemin, FEUILLE_REGLES, dict(STATUT, regle="valeurs"), statut="documenté",
               regle_retenue="liste fermée")
     message = _erreur_import(chemin)
     assert "1 problèmes" in message and "il n'y a rien à déclarer (choisir valide)" in message
 
     # Rien à écarter sur une colonne sans liste proposée ni valeur.
     chemin = _exporter(tmp_path / "ecartee")
-    _modifier(chemin, "regles", dict(COMMERCE, regle="valeurs"), statut="invalide",
+    _modifier(chemin, FEUILLE_REGLES, dict(COMMERCE, regle="valeurs"), statut="invalide",
               commentaire="texte libre")
     assert "il n'y a rien à écarter" in _erreur_import(chemin)
 
@@ -966,7 +979,7 @@ def test_annuler_ou_vider_une_liste_declaree(tmp_path):
 
     # Retour à « observé » : plus de liste en vigueur, les valeurs ajoutées restent.
     chemin = exporter_revue(declare, "2026-03", tmp_path / "annule.xlsx", nb_revues=1)
-    _modifier(chemin, "regles", dict(COMMERCE, regle="valeurs"), statut="observé",
+    _modifier(chemin, FEUILLE_REGLES, dict(COMMERCE, regle="valeurs"), statut="observé",
               regle_retenue=None)
     resultat, _, entree = appliquer_revue(declare, _importer(chemin, declare, 1), chemin, JOUR)
     regle = resultat["clients"]["type_commerce"]["valeurs"]
@@ -976,7 +989,7 @@ def test_annuler_ou_vider_une_liste_declaree(tmp_path):
 
     # Écarter une liste déclarée : elle a des valeurs, la décision est admise.
     chemin = exporter_revue(declare, "2026-03", tmp_path / "ecarte.xlsx", nb_revues=1)
-    _modifier(chemin, "regles", dict(COMMERCE, regle="valeurs"), statut="invalide",
+    _modifier(chemin, FEUILLE_REGLES, dict(COMMERCE, regle="valeurs"), statut="invalide",
               regle_retenue=None, commentaire="finalement libre")
     resultat, _, _ = appliquer_revue(declare, _importer(chemin, declare, 1), chemin, JOUR)
     assert resultat["clients"]["type_commerce"]["valeurs"]["regle"] == "aucune"
@@ -1140,13 +1153,13 @@ def test_ligne_format_et_lignes_des_formes():
     regles = {(l["colonne"], l["regle"]): l for l in lignes_regles(dictionnaire)}
     ligne = regles[("ref", "format")]
     assert (ligne["proposition"], ligne["regle_en_vigueur"], ligne["nb_a_arbitrer"]) == (
-        "1 forme", "formes fermées", 1,
+        "liste fermée (1 forme proposée)", "formes fermées", 1,
     )
     # Colonne candidate : des formes observées, mais aucun format proposé.
     assert regles[("type_commerce", "format")]["proposition"] == "aucune"
     _formes(dictionnaire).insert(1, _forme("AA-99999", "liste proposée", 30))
     regles = {(l["colonne"], l["regle"]): l for l in lignes_regles(dictionnaire)}
-    assert regles[("ref", "format")]["proposition"] == "2 formes"
+    assert regles[("ref", "format")]["proposition"] == "liste fermée (2 formes proposées)"
 
     lignes = lignes_formes(_avec_formats())
     assert [(l["colonne"], l["forme"], l["effectif"], l["origine"]) for l in lignes] == [
@@ -1192,9 +1205,9 @@ def test_feuille_des_formes_exportee(tmp_path):
     )
     assert menus[f"A6:A{5 + LIGNES_AJOUT}"] == "'listes'!$A$1:$B$1"
     assert "MATCH($A6,'listes'!$1:$1,0)" in menus[f"B6:B{5 + LIGNES_AJOUT}"]
-    # Sur une ligne « format », regle_retenue sert à déclarer des formes fermées.
-    regles = classeur["regles"]
-    ligne = next(l for l in regles.iter_rows(min_row=2) if l[2].value == "format")
+    # Sur une ligne « format », règle_retenue sert à déclarer des formes fermées.
+    regles = classeur[FEUILLE_REGLES]
+    ligne = next(l for l in regles.iter_rows(min_row=2) if l[1].value == "format")
     assert not ligne[COLONNES_REGLES.index("regle_retenue")].protection.locked
     notice = [c for c in classeur["mode_emploi"]["A"] if c.value]
     rubrique = next(c for c in notice if c.value.startswith("Feuille « formes » : les formes"))
@@ -1206,7 +1219,7 @@ def test_feuille_des_formes_exportee(tmp_path):
 
 def _revoir_le_format(chemin):
     """Valide le format de clients.ref, arbitre ses formes et en ajoute une."""
-    _modifier(chemin, "regles", dict(REF, regle="format"), statut="valide")
+    _modifier(chemin, FEUILLE_REGLES, dict(REF, regle="format"), statut="valide")
     _modifier(chemin, "formes", dict(REF, forme="AA-9999"), statut="valide")
     _modifier(chemin, "formes", dict(REF, forme="AA9999"), statut="invalide",
               commentaire="tiret oublié")
@@ -1373,8 +1386,8 @@ def test_declarer_un_format_non_propose(tmp_path):
         "(statuts conservés, sans effet tant que le format n'est pas déclaré)"
     ]
     # Déclaration : la forme observée est validée sans ressaisie, une autre est ajoutée.
-    _modifier(chemin, "regles", COMMERCE_FORMAT, statut="documenté",
-              regle_retenue="formes fermées")
+    _modifier(chemin, FEUILLE_REGLES, COMMERCE_FORMAT, statut="documenté",
+              regle_retenue="liste fermée")
     _modifier(chemin, "formes", FIN_FORMES + 1, **COMMERCE, forme="Aaaa-aaaa",
               statut="documenté")
     revue = _importer(chemin, dictionnaire)
@@ -1397,10 +1410,10 @@ def test_declarer_un_format_non_propose(tmp_path):
     )
     # Le classeur suivant affiche la déclaration et ne change rien.
     suivant = exporter_revue(resultat, "2026-03", tmp_path / "revue2.xlsx", nb_revues=1)
-    lue = next(l for l in _lire(load_workbook(suivant)["regles"])
+    lue = next(l for l in _lire(load_workbook(suivant)[FEUILLE_REGLES])
                if (l["colonne"], l["regle"]) == ("type_commerce", "format"))
     assert (lue["proposition"], lue["regle_en_vigueur"], lue["regle_retenue"]) == (
-        "aucune", "formes fermées", "formes fermées",
+        "aucune", "liste fermée", "liste fermée",
     )
     assert appliquer_revue(resultat, _importer(suivant, resultat, 1), suivant, JOUR)[2] is None
 
@@ -1412,7 +1425,7 @@ def test_declarer_un_format_non_propose(tmp_path):
 
     # Écarter le format déclaré : ses formes restent, sans effet, et c'est signalé.
     ecarte = exporter_revue(resultat, "2026-03", tmp_path / "ecarte.xlsx", nb_revues=1)
-    _modifier(ecarte, "regles", COMMERCE_FORMAT, statut="invalide", regle_retenue=None,
+    _modifier(ecarte, FEUILLE_REGLES, COMMERCE_FORMAT, statut="invalide", regle_retenue=None,
               commentaire="libellé libre")
     revue = _importer(ecarte, resultat, nb_revues=1)
     assert revue.avertissements == [
@@ -1432,27 +1445,27 @@ def test_declarations_de_format_refusees(tmp_path):
 
     # Format déclaré sans aucune forme valide ou documentée, puis avec une autre règle.
     chemin = _exporter_formats(tmp_path)
-    _modifier(chemin, "regles", COMMERCE_FORMAT, statut="documenté",
-              regle_retenue="formes fermées")
+    _modifier(chemin, FEUILLE_REGLES, COMMERCE_FORMAT, statut="documenté",
+              regle_retenue="liste fermée")
     assert (
         "format déclaré sans aucune forme au statut valide ou documenté pour "
         "clients.type_commerce (ajouter ses formes en bas de la feuille « formes »)"
     ) in erreur(chemin)
-    _modifier(chemin, "regles", COMMERCE_FORMAT, regle_retenue="liste fermée")
-    assert "regle_retenue 'liste fermée' hors du menu de la règle format" in erreur(chemin)
+    _modifier(chemin, FEUILLE_REGLES, COMMERCE_FORMAT, regle_retenue="aucune")
+    assert "règle_retenue 'aucune' hors du menu de la règle format" in erreur(chemin)
 
     # Un format déjà proposé se valide, il ne se déclare pas : un seul problème.
     chemin = _exporter_formats(tmp_path, "propose.xlsx")
-    _modifier(chemin, "regles", dict(REF, regle="format"), statut="documenté",
-              regle_retenue="formes fermées")
+    _modifier(chemin, FEUILLE_REGLES, dict(REF, regle="format"), statut="documenté",
+              regle_retenue="liste fermée")
     message = erreur(chemin)
     assert "1 problèmes" in message
     assert "un format est déjà proposé, il n'y a rien à déclarer (choisir valide)" in message
 
     # Rien à valider sans format proposé, rien à écarter sans aucune forme.
     chemin = _exporter_formats(tmp_path, "rien.xlsx")
-    _modifier(chemin, "regles", COMMERCE_FORMAT, statut="valide")
-    _modifier(chemin, "regles", dict(STATUT, regle="format"), statut="invalide",
+    _modifier(chemin, FEUILLE_REGLES, COMMERCE_FORMAT, statut="valide")
+    _modifier(chemin, FEUILLE_REGLES, dict(STATUT, regle="format"), statut="invalide",
               commentaire="libellé")
     message = erreur(chemin)
     assert "2 problèmes" in message
@@ -1461,9 +1474,9 @@ def test_declarations_de_format_refusees(tmp_path):
 
     # Écarter un format proposé reste admis, avec un commentaire.
     chemin = _exporter_formats(tmp_path, "ecarte.xlsx")
-    _modifier(chemin, "regles", dict(REF, regle="format"), statut="invalide")
+    _modifier(chemin, FEUILLE_REGLES, dict(REF, regle="format"), statut="invalide")
     assert "commentaire obligatoire avec le statut invalide" in erreur(chemin)
-    _modifier(chemin, "regles", dict(REF, regle="format"), commentaire="texte libre régulier")
+    _modifier(chemin, FEUILLE_REGLES, dict(REF, regle="format"), commentaire="texte libre régulier")
     resultat, _, entree = appliquer_revue(
         _avec_formats(), _importer(chemin, _avec_formats()), chemin, JOUR
     )
@@ -1518,8 +1531,8 @@ def test_forme_ajoutee_dans_une_colonne_sensible(tmp_path):
     dictionnaire = _dictionnaire()
     dictionnaire["clients"]["type_commerce"]["format"]["motif"] = "colonne sensible"
     chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
-    _modifier(chemin, "regles", COMMERCE_FORMAT, statut="documenté",
-              regle_retenue="formes fermées")
+    _modifier(chemin, FEUILLE_REGLES, COMMERCE_FORMAT, statut="documenté",
+              regle_retenue="liste fermée")
     _modifier(chemin, "formes", 2, **COMMERCE, forme="9 99 99 99 999 999 99",
               statut="documenté")
     _modifier(chemin, "formes", 3, **COMMERCE, forme="999999999999999", statut="documenté")
@@ -1557,7 +1570,80 @@ def test_classeur_exporte_avant_la_feuille_des_formes_refuse(tmp_path):
     # Classeur à trois lignes par colonne : la ligne « format » manque.
     chemin = _exporter(tmp_path / "ancien")
     classeur = load_workbook(chemin)
-    feuille = classeur["regles"]
+    feuille = classeur[FEUILLE_REGLES]
     feuille.delete_rows(_ligne(feuille, table="clients", colonne="code", regle="format"))
     classeur.save(chemin)
     assert "('clients', 'code', 'format') absente du classeur" in _erreur_import(chemin)
+
+
+# Présentation de la feuille des règles (noms affichés, ordre des colonnes et tri).
+
+
+def test_feuille_des_regles_triee_avec_les_noms_affiches(tmp_path):
+    # Tables dans le désordre alphabétique, colonnes de clients hors ordre alphabétique.
+    dictionnaire = _dictionnaire()
+    dictionnaire = {"interventions": dictionnaire["interventions"], "clients": dictionnaire["clients"]}
+    chemin = exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
+    feuille = load_workbook(chemin)[FEUILLE_REGLES]
+    assert [c.value for c in feuille[1]][:3] == ["table", "règle", "colonne"]
+    ordre = [(l["table"], l["regle"], l["colonne"]) for l in _lire(feuille)]
+    attendu = [
+        ("clients", regle, colonne)
+        for regle in ("obligation", "nature", "valeurs", "format")
+        for colonne in ("statut", "code", "type_commerce")
+    ] + [
+        ("interventions", regle, "duree")
+        for regle in ("obligation", "nature", "valeurs", "format")
+    ]
+    assert ordre == attendu
+    # « obligatoire » reste une valeur de la règle, jamais le nom de la règle.
+    lignes = _lire(feuille)
+    assert "obligatoire" not in {l["regle"] for l in lignes}
+    menus = [m.formula1 for m in feuille.data_validations.dataValidation]
+    assert '"obligatoire,facultatif,toujours vide"' in menus
+    # Le classeur trié se réimporte sans changement.
+    assert appliquer_revue(dictionnaire, importer_revue(chemin, dictionnaire, nb_revues=0),
+                           chemin, JOUR)[2] is None
+
+
+def test_format_affiche_en_liste_fermee_et_relu_en_formes_fermees(tmp_path):
+    dictionnaire = _avec_formats()
+    chemin = _exporter_formats(tmp_path)
+    lignes = _lire(load_workbook(chemin)[FEUILLE_REGLES])
+    ref = next(l for l in lignes if (l["colonne"], l["regle"]) == ("ref", "format"))
+    assert (ref["proposition"], ref["regle_en_vigueur"]) == (
+        "liste fermée (1 forme proposée)", "liste fermée",
+    )
+    assert "formes fermées" not in {v for l in lignes for v in l.values()}
+    # Valider la ligne garde la règle du dictionnaire, « formes fermées ».
+    _modifier(chemin, FEUILLE_REGLES, dict(REF, regle="format"), statut="valide")
+    revue = _importer(chemin, dictionnaire)
+    resultat = appliquer_revue(dictionnaire, revue, chemin, JOUR)[0]
+    assert resultat["clients"]["ref"]["format"]["regle"] == "formes fermées"
+
+
+def test_messages_de_la_feuille_des_regles_avec_les_noms_affiches(tmp_path):
+    chemin = _exporter(tmp_path)
+    classeur = load_workbook(chemin)
+    feuille = classeur[FEUILLE_REGLES]
+    feuille.delete_rows(_ligne(feuille, table="clients", colonne="statut", regle="obligatoire"))
+    classeur.save(chemin)
+    _modifier(chemin, FEUILLE_REGLES, dict(table="clients", colonne="code", regle="obligatoire"),
+              statut="documenté", regle_retenue="texte")
+    message = _erreur_import(chemin)
+    assert "règle ('clients', 'statut', 'obligation') absente du classeur" in message
+    assert "règle_retenue 'texte' hors du menu de la règle obligation" in message
+
+
+def test_mode_emploi_avec_les_noms_affiches(tmp_path):
+    textes = " ".join(
+        c.value for c in load_workbook(_exporter(tmp_path))["mode_emploi"]["A"] if c.value
+    )
+    assert "triées par table, puis par règle dans l'ordre de traitement (obligation, " \
+        "nature, valeurs, format)" in textes
+    for nom in ("règle_retenue", "règle_en_vigueur", "nb_à_arbitrer"):
+        assert nom in textes
+    for nom in ("regle_retenue", "regle_en_vigueur", "nb_a_arbitrer", "formes fermées"):
+        assert nom not in textes
+    assert textes.count("« liste fermée » dans règle_retenue") == 2
+    assert "« liste fermée (N valeurs proposées) »" in textes
