@@ -17,6 +17,9 @@ from frigeo.formulaire_controles import (
     ENTETE_CONTROLES,
     LIGNES_AJOUT,
     REPERE_EMPREINTE,
+    appliquer_formulaire,
+    archiver_formulaire,
+    dossier_archives,
     ecrire_controles,
     empreinte_controles,
     exporter_formulaire,
@@ -765,3 +768,100 @@ def test_nombre_de_decimales_negatif_refuse(tmp_path):
         f"ligne {numero} (factures.remise) : décimales : un nombre entier positif "
         "ou nul est attendu"
     ) in str(erreur.value)
+
+
+# --- Application d'un formulaire (morceau d) -------------------------------------
+
+
+def _horloge(monkeypatch, *instant):
+    import frigeo.dictionnaire as module_dictionnaire
+    from datetime import datetime
+
+    monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: datetime(*instant))
+
+
+def test_archivage_d_un_formulaire(tmp_path, monkeypatch):
+    _horloge(monkeypatch, 2026, 10, 22, 18, 4, 5)
+    chemin = tmp_path / "formulaires" / "controles_2026-03.xlsx"
+    chemin.parent.mkdir()
+    chemin.write_bytes(b"classeur")
+    archive = archiver_formulaire(chemin)
+    assert archive == tmp_path / "formulaires" / "appliques" / (
+        "controles_2026-03_2026-10-22_180405.xlsx"
+    )
+    assert archive.read_bytes() == b"classeur" and not chemin.exists()
+    assert dossier_archives(chemin) == archive.parent
+    # Une archive du même nom n'est jamais remplacée.
+    chemin.write_bytes(b"autre")
+    with pytest.raises(FileExistsError, match="rien n'a été modifié"):
+        archiver_formulaire(chemin)
+    assert chemin.read_bytes() == b"autre" and archive.read_bytes() == b"classeur"
+
+
+def test_classeur_ouvert_non_archive(tmp_path, monkeypatch):
+    from pathlib import Path
+
+    chemin = tmp_path / "controles_2026-03.xlsx"
+    chemin.write_bytes(b"classeur")
+
+    def refuser(self, cible):
+        raise PermissionError("ouvert")
+
+    monkeypatch.setattr(Path, "rename", refuser)
+    with pytest.raises(PermissionError, match="fermer le classeur dans Excel"):
+        archiver_formulaire(chemin, tmp_path / "a")
+    assert chemin.exists()
+
+
+def _application(tmp_path, monkeypatch, modifier=True):
+    """Fichier des contrôles du jeu d'essai, formulaire exporté (et revu si
+    `modifier`), puis importé."""
+    _horloge(monkeypatch, 2026, 10, 22, 18, 30, 0)
+    tables, dictionnaire, contenu, sensibles = _jeu()
+    chemin_yaml = tmp_path / "config" / "controles.yaml"
+    chemin_yaml.parent.mkdir()
+    chemin_yaml.write_text(texte_controles(contenu), encoding="utf-8")
+    contenu = lire_fichier_controles(chemin_yaml)
+    empreinte = empreinte_controles(chemin_yaml)
+    chemin = exporter_formulaire(
+        tables, dictionnaire, contenu, sensibles, "2026-03",
+        tmp_path / "formulaires" / "controles_2026-03.xlsx", empreinte=empreinte,
+    )
+    if modifier:
+        _modifier(chemin, "décimales", ("factures", "remise"), statut="valide")
+    formulaire = importer_formulaire(chemin, dictionnaire, contenu, empreinte=empreinte)
+    options = {"empreinte": empreinte, "chemin": chemin_yaml, "dossier": tmp_path / "s"}
+    return formulaire, chemin, contenu, chemin_yaml, options
+
+
+def test_formulaire_non_rempli_rien_n_est_fait(tmp_path, monkeypatch):
+    formulaire, chemin, contenu, chemin_yaml, options = _application(
+        tmp_path, monkeypatch, modifier=False
+    )
+    avant = chemin_yaml.read_bytes()
+    assert appliquer_formulaire(formulaire, chemin, contenu, **options) == (False, None, None)
+    assert chemin.exists() and chemin_yaml.read_bytes() == avant
+    assert not (tmp_path / "s").exists()
+
+
+def test_formulaire_applique_puis_archive(tmp_path, monkeypatch):
+    formulaire, chemin, contenu, chemin_yaml, options = _application(tmp_path, monkeypatch)
+    avant = chemin_yaml.read_bytes()
+    resultat = appliquer_formulaire(formulaire, chemin, contenu, **options)
+    archive = chemin.parent / "appliques" / "controles_2026-03_2026-10-22_183000.xlsx"
+    assert resultat == (True, tmp_path / "s" / "controles_2026-10-22_183000.yaml", archive)
+    assert not chemin.exists() and archive.exists()
+    assert resultat.sauvegarde.read_bytes() == avant
+    assert lire_fichier_controles(chemin_yaml)["regles"]["factures"]["remise"] == {
+        "decimales": 0, "bornes": {"min": 0, "max": 15, "max_exclu": True},
+    }
+
+
+def test_ecriture_refusee_formulaire_remis_en_place(tmp_path, monkeypatch):
+    formulaire, chemin, contenu, chemin_yaml, options = _application(tmp_path, monkeypatch)
+    chemin_yaml.write_text(chemin_yaml.read_text(encoding="utf-8") + "\n", encoding="utf-8")
+    modifie = chemin_yaml.read_bytes()
+    with pytest.raises(ValueError, match="a changé depuis la lecture du formulaire"):
+        appliquer_formulaire(formulaire, chemin, contenu, **options)
+    assert chemin.exists() and not list((chemin.parent / "appliques").iterdir())
+    assert chemin_yaml.read_bytes() == modifie

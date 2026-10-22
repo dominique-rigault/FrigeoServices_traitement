@@ -1507,3 +1507,83 @@ def ecrire_controles(
     with open(chemin, "w", encoding="utf-8", newline="\n") as flux:
         flux.write(texte)
     return EcritureControles(chemin, sauvegarde, True)
+
+
+# --- Application d'un formulaire -------------------------------------------------
+
+
+def dossier_archives(chemin: str | Path | None = None) -> Path:
+    """Dossier des formulaires appliqués : `appliques/`, à côté du formulaire."""
+    chemin = Path(chemin) if chemin is not None else chemin_formulaire("AAAA-MM")
+    return chemin.parent / "appliques"
+
+
+def archiver_formulaire(chemin: str | Path, dossier: str | Path | None = None) -> Path:
+    """Déplace un formulaire appliqué dans `dossier` (par défaut data/formulaires/
+    appliques) et rend son nouveau chemin.
+
+    Le nom reçoit l'heure de l'archivage : `controles_<AAAA-MM>_<AAAA-MM-JJ>_<HHMMSS>.xlsx`.
+    Une archive déjà présente sous ce nom n'est jamais remplacée. Sous Windows, un
+    classeur ouvert dans Excel ne peut pas être déplacé (PermissionError) : rien
+    n'est alors modifié.
+    """
+    chemin = Path(chemin)
+    dossier = Path(dossier) if dossier is not None else dossier_archives(chemin)
+    instant = module_dictionnaire._maintenant()
+    archive = dossier / f"{chemin.stem}_{instant:%Y-%m-%d_%H%M%S}{chemin.suffix}"
+    if archive.exists():
+        raise FileExistsError(
+            f"{archive} existe déjà : archivage refusé, rien n'a été modifié (relancer "
+            "dans une seconde)"
+        )
+    dossier.mkdir(parents=True, exist_ok=True)
+    try:
+        chemin.rename(archive)
+    except PermissionError:
+        raise PermissionError(
+            f"{chemin} ne peut pas être déplacé : fermer le classeur dans Excel, puis "
+            "relancer la cellule (rien n'a été modifié)"
+        ) from None
+    return archive
+
+
+class ApplicationFormulaire(NamedTuple):
+    """Résultat de `appliquer_formulaire` : si config/controles.yaml a été réécrit,
+    sa copie datée et l'archive du formulaire (None quand rien n'a changé)."""
+
+    ecrit: bool
+    sauvegarde: Path | None
+    archive: Path | None
+
+
+def appliquer_formulaire(
+    formulaire: Formulaire,
+    chemin_formulaire: str | Path,
+    contenu: dict,
+    *,
+    empreinte: str,
+    chemin: str | Path | None = None,
+    dossier: str | Path | None = None,
+    dossier_archive: str | Path | None = None,
+) -> ApplicationFormulaire:
+    """Écrit les règles d'un formulaire importé, puis met le formulaire de côté.
+
+    `contenu` et `empreinte` sont ceux de config/controles.yaml lus avant l'import.
+    Si les règles du formulaire sont celles du fichier (formulaire pas encore
+    rempli), rien n'est fait : le formulaire reste en place. Sinon, le formulaire est
+    d'abord archivé (un classeur ouvert dans Excel arrête tout, sans rien modifier),
+    puis le fichier est réécrit après sa copie datée (`ecrire_controles`); si
+    l'écriture échoue, le formulaire est remis à sa place.
+    """
+    if formulaire.contenu == contenu:
+        return ApplicationFormulaire(False, None, None)
+    chemin_formulaire = Path(chemin_formulaire)
+    archive = archiver_formulaire(chemin_formulaire, dossier_archive)
+    try:
+        ecriture = ecrire_controles(
+            formulaire.contenu, chemin, empreinte=empreinte, dossier=dossier
+        )
+    except Exception:
+        archive.rename(chemin_formulaire)
+        raise
+    return ApplicationFormulaire(ecriture.ecrit, ecriture.sauvegarde, archive)
