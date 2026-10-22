@@ -127,7 +127,17 @@ CLE_REGLES_COMPLEMENTAIRES = "regles"
 # Le même fichier porte, sous une autre clé, les déclarations de doublons (voir le
 # module doublons).
 CLE_DOUBLONS = "doublons"
-CLES_FICHIER_CONTROLES = (CLE_REGLES_COMPLEMENTAIRES, CLE_DOUBLONS)
+# Et deux clés propres au formulaire des règles de contrôle, sans effet sur les
+# contrôles (voir le module formulaire_controles) : les propositions écartées par le
+# métier et ses commentaires.
+CLE_ECARTEES = "ecartees"
+CLE_COMMENTAIRES = "commentaires"
+CLES_FICHIER_CONTROLES = (
+    CLE_REGLES_COMPLEMENTAIRES,
+    CLE_DOUBLONS,
+    CLE_ECARTEES,
+    CLE_COMMENTAIRES,
+)
 # Tolérance relative pour les décimales d'un nombre natif, dont le calcul par le
 # tableur laisse parfois une imprécision (181.45000000000002).
 TOLERANCE_DECIMALES = 1e-9
@@ -291,7 +301,8 @@ def lire_fichier_controles(chemin: str | Path | None = None) -> dict:
         return {}
     with open(chemin, encoding="utf-8") as flux:
         contenu = yaml.safe_load(flux)
-    attendues = " et ".join(f"« {cle} »" for cle in CLES_FICHIER_CONTROLES)
+    noms = [f"« {cle} »" for cle in CLES_FICHIER_CONTROLES]
+    attendues = ", ".join(noms[:-1]) + " et " + noms[-1]
     if not isinstance(contenu, dict):
         raise ValueError(
             f"Fichier de contrôles invalide ({chemin}) : les seules clés attendues "
