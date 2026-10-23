@@ -97,6 +97,13 @@ ORIGINE_EN_VIGUEUR = "en vigueur"
 ORIGINE_PROPOSEE = "proposée"
 ORIGINE_ECARTEE = "écartée"
 STATUT_OBSERVE, STATUT_VALIDE, STATUT_INVALIDE, STATUT_DOCUMENTE = STATUTS
+# Natures de la feuille des décimales : un entier écrit en texte n'y figure pas, sa
+# règle de nature interdit déjà toute décimale.
+NATURES_DECIMALES = tuple(nature for nature in NATURES_NOMBRE if nature != "entier (texte)")
+# Colonnes du formulaire pour inclure ou exclure une borne, d'après la borne : « non »
+# exclut la borne (min_exclu ou max_exclu dans config/controles.yaml), une cellule
+# vide ou « oui » l'inclut.
+INCLUSIONS = {"min": "min_inclus", "max": "max_inclus"}
 # Part minimale de clés de Luhn valides pour proposer la règle.
 SEUIL_LUHN = 0.95
 # Natures des colonnes où une clé candidate peut être proposée : un montant ou une
@@ -127,9 +134,9 @@ COLONNES_BORNES = (
     "en_vigueur",
     "statut",
     "min",
-    "min_exclu",
+    "min_inclus",
     "max",
-    "max_exclu",
+    "max_inclus",
     "commentaire",
     "proposition_min",
     "proposition_max",
@@ -155,11 +162,13 @@ COLONNES_TYPE = {
 }
 MODIFIABLES = {
     "decimales": ("statut", "décimales", "commentaire"),
-    "bornes": ("statut", "min", "min_exclu", "max", "max_exclu", "commentaire"),
+    "bornes": ("statut", "min", "min_inclus", "max", "max_inclus", "commentaire"),
     "cle_luhn": ("statut", "commentaire"),
 }
 MODIFIABLES_DOUBLONS = ("type", "statut", "commentaire")
 SAISIE_AJOUT_DOUBLONS = ("table", "type", "colonnes", "statut", "commentaire")
+# Colonnes des nombres saisis, alignées à droite.
+COLONNES_A_DROITE = ("décimales", "min", "max")
 # Colonnes techniques, masquées : la proposition des bornes en nombres, relue à
 # l'import.
 COLONNES_MASQUEES = ("proposition_min", "proposition_max")
@@ -174,9 +183,9 @@ LARGEURS = {
     "statut": 13,
     "décimales": 11,
     "min": 11,
-    "min_exclu": 11,
+    "min_inclus": 11,
     "max": 11,
-    "max_exclu": 11,
+    "max_inclus": 11,
     "commentaire": 50,
     "proposition_min": 8,
     "proposition_max": 8,
@@ -225,6 +234,12 @@ def _arrondi(nombre):
     if float(nombre).is_integer():
         return int(nombre)
     return round(float(nombre), 10)
+
+
+def texte_regle(nom: str, parametre) -> str:
+    """Texte d'une règle pour le formulaire et le rapport, nombres à la française
+    (« 0,1 à 1 exclu »)."""
+    return _parametre_en_texte(nom, parametre).replace(".", ",")
 
 
 def texte_nombre(nombre) -> str:
@@ -339,7 +354,8 @@ def _statut_export(en_vigueur, ecartee: bool) -> str:
 
 
 def lignes_decimales(tables: dict, dictionnaire: dict, contenu: dict) -> list[dict]:
-    """Lignes de la feuille des décimales : une par colonne de nature numérique.
+    """Lignes de la feuille des décimales : une par colonne de nature numérique, sauf
+    les entiers écrits en texte (`NATURES_DECIMALES`).
 
     La proposition est le plus grand nombre de décimales observé; « aucune » sans
     valeur lisible.
@@ -348,7 +364,7 @@ def lignes_decimales(tables: dict, dictionnaire: dict, contenu: dict) -> list[di
     ecartees = _ecartees(contenu, "decimales")
     commentaires = _commentaires(contenu, "decimales")
     lignes = []
-    for table, colonne, nature in _colonnes_de_nature(dictionnaire, NATURES_NOMBRE):
+    for table, colonne, nature in _colonnes_de_nature(dictionnaire, NATURES_DECIMALES):
         observation = observer_nombres(tables[table][colonne])
         en_vigueur = regles.get(table, {}).get(colonne, {}).get("decimales")
         decimales = observation["decimales"]
@@ -403,13 +419,13 @@ def lignes_bornes(
             "observé": observe,
             "proposition": proposition,
             "en_vigueur": (
-                None if en_vigueur is None else _parametre_en_texte("bornes", en_vigueur)
+                None if en_vigueur is None else texte_regle("bornes", en_vigueur)
             ),
             "statut": _statut_export(en_vigueur, colonne in ecartees.get(table, [])),
             "min": None,
-            "min_exclu": None,
+            "min_inclus": None,
             "max": None,
-            "max_exclu": None,
+            "max_inclus": None,
             "commentaire": commentaires.get(table, {}).get(colonne),
             "proposition_min": mini,
             "proposition_max": maxi,
@@ -417,7 +433,7 @@ def lignes_bornes(
         for borne, exclusion in EXCLUSIONS.items():
             if en_vigueur is not None and borne in en_vigueur:
                 ligne[borne] = en_vigueur[borne]
-                ligne[exclusion] = OUI if en_vigueur.get(exclusion) else NON
+                ligne[INCLUSIONS[borne]] = NON if en_vigueur.get(exclusion) else None
         lignes.append(ligne)
     return lignes
 
@@ -596,15 +612,18 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "",
         f"Feuille « {FEUILLE_DECIMALES} » : le nombre maximal de décimales d'un nombre",
         "Une ligne par colonne numérique, codes compris : pour un code ou un "
-        "identifiant (SIRET, compte), choisir invalide. La proposition est le plus grand "
-        "nombre de décimales observé. Colonne à saisir : décimales.",
+        "identifiant (année, numéro), choisir invalide ou documenté avec 0. Un entier "
+        "écrit en texte (nature « entier (texte) ») n'y figure pas : sa règle de nature "
+        "interdit déjà toute décimale. La proposition est le plus grand nombre de "
+        "décimales observé. Colonne à saisir : décimales.",
         "",
         f"Feuille « {FEUILLE_BORNES} » : le minimum et le maximum admis",
         "La proposition est le plus petit et le plus grand nombre observés, bornes "
         "incluses. Attention : si les données contiennent une erreur (un taux de 80 au "
         "lieu de 0,8), elle fait partie de la proposition. Colonnes à saisir : min, max "
-        "(l'un ou l'autre suffit), et pour chacun min_exclu ou max_exclu (oui si la "
-        "borne elle-même est interdite : « plus de 0 » s'écrit min 0 et min_exclu oui). "
+        "(l'un ou l'autre suffit), et pour chacun min_inclus ou max_inclus : vide ou oui "
+        "si la borne elle-même est admise, non si elle est interdite (« plus de 0 » "
+        "s'écrit min 0 et min_inclus non). "
         f"Pour une colonne sensible, le minimum et le maximum observés sont « {MASQUE} » "
         "et rien n'est proposé : donner les bornes au statut documenté.",
         "",
@@ -663,6 +682,8 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, saisie_ajou
                 _ecrire_texte(cellule, valeur)
             if nom in modifiables:
                 cellule.protection = Protection(locked=False)
+            if nom in COLONNES_A_DROITE:
+                cellule.alignment = Alignment(horizontal="right")
     fin = len(lignes) + 1
     for numero in range(fin + 1, fin + lignes_ajout + 1):
         for indice, nom in enumerate(colonnes, start=1):
@@ -743,8 +764,8 @@ def exporter_formulaire(
         _ajouter_menu(feuille, _menu(feuille, STATUTS), colonnes, "statut", 2, derniere)
         if nom == "bornes":
             menu = _menu(feuille, (OUI, NON))
-            for exclusion in EXCLUSIONS.values():
-                _ajouter_menu(feuille, menu, colonnes, exclusion, 2, derniere)
+            for inclusion in INCLUSIONS.values():
+                _ajouter_menu(feuille, menu, colonnes, inclusion, 2, derniere)
 
     feuille = classeur.create_sheet(FEUILLE_DOUBLONS)
     doublons = lignes["doublons"]
@@ -895,12 +916,15 @@ def _saisie(nom: str, ligne: dict) -> tuple[object, str | None]:
                 if nombre is None:
                     return None, f"{borne} : un nombre est attendu"
                 parametre[borne] = nombre
-        for exclusion in EXCLUSIONS.values():
-            choix = _texte(ligne[exclusion])
-            if choix == OUI:
+        for borne, exclusion in EXCLUSIONS.items():
+            inclusion = INCLUSIONS[borne]
+            choix = _texte(ligne[inclusion])
+            if choix == NON:
+                if borne not in parametre:
+                    return None, f"{inclusion} à {NON} sans {borne}"
                 parametre[exclusion] = True
-            elif choix not in ("", NON):
-                return None, f"{exclusion} : {OUI} ou {NON} est attendu"
+            elif choix not in ("", OUI):
+                return None, f"{inclusion} : {OUI}, {NON} ou vide est attendu"
         return parametre or None, None
     return None, None
 
@@ -1211,7 +1235,7 @@ def _etats_regles(contenu: dict, nom: str) -> dict:
     for table, colonnes in _section(contenu, CLE_REGLES_COMPLEMENTAIRES).items():
         for colonne, types in (colonnes or {}).items():
             if isinstance(types, dict) and nom in types:
-                etats[(table, colonne)] = _parametre_en_texte(nom, types[nom])
+                etats[(table, colonne)] = texte_regle(nom, types[nom])
     return etats
 
 

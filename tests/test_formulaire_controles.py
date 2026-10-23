@@ -121,10 +121,10 @@ def test_observations_des_cles_de_luhn_et_des_groupes():
 
 def test_lignes_des_decimales():
     lignes = _par_colonne(lignes_decimales(*_jeu()[:3]))
-    # Une ligne par colonne numérique, codes compris, dans l'ordre du dictionnaire.
+    # Une ligne par colonne numérique, codes compris, dans l'ordre du dictionnaire,
+    # sauf les entiers écrits en texte (siret), dont la nature interdit les décimales.
     assert list(lignes) == [
-        ("factures", "montant"), ("factures", "remise"), ("factures", "siret"),
-        ("factures", "salaire"),
+        ("factures", "montant"), ("factures", "remise"), ("factures", "salaire"),
         ("parametres", "annee"), ("parametres", "taux"),
     ]
     montant = lignes[("factures", "montant")]
@@ -146,8 +146,9 @@ def test_lignes_des_bornes():
     assert (remise["observé"], remise["proposition"]) == ("de 0 à 15", "0 à 15")
     assert (remise["proposition_min"], remise["proposition_max"]) == (0, 15)
     assert (remise["en_vigueur"], remise["statut"]) == ("0 à 15 exclu", "documenté")
-    assert (remise["min"], remise["min_exclu"], remise["max"], remise["max_exclu"]) == (
-        0, "non", 15, "oui",
+    # Une borne incluse laisse sa cellule vide, une borne exclue porte « non ».
+    assert (remise["min"], remise["min_inclus"], remise["max"], remise["max_inclus"]) == (
+        0, None, 15, "non",
     )
     assert remise["commentaire"] == "remise commerciale plafonnée"
     montant = lignes[("factures", "montant")]
@@ -158,6 +159,14 @@ def test_lignes_des_bornes():
     salaire = lignes[("factures", "salaire")]
     assert (salaire["observé"], salaire["proposition"]) == ("masqué", "aucune")
     assert (salaire["proposition_min"], salaire["proposition_max"]) == (None, None)
+    # Règle en vigueur écrite avec une virgule décimale.
+    contenu["regles"]["parametres"] = {
+        "taux": {"bornes": {"min": 0.1, "max": 1, "max_exclu": True}}
+    }
+    taux = _par_colonne(lignes_bornes(tables, dictionnaire, contenu, sensibles))[
+        ("parametres", "taux")
+    ]
+    assert (taux["en_vigueur"], taux["min"], taux["max_inclus"]) == ("0,1 à 1 exclu", 0.1, "non")
     assert "1800" not in repr(salaire) and "3100" not in repr(salaire)
 
 
@@ -248,7 +257,7 @@ def test_formulaire_exporte(tmp_path):
         assert classeur[nom].protection.sheet
     assert classeur["listes"].sheet_state == "hidden"
     assert [c.value for c in classeur["listes"]["A"]] == ["factures", "parametres"]
-    assert len(_lire(classeur["décimales"])) == 6
+    assert len(_lire(classeur["décimales"])) == 5
     assert len(_lire(classeur["doublons"])) == 3
     # Les nombres restent des nombres, les colonnes techniques sont masquées.
     bornes = classeur["bornes"]
@@ -265,7 +274,7 @@ def test_formulaire_exporte(tmp_path):
     repere = next(r for r in notice.iter_rows(values_only=True) if r[0] == REPERE_EMPREINTE)
     assert repere[1] == "abc123"
     texte = " ".join(str(c.value) for c in notice["A"] if c.value)
-    assert "Feuille « décimales » : 4 lignes à « observé » sur 6" in texte
+    assert "Feuille « décimales » : 3 lignes à « observé » sur 5" in texte
     assert "Feuille « doublons » : 1 sur 3" in texte
 
 
@@ -279,8 +288,16 @@ def test_cellules_modifiables_et_menus(tmp_path):
 
     assert libres(classeur["décimales"], 2) == {"statut", "décimales", "commentaire"}
     assert libres(classeur["bornes"], 2) == {
-        "statut", "min", "min_exclu", "max", "max_exclu", "commentaire",
+        "statut", "min", "min_inclus", "max", "max_inclus", "commentaire",
     }
+    # Nombres saisis alignés à droite.
+    entete = [c.value for c in classeur["bornes"][1]]
+    for nom in ("min", "max"):
+        cellule = classeur["bornes"].cell(row=2, column=entete.index(nom) + 1)
+        assert cellule.alignment.horizontal == "right"
+    entete = [c.value for c in classeur["décimales"][1]]
+    cellule = classeur["décimales"].cell(row=2, column=entete.index("décimales") + 1)
+    assert cellule.alignment.horizontal == "right"
     assert libres(classeur["clé_luhn"], 2) == {"statut", "commentaire"}
     assert libres(classeur["doublons"], 2) == {"type", "statut", "commentaire"}
     # Lignes d'ajout en bas de la feuille des doublons.
@@ -402,13 +419,13 @@ def test_import_des_regles_selon_le_statut(tmp_path):
     _modifier(chemin, "décimales", ("factures", "salaire"), statut="observé")
     # Une saisie sur une ligne qui n'est pas documentée est ignorée, avec un
     # avertissement.
-    ligne_siret = _modifier(chemin, "décimales", ("factures", "siret"), décimales=4)
+    ligne_annee = _modifier(chemin, "décimales", ("parametres", "annee"), décimales=4)
     # Bornes : proposition observée, saisie avec une borne exclue, règle en vigueur
     # remise à observé (retirée sans refus).
     _modifier(chemin, "bornes", ("factures", "montant"), statut="valide")
     _modifier(
         chemin, "bornes", ("parametres", "taux"), statut="documenté", min="0",
-        min_exclu="oui", max=1, max_exclu="non", commentaire="taux de charges",
+        min_inclus="non", max=1, max_inclus="oui", commentaire="taux de charges",
     )
     _modifier(chemin, "bornes", ("factures", "remise"), statut="observé", commentaire=None)
     _modifier(chemin, "clé_luhn", ("factures", "siret"), statut="documenté")
@@ -433,14 +450,14 @@ def test_import_des_regles_selon_le_statut(tmp_path):
         "doublons": {"factures": {"num": "numéro de facture"}},
     }
     assert formulaire.avertissements == [
-        f"feuille « décimales », ligne {ligne_siret} (factures.siret)\u00a0: valeurs saisies "
+        f"feuille « décimales », ligne {ligne_annee} (parametres.annee)\u00a0: valeurs saisies "
         "ignorées (statut observé, seul le statut documenté prend les valeurs saisies)"
     ]
     assert _changements(formulaire) == [
         ("factures", "montant", "decimales", "2", "écartée"),
         ("factures", "remise", "decimales", None, "0"),
         ("factures", "salaire", "decimales", "écartée", None),
-        ("factures", "montant", "bornes", None, "3 à 181.45"),
+        ("factures", "montant", "bornes", None, "3 à 181,45"),
         ("factures", "remise", "bornes", "0 à 15 exclu", None),
         ("factures", "siret", "cle_luhn", None, "oui"),
         ("parametres", "taux", "decimales", None, "3"),
@@ -473,7 +490,7 @@ def test_problemes_des_regles_listes_en_une_fois(tmp_path):
         _modifier(chemin, "bornes", ("factures", "montant"), statut="documenté", min=10,
                   max=2),
         _modifier(chemin, "bornes", ("parametres", "taux"), statut="documenté",
-                  max_exclu="oui"),
+                  max_inclus="non"),
         _modifier(chemin, "bornes", ("factures", "salaire"), statut="valide"),
         _modifier(chemin, "décimales", ("parametres", "annee"), statut="à voir"),
     ]
@@ -488,8 +505,7 @@ def test_problemes_des_regles_listes_en_une_fois(tmp_path):
         "feuille « décimales », ligne {} (parametres.taux)\u00a0: décimales\u00a0: un nombre "
         "entier positif ou nul est attendu",
         "feuille « bornes », ligne {} (factures.montant)\u00a0: le minimum dépasse le maximum",
-        "feuille « bornes », ligne {} (parametres.taux)\u00a0: un minimum (min), un "
-        "maximum (max) ou les deux sont attendus",
+        "feuille « bornes », ligne {} (parametres.taux)\u00a0: max_inclus à non sans max",
         "feuille « bornes », ligne {} (factures.salaire)\u00a0: statut valide impossible",
         "feuille « décimales », ligne {} (parametres.annee)\u00a0: statut 'à voir' inconnu",
     ]
@@ -708,7 +724,7 @@ def test_aller_retour_complet_stable(tmp_path, monkeypatch):
         tmp_path / "f1.xlsx", empreinte=empreinte,
     )
     _modifier(chemin, "bornes", ("parametres", "taux"), statut="documenté", min=0,
-              min_exclu="oui", max=1)
+              min_inclus="non", max=1)
     _modifier(chemin, "doublons", ("factures", "unique", "code"), statut="invalide")
     formulaire = importer_formulaire(
         chemin, dictionnaire, lire_fichier_controles(chemin_yaml), empreinte=empreinte
@@ -865,3 +881,27 @@ def test_ecriture_refusee_formulaire_remis_en_place(tmp_path, monkeypatch):
         appliquer_formulaire(formulaire, chemin, contenu, **options)
     assert chemin.exists() and not list((chemin.parent / "appliques").iterdir())
     assert chemin_yaml.read_bytes() == modifie
+
+
+def test_bornes_incluses_par_defaut_ou_par_oui(tmp_path):
+    chemin = _exporter(tmp_path)
+    # Vide ou « oui » inclut la borne, « non » l'exclut.
+    _modifier(chemin, "bornes", ("parametres", "taux"), statut="documenté", min=0,
+              min_inclus="oui", max="0,9")
+    _modifier(chemin, "bornes", ("factures", "remise"), max_inclus=None)
+    formulaire = _importer(chemin)
+    assert formulaire.contenu["regles"]["parametres"]["taux"] == {
+        "bornes": {"min": 0, "max": 0.9}
+    }
+    assert formulaire.contenu["regles"]["factures"]["remise"] == {
+        "bornes": {"min": 0, "max": 15}
+    }
+    assert ("factures", "remise", "bornes", "0 à 15 exclu", "0 à 15") in _changements(formulaire)
+    assert ("parametres", "taux", "bornes", None, "0 à 0,9") in _changements(formulaire)
+    numero = _modifier(chemin, "bornes", ("factures", "montant"), statut="documenté", min=1,
+                       min_inclus="peut-être")
+    with pytest.raises(ValueError) as erreur:
+        _importer(chemin)
+    assert (
+        f"ligne {numero} (factures.montant) : min_inclus : oui, non ou vide est attendu"
+    ) in str(erreur.value)
