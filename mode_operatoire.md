@@ -89,9 +89,11 @@ Repères pour la phase 3 :
 | 4.2 | Mettre `PERIODE_FIN` à jour et exécuter les cellules jusqu'à `# ECRITURE APRES FUSION` (premier dictionnaire : `# FUSION` affiche « rien à fusionner ») | C | notebook 03 | opérationnel |
 | 4.3 | Exporter le classeur de revue | C | cellule `# EXPORT` | opérationnel |
 | 4.4 | Revoir le classeur (feuilles `règles`, `valeurs`, `formes`, mode d'emploi dans la première feuille); une revue partielle suffit pour avancer | M avec C | Excel | opérationnel |
-| 4.5 | Appliquer la revue : enregistrer et fermer le classeur, `# IMPORT`, `# APPLICATION`, `# ECRITURE`, supprimer le classeur périmé de `data/revue/`, puis `# EXPORT` pour la revue suivante | C | notebook 03 | opérationnel |
+| 4.5 | Appliquer la revue : enregistrer et fermer le classeur, `# IMPORT`, `# APPLICATION`, `# ECRITURE` (qui archive le classeur appliqué dans `data/formulaires/appliques/`), puis `# EXPORT` pour la revue suivante | C | notebook 03 | opérationnel |
 
 Repères pour la phase 4 :
+
+- les trois classeurs remplis par le métier (revue du dictionnaire, règles de contrôle, arbitrage) sont rangés ensemble dans `data/formulaires/`, hors du dépôt; un classeur appliqué est archivé dans `data/formulaires/appliques/`, sous un nom qui porte l'heure de l'archivage, et un classeur ouvert dans Excel arrête l'écriture sans rien modifier;
 
 - `# IMPORT` puis `# APPLICATION` sur un classeur non modifié est sans effet (aucune écriture);
 - `# FUSION` et `# ECRITURE APRES FUSION` ne servent qu'à une régénération (un mois de plus, ou une nouvelle version du code de génération); chaque exécution de `# ECRITURE APRES FUSION` sur un dictionnaire revu ajoute une copie de sauvegarde, même si rien n'a changé;
@@ -113,7 +115,7 @@ Repères pour la phase 5 :
 
 - le formulaire porte des valeurs observées (minimum et maximum, masqués pour une colonne sensible) : il reste dans `data/formulaires/` et ne se colle pas dans la conversation;
 - un formulaire pas encore rempli ne change rien, si bien que le notebook peut toujours être exécuté en entier; après une écriture, l'exécution suivante exporte un nouveau formulaire;
-- le formulaire porte le nom de la période (`controles_2026-04.xlsx`) : un formulaire d'un mois précédent laissé sans revue reste dans `data/formulaires/` et `# EXPORT FORMULAIRE` le signale (« autres formulaires en attente »); le supprimer à la main, celui du mois en reprend les lignes;
+- le formulaire porte le nom de la période (`controles_2026-04.xlsx`) : un formulaire d'un mois précédent laissé sans revue reste dans `data/formulaires/` et `# EXPORT FORMULAIRE` le signale (« autres formulaires en attente », qui liste aussi un classeur de revue ou d'arbitrage non importé); le supprimer à la main, celui du mois en reprend les lignes;
 - un formulaire exporté avant une modification de `config/controles.yaml` (un motif ajouté à la main, par exemple) est refusé à l'import : le supprimer, puis le réexporter;
 - `config/controles.yaml` est réécrit en entier, dans l'ordre du dictionnaire : un commentaire écrit à la main y est perdu, celui du métier se saisit dans le formulaire;
 - une forme fixe (code postal, SIRET, téléphone) ne va pas dans ce formulaire : elle relève de la règle `format` du dictionnaire, décidée à la revue (phase 4).
@@ -156,9 +158,9 @@ Repères pour la phase 7 :
 | --- | --- | --- | --- | --- |
 | 8.1 | Mettre `PERIODE_FIN` à jour et exécuter le notebook en entier (environ trois minutes : nettoyage, puis contrôles avant et après nettoyage); vérifier le nombre de décisions du métier lues (emplacement attendu), les corrections sur une colonne sensible toutes masquées, 0 ligne dont la valeur ou la clé sensible n'est pas masquée | C | notebook 07 | opérationnel |
 | 8.2 | Lire le bilan du nettoyage (cellules corrigées, lignes retirées, raisons de non-correction) et la comparaison avant et après; regarder un par un les contrôles aux anomalies apparues (une valeur devenue lisible rend une règle évaluable) | C, A (décomptes seulement) | cellules `# NETTOYAGE` et `# COMPARAISON` | opérationnel |
-| 8.3 | Exporter le classeur d'arbitrage dans `data/decisions/` (cellule `# EXPORT ARBITRAGE`) | C | notebook 07 | opérationnel |
+| 8.3 | Exporter le classeur d'arbitrage dans `data/formulaires/` (cellule `# EXPORT ARBITRAGE`) | C | notebook 07 | opérationnel |
 | 8.4 | Trancher les lignes du classeur dans la colonne `decision` (corriger avec la valeur retenue, garder ou retirer, selon la sorte), mode d'emploi dans la première feuille; une ligne sans décision sera proposée de nouveau | M avec C | Excel | opérationnel |
-| 8.5 | Enregistrer et fermer le classeur, puis `# IMPORT ARBITRAGE` (tous les problèmes listés en une fois, décisions enregistrées dans `data/config/decisions.yaml` avec une copie datée); supprimer le classeur importé de `data/decisions/` | C | notebook 07 | opérationnel |
+| 8.5 | Enregistrer et fermer le classeur, puis `# IMPORT ARBITRAGE` (tous les problèmes listés en une fois, décisions enregistrées dans `data/config/decisions.yaml` avec une copie datée, classeur archivé dans `data/formulaires/appliques/`) | C | notebook 07 | opérationnel |
 | 8.6 | Relancer le notebook en entier : `# NETTOYAGE` applique les décisions, et le classeur suivant ne propose que les éléments restants | C | notebook 07 | opérationnel |
 | 8.7 | Écrire le journal et le bilan du nettoyage dans `data/nettoyage/`, et la table des anomalies après nettoyage avec la décision du métier, et son bilan, dans `data/anomalies/` (cellule `# ECRITURE`); un CSV ouvert dans Excel bloque l'écriture sans rien modifier | C | notebook 07 | opérationnel |
 
@@ -167,7 +169,7 @@ Repères pour la phase 8 :
 - les règles automatiques ne corrigent que ce qui se lit sans ambiguïté; tout le reste passe par une décision du métier, gardée d'un mois à l'autre tant que la donnée ne change pas;
 - une décision dont la donnée a changé (source corrigée, ou réexportée avec des lignes décalées) devient caduque : le nettoyage ne l'applique pas, son bilan le dit, et l'élément revient au classeur suivant;
 - une anomalie de règle de gestion (issue « anomalie ») n'entre pas dans le classeur : sa correction se fait dans le logiciel source;
-- le classeur porte des valeurs du client, colonnes sensibles comprises : il reste dans `data/decisions/` et ne se colle pas dans la conversation; le journal du nettoyage masque les colonnes sensibles;
+- le classeur porte des valeurs du client, colonnes sensibles comprises : il reste dans `data/formulaires/` et ne se colle pas dans la conversation; le journal du nettoyage masque les colonnes sensibles;
 - une année écrite sur deux chiffres est complétée en 20AA si la date ne dépasse pas la date de coupure; ces conversions sont visibles au journal (« siècle 20 ajouté ») et sont à faire vérifier par le métier quand une règle de gestion les signale;
 - le jeu nettoyé n'est pas écrit : il se recalcule à chaque exécution à partir des fichiers bruts, des règles et des décisions.
 

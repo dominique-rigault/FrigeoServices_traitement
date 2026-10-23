@@ -55,7 +55,7 @@ Les notebooks 01 à 07 ne contiennent aucun nom de table, de colonne ni de valeu
 - **Gravité et indicateurs affectés.** Ils sont déclarés par le consultant dans `config/anomalies.yaml`, à faire valider par le métier, et non calculés. La gravité par défaut est grossière (« majeure » dès qu'une colonne alimente un indicateur) et se nuance par des exceptions, sans code. Le fichier est à revoir quand un indicateur ou une colonne change.
 - **Export CSV.** Séparateur point-virgule et virgule décimale, pour Excel en paramètres français. Ouvert par double-clic, Excel retire les zéros en tête, écrit un SIRET en notation scientifique, lit `2026-03` comme une date et une valeur commençant par `=` comme une formule. Il faut donc ouvrir le fichier par Données, À partir d'un fichier texte/CSV, sans détection des types. Les identifiants d'anomalie changent si un fichier est réexporté avec des lignes décalées.
 - **Nettoyage automatique.** Les règles ne corrigent que ce qui se lit sans ambiguïté : encodages, remplacements décidés au dictionnaire, formes élargies de date et de nombre, doublons exacts. Une durée avec unité (1h30) n'est jamais convertie. Une année écrite sur deux chiffres est complétée en 20AA si la date ne dépasse pas la date de coupure : une date ancienne mal saisie peut ainsi devenir fausse, et la conversion n'est visible qu'au journal du nettoyage (« siècle 20 ajouté »).
-- **Décisions du métier.** Le classeur d'arbitrage porte des valeurs du client, colonnes sensibles comprises, et reste dans `data/decisions/`. Une décision est rattachée à l'identifiant de l'anomalie et à une empreinte de la donnée : un fichier réexporté avec des lignes décalées rend les décisions caduques, et les éléments reviennent au classeur suivant. On ne peut pas corriger une cellule vers une valeur vide, et une anomalie de règle de gestion (hors écart à arbitrer) ne se tranche pas dans le classeur : sa correction se fait dans le logiciel source.
+- **Décisions du métier.** Le classeur d'arbitrage porte des valeurs du client, colonnes sensibles comprises, et reste dans `data/formulaires/`. Une décision est rattachée à l'identifiant de l'anomalie et à une empreinte de la donnée : un fichier réexporté avec des lignes décalées rend les décisions caduques, et les éléments reviennent au classeur suivant. On ne peut pas corriger une cellule vers une valeur vide, et une anomalie de règle de gestion (hors écart à arbitrer) ne se tranche pas dans le classeur : sa correction se fait dans le logiciel source.
 - **Jeu nettoyé.** Il n'est pas écrit sur disque : il se recalcule à chaque exécution à partir des fichiers bruts, des règles et des décisions, la source brute restant la seule référence. La représentation de la source est conservée (une date en texte reste un texte); la conversion des types se fera au chargement en base (étape 7).
 
 ## Structure du dépôt
@@ -96,10 +96,8 @@ data/
   raw/2026/         exports mensuels 2026
   referentiels/     intervenants, clients, fournisseurs, catalogue, paramètres
   config/           dictionnaire généré (contient des valeurs observées) et décisions du métier
-  revue/            classeur de revue du dictionnaire (étape 2d)
-  formulaires/      formulaire des règles de contrôle et formulaires appliqués (étape 3)
+  formulaires/      classeurs remplis par le métier (revue du dictionnaire, règles de contrôle, arbitrage des anomalies), et appliques/ pour les classeurs appliqués
   anomalies/        table des anomalies et bilan par contrôle en CSV (étape 5, et après nettoyage à l'étape 6)
-  decisions/        classeur d'arbitrage des anomalies par le métier (étape 6)
   nettoyage/        journal et bilan du nettoyage en CSV (étape 6)
 ```
 
