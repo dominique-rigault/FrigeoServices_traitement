@@ -14,10 +14,10 @@
 
 regles:
   interventions:
-    duree_min: {decimales: 0, bornes: {min: 5, max: 720}}
-    duree_trajet_min: {decimales: 0, bornes: {min: 1, max: 180}}
+    duree_min: {bornes: {min: 5, max: 720}}
+    duree_trajet_min: {bornes: {min: 1, max: 180}}
     distance_km: {decimales: 1, bornes: {min: 0, max: 200, min_exclu: true}}
-    lieu_cp: {decimales: 0, bornes: {min: 27000, max: 76999}}
+    lieu_cp: {bornes: {min: 27000, max: 76999}}
   pieces_interventions:
     quantite: {decimales: 1, bornes: {min: 0, max: 5, min_exclu: true}}
   factures_entetes:
@@ -40,25 +40,25 @@ regles:
     quantite: {decimales: 2, bornes: {min: -200, max: 200}}
     pu_achat_ht: {decimales: 2}
     montant_ht: {decimales: 2}
-    compte_charge: {decimales: 0, bornes: {min: 601100, max: 628800}}
+    compte_charge: {bornes: {min: 601100, max: 628800}}
   fec:
-    CompteNum: {decimales: 0, bornes: {min: 101300, max: 708500}}
+    CompteNum: {bornes: {min: 101300, max: 708500}}
     Debit: {decimales: 2}
     Credit: {decimales: 2}
     Montantdevise: {decimales: 2}
   intervenants:
-    nom: {motif: '[^a-zà-ÿ]+'}
-    secteur: {decimales: 0, bornes: {min: 27000, max: 76999}}
+    nom: {motif: '[A-ZÀ-ÖØ-ÞŒŸ]+(?:[ ''’-][A-ZÀ-ÖØ-ÞŒŸ]+)*'}
+    secteur: {bornes: {min: 27000, max: 76999}}
   remunerations:
     salaire_brut_mensuel: {decimales: 2, bornes: {min: 1000}}
     taux_activite: {decimales: 2, bornes: {min: 0, max: 1, min_exclu: true}}
   clients:
-    siret: {decimales: 0, cle_luhn: true}
-    cp: {decimales: 0, bornes: {min: 27000, max: 76999}}
+    siret: {cle_luhn: true}
+    cp: {bornes: {min: 27000, max: 76999}}
     email: {motif: '[^@\s]+@[^@\s]+\.[^@\s]+'}
   fournisseurs:
-    siret: {decimales: 0, cle_luhn: true}
-    cp: {decimales: 0, bornes: {min: 27000, max: 76999}}
+    siret: {cle_luhn: true}
+    cp: {bornes: {min: 27000, max: 76999}}
   catalogue_pieces:
     prix_vente_ht_2025: {decimales: 2, bornes: {min: 0, max: 1000, min_exclu: true}}
     stock_initial: {decimales: 2, bornes: {min: 0}}
