@@ -15,8 +15,8 @@
 regles:
   interventions:
     duree_min: {bornes: {min: 5, max: 720}}
-    duree_trajet_min: {bornes: {min: 1, max: 180}}
-    distance_km: {decimales: 1, bornes: {min: 0, max: 200, min_exclu: true}}
+    duree_trajet_min: {bornes: {min: 0, max: 180}}
+    distance_km: {decimales: 1, bornes: {min: 0, max: 200}}
     lieu_cp: {bornes: {min: 27000, max: 76999}}
   pieces_interventions:
     quantite: {decimales: 1, bornes: {min: 0, max: 5, min_exclu: true}}
@@ -48,7 +48,6 @@ regles:
     Montantdevise: {decimales: 2}
   intervenants:
     nom: {motif: '[A-ZÀ-ÖØ-ÞŒŸ]+(?:[ ''’-][A-ZÀ-ÖØ-ÞŒŸ]+)*'}
-    secteur: {bornes: {min: 27000, max: 76999}}
   remunerations:
     salaire_brut_mensuel: {decimales: 2, bornes: {min: 1000}}
     taux_activite: {decimales: 2, bornes: {min: 0, max: 1, min_exclu: true}}
@@ -129,6 +128,7 @@ ecartees:
     achats_entetes: [total_ht, total_tva, total_ttc]
     achats_lignes: [pu_achat_ht, montant_ht]
     fec: [Debit, Credit, Montantdevise]
+    intervenants: [secteur]
     clients: [siret]
     fournisseurs: [siret]
   cle_luhn:
