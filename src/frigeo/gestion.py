@@ -115,7 +115,15 @@ CLE_REGLES_GESTION = "regles"
 # chaque règle dont le type a un paramètre feries et qui n'en déclare pas.
 CLE_JOURS_FERIES = "jours_feries"
 PARAMETRE_FERIES = "feries"
-CLES_FICHIER_GESTION = (CLE_REGLES_GESTION, CLE_JOURS_FERIES)
+# Clés tenues par le formulaire des règles de gestion (voir frigeo.formulaire_gestion),
+# sans effet sur les contrôles : propositions refusées par le métier, règles retirées
+# (gardées en entier pour pouvoir les rétablir) et règles demandées en texte libre.
+CLE_ECARTEES = "ecartees"
+CLE_RETIREES = "retirees"
+CLE_DEMANDES = "demandes"
+CLES_FICHIER_GESTION = (
+    CLE_REGLES_GESTION, CLE_JOURS_FERIES, CLE_ECARTEES, CLE_RETIREES, CLE_DEMANDES
+)
 # Clés communes à toutes les instances, en plus des paramètres de leur type.
 CLES_COMMUNES = ("ref", "libelle", "type", "table")
 # Clés communes facultatives : filtre des lignes contrôlées, issue des écarts et
@@ -4019,7 +4027,8 @@ def lire_fichier_gestion(chemin: str | Path | None = None) -> dict:
         contenu = yaml.safe_load(flux)
     if contenu is None:
         return {}
-    attendues = " et ".join(f"« {cle} »" for cle in CLES_FICHIER_GESTION)
+    noms = [f"« {cle} »" for cle in CLES_FICHIER_GESTION]
+    attendues = ", ".join(noms[:-1]) + " et " + noms[-1]
     if not isinstance(contenu, dict):
         raise ValueError(
             f"Fichier des règles de gestion invalide ({chemin}) : les clés "

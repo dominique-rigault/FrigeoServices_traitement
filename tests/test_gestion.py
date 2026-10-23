@@ -406,7 +406,11 @@ def test_chargement_du_fichier(tmp_path):
     with pytest.raises(ValueError, match="clé inconnue : regle"):
         charger_regles_gestion(chemin)
     chemin.write_text("- ref: x\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="clés attendues sont « regles » et « jours_feries »"):
+    with pytest.raises(
+        ValueError,
+        match="clés attendues sont « regles », « jours_feries », « ecartees », « retirees » "
+        "et « demandes »",
+    ):
         charger_regles_gestion(chemin)
     chemin.write_text(
         "regles:\n  - ref: decoupage\n    libelle: x\n    type: autre\n    table: t\n"
