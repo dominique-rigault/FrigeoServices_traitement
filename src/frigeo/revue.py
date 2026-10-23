@@ -20,7 +20,6 @@ from openpyxl.styles import Alignment, Font, Protection
 from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.worksheet.datavalidation import DataValidation
 
-from . import racine_projet
 from .dictionnaire import (
     A_DECIDER,
     AUCUNE_LISTE,
@@ -44,6 +43,7 @@ from .dictionnaire import (
     horodater,
     problemes_dictionnaire,
 )
+from .formulaires import dossier_formulaires
 from .profilage import signature
 
 FEUILLE_MODE_EMPLOI = "mode_emploi"
@@ -184,8 +184,8 @@ LARGEURS = {
 
 
 def chemin_revue(periode_fin: str) -> Path:
-    """Emplacement par défaut du classeur : data/revue/, hors du dépôt."""
-    return racine_projet() / "data" / "revue" / f"dictionnaire_revue_{periode_fin}.xlsx"
+    """Emplacement par défaut du classeur : data/formulaires/, hors du dépôt."""
+    return dossier_formulaires() / f"dictionnaire_revue_{periode_fin}.xlsx"
 
 
 def _proposition_affichee(nom: str, regle: dict) -> str:

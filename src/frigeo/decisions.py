@@ -24,7 +24,7 @@ l'élément est de nouveau proposé au métier.
 
 Fichiers, tous hors du dépôt :
 
-- data/decisions/arbitrage_AAAA-MM.xlsx : le classeur d'arbitrage
+- data/formulaires/arbitrage_AAAA-MM.xlsx : le classeur d'arbitrage
   (`exporter_arbitrage`, `importer_arbitrage`); il porte des valeurs du client, y
   compris celles des colonnes sensibles;
 - data/config/decisions.yaml : les décisions enregistrées et le journal des
@@ -50,7 +50,6 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, Protection
 from openpyxl.utils import get_column_letter
 
-from . import racine_projet
 from .anomalies import (
     COLONNE_DECISION_METIER,
     COLONNES_ANOMALIES,
@@ -68,6 +67,7 @@ from .dictionnaire import (
     lire_instant,
 )
 from .doublons import SEPARATEUR, _texte
+from .formulaires import dossier_formulaires
 from .nettoyage import _convertir
 from .profilage import _interpretations
 from .revue import _ecrire_texte, _est_vide, _menu
@@ -206,8 +206,8 @@ COLONNES_DECISIONS_LUES = (
 
 
 def chemin_arbitrage(periode_fin: str) -> Path:
-    """Emplacement par défaut du classeur : data/decisions/, hors du dépôt."""
-    return racine_projet() / "data" / "decisions" / f"arbitrage_{periode_fin}.xlsx"
+    """Emplacement par défaut du classeur : data/formulaires/, hors du dépôt."""
+    return dossier_formulaires() / f"arbitrage_{periode_fin}.xlsx"
 
 
 def chemin_decisions() -> Path:
@@ -549,7 +549,7 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
         "",
         "Confidentialité",
         "Ce classeur porte des valeurs du client, y compris celles des colonnes "
-        "sensibles. Il reste dans le dossier data/decisions et n'est ni transmis ni "
+        "sensibles. Il reste dans le dossier data/formulaires et n'est ni transmis ni "
         "recopié ailleurs.",
         "",
         "Règles à respecter pour que le classeur puisse être réimporté",

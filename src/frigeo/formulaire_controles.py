@@ -45,7 +45,6 @@ from openpyxl.styles import Alignment, Font, Protection
 from openpyxl.utils import get_column_letter, quote_sheetname
 
 from . import dictionnaire as module_dictionnaire
-from . import racine_projet
 from .confidentialite import est_sensible
 from .controles import (
     CLE_COMMENTAIRES,
@@ -65,6 +64,7 @@ from .controles import (
 )
 from .dictionnaire import STATUTS, _valeurs_renseignees, dossier_sauvegardes
 from .doublons import problemes_declarations_doublons
+from .formulaires import dossier_formulaires, ecrire_et_archiver
 from .revue import _ecrire_texte, _menu
 from .typage import NATURES_NOMBRE
 
@@ -201,7 +201,7 @@ LARGEURS = {
 
 def chemin_formulaire(periode_fin: str) -> Path:
     """Emplacement par défaut du formulaire : data/formulaires/, hors du dépôt."""
-    return racine_projet() / "data" / "formulaires" / f"controles_{periode_fin}.xlsx"
+    return dossier_formulaires() / f"controles_{periode_fin}.xlsx"
 
 
 def empreinte_controles(chemin: str | Path | None = None) -> str:
@@ -1536,41 +1536,6 @@ def ecrire_controles(
 # --- Application d'un formulaire -------------------------------------------------
 
 
-def dossier_archives(chemin: str | Path | None = None) -> Path:
-    """Dossier des formulaires appliqués : `appliques/`, à côté du formulaire."""
-    chemin = Path(chemin) if chemin is not None else chemin_formulaire("AAAA-MM")
-    return chemin.parent / "appliques"
-
-
-def archiver_formulaire(chemin: str | Path, dossier: str | Path | None = None) -> Path:
-    """Déplace un formulaire appliqué dans `dossier` (par défaut data/formulaires/
-    appliques) et rend son nouveau chemin.
-
-    Le nom reçoit l'heure de l'archivage : `controles_<AAAA-MM>_<AAAA-MM-JJ>_<HHMMSS>.xlsx`.
-    Une archive déjà présente sous ce nom n'est jamais remplacée. Sous Windows, un
-    classeur ouvert dans Excel ne peut pas être déplacé (PermissionError) : rien
-    n'est alors modifié.
-    """
-    chemin = Path(chemin)
-    dossier = Path(dossier) if dossier is not None else dossier_archives(chemin)
-    instant = module_dictionnaire._maintenant()
-    archive = dossier / f"{chemin.stem}_{instant:%Y-%m-%d_%H%M%S}{chemin.suffix}"
-    if archive.exists():
-        raise FileExistsError(
-            f"{archive} existe déjà : archivage refusé, rien n'a été modifié (relancer "
-            "dans une seconde)"
-        )
-    dossier.mkdir(parents=True, exist_ok=True)
-    try:
-        chemin.rename(archive)
-    except PermissionError:
-        raise PermissionError(
-            f"{chemin} ne peut pas être déplacé : fermer le classeur dans Excel, puis "
-            "relancer la cellule (rien n'a été modifié)"
-        ) from None
-    return archive
-
-
 class ApplicationFormulaire(NamedTuple):
     """Résultat de `appliquer_formulaire` : si config/controles.yaml a été réécrit,
     sa copie datée et l'archive du formulaire (None quand rien n'a changé)."""
@@ -1601,13 +1566,9 @@ def appliquer_formulaire(
     """
     if formulaire.contenu == contenu:
         return ApplicationFormulaire(False, None, None)
-    chemin_formulaire = Path(chemin_formulaire)
-    archive = archiver_formulaire(chemin_formulaire, dossier_archive)
-    try:
-        ecriture = ecrire_controles(
-            formulaire.contenu, chemin, empreinte=empreinte, dossier=dossier
-        )
-    except Exception:
-        archive.rename(chemin_formulaire)
-        raise
+    ecriture, archive = ecrire_et_archiver(
+        chemin_formulaire,
+        lambda: ecrire_controles(formulaire.contenu, chemin, empreinte=empreinte, dossier=dossier),
+        dossier_archive,
+    )
     return ApplicationFormulaire(ecriture.ecrit, ecriture.sauvegarde, archive)

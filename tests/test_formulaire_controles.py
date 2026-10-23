@@ -18,8 +18,6 @@ from frigeo.formulaire_controles import (
     LIGNES_AJOUT,
     REPERE_EMPREINTE,
     appliquer_formulaire,
-    archiver_formulaire,
-    dossier_archives,
     ecrire_controles,
     empreinte_controles,
     exporter_formulaire,
@@ -794,39 +792,6 @@ def _horloge(monkeypatch, *instant):
     from datetime import datetime
 
     monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: datetime(*instant))
-
-
-def test_archivage_d_un_formulaire(tmp_path, monkeypatch):
-    _horloge(monkeypatch, 2026, 10, 22, 18, 4, 5)
-    chemin = tmp_path / "formulaires" / "controles_2026-03.xlsx"
-    chemin.parent.mkdir()
-    chemin.write_bytes(b"classeur")
-    archive = archiver_formulaire(chemin)
-    assert archive == tmp_path / "formulaires" / "appliques" / (
-        "controles_2026-03_2026-10-22_180405.xlsx"
-    )
-    assert archive.read_bytes() == b"classeur" and not chemin.exists()
-    assert dossier_archives(chemin) == archive.parent
-    # Une archive du même nom n'est jamais remplacée.
-    chemin.write_bytes(b"autre")
-    with pytest.raises(FileExistsError, match="rien n'a été modifié"):
-        archiver_formulaire(chemin)
-    assert chemin.read_bytes() == b"autre" and archive.read_bytes() == b"classeur"
-
-
-def test_classeur_ouvert_non_archive(tmp_path, monkeypatch):
-    from pathlib import Path
-
-    chemin = tmp_path / "controles_2026-03.xlsx"
-    chemin.write_bytes(b"classeur")
-
-    def refuser(self, cible):
-        raise PermissionError("ouvert")
-
-    monkeypatch.setattr(Path, "rename", refuser)
-    with pytest.raises(PermissionError, match="fermer le classeur dans Excel"):
-        archiver_formulaire(chemin, tmp_path / "a")
-    assert chemin.exists()
 
 
 def _application(tmp_path, monkeypatch, modifier=True):
