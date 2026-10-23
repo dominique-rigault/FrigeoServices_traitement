@@ -19,7 +19,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 2b | Configuration des sources, chargement piloté, masquage, tests | Python, Jupyter | aucun | Terminé |
 | 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 03 | Terminé |
 | 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 03 | Terminé |
-| 3 | Contrôles de format et de complétude, détection des doublons | Python, Jupyter | 04 | Terminé |
+| 3 | Contrôles de format et de complétude, détection des doublons, formulaire des règles de contrôle pour le métier | Python, Excel, Jupyter | 04 | Terminé |
 | 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 05 | Terminé |
 | 5 | Table des anomalies, gravité et indicateurs affectés, export CSV | Python, Jupyter | 06 | Terminé |
 | 6 | Règles de nettoyage explicites, décisions du métier ligne par ligne, journal des corrections | Python, Excel, Jupyter | 07 | Terminé |
@@ -51,6 +51,7 @@ Les notebooks 01 à 07 ne contiennent aucun nom de table, de colonne ni de valeu
 - **Lieux de stockage.** Un seul lieu. Un stock par référence et par lieu est possible si chaque table porte un code de lieu, mais pas les transferts entre lieux.
 - **Stock rendu négatif par un avoir.** Il n'est signalé qu'à la sortie suivante. Le stock n'est contrôlé qu'à partir de la date du stock initial, qu'il vaut mieux lire dans le fichier du client que déclarer dans la configuration.
 - **Encodages suspects.** La règle `encodage` essaie les trois encodages d'Europe occidentale (Windows-1252, ISO-8859-15, Latin-1). Des fichiers venus d'un autre jeu de caractères (Europe centrale, cyrillique) demanderaient d'étendre `ENCODAGES_SUSPECTS`. Un `à` mal décodé n'est plus reconnaissable si un logiciel a remplacé l'espace insécable qui le suit par une espace ordinaire, et un double encodage n'est signalé qu'une fois.
+- **Formulaire des règles de contrôle.** Il réécrit `config/controles.yaml` en entier, dans l'ordre du dictionnaire : un commentaire écrit à la main dans ce fichier est perdu, et seuls les motifs (expressions régulières) s'y écrivent encore à la main. Il porte les minimums et maximums observés (masqués pour une colonne sensible) et reste donc dans `data/formulaires/`. Un formulaire exporté avant une modification du fichier est refusé à l'import.
 - **Gravité et indicateurs affectés.** Ils sont déclarés par le consultant dans `config/anomalies.yaml`, à faire valider par le métier, et non calculés. La gravité par défaut est grossière (« majeure » dès qu'une colonne alimente un indicateur) et se nuance par des exceptions, sans code. Le fichier est à revoir quand un indicateur ou une colonne change.
 - **Export CSV.** Séparateur point-virgule et virgule décimale, pour Excel en paramètres français. Ouvert par double-clic, Excel retire les zéros en tête, écrit un SIRET en notation scientifique, lit `2026-03` comme une date et une valeur commençant par `=` comme une formule. Il faut donc ouvrir le fichier par Données, À partir d'un fichier texte/CSV, sans détection des types. Les identifiants d'anomalie changent si un fichier est réexporté avec des lignes décalées.
 - **Nettoyage automatique.** Les règles ne corrigent que ce qui se lit sans ambiguïté : encodages, remplacements décidés au dictionnaire, formes élargies de date et de nombre, doublons exacts. Une durée avec unité (1h30) n'est jamais convertie. Une année écrite sur deux chiffres est complétée en 20AA si la date ne dépasse pas la date de coupure : une date ancienne mal saisie peut ainsi devenir fausse, et la conversion n'est visible qu'au journal du nettoyage (« siècle 20 ajouté »).
@@ -96,6 +97,7 @@ data/
   referentiels/     intervenants, clients, fournisseurs, catalogue, paramètres
   config/           dictionnaire généré (contient des valeurs observées) et décisions du métier
   revue/            classeur de revue du dictionnaire (étape 2d)
+  formulaires/      formulaire des règles de contrôle et formulaires appliqués (étape 3)
   anomalies/        table des anomalies et bilan par contrôle en CSV (étape 5, et après nettoyage à l'étape 6)
   decisions/        classeur d'arbitrage des anomalies par le métier (étape 6)
   nettoyage/        journal et bilan du nettoyage en CSV (étape 6)
