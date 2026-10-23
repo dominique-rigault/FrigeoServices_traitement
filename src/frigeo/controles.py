@@ -127,7 +127,17 @@ CLE_REGLES_COMPLEMENTAIRES = "regles"
 # Le même fichier porte, sous une autre clé, les déclarations de doublons (voir le
 # module doublons).
 CLE_DOUBLONS = "doublons"
-CLES_FICHIER_CONTROLES = (CLE_REGLES_COMPLEMENTAIRES, CLE_DOUBLONS)
+# Et deux clés propres au formulaire des règles de contrôle, sans effet sur les
+# contrôles (voir le module formulaire_controles) : les propositions écartées par le
+# métier et ses commentaires.
+CLE_ECARTEES = "ecartees"
+CLE_COMMENTAIRES = "commentaires"
+CLES_FICHIER_CONTROLES = (
+    CLE_REGLES_COMPLEMENTAIRES,
+    CLE_DOUBLONS,
+    CLE_ECARTEES,
+    CLE_COMMENTAIRES,
+)
 # Tolérance relative pour les décimales d'un nombre natif, dont le calcul par le
 # tableur laisse parfois une imprécision (181.45000000000002).
 TOLERANCE_DECIMALES = 1e-9
@@ -183,21 +193,63 @@ def _est_nombre(valeur) -> bool:
     return isinstance(valeur, numbers.Real) and not isinstance(valeur, bool)
 
 
+# Clés d'une règle `bornes` : les bornes, et pour chacune l'option qui l'exclut.
+BORNES = ("min", "max")
+EXCLUSIONS = {"min": "min_exclu", "max": "max_exclu"}
+
+
+def _probleme_bornes(parametre) -> str | None:
+    """Problème du paramètre d'une règle `bornes`, None s'il est correct.
+
+    Le paramètre porte `min`, `max` ou les deux, en nombres; `min_exclu` ou
+    `max_exclu` (true ou false) exclut la borne correspondante, qui doit alors être
+    donnée.
+    """
+    if (
+        not isinstance(parametre, dict)
+        or not set(parametre) & set(BORNES)
+        or set(parametre) - set(BORNES) - set(EXCLUSIONS.values())
+        or not all(_est_nombre(parametre[borne]) for borne in BORNES if borne in parametre)
+    ):
+        return (
+            "un minimum (min), un maximum (max) ou les deux sont attendus, en nombres, "
+            "avec au besoin min_exclu ou max_exclu"
+        )
+    for borne, exclusion in EXCLUSIONS.items():
+        if exclusion in parametre and not isinstance(parametre[exclusion], bool):
+            return f"{exclusion} vaut true ou false"
+        if exclusion in parametre and borne not in parametre:
+            return f"{exclusion} sans {borne}"
+    if "min" in parametre and "max" in parametre:
+        if parametre["min"] > parametre["max"]:
+            return "le minimum dépasse le maximum"
+        exclue = parametre.get("min_exclu") or parametre.get("max_exclu")
+        if parametre["min"] == parametre["max"] and exclue:
+            return "minimum égal au maximum avec une borne exclue : aucune valeur admise"
+    return None
+
+
+def _hors_bornes(nombre, parametre) -> bool:
+    """Vrai si le nombre est sous le minimum ou au-dessus du maximum (ou sur une borne
+    exclue)."""
+    if "min" in parametre:
+        minimum = parametre["min"]
+        if nombre < minimum or (parametre.get("min_exclu") and nombre == minimum):
+            return True
+    if "max" in parametre:
+        maximum = parametre["max"]
+        if nombre > maximum or (parametre.get("max_exclu") and nombre == maximum):
+            return True
+    return False
+
+
 def _probleme_parametre(type_regle: str, parametre) -> str | None:
     """Problème du paramètre d'une règle complémentaire, None s'il est correct."""
     if type_regle == "decimales":
         if isinstance(parametre, bool) or not isinstance(parametre, int) or parametre < 0:
             return "un nombre entier de décimales, positif ou nul, est attendu"
     elif type_regle == "bornes":
-        if (
-            not isinstance(parametre, dict)
-            or not parametre
-            or set(parametre) - {"min", "max"}
-            or not all(_est_nombre(borne) for borne in parametre.values())
-        ):
-            return "un minimum (min), un maximum (max) ou les deux sont attendus, en nombres"
-        if len(parametre) == 2 and parametre["min"] > parametre["max"]:
-            return "le minimum dépasse le maximum"
+        return _probleme_bornes(parametre)
     elif type_regle == "motif":
         if not isinstance(parametre, str) or parametre == "":
             return "une expression régulière entre guillemets est attendue"
@@ -249,7 +301,8 @@ def lire_fichier_controles(chemin: str | Path | None = None) -> dict:
         return {}
     with open(chemin, encoding="utf-8") as flux:
         contenu = yaml.safe_load(flux)
-    attendues = " et ".join(f"« {cle} »" for cle in CLES_FICHIER_CONTROLES)
+    noms = [f"« {cle} »" for cle in CLES_FICHIER_CONTROLES]
+    attendues = ", ".join(noms[:-1]) + " et " + noms[-1]
     if not isinstance(contenu, dict):
         raise ValueError(
             f"Fichier de contrôles invalide ({chemin}) : les seules clés attendues "
@@ -272,7 +325,8 @@ def charger_regles_complementaires(chemin: str | Path | None = None) -> dict:
 
     - `decimales: 2` : au plus deux décimales significatives;
     - `bornes: {min: 0, max: 15}` : valeur comprise entre les bornes, incluses (une
-      seule borne est possible);
+      seule borne est possible); `min_exclu: true` ou `max_exclu: true` exclut une
+      borne (`{min: 0, max: 1, min_exclu: true}` : plus de 0, au plus 1);
     - `motif: "..."` : la valeur entière correspond à l'expression régulière;
     - `cle_luhn: true` : la clé de contrôle de Luhn est valide.
 
@@ -467,10 +521,7 @@ def _verdict_complementaire(type_regle: str, parametre, valeur) -> bool | None:
             return None
         if type_regle == "decimales":
             return _trop_de_decimales(nombre, parametre)
-        return bool(
-            ("min" in parametre and nombre < parametre["min"])
-            or ("max" in parametre and nombre > parametre["max"])
-        )
+        return _hors_bornes(nombre, parametre)
     texte = str(valeur)
     if type_regle == "motif":
         return re.fullmatch(parametre, texte) is None
@@ -549,10 +600,15 @@ def _controler_encodage(presentes: pd.Series):
 def _parametre_en_texte(type_regle: str, parametre) -> str:
     """Texte du paramètre d'une règle complémentaire, pour la table des écarts."""
     if type_regle == "bornes":
-        if len(parametre) == 2:
-            return f"{parametre['min']} à {parametre['max']}"
-        borne, valeur = next(iter(parametre.items()))
-        return f"{borne} {valeur}"
+        textes = {
+            borne: f"{parametre[borne]}" + (" exclu" if parametre.get(EXCLUSIONS[borne]) else "")
+            for borne in BORNES
+            if borne in parametre
+        }
+        if len(textes) == 2:
+            return f"{textes['min']} à {textes['max']}"
+        borne, texte = next(iter(textes.items()))
+        return f"{borne} {texte}"
     return "oui" if type_regle == "cle_luhn" else str(parametre)
 
 

@@ -489,6 +489,41 @@ def test_bornes_incluses_et_borne_unique():
     ]
 
 
+
+def test_bornes_exclues():
+    donnees = _table(
+        taux=[0, 0.5, 1, 1.2, "0,0"],
+        remise=[0, 14.99, 15, 16, -1],
+        stock=[0, 3, -1, 0.0, 2],
+    )
+    ecarts, bilan = _controler(
+        donnees,
+        {"taux": _colonne(), "remise": _colonne(), "stock": _colonne()},
+        complementaires={
+            "taux": {"bornes": {"min": 0, "max": 1, "min_exclu": True}},
+            "remise": {"bornes": {"min": 0, "max": 15, "max_exclu": True, "min_exclu": False}},
+            "stock": {"bornes": {"min": 0, "min_exclu": True}},
+        },
+    )
+    # Une borne exclue est elle-même hors bornes; l'autre reste incluse.
+    assert _lignes(ecarts, "num_ligne_source", "colonne", "valeur") == [
+        (2, "taux", "0"),
+        (2, "stock", "0"),
+        (4, "remise", "15"),
+        (4, "stock", "-1"),
+        (5, "taux", "1.2"),
+        (5, "remise", "16"),
+        (5, "stock", "0.0"),
+        (6, "taux", "0,0"),
+        (6, "remise", "-1"),
+    ]
+    assert _lignes(bilan, "colonne", "regle_en_vigueur") == [
+        ("taux", "0 exclu à 1"),
+        ("remise", "0 à 15 exclu"),
+        ("stock", "min 0 exclu"),
+    ]
+
+
 def test_motif_sur_la_valeur_entiere():
     donnees = _table(nom=["LEROUX", "Leroux", "D'ARC", "DE LA TOUR", "", None])
     ecarts, bilan = _controler(
@@ -562,11 +597,16 @@ def test_problemes_des_regles_complementaires_listes_en_une_fois():
             "e": {"cle_luhn": False},
             "f": {"decimales": True},
             "g": {},
+            "h": {"bornes": {"min_exclu": True}},
+            "i": {"bornes": {"max": 1, "min_exclu": True}},
+            "j": {"bornes": {"min": 0, "min_exclu": "oui"}},
+            "k": {"bornes": {"min": 1, "max": 1, "max_exclu": True}},
+            "l": {"bornes": {"min": 0, "entre": 1}},
         },
         "u": [],
     }
     problemes = problemes_regles_complementaires(regles)
-    assert len(problemes) == 9
+    assert len(problemes) == 14
     texte = "\n".join(problemes)
     for attendu in (
         "t.a, règle decimales",
@@ -578,6 +618,11 @@ def test_problemes_des_regles_complementaires_listes_en_une_fois():
         "t.f, règle decimales",
         "t.g : au moins une règle",
         "u : un dictionnaire de colonnes",
+        "t.h, règle bornes : un minimum (min), un maximum (max) ou les deux",
+        "t.i, règle bornes : min_exclu sans min",
+        "t.j, règle bornes : min_exclu vaut true ou false",
+        "t.k, règle bornes : minimum égal au maximum avec une borne exclue",
+        "t.l, règle bornes : un minimum (min), un maximum (max) ou les deux",
     ):
         assert attendu in texte
     with pytest.raises(ValueError, match="Règles complémentaires invalides"):

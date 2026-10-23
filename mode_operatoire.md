@@ -102,11 +102,21 @@ Repères pour la phase 4 :
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
-| 5.1 | Remplir le formulaire des règles de contrôle : décimales, bornes, motif, clé de Luhn par colonne; pour les doublons, la clé de chaque table, les colonnes uniques, les colonnes présumées uniques, les tables où chercher les lignes identiques hors clé | M avec C | formulaire | à créer |
-| 5.2 | Rédiger `config/controles.yaml` (clés `regles` et `doublons`) et le vérifier par son chargement | A, puis C (dépôt dans `config/`) | formulaire 5.1 | opérationnel |
-| 5.3 | Exécuter le notebook en entier, et vérifier les lignes « N règles complémentaires lues » et « N tables avec des doublons déclarés » (emplacement attendu) | C | notebook 04 | opérationnel |
+| 5.1 | Mettre `PERIODE_FIN` à jour, exécuter `# CHARGEMENT` puis `# EXPORT FORMULAIRE`, qui écrit `data/formulaires/controles_AAAA-MM.xlsx` : les règles en vigueur dans `config/controles.yaml` (statut documenté) et les propositions tirées des données (statut observé) pour les décimales, les bornes et la clé de Luhn de chaque colonne numérique ou de chiffres, les groupes de colonnes qui ne doivent pas se répéter (clé, unique, présumé unique) et, par table, la recherche des lignes identiques hors clé | C | notebook 04 | opérationnel |
+| 5.2 | Revoir le formulaire (mode d'emploi dans la première feuille) : un statut par ligne (valide adopte la proposition, documenté prend les valeurs saisies, invalide écarte la règle et la proposition), un commentaire si besoin, un groupe de plusieurs colonnes ajouté en bas de la feuille `doublons`; une revue partielle suffit pour avancer | M avec C | Excel | opérationnel |
+| 5.3 | Enregistrer et fermer le formulaire, exécuter `# IMPORT FORMULAIRE` (rapport des règles changées et avertissements; un formulaire mal rempli arrête la cellule avec la liste des lignes à corriger), puis `# ECRITURE FORMULAIRE`, qui copie l'ancien fichier dans `data/config/sauvegardes/`, archive le formulaire dans `data/formulaires/appliques/` et réécrit `config/controles.yaml` | C | notebook 04 | opérationnel |
+| 5.4 | Commiter `config/controles.yaml` | C | Git | opérationnel |
+| 5.5 | Si le métier demande un motif (expression régulière), l'écrire à la main dans `config/controles.yaml`, quand aucun formulaire n'attend son import | A, puis C (dépôt dans `config/`) | `config/controles.yaml` | opérationnel |
+| 5.6 | Exécuter le notebook en entier, et vérifier les lignes « N règles complémentaires lues » et « N tables avec des doublons déclarés » (emplacement attendu) | C | notebook 04 | opérationnel |
 
-Une forme fixe (code postal, SIRET, téléphone) ne va pas dans ce formulaire : elle relève de la règle `format` du dictionnaire, décidée à la revue (phase 4).
+Repères pour la phase 5 :
+
+- le formulaire porte des valeurs observées (minimum et maximum, masqués pour une colonne sensible) : il reste dans `data/formulaires/` et ne se colle pas dans la conversation;
+- un formulaire pas encore rempli ne change rien, si bien que le notebook peut toujours être exécuté en entier; après une écriture, l'exécution suivante exporte un nouveau formulaire;
+- le formulaire porte le nom de la période (`controles_2026-04.xlsx`) : un formulaire d'un mois précédent laissé sans revue reste dans `data/formulaires/` et `# EXPORT FORMULAIRE` le signale (« autres formulaires en attente »); le supprimer à la main, celui du mois en reprend les lignes;
+- un formulaire exporté avant une modification de `config/controles.yaml` (un motif ajouté à la main, par exemple) est refusé à l'import : le supprimer, puis le réexporter;
+- `config/controles.yaml` est réécrit en entier, dans l'ordre du dictionnaire : un commentaire écrit à la main y est perdu, celui du métier se saisit dans le formulaire;
+- une forme fixe (code postal, SIRET, téléphone) ne va pas dans ce formulaire : elle relève de la règle `format` du dictionnaire, décidée à la revue (phase 4).
 
 ### Phase 6, règles de gestion (notebook 05)
 
@@ -171,7 +181,7 @@ Repères pour la phase 8 :
 | M.4 | Exécuter le notebook 02 seulement si un format nouveau est soupçonné (points « nature différente selon l'export » et « forme numérique non reconnue ») | C | notebook 02 | opérationnel |
 | M.5 | Régénérer le dictionnaire : cellules jusqu'à `# ECRITURE APRES FUSION`, lire le rapport de `# FUSION` (événements « à regarder ») | C | notebook 03 | opérationnel |
 | M.6 | Revue si de nouvelles valeurs ou formes sont à arbitrer (phase 4, étapes 4.3 à 4.5) | M avec C | Excel, notebook 03 | opérationnel |
-| M.7 | Exécuter les notebooks 04 puis 05 en entier | C | notebooks 04, 05 | opérationnel |
+| M.7 | Exécuter les notebooks 04 puis 05 en entier; si `# EXPORT FORMULAIRE` signale des lignes à « observé » nouvelles (une colonne, un groupe ou une proposition de plus), faire revoir le formulaire du mois (phase 5, actions 5.2 à 5.4) | C, M | notebooks 04, 05, Excel | opérationnel |
 | M.8 | Exécuter le notebook 06 en entier : il relance les contrôles et réécrit les deux CSV de la période dans `data/anomalies/` | C | notebook 06 | opérationnel |
 | M.9 | Revoir `config/anomalies.yaml` quand une colonne ou un indicateur change (le notebook 06 liste les colonnes non déclarées et les contrôles non qualifiés) | A, puis C | `config/anomalies.yaml` | opérationnel |
 | M.10 | Exécuter le notebook 07 en entier, puis l'arbitrage si des éléments sont à trancher (phase 8, étapes 8.3 à 8.7) | C, M | notebook 07, Excel | opérationnel |
@@ -181,7 +191,7 @@ Une fois par an : compléter les jours fériés de l'année suivante dans `conf
 ## Points ouverts
 
 - **Changement d'année.** Le modèle de périodes garde une période annuelle unique suivie de mois. Le passage à un export annuel de l'année suivante n'est pas prévu.
-- **Formulaires.** Les formulaires des règles de contrôle et des règles de gestion restent à concevoir (forme, et passage du formulaire au YAML).
+- **Formulaires.** Le formulaire des règles de gestion (phase 6.1) reste à concevoir (forme, et passage du formulaire au YAML); celui des règles de contrôle est fait (phase 5).
 - **Rapport.** Le rapport au client (plan, destinataire, format) n'est pas encore défini; les parties 2.5 et 3.3 en sont les premières briques.
 - **Découverte des encodages et séparateurs.** Ils sont déclarés à la main dans `config/sources.yaml`; l'étape qui les proposerait n'est pas faite.
 - **Dates dont le siècle a été ajouté.** Elles ne sont pas soumises à la confirmation du métier; les faire confirmer dans le classeur d'arbitrage serait une amélioration possible.
