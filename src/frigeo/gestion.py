@@ -65,6 +65,7 @@ from __future__ import annotations
 
 import datetime as dt
 import math
+from copy import deepcopy
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -110,13 +111,19 @@ ISSUE_INFORMATION = "information"
 ISSUES = (ISSUE_ANOMALIE, ISSUE_A_ARBITRER, ISSUE_INFORMATION)
 
 CLE_REGLES_GESTION = "regles"
-CLES_FICHIER_GESTION = (CLE_REGLES_GESTION,)
+# Jours fériés déclarés une fois pour le fichier (année vers liste de dates), repris par
+# chaque règle dont le type a un paramètre feries et qui n'en déclare pas.
+CLE_JOURS_FERIES = "jours_feries"
+PARAMETRE_FERIES = "feries"
+CLES_FICHIER_GESTION = (CLE_REGLES_GESTION, CLE_JOURS_FERIES)
 # Clés communes à toutes les instances, en plus des paramètres de leur type.
 CLES_COMMUNES = ("ref", "libelle", "type", "table")
-# Clés communes facultatives : filtre des lignes contrôlées et issue des écarts.
+# Clés communes facultatives : filtre des lignes contrôlées, issue des écarts et
+# commentaire (texte libre, sans effet sur les contrôles).
 CLE_FILTRE = "filtre"
 CLE_ISSUE = "issue"
-CLES_FACULTATIVES = (CLE_FILTRE, CLE_ISSUE)
+CLE_COMMENTAIRE = "commentaire"
+CLES_FACULTATIVES = (CLE_FILTRE, CLE_ISSUE, CLE_COMMENTAIRE)
 # Clés d'une condition (filtre, conditions et exceptions d'un type) : la colonne, et
 # soit la liste des valeurs admises, soit un motif (expression régulière qui couvre la
 # valeur entière).
@@ -1985,6 +1992,44 @@ def _au_plus_une_non_nulle(donnees, parametres, natures) -> Constats:
     return Constats(evaluables, _ecarts(constats))
 
 
+CONSTAT_VALEUR_MANQUANTE = "valeur manquante"
+CONSTAT_VALEUR_INATTENDUE = "valeur inattendue"
+
+
+def _renseignee_selon_valeur(donnees, parametres, natures) -> Constats:
+    """Colonne renseignée quand une autre colonne vaut l'une des valeurs, et vide
+    sinon si vide_sinon vaut true.
+
+    La valeur de la colonne `selon` est comparée telle quelle aux valeurs, comme dans
+    un filtre. Une cellule vide ou faite d'espaces compte comme vide. Une ligne dont
+    `selon` est vide est non évaluable; une ligne dont `selon` porte une autre valeur
+    est hors champ quand vide_sinon ne vaut pas true (la règle ne lui impose rien).
+    """
+    colonne, valeurs = parametres["colonne"], parametres["valeurs"]
+    vide_sinon = parametres.get("vide_sinon", False)
+    evaluables = pd.Series(False, index=donnees.index, dtype=bool)
+    hors_champ = pd.Series(False, index=donnees.index, dtype=bool)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    for position, choix, valeur in zip(
+        donnees.index, donnees[parametres["selon"]], donnees[colonne]
+    ):
+        choix = _texte_lu(choix)
+        renseignee = _texte_lu(valeur) is not None
+        if choix is None:
+            continue
+        if choix in valeurs:
+            evaluables.loc[position] = True
+            if not renseignee:
+                constats.loc[position] = CONSTAT_VALEUR_MANQUANTE
+        elif vide_sinon:
+            evaluables.loc[position] = True
+            if renseignee:
+                constats.loc[position] = CONSTAT_VALEUR_INATTENDUE
+        else:
+            hors_champ.loc[position] = True
+    return Constats(evaluables, _ecarts(constats), hors_champ=hors_champ)
+
+
 CONSTAT_DATE_DIFFERENTE = "date différente de celle des lignes liées"
 CONSTAT_PLUSIEURS_GROUPES = "lignes liées réparties en plusieurs groupes"
 CONSTAT_SOMMES_DIFFERENTES = "sommes des lignes liées différentes des montants"
@@ -2579,6 +2624,15 @@ def _verifier_plusieurs_colonnes(parametres: dict) -> list[str]:
     if len(parametres["colonnes"]) < 2:
         return ["colonnes : au moins deux colonnes sont attendues"]
     return []
+
+
+def _verifier_renseignee(parametres: dict) -> list[str]:
+    problemes = []
+    if parametres["colonne"] == parametres["selon"]:
+        problemes.append("colonne et selon : deux colonnes différentes sont attendues")
+    if not parametres["valeurs"]:
+        problemes.append("valeurs : au moins une valeur est attendue")
+    return problemes
 
 
 def _verifier_rapport(parametres: dict) -> list[str]:
@@ -3263,6 +3317,25 @@ TYPES = {
             "date_en_tetes": "table_en_tetes",
         },
     ),
+    "renseignee_selon_valeur": TypeRegle(
+        description=(
+            "La colonne est renseignée sur chaque ligne dont la colonne selon vaut l'une "
+            "des valeurs (par exemple la facture d'origine d'un avoir), et vide sur les "
+            "autres lignes si vide_sinon vaut true (false par défaut). Une cellule faite "
+            "d'espaces compte comme vide. Une ligne dont selon est vide est non évaluable; "
+            "une ligne dont selon porte une autre valeur est hors champ sans vide_sinon."
+        ),
+        parametres={
+            "colonne": GENRE_COLONNE,
+            "selon": GENRE_COLONNE,
+            "valeurs": GENRE_VALEURS,
+            "vide_sinon": GENRE_BOOLEEN,
+        },
+        vue=VUE_TOUTES,
+        controler=_renseignee_selon_valeur,
+        facultatifs=("vide_sinon",),
+        verifier=_verifier_renseignee,
+    ),
 }
 
 
@@ -3332,6 +3405,12 @@ def _colonne_qualifiee(colonne: str, table: str, liees) -> tuple[str, str]:
     return table, colonne
 
 
+class _TableDeLaRegle(str):
+    """Nom de la table de la règle dans les références d'une instance, qui distingue ses
+    colonnes de celles d'une table liée de même nom (une table qui se prend pour
+    référence, par exemple la facture d'origine d'un avoir)."""
+
+
 def _references(instance: dict) -> list[tuple[str, str, str, str]]:
     """Colonnes citées par une instance : (paramètre, table, colonne, genre de colonne).
 
@@ -3343,7 +3422,7 @@ def _references(instance: dict) -> list[tuple[str, str, str, str]]:
     """
     instance = _avec_defauts(instance)
     type_regle = TYPES[instance["type"]]
-    table = instance["table"]
+    table = _TableDeLaRegle(instance["table"])
     liees = set(_tables_liees(instance).values())
 
     def table_liee(parametre):
@@ -3420,14 +3499,19 @@ def _references(instance: dict) -> list[tuple[str, str, str, str]]:
 
 
 def _colonnes_instance(instance: dict, table: str | None = None) -> list[str]:
-    """Colonnes citées par une instance dans une table (la sienne par défaut).
+    """Colonnes citées par une instance dans sa table (par défaut) ou dans une table liée.
 
-    Dans l'ordre des paramètres de son type, chaque colonne une seule fois.
+    Dans l'ordre des paramètres de son type, chaque colonne une seule fois. Quand une
+    table liée est la table de la règle elle-même, les colonnes citées comme colonnes
+    de la table liée sont rendues pour la table liée seulement, et inversement.
     """
-    table = instance["table"] if table is None else table
     colonnes = []
     for _, nom_table, colonne, _ in _references(instance):
-        if nom_table == table and colonne not in colonnes:
+        if table is None:
+            retenue = isinstance(nom_table, _TableDeLaRegle)
+        else:
+            retenue = nom_table == table and not isinstance(nom_table, _TableDeLaRegle)
+        if retenue and colonne not in colonnes:
             colonnes.append(colonne)
     return colonnes
 
@@ -3839,6 +3923,8 @@ def problemes_regles_gestion(regles) -> list[str]:
         for cle in CLES_COMMUNES:
             if cle in instance and not _texte_attendu(instance[cle]):
                 problemes.append(f"{nom}, {cle} : un texte non vide est attendu")
+        if CLE_COMMENTAIRE in instance and not _texte_attendu(instance[CLE_COMMENTAIRE]):
+            problemes.append(f"{nom}, {CLE_COMMENTAIRE} : un texte non vide est attendu")
         if CLE_ISSUE in instance and instance[CLE_ISSUE] not in ISSUES:
             problemes.append(
                 f"{nom}, issue : issue inconnue {instance[CLE_ISSUE]!r} (issues possibles : "
@@ -3875,7 +3961,13 @@ def problemes_regles_gestion(regles) -> list[str]:
             if parametre not in instance and parametre not in type_regle.facultatifs
         ]
         if absents:
-            problemes.append(f"{nom} : paramètre manquant ({', '.join(absents)})")
+            probleme = f"{nom} : paramètre manquant ({', '.join(absents)})"
+            if PARAMETRE_FERIES in absents:
+                probleme += (
+                    " (les jours fériés peuvent aussi se déclarer une fois pour le "
+                    f"fichier, sous la clé {CLE_JOURS_FERIES})"
+                )
+            problemes.append(probleme)
         for parametre, genre in type_regle.parametres.items():
             if parametre in instance:
                 problemes.extend(
@@ -3913,12 +4005,65 @@ def problemes_regles_gestion(regles) -> list[str]:
     return problemes
 
 
+def lire_fichier_gestion(chemin: str | Path | None = None) -> dict:
+    """Contenu de config/gestion.yaml par clé, tel qu'il est écrit.
+
+    Un fichier absent ou vide donne un dictionnaire vide. Un contenu qui n'est pas un
+    dictionnaire, ou une clé autre que celles de `CLES_FICHIER_GESTION`, est refusé
+    (`ValueError`). Les règles ne sont pas vérifiées ici (voir `charger_regles_gestion`).
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_regles_gestion()
+    if not chemin.is_file():
+        return {}
+    with open(chemin, encoding="utf-8") as flux:
+        contenu = yaml.safe_load(flux)
+    if contenu is None:
+        return {}
+    attendues = " et ".join(f"« {cle} »" for cle in CLES_FICHIER_GESTION)
+    if not isinstance(contenu, dict):
+        raise ValueError(
+            f"Fichier des règles de gestion invalide ({chemin}) : les clés "
+            f"attendues sont {attendues}"
+        )
+    inconnues = [str(cle) for cle in contenu if cle not in CLES_FICHIER_GESTION]
+    if inconnues:
+        raise ValueError(
+            f"Fichier des règles de gestion invalide ({chemin}) : les clés "
+            f"attendues sont {attendues} (clé inconnue : {', '.join(inconnues)})"
+        )
+    return contenu
+
+
+def completer_jours_feries(regles, jours_feries) -> list:
+    """Règles où chaque règle dont le type a un paramètre feries, et qui n'en déclare
+    pas, reçoit les jours fériés du fichier; une règle qui déclare les siens les garde.
+
+    Sans jours fériés du fichier (None), les règles sont rendues telles quelles. Les
+    arguments ne sont pas modifiés; une règle mal formée est rendue telle quelle (ses
+    problèmes sont listés par `problemes_regles_gestion`).
+    """
+    if jours_feries is None or not isinstance(regles, list):
+        return regles
+    completes = []
+    for instance in regles:
+        type_regle = None
+        if isinstance(instance, dict) and isinstance(instance.get("type"), str):
+            type_regle = TYPES.get(instance["type"])
+        if (
+            type_regle is not None
+            and PARAMETRE_FERIES in type_regle.parametres
+            and PARAMETRE_FERIES not in instance
+        ):
+            instance = {**instance, PARAMETRE_FERIES: deepcopy(jours_feries)}
+        completes.append(instance)
+    return completes
+
+
 def charger_regles_gestion(chemin: str | Path | None = None) -> list:
     """Règles de gestion de config/gestion.yaml, dans l'ordre du fichier.
 
-    Le fichier est écrit à la main, d'après ce que dit le métier. Sous la clé
-    `regles`, chaque règle est une instance d'un type du catalogue, avec un filtre
-    et une issue facultatifs :
+    Sous la clé `regles`, chaque règle est une instance d'un type du catalogue, avec
+    un filtre, une issue et un commentaire facultatifs :
 
         regles:
           - ref: R22
@@ -3933,32 +4078,29 @@ def charger_regles_gestion(chemin: str | Path | None = None) -> list:
                 valeurs: [Réalisée]
             issue: anomalie
 
+    La clé `jours_feries`, facultative, déclare les jours fériés une fois pour le
+    fichier (année vers liste de dates AAAA-MM-JJ) : chaque règle dont le type a un
+    paramètre feries et qui n'en déclare pas les reçoit (voir
+    `completer_jours_feries`).
+
     Un fichier absent, ou sans clé `regles`, ne donne aucune règle. Un fichier mal
     formé est refusé, tous les problèmes étant listés en une fois.
     """
     chemin = Path(chemin) if chemin is not None else chemin_regles_gestion()
-    if not chemin.is_file():
-        return []
-    with open(chemin, encoding="utf-8") as flux:
-        contenu = yaml.safe_load(flux)
-    if contenu is None:
-        return []
-    attendue = " et ".join(f"« {cle} »" for cle in CLES_FICHIER_GESTION)
-    if not isinstance(contenu, dict):
-        raise ValueError(
-            f"Fichier des règles de gestion invalide ({chemin}) : la seule clé "
-            f"attendue est {attendue}"
-        )
-    inconnues = [str(cle) for cle in contenu if cle not in CLES_FICHIER_GESTION]
-    if inconnues:
-        raise ValueError(
-            f"Fichier des règles de gestion invalide ({chemin}) : la seule clé "
-            f"attendue est {attendue} (clé inconnue : {', '.join(inconnues)})"
-        )
+    contenu = lire_fichier_gestion(chemin)
     regles = contenu.get(CLE_REGLES_GESTION)
     if regles is None:
         return []
-    problemes = problemes_regles_gestion(regles)
+    problemes = []
+    jours_feries = contenu.get(CLE_JOURS_FERIES)
+    if CLE_JOURS_FERIES in contenu:
+        problemes = [
+            f"{CLE_JOURS_FERIES} : {probleme}" for probleme in _problemes_feries(jours_feries)
+        ]
+        if problemes:
+            jours_feries = None
+    regles = completer_jours_feries(regles, jours_feries)
+    problemes.extend(problemes_regles_gestion(regles))
     if problemes:
         raise ValueError(
             f"Règles de gestion invalides ({chemin})\n  " + "\n  ".join(problemes)

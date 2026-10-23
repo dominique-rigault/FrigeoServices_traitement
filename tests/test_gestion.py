@@ -50,6 +50,8 @@ from frigeo.gestion import (
     CONSTAT_SOMMES_DIFFERENTES,
     CONSTAT_SUPERIEURE,
     CONSTAT_TOTAL_DIFFERENT,
+    CONSTAT_VALEUR_INATTENDUE,
+    CONSTAT_VALEUR_MANQUANTE,
     CONSTAT_VALEURS_DIFFERENTES,
     PREFIXE_PRATIQUE,
     ISSUE_INFORMATION,
@@ -59,7 +61,9 @@ from frigeo.gestion import (
     TypeRegle,
     catalogue_types,
     charger_regles_gestion,
+    completer_jours_feries,
     controler_gestion,
+    lire_fichier_gestion,
     problemes_regles_gestion,
 )
 
@@ -242,9 +246,11 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "rattachement_unique_dans_delai, reference_conforme, concordance_entre_references, "
         "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
         "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle, "
-        "sommes_liees_concordantes, totaux_par_periode, solde_jamais_negatif)",
+        "sommes_liees_concordantes, totaux_par_periode, solde_jamais_negatif, "
+        "renseignee_selon_valeur)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
-        "date_dans_periode_export : ref, libelle, type, table, filtre, issue, colonne)",
+        "date_dans_periode_export : ref, libelle, type, table, filtre, issue, commentaire, "
+        "colonne)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
         "règle n° 6 (decoupage), libelle : un texte non vide est attendu",
         "règle n° 7 (decoupage), table : un texte non vide est attendu",
@@ -400,7 +406,7 @@ def test_chargement_du_fichier(tmp_path):
     with pytest.raises(ValueError, match="clé inconnue : regle"):
         charger_regles_gestion(chemin)
     chemin.write_text("- ref: x\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="seule clé"):
+    with pytest.raises(ValueError, match="clés attendues sont « regles » et « jours_feries »"):
         charger_regles_gestion(chemin)
     chemin.write_text(
         "regles:\n  - ref: decoupage\n    libelle: x\n    type: autre\n    table: t\n"
@@ -3704,3 +3710,206 @@ def test_catalogue_et_chargement_du_4h(tmp_path):
     regles = charger_regles_gestion(chemin)
     assert regles[0]["date_initial"] == dt.date(2025, 1, 1)
     assert regles[0]["avance_entrees"] == 7
+
+
+# Formulaire des règles de gestion, morceau (a) : colonne renseignée selon une autre,
+# jours fériés du fichier, commentaire, table qui se prend pour référence.
+
+NATURES_RENSEIGNEE = {"o": "texte", "p": "texte"}
+
+
+def _renseignee(**autres):
+    return _instance(
+        "renseignee_selon_valeur", ref="renseignement",
+        **{"colonne": "o", "selon": "p", "valeurs": ["Avoir"], **autres},
+    )
+
+
+def _pieces_et_origines():
+    return _table(
+        p=["Avoir", "Facture", "Avoir", "Facture", " ", "Avoir", "Autre", "Avoir"],
+        o=["FA-1", "", " ", "FA-2", "FA-3", None, "", "FA-4"],
+    )
+
+
+def test_renseignee_selon_valeur():
+    donnees = _pieces_et_origines()
+    ecarts, bilan = _controler(donnees, NATURES_RENSEIGNEE, regles=[_renseignee()])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes") == [
+        (4, CONSTAT_VALEUR_MANQUANTE, "anomalie", "o, p"),
+        (7, CONSTAT_VALEUR_MANQUANTE, "anomalie", "o, p"),
+    ]
+    resume = _bilan(bilan)
+    # Facture et Autre hors champ, choix fait d'espaces non évaluable.
+    assert (resume["vue"], resume["hors_champ"], resume["non_evaluables"],
+            resume["controlees"], resume["anomalies"]) == (VUE_TOUTES, 3, 1, 4, 2)
+    ecarts, bilan = _controler(
+        donnees, NATURES_RENSEIGNEE,
+        regles=[_renseignee(vide_sinon=True, issue="à arbitrer", commentaire="Dossier, 2.5")],
+    )
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "valeur") == [
+        (4, CONSTAT_VALEUR_MANQUANTE, "à arbitrer", "  | Avoir"),
+        (5, CONSTAT_VALEUR_INATTENDUE, "à arbitrer", "FA-2 | Facture"),
+        (7, CONSTAT_VALEUR_MANQUANTE, "à arbitrer", " | Avoir"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"],
+            resume["a_arbitrer"]) == (0, 1, 7, 3)
+    # Plusieurs valeurs, comparées telles quelles; un filtre s'ajoute.
+    ecarts, bilan = _controler(
+        donnees, NATURES_RENSEIGNEE,
+        regles=[_renseignee(valeurs=["Facture", "avoir"], vide_sinon=True,
+                            filtre=[{"colonne": "p", "valeurs": ["Facture", "Avoir"]}])],
+    )
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (2, CONSTAT_VALEUR_INATTENDUE),
+        (3, CONSTAT_VALEUR_MANQUANTE),
+        (9, CONSTAT_VALEUR_INATTENDUE),
+    ]
+    assert _bilan(bilan)["hors_champ"] == 2
+
+
+def test_renseignee_selon_valeur_masquee_si_une_colonne_est_sensible():
+    donnees = _pieces_et_origines()
+    for sensible in ("o", "p"):
+        ecarts, _ = _controler(donnees, NATURES_RENSEIGNEE,
+                               regles=[_renseignee(vide_sinon=True)],
+                               sensibles={"t": frozenset({sensible})})
+        assert set(ecarts["valeur"]) == {VALEUR_MASQUEE}
+        assert len(ecarts) == 3
+
+
+def test_structure_de_renseignee_selon_valeur_et_du_commentaire():
+    regles = [
+        _renseignee(selon="o"),
+        _renseignee(valeurs=[]),
+        _renseignee(vide_sinon="oui"),
+        {cle: v for cle, v in _renseignee().items() if cle != "selon"},
+        _renseignee(commentaire=" "),
+        _renseignee(commentaire="Premier"),
+        _renseignee(commentaire="Second"),
+    ]
+    # Le commentaire ne distingue pas deux règles.
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (renseignement) : colonne et selon : deux colonnes différentes sont "
+        "attendues",
+        "règle n° 2 (renseignement) : valeurs : au moins une valeur est attendue",
+        "règle n° 3 (renseignement), vide_sinon : true ou false est attendu",
+        "règle n° 4 (renseignement) : paramètre manquant (selon)",
+        "règle n° 5 (renseignement), commentaire : un texte non vide est attendu",
+        "règle n° 7 (renseignement) : règle en double (même type, même table, mêmes "
+        "paramètres et même filtre que la règle n° 6 (renseignement))",
+    ]
+
+
+def test_jours_feries_du_fichier_et_commentaire(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    horaires = (
+        "    type: hors_horaires_selon_valeur\n    table: t\n    date: d\n    heure: h\n"
+        "    horaires:\n      lundi: [{debut: '07:30', fin: '18:00'}]\n"
+        "    colonne: c\n    valeurs: [Dépannage]\n"
+    )
+    chemin.write_text(
+        "jours_feries:\n  2025: ['2025-01-01', '2025-05-01']\n"
+        "regles:\n"
+        "  - ref: R04\n    libelle: Jours du fichier\n" + horaires
+        + "    feries_minimum: 2\n    commentaire: Jours fériés du fichier\n"
+        "  - ref: R04\n    libelle: Jours propres\n" + horaires.replace("lundi", "mardi")
+        + "    feries:\n      2025: ['2025-12-25']\n"
+        "  - ref: decoupage\n    libelle: Date\n    type: date_dans_periode_export\n"
+        "    table: t\n    colonne: d\n",
+        encoding="utf-8",
+    )
+    regles = charger_regles_gestion(chemin)
+    assert regles[0]["feries"] == {2025: ["2025-01-01", "2025-05-01"]}
+    assert regles[0]["commentaire"] == "Jours fériés du fichier"
+    assert regles[1]["feries"] == {2025: ["2025-12-25"]}
+    assert "feries" not in regles[2]
+    # Le contenu lu tel quel n'est pas complété.
+    contenu = lire_fichier_gestion(chemin)
+    assert set(contenu) == {"jours_feries", "regles"}
+    assert "feries" not in contenu["regles"][0]
+    # Les règles complétées s'appliquent.
+    donnees = _table(d=["01/05/2025", "05/05/2025"], h=["10:00", "10:00"],
+                     c=["Maintenance", "Maintenance"])
+    _, bilan = _controler(donnees, NATURES_HORAIRES, regles=regles[:1])
+    assert _bilan(bilan)["controlees"] == 2
+    # Jours fériés du fichier mal formés : refusés, la règle qui en dépend aussi.
+    texte = chemin.read_text(encoding="utf-8")
+    chemin.write_text(texte.replace("'2025-05-01'", "'2026-05-01'"), encoding="utf-8")
+    with pytest.raises(ValueError) as erreur:
+        charger_regles_gestion(chemin)
+    manquant = (
+        "  règle n° 1 (R04) : paramètre manquant (feries) (les jours fériés peuvent aussi "
+        "se déclarer une fois pour le fichier, sous la clé jours_feries)"
+    )
+    assert str(erreur.value).splitlines()[1:] == [
+        "  jours_feries : année 2025 : 2026-05-01 n'est pas de cette année",
+        manquant,
+    ]
+    # Sans jours fériés du fichier, la règle qui n'en déclare pas est refusée.
+    chemin.write_text(texte.split("regles:\n", 1)[1].join(["regles:\n", ""]), encoding="utf-8")
+    with pytest.raises(ValueError) as erreur:
+        charger_regles_gestion(chemin)
+    assert str(erreur.value).splitlines()[1:] == [manquant]
+    chemin.write_text("autre: 1\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="clé inconnue : autre"):
+        lire_fichier_gestion(chemin)
+    assert lire_fichier_gestion(tmp_path / "absent.yaml") == {}
+
+
+def test_completer_jours_feries_sans_modifier_les_arguments():
+    regles = [_horaires(), {k: v for k, v in _horaires().items() if k != "feries"}, "x"]
+    copie = deepcopy(regles)
+    jours = {2026: ["2026-01-01"]}
+    completes = completer_jours_feries(regles, jours)
+    assert regles == copie
+    assert completes[0]["feries"] == {2025: ["2025-05-01"]}
+    assert completes[1]["feries"] == jours
+    assert completes[1]["feries"] is not jours
+    assert completes[2] == "x"
+    assert completer_jours_feries(regles, None) is regles
+
+
+def _factures_et_avoirs():
+    return _table(
+        n=["FA-1", "FA-2", "AV-1", "AV-2", "AV-3", "AV-4", "AV-5"],
+        tp=["Facture", "Facture", "Avoir", "Avoir", "Avoir", "Avoir", "Avoir"],
+        d=["10/01/2025", "20/01/2025", "15/01/2025", "16/01/2025", "17/01/2025",
+           "18/01/2025", "20/01/2025"],
+        o=["", "", "FA-1", "AV-1", "FA-9", "FA-2", "FA-2"],
+    )
+
+
+NATURES_FACTURES = {"n": "texte", "tp": "texte", "d": "date JJ/MM/AAAA", "o": "texte"}
+
+
+def test_table_qui_se_prend_pour_reference():
+    commun = {"cle": ["o"], "table_reference": "t", "cle_reference": ["n"],
+              "cle_facultative": True}
+    regles = [
+        _instance("existence_dans_reference", ref="existence", **commun),
+        _instance("reference_conforme", ref="existence",
+                  attendu=[{"colonne": "tp", "valeurs": ["Facture"]}], **commun),
+        _instance("date_dans_periode_reference", ref="existence", date="d", debut="d",
+                  **commun),
+    ]
+    ecarts, bilan = _controler(_factures_et_avoirs(), NATURES_FACTURES, regles=regles)
+    # Les colonnes de la ligne et celles de sa référence sont distinguées.
+    assert _lignes(ecarts, "type", "num_ligne_source", "constat", "colonnes", "valeur") == [
+        ("existence_dans_reference", 6, CONSTAT_ABSENTE, "o, t.n", "FA-9"),
+        ("reference_conforme", 5, CONSTAT_NON_CONFORME, "o, t.n, t.tp", "t.tp = Avoir"),
+        ("date_dans_periode_reference", 6, CONSTAT_ABSENTE, "o, d, t.n, t.d",
+         "FA-9 | 17/01/2025"),
+        ("date_dans_periode_reference", 7, CONSTAT_HORS_PERIODES, "o, d, t.n, t.d",
+         "18/01/2025 (période depuis le 20/01/2025)"),
+    ]
+    # Factures sans origine hors champ; origine absente non évaluable pour la conformité.
+    assert [
+        (r["hors_champ"], r["non_evaluables"], r["controlees"], r["anomalies"])
+        for r in bilan.to_dict("records")
+    ] == [(2, 0, 5, 1), (2, 1, 4, 1), (2, 0, 5, 2)]
+    # Une colonne sensible de la ligne masque sa valeur, pas celle d'une autre colonne.
+    ecarts, _ = _controler(_factures_et_avoirs(), NATURES_FACTURES, regles=regles[:1],
+                           sensibles={"t": frozenset({"o"})})
+    assert _lignes(ecarts, "valeur") == [(VALEUR_MASQUEE,)]
