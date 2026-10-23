@@ -1,6 +1,9 @@
 # Règles de contrôle données par le métier, que le dictionnaire des données ne peut
 # pas déduire des fichiers. Une forme fixe (code postal, numéro à longueur fixe) ne
 # se déclare pas ici mais dans le classeur de revue du dictionnaire (règle format).
+# Ce fichier est réécrit en entier par le formulaire des règles de contrôle (notebook
+# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs s'écrivent à
+# la main, le formulaire les reprend tels quels.
 #
 # Règles possibles pour une colonne
 #   decimales  nombre maximal de décimales
@@ -11,45 +14,61 @@
 
 regles:
   interventions:
-    distance_km: {decimales: 1}
+    duree_min: {decimales: 0, bornes: {min: 5, max: 720}}
+    duree_trajet_min: {decimales: 0, bornes: {min: 1, max: 180}}
+    distance_km: {decimales: 1, bornes: {min: 0, max: 200, min_exclu: true}}
+    lieu_cp: {decimales: 0, bornes: {min: 27000, max: 76999}}
   pieces_interventions:
-    quantite: {decimales: 2}
+    quantite: {decimales: 1, bornes: {min: 0, max: 5, min_exclu: true}}
   factures_entetes:
     total_ht: {decimales: 2}
     total_tva: {decimales: 2}
     total_ttc: {decimales: 2}
   factures_lignes:
-    quantite: {decimales: 2}
-    pu_ht: {decimales: 2}
+    num_ligne: {decimales: 0, bornes: {min: 1, max: 100, max_exclu: true}}
+    quantite: {decimales: 2, bornes: {min: -60, max: 60}}
+    pu_ht: {decimales: 2, bornes: {min: 0, max: 10000}}
+    remise_pct: {decimales: 2, bornes: {min: 0, max: 15}}
     montant_ht: {decimales: 2}
-    remise_pct: {bornes: {min: 0, max: 15}}
-    taux_tva: {bornes: {min: 20, max: 20}}
+    taux_tva: {decimales: 2, bornes: {min: 20, max: 20}}
   achats_entetes:
     total_ht: {decimales: 2}
     total_tva: {decimales: 2}
     total_ttc: {decimales: 2}
   achats_lignes:
-    quantite: {decimales: 2}
+    num_ligne: {decimales: 0, bornes: {min: 1, max: 100, max_exclu: true}}
+    quantite: {decimales: 2, bornes: {min: -200, max: 200}}
     pu_achat_ht: {decimales: 2}
     montant_ht: {decimales: 2}
-  clients:
-    siret: {cle_luhn: true}
-    email: {motif: '[^@\s]+@[^@\s]+\.[^@\s]+'}
-  fournisseurs:
-    siret: {cle_luhn: true}
+    compte_charge: {decimales: 0, bornes: {min: 601100, max: 628800}}
+  fec:
+    CompteNum: {decimales: 0, bornes: {min: 101300, max: 708500}}
+    Debit: {decimales: 2}
+    Credit: {decimales: 2}
+    Montantdevise: {decimales: 2}
   intervenants:
     nom: {motif: '[^a-zà-ÿ]+'}
+    secteur: {decimales: 0, bornes: {min: 27000, max: 76999}}
   remunerations:
-    salaire_brut_mensuel: {decimales: 2}
-    taux_activite: {bornes: {min: 0, max: 1, min_exclu: true}}
+    salaire_brut_mensuel: {decimales: 2, bornes: {min: 1000}}
+    taux_activite: {decimales: 2, bornes: {min: 0, max: 1, min_exclu: true}}
+  clients:
+    siret: {decimales: 0, cle_luhn: true}
+    cp: {decimales: 0, bornes: {min: 27000, max: 76999}}
+    email: {motif: '[^@\s]+@[^@\s]+\.[^@\s]+'}
+  fournisseurs:
+    siret: {decimales: 0, cle_luhn: true}
+    cp: {decimales: 0, bornes: {min: 27000, max: 76999}}
   catalogue_pieces:
-    prix_vente_ht_2025: {decimales: 2}
-    stock_initial: {decimales: 2}
-    cump_initial: {decimales: 4}
+    prix_vente_ht_2025: {decimales: 2, bornes: {min: 0, max: 1000, min_exclu: true}}
+    stock_initial: {decimales: 2, bornes: {min: 0}}
+    cump_initial: {decimales: 4, bornes: {min: 0, min_exclu: true}}
   parametres_couts:
-    cout_km: {decimales: 2}
-    taux_charges_cdi_cdd: {bornes: {min: 0, max: 1}}
-    taux_charges_apprenti: {bornes: {min: 0, max: 1}}
+    annee: {decimales: 0, bornes: {min: 2025, max: 2100, max_exclu: true}}
+    cout_km: {decimales: 2, bornes: {min: 0.1, max: 10, max_exclu: true}}
+    taux_charges_cdi_cdd: {decimales: 2, bornes: {min: 0.1, max: 1, max_exclu: true}}
+    taux_charges_apprenti: {decimales: 2, bornes: {min: 0.01, max: 1, max_exclu: true}}
+    heures_annuelles: {decimales: 0, bornes: {min: 1500, max: 1800}}
 
 
 # Doublons, déclarés d'après ce que dit le métier.
@@ -59,6 +78,7 @@ regles:
 doublons:
   interventions:
     cle: [id_intervention]
+    identique_hors_cle: false
   pieces_interventions:
     cle: [id_consommation]
   factures_entetes:
@@ -71,6 +91,11 @@ doublons:
       - [code_fournisseur, ref_facture_fournisseur]
   achats_lignes:
     cle: [num_piece_achat, num_ligne]
+  intervenants:
+    cle: [matricule, date_entree]
+    identique_hors_cle: false
+  remunerations:
+    cle: [matricule, date_effet]
     identique_hors_cle: false
   clients:
     cle: [code_client]
@@ -78,20 +103,38 @@ doublons:
       - [siret]
     presume_unique:
       - [raison_sociale, cp]
+    identique_hors_cle: false
   fournisseurs:
     cle: [code_fournisseur]
     unique:
       - [siret]
     presume_unique:
       - [raison_sociale]
-  intervenants:
-    cle: [matricule, date_entree]
-  remunerations:
-    cle: [matricule, date_effet]
     identique_hors_cle: false
   catalogue_pieces:
     cle: [ref_piece]
-    presume_unique:
+    unique:
       - [libelle]
+    identique_hors_cle: false
   parametres_couts:
     cle: [annee]
+
+
+# Propositions du formulaire écartées par le métier, qui ne sont plus proposées
+# (sans effet sur les contrôles).
+ecartees:
+  bornes:
+    factures_entetes: [total_ht, total_tva, total_ttc]
+    factures_lignes: [montant_ht]
+    achats_entetes: [total_ht, total_tva, total_ttc]
+    achats_lignes: [pu_achat_ht, montant_ht]
+    fec: [Debit, Credit, Montantdevise]
+    clients: [siret]
+    fournisseurs: [siret]
+  cle_luhn:
+    interventions: [duree_min, duree_trajet_min, lieu_cp]
+    achats_lignes: [compte_charge]
+    fec: [CompteNum]
+    intervenants: [secteur]
+    clients: [cp]
+    fournisseurs: [cp]
