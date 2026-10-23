@@ -5,9 +5,10 @@ dans config/gestion.yaml. Plutôt que de faire écrire ce fichier à la main, le
 les revoit dans un classeur Excel, sur le modèle du formulaire des règles de
 contrôle (`frigeo.formulaire_controles`) :
 
-- les familles de règles qui tiennent sur une ligne ont leur feuille, où les règles
-  en vigueur (statut « documenté ») voisinent avec des propositions tirées des
-  données (statut « observé »);
+- les familles de règles qui tiennent sur une ligne (références, renseignement selon
+  une autre colonne, période d'export) ont leur feuille, où les règles en vigueur
+  (statut « documenté ») voisinent avec des propositions tirées des données (statut
+  « observé »);
 - les autres règles sont affichées en clair dans la feuille des autres règles, où le
   métier peut seulement les retirer, changer leur libellé et leur issue, ou les
   commenter;
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import datetime as dt
 import hashlib
+from collections import Counter
 from datetime import date
 from pathlib import Path
 
@@ -36,10 +38,11 @@ import pandas as pd
 import yaml
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, Protection
-from openpyxl.utils import get_column_letter
+from openpyxl.utils import get_column_letter, quote_sheetname
 
-from .dictionnaire import STATUTS
-from .formulaire_controles import texte_nombre
+from .dictionnaire import LISTE_FERMEE, STATUTS
+from .doublons import COMPARAISON_TELLE_QUELLE
+from .formulaire_controles import NATURES_CLE, texte_nombre
 from .formulaires import dossier_formulaires
 from .gestion import (
     CLE_COMMENTAIRE,
@@ -52,23 +55,29 @@ from .gestion import (
     CLE_RETIREES,
     CLES_COMMUNES,
     COLONNE_PERIODE,
+    COMPARAISONS,
     ISSUES,
     TYPES,
     _annee_feries,
     _bornes_periode,
+    _cles_comparees,
+    _dans_le_champ,
     _ecrire_condition,
     _jour_ferie,
     _prerequis_export,
     _problemes_feries,
     _texte_filtre,
+    _texte_lu,
     chemin_regles_gestion,
     completer_jours_feries,
     problemes_regles_gestion,
 )
-from .revue import _ecrire_texte, _feuille_listes, _menu, _menus_d_ajout
+from .revue import FEUILLE_LISTES, _ecrire_texte, _feuille_listes, _menu, _menus_d_ajout
 from .typage import NATURES_DATE, lire
 
 FEUILLE_MODE_EMPLOI = "mode_emploi"
+FEUILLE_REFERENCES = "références"
+FEUILLE_RENSEIGNEMENT = "renseignement"
 FEUILLE_PERIODES = "périodes_export"
 FEUILLE_FERIES = "jours_fériés"
 FEUILLE_AUTRES = "autres_règles"
@@ -82,18 +91,36 @@ ORIGINE_PROPOSEE = "proposée"
 ORIGINE_ECARTEE = "écartée"
 ORIGINE_RETIREE = "retirée"
 STATUT_OBSERVE, STATUT_VALIDE, STATUT_INVALIDE, STATUT_DOCUMENTE = STATUTS
-# Part minimale des lignes qui suivent une règle pour la proposer.
+# Part minimale des lignes qui suivent une règle pour la proposer, comptée avec une
+# ligne contraire de plus (voir `_seuil_atteint`).
 SEUIL_PROPOSITION = 0.95
+# Références : nombre minimal de valeurs distinctes trouvées pour une proposition.
+MIN_DISTINCTES = 2
+# Renseignement : nombre maximal de valeurs de la liste fermée de la colonne selon.
+MAX_VALEURS_SELON = 12
 LIGNES_AJOUT = 50
 REPERE_EMPREINTE = "Empreinte de config/gestion.yaml à l'export (repère technique)"
 
 # Familles de règles qui ont leur feuille : nom sous la clé `ecartees`, type du
 # catalogue et référence donnée à une proposition.
+FAMILLE_REFERENCES = "references"
+TYPE_REFERENCES = "existence_dans_reference"
+REF_REFERENCES = "existence"
+FAMILLE_RENSEIGNEMENT = "renseignement"
+TYPE_RENSEIGNEMENT = "renseignee_selon_valeur"
+REF_RENSEIGNEMENT = "renseignement"
 FAMILLE_PERIODES = "periodes_export"
 TYPE_PERIODES = "date_dans_periode_export"
 REF_PERIODES = "decoupage"
 FAMILLE_FERIES = CLE_JOURS_FERIES
-FAMILLES_ECARTEES = (FAMILLE_PERIODES, FAMILLE_FERIES)
+FAMILLES_ECARTEES = (FAMILLE_REFERENCES, FAMILLE_RENSEIGNEMENT, FAMILLE_PERIODES, FAMILLE_FERIES)
+# Clés d'une proposition écartée, par famille (liste de dictionnaires de textes);
+# les jours fériés écartés suivent la forme de la clé jours_feries.
+CLES_PROPOSITION_ECARTEE = {
+    FAMILLE_REFERENCES: ("table", "colonne", "table_reference", "colonne_reference"),
+    FAMILLE_RENSEIGNEMENT: ("table", "colonne", "selon"),
+    FAMILLE_PERIODES: ("table", "colonne"),
+}
 # Clés d'une règle demandée en texte libre, avec leur colonne dans le classeur.
 COLONNES_DEMANDE = {
     "regle": "règle",
@@ -104,6 +131,61 @@ COLONNES_DEMANDE = {
     "commentaire": "commentaire",
 }
 
+COLONNES_REFERENCES = (
+    "table",
+    "colonne",
+    "table_reference",
+    "colonne_reference",
+    "observé",
+    "proposition",
+    "origine",
+    "statut",
+    "ref",
+    "libellé",
+    "issue",
+    "clé_facultative",
+    "comparaison",
+    "filtre_colonne",
+    "filtre_valeurs",
+    "commentaire",
+    "rang",
+    "proposition_clé_facultative",
+)
+MODIFIABLES_REFERENCES = (
+    "statut", "ref", "libellé", "issue", "clé_facultative", "comparaison", "commentaire",
+)
+SAISIE_AJOUT_REFERENCES = (
+    "table", "colonne", "table_reference", "colonne_reference", "statut", "ref", "libellé",
+    "issue", "clé_facultative", "comparaison", "filtre_colonne", "filtre_valeurs",
+    "commentaire",
+)
+COLONNES_RENSEIGNEMENT = (
+    "table",
+    "colonne",
+    "selon",
+    "observé",
+    "proposition",
+    "origine",
+    "statut",
+    "ref",
+    "libellé",
+    "issue",
+    "valeurs",
+    "vide_sinon",
+    "filtre_colonne",
+    "filtre_valeurs",
+    "commentaire",
+    "rang",
+    "proposition_valeurs",
+    "proposition_vide_sinon",
+)
+MODIFIABLES_RENSEIGNEMENT = (
+    "statut", "ref", "libellé", "issue", "valeurs", "vide_sinon", "commentaire",
+)
+SAISIE_AJOUT_RENSEIGNEMENT = (
+    "table", "colonne", "selon", "statut", "ref", "libellé", "issue", "valeurs", "vide_sinon",
+    "filtre_colonne", "filtre_valeurs", "commentaire",
+)
 COLONNES_PERIODES = (
     "table",
     "colonne",
@@ -144,13 +226,26 @@ COLONNES_AUTRES = (
 )
 MODIFIABLES_AUTRES = ("libellé", "issue", "statut", "commentaire")
 COLONNES_NOUVELLES = tuple(COLONNES_DEMANDE.values())
-# Colonnes techniques, masquées : le rang de la règle dans config/gestion.yaml (sous
-# la clé regles, ou sous la clé retirees pour une règle retirée), relu à l'import.
-COLONNES_MASQUEES = ("rang",)
+# Colonnes techniques, masquées, relues à l'import : le rang de la règle dans
+# config/gestion.yaml (sous la clé regles, ou sous la clé retirees pour une règle
+# retirée), et les paramètres proposés, que le statut valide adopte.
+COLONNES_MASQUEES = (
+    "rang", "proposition_clé_facultative", "proposition_valeurs", "proposition_vide_sinon",
+)
 FORMAT_DATE = "DD/MM/YYYY"
 LARGEURS = {
     "table": 22,
     "colonne": 22,
+    "table_reference": 22,
+    "colonne_reference": 22,
+    "selon": 18,
+    "clé_facultative": 10,
+    "comparaison": 20,
+    "valeurs": 24,
+    "vide_sinon": 10,
+    "proposition_clé_facultative": 10,
+    "proposition_valeurs": 10,
+    "proposition_vide_sinon": 10,
     "nature": 18,
     "dates": 9,
     "observé": 40,
@@ -282,15 +377,16 @@ def problemes_contenu_formulaire(contenu: dict) -> list[str]:
             nom = f"{CLE_ECARTEES}, {famille}"
             if famille == FAMILLE_FERIES:
                 problemes.extend(f"{nom} : {probleme}" for probleme in _problemes_feries(valeur))
-            elif famille == FAMILLE_PERIODES:
+            elif famille in CLES_PROPOSITION_ECARTEE:
+                cles = CLES_PROPOSITION_ECARTEE[famille]
                 if not isinstance(valeur, list) or not all(
                     isinstance(element, dict)
-                    and set(element) == {"table", "colonne"}
+                    and set(element) == set(cles)
                     and all(isinstance(v, str) and v for v in element.values())
                     for element in valeur
                 ):
                     problemes.append(
-                        f"{nom} : une liste de {{table, colonne}} (textes) est attendue"
+                        f"{nom} : une liste de {{{', '.join(cles)}}} (textes) est attendue"
                     )
             else:
                 problemes.append(
@@ -395,6 +491,21 @@ def _filtre_simple(instance: dict) -> tuple[str, str] | None:
     return None
 
 
+def _seuil_atteint(favorables: int, total: int) -> bool:
+    """Vrai si au moins `SEUIL_PROPOSITION` des lignes suivent la règle, en comptant une
+    ligne contraire de plus : une proposition ne repose pas sur une poignée de lignes
+    (à 95 %, il en faut au moins 19, toutes conformes)."""
+    return total > 0 and favorables / (total + 1) >= SEUIL_PROPOSITION
+
+
+def lignes_minimales() -> int:
+    """Nombre minimal de lignes, toutes conformes, pour atteindre le seuil."""
+    lignes = 1
+    while not _seuil_atteint(lignes, lignes):
+        lignes += 1
+    return lignes
+
+
 def _en_periode(instance: dict) -> bool:
     """Vrai pour une règle de la famille des périodes d'export qui tient sur une ligne."""
     return instance.get("type") == TYPE_PERIODES and _filtre_simple(instance) is not None
@@ -426,7 +537,7 @@ def _ligne_periode(table, colonne, nature, observation) -> dict:
         )
     else:
         observe = None
-    proposition = OUI if lues and dans / lues >= SEUIL_PROPOSITION else AUCUNE
+    proposition = OUI if _seuil_atteint(dans, lues) else AUCUNE
     return {
         "table": table,
         "colonne": colonne,
@@ -459,7 +570,8 @@ def lignes_periodes(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
 
     Par table, dans l'ordre du dictionnaire : les règles en vigueur (documenté), les
     propositions (observé, « oui » quand au moins `SEUIL_PROPOSITION` des dates
-    tombent dans la période de leur export), puis les règles retirées et les
+    tombent dans la période de leur export, seuil compté avec une date hors période de
+    plus), puis les règles retirées et les
     propositions écartées (invalide). Une colonne qui a une règle de la famille, en
     vigueur ou retirée (y compris une règle à filtre complexe, affichée dans la
     feuille des autres règles), ou une proposition écartée, n'a pas de proposition.
@@ -549,6 +661,503 @@ def lignes_periodes(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
     return lignes
 
 
+# --- Références : valeur connue d'une colonne de référence ------------------------
+
+
+def _en_reference(instance: dict) -> bool:
+    """Vrai pour une règle de la famille des références qui tient sur une ligne."""
+    return instance.get("type") == TYPE_REFERENCES and _filtre_simple(instance) is not None
+
+
+def _champs_regle(instance: dict, rang: int, origine: str) -> dict:
+    """Colonnes communes de la ligne d'une règle en vigueur ou retirée."""
+    filtre_colonne, filtre_valeurs = _filtre_simple(instance)
+    return {
+        "origine": origine,
+        "statut": STATUT_DOCUMENTE if origine == ORIGINE_EN_VIGUEUR else STATUT_INVALIDE,
+        "ref": instance["ref"],
+        "libellé": instance["libelle"],
+        "issue": _issue(instance),
+        "filtre_colonne": filtre_colonne or None,
+        "filtre_valeurs": filtre_valeurs or None,
+        "commentaire": instance.get(CLE_COMMENTAIRE),
+        "rang": rang,
+    }
+
+
+def _par_table(dictionnaire: dict, groupes: list[list[dict]]) -> list[dict]:
+    """Lignes de plusieurs groupes, rangées par table (ordre du dictionnaire, puis tables
+    inconnues par nom), et dans chaque table groupe après groupe."""
+    ordre = list(dictionnaire)
+    noms = sorted(
+        {ligne["table"] for groupe in groupes for ligne in groupe},
+        key=lambda t: (ordre.index(t) if t in ordre else len(ordre), t),
+    )
+    return [ligne for t in noms for groupe in groupes for ligne in groupe if ligne["table"] == t]
+
+
+def _ecartees_famille(contenu: dict, famille: str) -> list[tuple]:
+    """Propositions écartées d'une famille, en tuples dans l'ordre de leurs clés."""
+    return [
+        tuple(element[cle] for cle in CLES_PROPOSITION_ECARTEE[famille])
+        for element in _ecartees(contenu, famille) or []
+    ]
+
+
+def cibles_references(dictionnaire: dict, declarations: dict | None) -> list[tuple[str, str]]:
+    """Colonnes vers lesquelles une référence peut être proposée : la clé ou une colonne
+    unique, d'une seule colonne, déclarées dans config/controles.yaml (doublons), de
+    nature texte ou entier (texte), dans l'ordre du dictionnaire."""
+    cibles = []
+    for table, colonnes in dictionnaire.items():
+        declaration = (declarations or {}).get(table) or {}
+        groupes = [declaration.get("cle") or []] + list(declaration.get("unique") or [])
+        for groupe in groupes:
+            if (
+                len(groupe) == 1
+                and groupe[0] in colonnes
+                and colonnes[groupe[0]]["nature"]["regle"] in NATURES_CLE
+                and (table, groupe[0]) not in cibles
+            ):
+                cibles.append((table, groupe[0]))
+    return cibles
+
+
+def _compter_reference(cles: pd.Series, connues: set) -> dict:
+    renseignees = cles.dropna()
+    effectifs = renseignees.value_counts()
+    trouvees = effectifs[effectifs.index.isin(list(connues))]
+    return {
+        "renseignees": len(renseignees),
+        "trouvees": int(trouvees.sum()),
+        "distinctes": len(trouvees),
+        "vides": int(cles.isna().sum()),
+    }
+
+
+def observer_reference(
+    donnees: pd.DataFrame,
+    colonnes: list[str],
+    reference: pd.DataFrame,
+    colonnes_reference: list[str],
+    comparaison: str = COMPARAISON_TELLE_QUELLE,
+) -> dict:
+    """Clés d'une table retrouvées dans une table de référence, comparées comme le fait
+    le type existence_dans_reference : lignes à clé renseignée, lignes trouvées, valeurs
+    distinctes trouvées et lignes à clé vide."""
+    cles = _cles_comparees(donnees, list(colonnes), comparaison)
+    connues = set(_cles_comparees(reference, list(colonnes_reference), comparaison).dropna())
+    return _compter_reference(cles, connues)
+
+
+def _colonnes_observation_reference(observation: dict | None) -> dict:
+    """Colonnes observé, proposition et proposition_clé_facultative d'une ligne."""
+    if observation is None:
+        return {"observé": None, "proposition": AUCUNE, "proposition_clé_facultative": None}
+    renseignees, trouvees = observation["renseignees"], observation["trouvees"]
+    if renseignees:
+        observe = (
+            f"{renseignees} lignes renseignées, {trouvees} trouvées "
+            f"({_pourcentage(trouvees / renseignees)} %)"
+        )
+    else:
+        observe = "aucune ligne renseignée"
+    if observation["vides"]:
+        observe += f", {observation['vides']} vides"
+    proposee = (
+        _seuil_atteint(trouvees, renseignees) and observation["distinctes"] >= MIN_DISTINCTES
+    )
+    return {
+        "observé": observe,
+        "proposition": OUI if proposee else AUCUNE,
+        "proposition_clé_facultative": OUI if observation["vides"] else NON,
+    }
+
+
+def _base_reference(tables, table, colonnes, table_ref, colonnes_ref, comparaison, filtre):
+    observation = None
+    utiles = [(table, c) for c in colonnes] + [(table_ref, c) for c in colonnes_ref]
+    utiles += [(table, condition["colonne"]) for condition in filtre or []]
+    if all(t in tables and c in tables[t].columns for t, c in utiles):
+        donnees = tables[table]
+        if filtre:
+            donnees = donnees[_dans_le_champ(donnees, filtre)]
+        observation = observer_reference(
+            donnees, colonnes, tables[table_ref], colonnes_ref, comparaison
+        )
+    return {
+        "table": table,
+        "colonne": ", ".join(colonnes),
+        "table_reference": table_ref,
+        "colonne_reference": ", ".join(colonnes_ref),
+        **_colonnes_observation_reference(observation),
+    }
+
+
+def _ligne_regle_reference(tables, instance, rang, origine) -> dict:
+    colonnes_ref = instance.get("cle_reference") or instance["cle"]
+    comparaison = instance.get("comparaison", COMPARAISON_TELLE_QUELLE)
+    base = _base_reference(
+        tables, instance["table"], instance["cle"], instance["table_reference"], colonnes_ref,
+        comparaison, instance.get(CLE_FILTRE),
+    )
+    return {
+        **base,
+        **_champs_regle(instance, rang, origine),
+        "clé_facultative": OUI if instance.get("cle_facultative") else NON,
+        "comparaison": comparaison,
+    }
+
+
+def _ligne_proposition_reference(base: dict, origine: str) -> dict:
+    return {
+        **base,
+        "origine": origine,
+        "statut": STATUT_OBSERVE if origine == ORIGINE_PROPOSEE else STATUT_INVALIDE,
+        "ref": REF_REFERENCES,
+        "libellé": (
+            f"{base['table']}.{base['colonne']} connue de "
+            f"{base['table_reference']}.{base['colonne_reference']}"
+        ),
+        "issue": TYPES[TYPE_REFERENCES].issue,
+        "clé_facultative": base["proposition_clé_facultative"] or NON,
+        "comparaison": COMPARAISON_TELLE_QUELLE,
+    }
+
+
+def lignes_references(
+    tables: dict, dictionnaire: dict, contenu: dict, declarations: dict | None
+) -> list[dict]:
+    """Lignes de la feuille des références : les règles de la famille et les
+    propositions.
+
+    Une colonne A est proposée vers une colonne B, clé ou unique d'une seule colonne
+    (`cibles_references`), de même nature, distincte de A (une table peut se viser
+    elle-même), quand au moins `SEUIL_PROPOSITION` des lignes à A renseignée sont
+    trouvées dans B (seuil compté avec une ligne contraire de plus) et qu'au moins
+    `MIN_DISTINCTES` valeurs distinctes y sont trouvées; la clé facultative est proposée
+    si A a des vides. Aucune proposition quand une règle en vigueur ou retirée, ou une
+    proposition écartée, relie déjà A à B, quel que soit son filtre. Par table A, dans
+    l'ordre du dictionnaire : règles en vigueur (documenté), propositions (observé),
+    règles retirées, puis propositions écartées (invalide).
+    """
+    ecartees = _ecartees_famille(contenu, FAMILLE_REFERENCES)
+    vigueur, retirees = (
+        [(r, rang) for rang, r in enumerate(contenu.get(cle) or []) if _en_reference(r)]
+        for cle in (CLE_REGLES_GESTION, CLE_RETIREES)
+    )
+    connues = {(t, (c,), tr, (cr,)) for t, c, tr, cr in ecartees} | {
+        (r["table"], tuple(r["cle"]), r["table_reference"],
+         tuple(r.get("cle_reference") or r["cle"]))
+        for cle in (CLE_REGLES_GESTION, CLE_RETIREES)
+        for r in contenu.get(cle) or []
+        if r.get("type") == TYPE_REFERENCES
+    }
+    cache = {}
+
+    def cles(table, colonne):
+        if (table, colonne) not in cache:
+            cache[(table, colonne)] = _cles_comparees(tables[table], [colonne])
+        return cache[(table, colonne)]
+
+    cibles = [
+        (t, c) for t, c in cibles_references(dictionnaire, declarations)
+        if t in tables and c in tables[t].columns
+    ]
+    propositions = []
+    for rang_cible, (table_b, colonne_b) in enumerate(cibles):
+        nature_b = dictionnaire[table_b][colonne_b]["nature"]["regle"]
+        connues_b = set(cles(table_b, colonne_b).dropna())
+        for table_a, colonnes_a in dictionnaire.items():
+            if table_a not in tables:
+                continue
+            for rang_a, (colonne_a, regles_a) in enumerate(colonnes_a.items()):
+                if (
+                    (table_a, colonne_a) == (table_b, colonne_b)
+                    or regles_a["nature"]["regle"] != nature_b
+                    or colonne_a not in tables[table_a].columns
+                    or (table_a, (colonne_a,), table_b, (colonne_b,)) in connues
+                ):
+                    continue
+                observation = _compter_reference(cles(table_a, colonne_a), connues_b)
+                base = {
+                    "table": table_a,
+                    "colonne": colonne_a,
+                    "table_reference": table_b,
+                    "colonne_reference": colonne_b,
+                    **_colonnes_observation_reference(observation),
+                }
+                if base["proposition"] == OUI:
+                    propositions.append(((rang_a, rang_cible), base))
+    propositions = [
+        _ligne_proposition_reference(base, ORIGINE_PROPOSEE)
+        for _, base in sorted(propositions, key=lambda element: element[0])
+    ]
+    lignes_ecartees = [
+        _ligne_proposition_reference(
+            _base_reference(tables, t, [c], tr, [cr], COMPARAISON_TELLE_QUELLE, None),
+            ORIGINE_ECARTEE,
+        )
+        for t, c, tr, cr in ecartees
+    ]
+    return _par_table(dictionnaire, [
+        [_ligne_regle_reference(tables, r, rang, ORIGINE_EN_VIGUEUR) for r, rang in vigueur],
+        propositions,
+        [_ligne_regle_reference(tables, r, rang, ORIGINE_RETIREE) for r, rang in retirees],
+        lignes_ecartees,
+    ])
+
+
+# --- Renseignement : colonne renseignée selon la valeur d'une autre --------------
+
+
+def _en_renseignement(instance: dict) -> bool:
+    """Vrai pour une règle de la famille du renseignement qui tient sur une ligne."""
+    return instance.get("type") == TYPE_RENSEIGNEMENT and _filtre_simple(instance) is not None
+
+
+def _liste_en_vigueur(dictionnaire: dict, table: str, colonne: str) -> list[str] | None:
+    """Valeurs (textes) de la liste fermée en vigueur d'une colonne, hors valeurs
+    invalidées, dans l'ordre du dictionnaire; None sans liste fermée en vigueur."""
+    regle = dictionnaire.get(table, {}).get(colonne, {}).get("valeurs") or {}
+    if regle.get("regle") != LISTE_FERMEE:
+        return None
+    return [
+        str(element["valeur"]) for element in regle.get("liste") or []
+        if element.get("statut") != STATUT_INVALIDE
+    ]
+
+
+def _liste_selon(dictionnaire: dict, table: str, selon: str, sensibles: dict) -> list[str] | None:
+    """Liste en vigueur d'une colonne qui peut servir de colonne selon à une
+    proposition : liste fermée d'au plus `MAX_VALEURS_SELON` valeurs, colonne non
+    sensible (ses valeurs entreraient dans config/gestion.yaml, versionné); None sinon."""
+    liste = _liste_en_vigueur(dictionnaire, table, selon)
+    if liste is None or len(liste) > MAX_VALEURS_SELON or selon in sensibles.get(table, ()):
+        return None
+    return liste
+
+
+def _compter_renseignement(choix: list, remplies: list) -> dict:
+    lignes, renseignees, vides = Counter(), Counter(), 0
+    for valeur, remplie in zip(choix, remplies):
+        if valeur is None:
+            vides += 1
+        else:
+            lignes[valeur] += 1
+            renseignees[valeur] += remplie
+    return {"lignes": lignes, "renseignees": renseignees, "selon_vide": vides}
+
+
+def observer_renseignement(donnees: pd.DataFrame, colonne: str, selon: str) -> dict:
+    """Par valeur de la colonne selon (texte lu, comparé tel quel comme dans la règle) :
+    lignes, et lignes où la colonne est renseignée (une cellule faite d'espaces compte
+    comme vide); et nombre de lignes où selon est vide."""
+    return _compter_renseignement(
+        [_texte_lu(valeur) for valeur in donnees[selon]],
+        [_texte_lu(valeur) is not None for valeur in donnees[colonne]],
+    )
+
+
+def proposer_renseignement(observation: dict, liste: list[str]) -> tuple[list[str], bool] | None:
+    """Valeurs retenues (dans l'ordre de la liste) et vide_sinon proposés, None sans
+    proposition.
+
+    Seules comptent les lignes dont selon porte une valeur de la liste en vigueur (les
+    autres sont déjà des anomalies de format). Une valeur est retenue quand la colonne
+    est renseignée sur au moins `SEUIL_PROPOSITION` de ses lignes, seuil compté avec
+    une ligne contraire de plus. Pas de proposition sans valeur retenue, ni quand
+    toutes les valeurs observées atteignent le seuil compté simplement : la colonne
+    est alors renseignée quelle que soit la valeur, ce que dit la règle obligatoire du
+    dictionnaire. vide_sinon est proposé quand la colonne est vide sur au moins
+    `SEUIL_PROPOSITION` des autres lignes (avec une ligne contraire de plus).
+    """
+    lignes = {v: observation["lignes"][v] for v in liste if observation["lignes"][v]}
+    renseignees = {v: observation["renseignees"][v] for v in lignes}
+    retenues = [v for v in lignes if _seuil_atteint(renseignees[v], lignes[v])]
+    if not retenues or all(
+        renseignees[v] / lignes[v] >= SEUIL_PROPOSITION for v in lignes
+    ):
+        return None
+    autres = sum(lignes[v] for v in lignes if v not in retenues)
+    vides_autres = autres - sum(renseignees[v] for v in lignes if v not in retenues)
+    return retenues, _seuil_atteint(vides_autres, autres)
+
+
+def _texte_renseignement(observation: dict, valeurs: list[str]) -> str:
+    """Observé d'une ligne : « Avoir 11 sur 11 renseignées; autres valeurs 0 sur 8596
+    renseignées »."""
+    lignes, renseignees = observation["lignes"], observation["renseignees"]
+    parties = [f"{v} {renseignees[v]} sur {lignes[v]} renseignées" for v in valeurs]
+    autres = [v for v in lignes if v not in valeurs]
+    parties.append(
+        f"autres valeurs {sum(renseignees[v] for v in autres)} sur "
+        f"{sum(lignes[v] for v in autres)} renseignées"
+    )
+    if observation["selon_vide"]:
+        parties.append(f"selon vide sur {observation['selon_vide']} lignes")
+    return "; ".join(parties)
+
+
+def _libelle_renseignement(colonne, selon, valeurs, vide_sinon) -> str:
+    if not valeurs:
+        return f"{colonne} renseignée selon {selon}"
+    libelle = f"{colonne} renseignée si {selon} vaut {' ou '.join(valeurs)}"
+    return libelle + (", vide sinon" if vide_sinon else "")
+
+
+def _base_renseignement(tables, dictionnaire, sensibles, table, colonne, selon, filtre,
+                        valeurs=None):
+    """Colonnes observées d'une ligne, et la proposition (None sans proposition);
+    `valeurs` (règle) ou, à défaut, les valeurs proposées détaillent l'observé."""
+    base = {
+        "table": table,
+        "colonne": colonne,
+        "selon": selon,
+        "observé": None,
+        "proposition": AUCUNE,
+        "proposition_valeurs": None,
+        "proposition_vide_sinon": None,
+    }
+    utiles = [colonne, selon] + [condition["colonne"] for condition in filtre or []]
+    if table not in tables or any(c not in tables[table].columns for c in utiles):
+        return base, None
+    donnees = tables[table]
+    if filtre:
+        donnees = donnees[_dans_le_champ(donnees, filtre)]
+    observation = observer_renseignement(donnees, colonne, selon)
+    liste = _liste_selon(dictionnaire, table, selon, sensibles)
+    proposition = proposer_renseignement(observation, liste) if liste is not None else None
+    if proposition is not None:
+        retenues, vide_sinon = proposition
+        base["proposition"] = ", ".join(retenues) + ("; vide sinon" if vide_sinon else "")
+        base["proposition_valeurs"] = ", ".join(retenues)
+        base["proposition_vide_sinon"] = OUI if vide_sinon else NON
+    if valeurs is None:
+        valeurs = proposition[0] if proposition is not None else []
+    base["observé"] = _texte_renseignement(observation, valeurs)
+    return base, proposition
+
+
+def _ligne_regle_renseignement(tables, dictionnaire, sensibles, instance, rang, origine):
+    valeurs = [str(v) for v in instance["valeurs"]]
+    base, _ = _base_renseignement(
+        tables, dictionnaire, sensibles, instance["table"], instance["colonne"], instance["selon"],
+        instance.get(CLE_FILTRE), valeurs,
+    )
+    return {
+        **base,
+        **_champs_regle(instance, rang, origine),
+        "valeurs": ", ".join(valeurs),
+        "vide_sinon": OUI if instance.get("vide_sinon") else NON,
+    }
+
+
+def _ligne_proposition_renseignement(base: dict, proposition, origine: str) -> dict:
+    valeurs, vide_sinon = proposition if proposition is not None else ([], False)
+    return {
+        **base,
+        "origine": origine,
+        "statut": STATUT_OBSERVE if origine == ORIGINE_PROPOSEE else STATUT_INVALIDE,
+        "ref": REF_RENSEIGNEMENT,
+        "libellé": _libelle_renseignement(base["colonne"], base["selon"], valeurs, vide_sinon),
+        "issue": TYPES[TYPE_RENSEIGNEMENT].issue,
+        "valeurs": base["proposition_valeurs"],
+        "vide_sinon": base["proposition_vide_sinon"],
+    }
+
+
+def lignes_renseignement(
+    tables: dict, dictionnaire: dict, contenu: dict, sensibles: dict | None = None
+) -> list[dict]:
+    """Lignes de la feuille du renseignement : les règles de la famille et les
+    propositions.
+
+    Une colonne C est proposée selon une colonne S de la même table quand S a une liste
+    fermée en vigueur d'au plus `MAX_VALEURS_SELON` valeurs, que C a des cellules vides
+    et des cellules renseignées, et que `proposer_renseignement` retient des valeurs.
+    S ne doit pas être une colonne sensible : ses valeurs entreraient dans
+    config/gestion.yaml, versionné. Aucune proposition quand une règle en vigueur ou
+    retirée, ou une proposition écartée, porte déjà sur C selon S, quel que soit son
+    filtre. Les valeurs de S figurent dans le classeur (fichier du client). Par table,
+    dans l'ordre du dictionnaire : règles en vigueur (documenté), propositions
+    (observé), règles retirées, puis propositions écartées (invalide).
+    """
+    sensibles = sensibles or {}
+    ecartees = _ecartees_famille(contenu, FAMILLE_RENSEIGNEMENT)
+    vigueur, retirees = (
+        [(r, rang) for rang, r in enumerate(contenu.get(cle) or []) if _en_renseignement(r)]
+        for cle in (CLE_REGLES_GESTION, CLE_RETIREES)
+    )
+    connues = set(ecartees) | {
+        (r["table"], r["colonne"], r["selon"])
+        for cle in (CLE_REGLES_GESTION, CLE_RETIREES)
+        for r in contenu.get(cle) or []
+        if r.get("type") == TYPE_RENSEIGNEMENT
+    }
+    propositions = []
+    for table, colonnes in dictionnaire.items():
+        if table not in tables:
+            continue
+        donnees = tables[table]
+        presentes = [c for c in colonnes if c in donnees.columns]
+        listes = {s: _liste_selon(dictionnaire, table, s, sensibles) for s in presentes}
+        if all(liste is None for liste in listes.values()):
+            continue
+        remplies = {
+            c: [_texte_lu(valeur) is not None for valeur in donnees[c]] for c in presentes
+        }
+        for rang_s, selon in enumerate(presentes):
+            liste = listes[selon]
+            if liste is None:
+                continue
+            textes = [_texte_lu(valeur) for valeur in donnees[selon]]
+            for rang_c, colonne in enumerate(presentes):
+                # Une colonne sans vide, ou sans valeur, n'aurait pas de proposition :
+                # elle est écartée d'emblée.
+                if (
+                    colonne == selon
+                    or all(remplies[colonne])
+                    or not any(remplies[colonne])
+                    or (table, colonne, selon) in connues
+                ):
+                    continue
+                observation = _compter_renseignement(textes, remplies[colonne])
+                proposition = proposer_renseignement(observation, liste)
+                if proposition is None:
+                    continue
+                retenues, vide_sinon = proposition
+                base = {
+                    "table": table,
+                    "colonne": colonne,
+                    "selon": selon,
+                    "observé": _texte_renseignement(observation, retenues),
+                    "proposition": ", ".join(retenues) + ("; vide sinon" if vide_sinon else ""),
+                    "proposition_valeurs": ", ".join(retenues),
+                    "proposition_vide_sinon": OUI if vide_sinon else NON,
+                }
+                propositions.append(((rang_c, rang_s), base, proposition))
+    propositions = [
+        _ligne_proposition_renseignement(base, proposition, ORIGINE_PROPOSEE)
+        for _, base, proposition in sorted(propositions, key=lambda element: element[0])
+    ]
+    lignes_ecartees = [
+        _ligne_proposition_renseignement(
+            *_base_renseignement(tables, dictionnaire, sensibles, t, c, s, None),
+            ORIGINE_ECARTEE,
+        )
+        for t, c, s in ecartees
+    ]
+    return _par_table(dictionnaire, [
+        [_ligne_regle_renseignement(tables, dictionnaire, sensibles, r, rang,
+                                    ORIGINE_EN_VIGUEUR) for r, rang in vigueur],
+        propositions,
+        [_ligne_regle_renseignement(tables, dictionnaire, sensibles, r, rang, ORIGINE_RETIREE)
+         for r, rang in retirees],
+        lignes_ecartees,
+    ])
+
+
 def annees_des_exports(tables: dict) -> list[int]:
     """Années des périodes d'export des tables (colonne periode_export lisible)."""
     annees = set()
@@ -595,7 +1204,9 @@ def lignes_feries(tables: dict, contenu: dict) -> list[dict]:
     return lignes
 
 
-def lignes_autres(contenu: dict, familles=(_en_periode,)) -> list[dict]:
+def lignes_autres(
+    contenu: dict, familles=(_en_reference, _en_renseignement, _en_periode)
+) -> list[dict]:
     """Lignes de la feuille des autres règles : les règles qui n'ont pas leur feuille,
     en vigueur (documenté) puis retirées (invalide), dans l'ordre du fichier, avec
     leurs paramètres et leur filtre écrits en clair."""
@@ -640,6 +1251,7 @@ def _a_traiter(lignes: list[dict]) -> int:
 
 
 def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
+    references, renseignement = lignes["references"], lignes["renseignement"]
     periodes, feries = lignes["periodes"], lignes["feries"]
     autres, nouvelles = lignes["autres"], lignes["nouvelles"]
     issues = ", ".join(ISSUES)
@@ -653,7 +1265,10 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "des règles de gestion.",
         "",
         "Ce qui reste à traiter",
-        f"Feuille « {FEUILLE_PERIODES} » : {_a_traiter(periodes)} lignes à « observé » sur "
+        f"Feuille « {FEUILLE_REFERENCES} » : {_a_traiter(references)} lignes à « observé » "
+        f"sur {len(references)}. Feuille « {FEUILLE_RENSEIGNEMENT} » : "
+        f"{_a_traiter(renseignement)} sur {len(renseignement)}. Feuille "
+        f"« {FEUILLE_PERIODES} » : {_a_traiter(periodes)} sur "
         f"{len(periodes)}. Feuille « {FEUILLE_FERIES} » : {_a_traiter(feries)} sur "
         f"{len(feries)}. Feuille « {FEUILLE_AUTRES} » : {len(autres)} règles. Feuille "
         f"« {FEUILLE_NOUVELLES} » : {len(nouvelles)} règles demandées.",
@@ -677,19 +1292,49 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         f"L'issue d'un écart se choisit dans le menu : {issues}. « anomalie » pour une "
         "erreur, « à arbitrer » quand le métier doit dire s'il s'agit d'une erreur, "
         "« information » pour un cas normal qu'on veut voir.",
-        "Les colonnes qui désignent la règle (table, colonne, filtre) ne se modifient pas : "
-        "pour changer l'une d'elles, mettre invalide sur la ligne et ajouter une ligne en "
-        "bas de la feuille.",
+        "Les colonnes qui désignent la règle (table, colonnes, table de référence, filtre) "
+        "ne se modifient pas : pour changer l'une d'elles, mettre invalide sur la ligne et "
+        "ajouter une ligne en bas de la feuille. Le filtre, facultatif, limite la règle aux "
+        "lignes dont filtre_colonne vaut l'une des filtre_valeurs (séparées par une "
+        "virgule).",
+        f"Une proposition demande qu'au moins {_pourcentage(SEUIL_PROPOSITION)} % des "
+        "lignes observées suivent la règle, en comptant une ligne contraire de plus : elle "
+        f"ne repose jamais sur moins de {lignes_minimales()} lignes. Une règle utile mais "
+        "trop rare pour être proposée s'ajoute en bas de la feuille.",
+        "",
+        f"Feuille « {FEUILLE_REFERENCES} » : chaque valeur d'une colonne existe dans une "
+        "colonne de référence",
+        "Par exemple, le client d'une facture existe dans le fichier des clients. Une "
+        "colonne est proposée vers la clé ou une colonne unique d'une table (déclarées dans "
+        "les règles de contrôle), de même nature, quand au moins "
+        f"{_pourcentage(SEUIL_PROPOSITION)} % de ses valeurs y sont trouvées, avec au moins "
+        f"{MIN_DISTINCTES} valeurs différentes. clé_facultative à « {OUI} » : une ligne sans "
+        "valeur n'est pas contrôlée (sinon, elle ne peut pas être évaluée). comparaison : "
+        f"{', '.join(COMPARAISONS)} (sans accents, majuscules ni espaces en trop). Pour une "
+        "clé de plusieurs colonnes, ajouter une ligne en bas de la feuille et écrire les "
+        "colonnes séparées par une virgule (« a, b »), dans le même ordre dans colonne et "
+        "colonne_reference.",
+        "",
+        f"Feuille « {FEUILLE_RENSEIGNEMENT} » : une colonne est renseignée selon la valeur "
+        "d'une autre",
+        "Par exemple, la facture d'origine est renseignée pour un avoir et vide pour une "
+        "facture. La colonne selon a une liste fermée de valeurs au dictionnaire, de "
+        f"{MAX_VALEURS_SELON} valeurs au plus. Une colonne est proposée quand elle est "
+        f"renseignée sur au moins {_pourcentage(SEUIL_PROPOSITION)} % des lignes de "
+        "certaines valeurs (colonne valeurs, séparées par une virgule) sans l'être pour "
+        f"toutes. vide_sinon à « {OUI} » : la colonne doit être vide sur les autres lignes; "
+        "il est proposé quand elle l'est sur au moins "
+        f"{_pourcentage(SEUIL_PROPOSITION)} % d'entre elles.",
         "",
         f"Feuille « {FEUILLE_PERIODES} » : la date d'une ligne tombe dans la période de son "
         "export",
         "Une ligne par colonne de date d'un fichier exporté chaque mois ou chaque année. "
         "La règle est proposée quand au moins "
         f"{_pourcentage(SEUIL_PROPOSITION)} % des dates observées tombent dans la période "
-        "de leur export. Pour ajouter une règle : sur une ligne vide en bas de la feuille, "
-        "choisir la table et la colonne dans les menus, et le statut documenté. Le filtre, "
-        "facultatif, limite la règle aux lignes dont filtre_colonne vaut l'une des "
-        "filtre_valeurs (séparées par une virgule).",
+        "de leur export.",
+        "Pour ajouter une règle dans l'une de ces trois feuilles : sur une ligne vide en "
+        "bas de la feuille, choisir la table et les colonnes dans les menus, remplir les "
+        "autres cellules, et choisir le statut documenté.",
         "",
         f"Feuille « {FEUILLE_FERIES} » : les jours fériés, communs à toutes les règles "
         "d'horaires",
@@ -768,10 +1413,36 @@ def _ajouter_menu(menu, colonnes, nom, premiere, derniere) -> None:
         menu.add(f"{lettre}{premiere}:{lettre}{derniere}")
 
 
+def _menus_table(feuille, colonnes, nb_tables, premiere, derniere, nom_table, noms,
+                 souples=()) -> None:
+    """Menus d'une table et de ses colonnes sur les lignes d'ajout (voir
+    `revue._menus_d_ajout`) : le menu d'une colonne de `noms` ne propose que les
+    colonnes de la table choisie sur la ligne. Une colonne de `souples` admet aussi une
+    saisie hors du menu, après un avertissement (clé de plusieurs colonnes « a, b »)."""
+    if not nb_tables or derniere < premiere:
+        return
+    nom = quote_sheetname(FEUILLE_LISTES)
+    tables = f"{nom}!$A$1:${get_column_letter(nb_tables)}$1"
+    col_table = get_column_letter(colonnes.index(nom_table) + 1)
+    _menu(feuille, formule=tables).add(f"{col_table}{premiere}:{col_table}{derniere}")
+    # La référence à la table est relative à la ligne : elle suit chaque ligne d'ajout.
+    rang = f"MATCH(${col_table}{premiere},{nom}!$1:$1,0)-1"
+    choix = f"OFFSET({nom}!$A$1,1,{rang},COUNTA(OFFSET({nom}!$A:$A,0,{rang}))-1,1)"
+    for nom_colonne in noms:
+        lettre = get_column_letter(colonnes.index(nom_colonne) + 1)
+        menu = _menu(feuille, formule=choix)
+        if nom_colonne in souples:
+            menu.errorStyle = "warning"
+            menu.error = "Colonne hors du menu : vérifier les noms (clé « a, b » admise)."
+        menu.add(f"{lettre}{premiere}:{lettre}{derniere}")
+
+
 def exporter_formulaire_gestion(
     tables: dict,
     dictionnaire: dict,
     contenu: dict,
+    declarations: dict | None,
+    sensibles: dict | None,
     periode_fin: str,
     chemin: str | Path | None = None,
     *,
@@ -782,7 +1453,12 @@ def exporter_formulaire_gestion(
 
     `contenu` est celui de config/gestion.yaml (`gestion.lire_fichier_gestion`) et
     `empreinte` son empreinte (`empreinte_gestion`) : elle est inscrite dans le
-    formulaire, et l'import le refusera si le fichier a changé depuis. Un contenu
+    formulaire, et l'import le refusera si le fichier a changé depuis.
+    `declarations` sont les déclarations de doublons de config/controles.yaml
+    (`doublons.charger_declarations_doublons`), dont les clés et colonnes uniques
+    servent de cibles aux références proposées; `sensibles` les colonnes sensibles
+    (`confidentialite.charger_sensibilite`), qui ne servent pas de colonne selon à une
+    proposition de renseignement. Un contenu
     mal formé est refusé (`ValueError`, tous les problèmes listés). Sans
     `ecraser=True`, refuse de remplacer un formulaire existant : une revue y est
     peut-être en cours.
@@ -796,6 +1472,8 @@ def exporter_formulaire_gestion(
             "Fichier des règles de gestion invalide\n  " + "\n  ".join(problemes)
         )
     lignes = {
+        "references": lignes_references(tables, dictionnaire, contenu, declarations),
+        "renseignement": lignes_renseignement(tables, dictionnaire, contenu, sensibles),
         "periodes": lignes_periodes(tables, dictionnaire, contenu),
         "feries": lignes_feries(tables, contenu),
         "autres": lignes_autres(contenu),
@@ -816,6 +1494,35 @@ def exporter_formulaire_gestion(
         if texte.startswith(rubriques):
             cellule.font = Font(bold=True)
     notice.protection.sheet = True
+
+    nb_tables = len(dictionnaire)
+    feuille = classeur.create_sheet(FEUILLE_REFERENCES)
+    references = lignes["references"]
+    _remplir(feuille, COLONNES_REFERENCES, references, MODIFIABLES_REFERENCES, LIGNES_AJOUT,
+             SAISIE_AJOUT_REFERENCES)
+    derniere = len(references) + 1 + LIGNES_AJOUT
+    colonnes = COLONNES_REFERENCES
+    _ajouter_menu(_menu(feuille, STATUTS), colonnes, "statut", 2, derniere)
+    _ajouter_menu(_menu(feuille, ISSUES), colonnes, "issue", 2, derniere)
+    _ajouter_menu(_menu(feuille, (OUI, NON)), colonnes, "clé_facultative", 2, derniere)
+    _ajouter_menu(_menu(feuille, COMPARAISONS), colonnes, "comparaison", 2, derniere)
+    premiere = len(references) + 2
+    _menus_table(feuille, colonnes, nb_tables, premiere, derniere, "table", ("colonne",),
+                 souples=("colonne",))
+    _menus_table(feuille, colonnes, nb_tables, premiere, derniere, "table_reference",
+                 ("colonne_reference",), souples=("colonne_reference",))
+
+    feuille = classeur.create_sheet(FEUILLE_RENSEIGNEMENT)
+    renseignement = lignes["renseignement"]
+    colonnes = COLONNES_RENSEIGNEMENT
+    _remplir(feuille, colonnes, renseignement, MODIFIABLES_RENSEIGNEMENT, LIGNES_AJOUT,
+             SAISIE_AJOUT_RENSEIGNEMENT)
+    derniere = len(renseignement) + 1 + LIGNES_AJOUT
+    _ajouter_menu(_menu(feuille, STATUTS), colonnes, "statut", 2, derniere)
+    _ajouter_menu(_menu(feuille, ISSUES), colonnes, "issue", 2, derniere)
+    _ajouter_menu(_menu(feuille, (OUI, NON)), colonnes, "vide_sinon", 2, derniere)
+    _menus_table(feuille, colonnes, nb_tables, len(renseignement) + 2, derniere, "table",
+                 ("colonne", "selon"))
 
     feuille = classeur.create_sheet(FEUILLE_PERIODES)
     periodes = lignes["periodes"]
