@@ -1,8 +1,9 @@
 """Classeurs remplis par le métier : dossier commun et archivage des classeurs appliqués.
 
-Ce module ne contient rien de propre à un client. Trois classeurs Excel passent par
+Ce module ne contient rien de propre à un client. Quatre classeurs Excel passent par
 le métier : la revue du dictionnaire (notebook 03), le formulaire des règles de
-contrôle (notebook 04) et l'arbitrage des anomalies (notebook 07). Ils portent des
+contrôle (notebook 04), le formulaire des règles de gestion (notebook 05) et
+l'arbitrage des anomalies (notebook 07). Ils portent des
 valeurs du client et sont rangés ensemble hors du dépôt, dans data/formulaires/.
 Un classeur appliqué est déplacé dans data/formulaires/appliques/, sous un nom qui
 porte l'heure de l'archivage : il garde la trace des décisions du métier, et
