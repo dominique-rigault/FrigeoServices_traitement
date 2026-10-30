@@ -93,7 +93,7 @@ Repères pour la phase 3 :
 
 Repères pour la phase 4 :
 
-- les trois classeurs remplis par le métier (revue du dictionnaire, règles de contrôle, arbitrage) sont rangés ensemble dans `data/formulaires/`, hors du dépôt; un classeur appliqué est archivé dans `data/formulaires/appliques/`, sous un nom qui porte l'heure de l'archivage, et un classeur ouvert dans Excel arrête l'écriture sans rien modifier;
+- les quatre classeurs remplis par le métier (revue du dictionnaire, règles de contrôle, règles de gestion, arbitrage) sont rangés ensemble dans `data/formulaires/`, hors du dépôt; un classeur appliqué est archivé dans `data/formulaires/appliques/`, sous un nom qui porte l'heure de l'archivage, et un classeur ouvert dans Excel arrête l'écriture sans rien modifier;
 
 - `# IMPORT` puis `# APPLICATION` sur un classeur non modifié est sans effet (aucune écriture);
 - `# FUSION` et `# ECRITURE APRES FUSION` ne servent qu'à une régénération (un mois de plus, ou une nouvelle version du code de génération); chaque exécution de `# ECRITURE APRES FUSION` sur un dictionnaire revu ajoute une copie de sauvegarde, même si rien n'a changé;
@@ -124,13 +124,26 @@ Repères pour la phase 5 :
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
-| 6.1 | Remplir le formulaire des règles de gestion (entretiens) : règle en clair, tables concernées, tolérances, délais, horaires, jours fériés, pratiques normales à présenter en information | M avec C | formulaire | à créer |
-| 6.2 | Rattacher chaque règle à un type du catalogue (`# TYPES DE REGLES`); pour une règle qui n'entre dans aucun type, proposer un nouveau type générique, faire valider le critère, puis le coder avec ses tests | A, validé par C | `src/frigeo/gestion.py`, `tests` | opérationnel (catalogue limité aux 28 types de Frigéo) |
-| 6.3 | Si un seuil est une hypothèse, l'éprouver par une cellule d'essai qui n'affiche que des décomptes, puis la supprimer | A, exécutée par C | notebook 05 | opérationnel |
-| 6.4 | Rédiger `config/gestion.yaml` et le vérifier par `problemes_regles_gestion` | A, puis C (dépôt dans `config/`) | formulaire 6.1 | opérationnel |
-| 6.5 | Exécuter le notebook en entier; lire le nombre de règles lues et les avertissements (année absente des jours fériés, lignes de référentiel inutilisables) | C | notebook 05 | opérationnel |
+| 6.1 | Mettre `PERIODE_FIN` à jour, exécuter `# CHARGEMENT` puis `# EXPORT FORMULAIRE`, qui écrit `data/formulaires/gestion_AAAA-MM.xlsx` : les règles en vigueur dans `config/gestion.yaml` (statut documenté) et les propositions tirées des données (statut observé) pour trois familles de règles qui tiennent sur une ligne (valeur connue d'une colonne de référence, colonne renseignée selon la valeur d'une autre, date dans la période de son export), les jours fériés légaux de la France pour chaque année des données, les autres règles écrites en clair et les règles demandées | C | notebook 05 | opérationnel |
+| 6.2 | Revoir le formulaire avec le métier (mode d'emploi dans la première feuille) : un statut par ligne (valide adopte la proposition, documenté prend les valeurs saisies, invalide retire la règle ou écarte la proposition), un commentaire si besoin; une règle utile mais trop rare pour être proposée, ou une clé de plusieurs colonnes, s'ajoute en bas de sa feuille; un jour propre à l'entreprise (pont, fermeture) s'ajoute en bas de la feuille `jours_fériés`; pour les autres règles, changer le libellé ou l'issue (une pratique normale en information) ou retirer la règle; les règles voulues en plus se décrivent en clair dans la feuille `nouvelles_règles` (tables, tolérance ou délai, issue); une revue partielle suffit pour avancer | M avec C | Excel | opérationnel |
+| 6.3 | Enregistrer et fermer le formulaire, exécuter `# IMPORT FORMULAIRE` (rapport des changements et avertissements; un formulaire mal rempli arrête la cellule avec la liste des lignes à corriger), puis `# ECRITURE FORMULAIRE`, qui copie l'ancien fichier dans `data/config/sauvegardes/`, archive le formulaire dans `data/formulaires/appliques/` et réécrit `config/gestion.yaml` | C | notebook 05 | opérationnel |
+| 6.4 | Commiter `config/gestion.yaml` | C | Git | opérationnel |
+| 6.5 | Traduire chaque règle demandée (clé `demandes` de `config/gestion.yaml`) en une règle d'un type du catalogue (`# TYPES DE REGLES`); pour une règle qui n'entre dans aucun type, proposer un nouveau type générique, faire valider le critère, puis le coder avec ses tests | A, validé par C | `src/frigeo/gestion.py`, `tests` | opérationnel (catalogue limité aux 29 types de Frigéo) |
+| 6.6 | Si un seuil est une hypothèse, l'éprouver par une cellule d'essai qui n'affiche que des décomptes, puis la supprimer | A, exécutée par C | notebook 05 | opérationnel |
+| 6.7 | Écrire la règle traduite dans `config/gestion.yaml`, retirer sa demande de la clé `demandes`, vérifier le fichier par `problemes_regles_gestion`, puis le commiter; le faire quand aucun formulaire n'attend son import | A, puis C (dépôt dans `config/`) | `config/gestion.yaml` | opérationnel |
+| 6.8 | Exécuter le notebook en entier; lire le nombre de règles lues et les avertissements (année absente des jours fériés, lignes de référentiel inutilisables) | C | notebook 05 | opérationnel |
 
-Le code d'un type nouveau va dans `src/`, jamais dans le notebook ni dans une fonction propre au client. `config/controles.yaml` doit exister avant le notebook 05 : sa clé `doublons` donne la clé affichée et les doublons écartés des rapprochements.
+Repères pour la phase 6 :
+
+- le formulaire porte des valeurs du client (valeurs des listes, codes, dates) : il reste dans `data/formulaires/` et ne se colle pas dans la conversation; seuls les textes de la feuille `nouvelles_règles` sont transmis à l'assistant pour l'action 6.5, ils peuvent citer des codes du client;
+- une colonne sensible ne sert jamais de colonne selon à une proposition : ses valeurs entreraient dans `config/gestion.yaml`, versionné;
+- une proposition demande qu'au moins 95 % des lignes suivent la règle, en comptant une ligne contraire de plus : elle ne repose jamais sur moins de 19 lignes;
+- un formulaire pas encore rempli ne change rien, si bien que le notebook peut toujours être exécuté en entier; après une écriture, l'exécution suivante exporte un nouveau formulaire;
+- un formulaire exporté avant une modification de `config/gestion.yaml` (une règle écrite à l'action 6.7, par exemple) est refusé à l'import : le supprimer, puis le réexporter; d'où l'ordre, appliquer d'abord le formulaire, puis écrire les règles traduites;
+- `config/gestion.yaml` est réécrit en entier : une ligne de commentaire écrite à la main y est perdue, le commentaire d'une règle s'écrit sous sa clé `commentaire` ou dans le formulaire; une règle retirée reste sous la clé `retirees` et se rétablit par documenté;
+- les jours fériés sont déclarés une fois pour le fichier (clé `jours_feries`) et repris par chaque règle d'horaires qui n'en déclare pas.
+
+Le code d'un type nouveau va dans `src/`, jamais dans le notebook ni dans une fonction propre au client. `config/controles.yaml` doit exister avant le notebook 05 : sa clé `doublons` donne la clé affichée et les doublons écartés des rapprochements, et ses clés et colonnes uniques servent de cibles aux références proposées par le formulaire.
 
 ### Phase 7, table des anomalies (notebook 06)
 
@@ -183,17 +196,17 @@ Repères pour la phase 8 :
 | M.4 | Exécuter le notebook 02 seulement si un format nouveau est soupçonné (points « nature différente selon l'export » et « forme numérique non reconnue ») | C | notebook 02 | opérationnel |
 | M.5 | Régénérer le dictionnaire : cellules jusqu'à `# ECRITURE APRES FUSION`, lire le rapport de `# FUSION` (événements « à regarder ») | C | notebook 03 | opérationnel |
 | M.6 | Revue si de nouvelles valeurs ou formes sont à arbitrer (phase 4, étapes 4.3 à 4.5) | M avec C | Excel, notebook 03 | opérationnel |
-| M.7 | Exécuter les notebooks 04 puis 05 en entier; si `# EXPORT FORMULAIRE` signale des lignes à « observé » nouvelles (une colonne, un groupe ou une proposition de plus), faire revoir le formulaire du mois (phase 5, actions 5.2 à 5.4) | C, M | notebooks 04, 05, Excel | opérationnel |
+| M.7 | Exécuter les notebooks 04 puis 05 en entier; si `# EXPORT FORMULAIRE` signale des lignes à « observé » nouvelles (une colonne, un groupe ou une proposition de plus), faire revoir le formulaire du mois (phase 5, actions 5.2 à 5.4, ou phase 6, actions 6.2 à 6.4) | C, M | notebooks 04, 05, Excel | opérationnel |
 | M.8 | Exécuter le notebook 06 en entier : il relance les contrôles et réécrit les deux CSV de la période dans `data/anomalies/` | C | notebook 06 | opérationnel |
 | M.9 | Revoir `config/anomalies.yaml` quand une colonne ou un indicateur change (le notebook 06 liste les colonnes non déclarées et les contrôles non qualifiés) | A, puis C | `config/anomalies.yaml` | opérationnel |
 | M.10 | Exécuter le notebook 07 en entier, puis l'arbitrage si des éléments sont à trancher (phase 8, étapes 8.3 à 8.7) | C, M | notebook 07, Excel | opérationnel |
 
-Une fois par an : compléter les jours fériés de l'année suivante dans `config/gestion.yaml` (le notebook 05 avertit quand une année manque) et vérifier que les paramètres annuels du client couvrent la nouvelle année.
+Une fois par an : valider dans le formulaire des règles de gestion les jours fériés de la nouvelle année, proposés dès que ses premiers exports sont chargés (le notebook 05 avertit quand une année manque) et vérifier que les paramètres annuels du client couvrent la nouvelle année.
 
 ## Points ouverts
 
 - **Changement d'année.** Le modèle de périodes garde une période annuelle unique suivie de mois. Le passage à un export annuel de l'année suivante n'est pas prévu.
-- **Formulaires.** Le formulaire des règles de gestion (phase 6.1) reste à concevoir (forme, et passage du formulaire au YAML); celui des règles de contrôle est fait (phase 5).
+- **Formulaires.** Les formulaires des règles de contrôle (phase 5) et des règles de gestion (phase 6) sont faits. Deux familles de règles de gestion pourraient tenir sur une ligne du formulaire au lieu de la feuille des autres règles : les plages d'une valeur selon une autre colonne et les correspondances entre une valeur et la catégorie de la ligne liée.
 - **Rapport.** Le rapport au client (plan, destinataire, format) n'est pas encore défini; les parties 2.5 et 3.3 en sont les premières briques.
 - **Découverte des encodages et séparateurs.** Ils sont déclarés à la main dans `config/sources.yaml`; l'étape qui les proposerait n'est pas faite.
 - **Dates dont le siècle a été ajouté.** Elles ne sont pas soumises à la confirmation du métier; les faire confirmer dans le classeur d'arbitrage serait une amélioration possible.

@@ -20,7 +20,7 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 2c | Dictionnaire des données généré à partir des données observées, à faire valider par le métier | Python, Jupyter | 03 | Terminé |
 | 2d | Revue du dictionnaire par le métier (classeur de revue, import et fusion des statuts) | Python, Excel | 03 | Terminé |
 | 3 | Contrôles de format et de complétude, détection des doublons, formulaire des règles de contrôle pour le métier | Python, Excel, Jupyter | 04 | Terminé |
-| 4 | Contrôles des règles de gestion et rapprochements entre sources | Python, Jupyter | 05 | Terminé |
+| 4 | Contrôles des règles de gestion et rapprochements entre sources, formulaire des règles de gestion pour le métier | Python, Excel, Jupyter | 05 | Terminé |
 | 5 | Table des anomalies, gravité et indicateurs affectés, export CSV | Python, Jupyter | 06 | Terminé |
 | 6 | Règles de nettoyage explicites, décisions du métier ligne par ligne, journal des corrections | Python, Excel, Jupyter | 07 | Terminé |
 | 7 | Modèle en étoile, indicateurs et marge opérationnelle | SQL Server, Azure SQL Database | aucun | À venir |
@@ -42,7 +42,7 @@ Le mode opératoire d'un cycle de traitement (qui fait quoi et dans quel ordre, 
 
 Les notebooks 01 à 07 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`), dans le dictionnaire revu par le métier et dans ses décisions ligne par ligne (`data/config/decisions.yaml`). Le code porte cependant l'empreinte des données rencontrées sur quelques points :
 
-- **Types de règles de gestion.** Le catalogue de l'étape 4 (28 types génériques) ne couvre que les règles de ce cas. Un autre client demandera des types nouveaux, ajoutés au catalogue sans reprendre les autres.
+- **Types de règles de gestion.** Le catalogue de l'étape 4 (29 types génériques) ne couvre que les règles de ce cas. Un autre client demandera des types nouveaux, ajoutés au catalogue sans reprendre les autres.
 - **Natures reconnues.** Trois formes de date, l'heure HH:MM, les décimaux à virgule ou à point. Des heures HH:MM:SS, des milliers séparés par une espace ou des dates MM/JJ/AAAA demanderaient d'étendre `profilage.py` et `typage.py`.
 - **Périodes.** Une période annuelle puis des mois (`perimetre.py`). Un client qui ne livre que des mois ou des trimestres demanderait d'adapter ce modèle, que suivent aussi les totaux par période.
 - **Seuils du dictionnaire.** Les seuils de génération (200 valeurs, 12 valeurs principales, 95 %, 2 % de vides) sont des constantes du code, fixées a priori; les déplacer dans la configuration serait simple.
@@ -52,6 +52,7 @@ Les notebooks 01 à 07 ne contiennent aucun nom de table, de colonne ni de valeu
 - **Stock rendu négatif par un avoir.** Il n'est signalé qu'à la sortie suivante. Le stock n'est contrôlé qu'à partir de la date du stock initial, qu'il vaut mieux lire dans le fichier du client que déclarer dans la configuration.
 - **Encodages suspects.** La règle `encodage` essaie les trois encodages d'Europe occidentale (Windows-1252, ISO-8859-15, Latin-1). Des fichiers venus d'un autre jeu de caractères (Europe centrale, cyrillique) demanderaient d'étendre `ENCODAGES_SUSPECTS`. Un `à` mal décodé n'est plus reconnaissable si un logiciel a remplacé l'espace insécable qui le suit par une espace ordinaire, et un double encodage n'est signalé qu'une fois.
 - **Formulaire des règles de contrôle.** Il réécrit `config/controles.yaml` en entier, dans l'ordre du dictionnaire : un commentaire écrit à la main dans ce fichier est perdu, et seuls les motifs (expressions régulières) s'y écrivent encore à la main. Il porte les minimums et maximums observés (masqués pour une colonne sensible) et reste donc dans `data/formulaires/`. Un formulaire exporté avant une modification du fichier est refusé à l'import.
+- **Formulaire des règles de gestion.** Il réécrit `config/gestion.yaml` en entier : une ligne de commentaire écrite à la main y est perdue, le commentaire d'une règle s'écrit sous sa clé `commentaire`. Seules trois familles de règles (valeur connue d'une colonne de référence, colonne renseignée selon la valeur d'une autre, date dans la période de son export) et les jours fériés y sont proposés et modifiables; les autres règles s'y retirent ou s'y commentent seulement, et une règle nouvelle hors de ces familles est demandée en texte libre, puis écrite par le consultant. Les jours fériés proposés sont ceux de la France métropolitaine, sans l'Alsace-Moselle. Le formulaire porte des valeurs du client (valeurs des listes, codes) et reste dans `data/formulaires/`. Un formulaire exporté avant une modification du fichier est refusé à l'import.
 - **Gravité et indicateurs affectés.** Ils sont déclarés par le consultant dans `config/anomalies.yaml`, à faire valider par le métier, et non calculés. La gravité par défaut est grossière (« majeure » dès qu'une colonne alimente un indicateur) et se nuance par des exceptions, sans code. Le fichier est à revoir quand un indicateur ou une colonne change.
 - **Export CSV.** Séparateur point-virgule et virgule décimale, pour Excel en paramètres français. Ouvert par double-clic, Excel retire les zéros en tête, écrit un SIRET en notation scientifique, lit `2026-03` comme une date et une valeur commençant par `=` comme une formule. Il faut donc ouvrir le fichier par Données, À partir d'un fichier texte/CSV, sans détection des types. Les identifiants d'anomalie changent si un fichier est réexporté avec des lignes décalées.
 - **Nettoyage automatique.** Les règles ne corrigent que ce qui se lit sans ambiguïté : encodages, remplacements décidés au dictionnaire, formes élargies de date et de nombre, doublons exacts. Une durée avec unité (1h30) n'est jamais convertie. Une année écrite sur deux chiffres est complétée en 20AA si la date ne dépasse pas la date de coupure : une date ancienne mal saisie peut ainsi devenir fausse, et la conversion n'est visible qu'au journal du nettoyage (« siècle 20 ajouté »).
@@ -96,7 +97,7 @@ data/
   raw/2026/         exports mensuels 2026
   referentiels/     intervenants, clients, fournisseurs, catalogue, paramètres
   config/           dictionnaire généré (contient des valeurs observées) et décisions du métier
-  formulaires/      classeurs remplis par le métier (revue du dictionnaire, règles de contrôle, arbitrage des anomalies), et appliques/ pour les classeurs appliqués
+  formulaires/      classeurs remplis par le métier (revue du dictionnaire, règles de contrôle, règles de gestion, arbitrage des anomalies), et appliques/ pour les classeurs appliqués
   anomalies/        table des anomalies et bilan par contrôle en CSV (étape 5, et après nettoyage à l'étape 6)
   nettoyage/        journal et bilan du nettoyage en CSV (étape 6)
 ```
