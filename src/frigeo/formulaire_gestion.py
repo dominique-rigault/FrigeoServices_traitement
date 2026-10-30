@@ -28,22 +28,35 @@ hors du dépôt, dans data/formulaires/.
 
 from __future__ import annotations
 
+import copy
 import datetime as dt
 import hashlib
+import json
+import re
 from collections import Counter
 from datetime import date
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
 import yaml
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Font, Protection
 from openpyxl.utils import get_column_letter, quote_sheetname
 
-from .dictionnaire import LISTE_FERMEE, STATUTS
+from . import dictionnaire as module_dictionnaire
+from .dictionnaire import LISTE_FERMEE, STATUTS, dossier_sauvegardes
 from .doublons import COMPARAISON_TELLE_QUELLE
-from .formulaire_controles import NATURES_CLE, texte_nombre
-from .formulaires import dossier_formulaires
+from .formulaire_controles import (
+    NATURES_CLE,
+    ApplicationFormulaire,
+    Formulaire,
+    _lire_feuille,
+    _texte,
+    _yaml,
+    texte_nombre,
+)
+from .formulaires import dossier_formulaires, ecrire_et_archiver
 from .gestion import (
     CLE_COMMENTAIRE,
     CLE_DEMANDES,
@@ -54,8 +67,10 @@ from .gestion import (
     CLE_REGLES_GESTION,
     CLE_RETIREES,
     CLES_COMMUNES,
+    CLES_FICHIER_GESTION,
     COLONNE_PERIODE,
     COMPARAISONS,
+    GENRE_HORAIRES,
     ISSUES,
     TYPES,
     _annee_feries,
@@ -482,11 +497,16 @@ def _issue(instance: dict) -> str:
 
 def _filtre_simple(instance: dict) -> tuple[str, str] | None:
     """Colonne et valeurs (« a, b ») du filtre d'une règle qui tient sur une ligne :
-    ("", "") sans filtre, None si le filtre a plusieurs conditions ou un motif."""
+    ("", "") sans filtre, None si le filtre a plusieurs conditions, un motif, ou une
+    valeur qui contient une virgule (elle serait coupée en deux à l'import)."""
     filtre = instance.get(CLE_FILTRE)
     if not filtre:
         return "", ""
-    if len(filtre) == 1 and "valeurs" in filtre[0]:
+    if (
+        len(filtre) == 1
+        and "valeurs" in filtre[0]
+        and not any("," in str(v) for v in filtre[0]["valeurs"])
+    ):
         return filtre[0]["colonne"], ", ".join(str(v) for v in filtre[0]["valeurs"])
     return None
 
@@ -912,8 +932,13 @@ def lignes_references(
 
 
 def _en_renseignement(instance: dict) -> bool:
-    """Vrai pour une règle de la famille du renseignement qui tient sur une ligne."""
-    return instance.get("type") == TYPE_RENSEIGNEMENT and _filtre_simple(instance) is not None
+    """Vrai pour une règle de la famille du renseignement qui tient sur une ligne (pas
+    de valeur qui contient une virgule, elle serait coupée en deux à l'import)."""
+    return (
+        instance.get("type") == TYPE_RENSEIGNEMENT
+        and _filtre_simple(instance) is not None
+        and not any("," in str(v) for v in instance.get("valeurs") or [])
+    )
 
 
 def _liste_en_vigueur(dictionnaire: dict, table: str, colonne: str) -> list[str] | None:
@@ -1278,7 +1303,8 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "Ce qui est attendu",
         "Pour chaque ligne, choisir un statut dans le menu déroulant et, si besoin, écrire "
         "un commentaire (il est conservé).",
-        "observé : la ligne n'est pas revue; pas de règle.",
+        "observé : la ligne n'est pas revue; pas de règle. Sur une règle en vigueur ou "
+        "retirée, observé la supprime sans la garder.",
         f"valide : la proposition devient la règle. Impossible si la proposition est "
         f"« {AUCUNE} ».",
         "documenté : la règle est retenue telle que la ligne la décrit. Une règle en "
@@ -1334,7 +1360,8 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "de leur export.",
         "Pour ajouter une règle dans l'une de ces trois feuilles : sur une ligne vide en "
         "bas de la feuille, choisir la table et les colonnes dans les menus, remplir les "
-        "autres cellules, et choisir le statut documenté.",
+        "autres cellules, et choisir le statut documenté. ref et libellé laissés vides "
+        "prennent ceux d'une proposition.",
         "",
         f"Feuille « {FEUILLE_FERIES} » : les jours fériés, communs à toutes les règles "
         "d'horaires",
@@ -1558,3 +1585,1373 @@ def exporter_formulaire_gestion(
     chemin.parent.mkdir(parents=True, exist_ok=True)
     classeur.save(chemin)
     return chemin
+
+
+# --- Import du formulaire ---------------------------------------------------------
+
+COLONNES_CHANGEMENTS_GESTION = (
+    "feuille", "ref", "table", "colonnes", "changement", "avant", "apres",
+)
+CHANGEMENT_AJOUTEE = "ajoutée"
+CHANGEMENT_MODIFIEE = "modifiée"
+CHANGEMENT_RETIREE = "retirée"
+CHANGEMENT_RETABLIE = "rétablie"
+CHANGEMENT_SUPPRIMEE = "supprimée"
+CHANGEMENT_ECARTEE = "écartée"
+CHANGEMENT_REPROPOSEE = "reproposée"
+CHANGEMENT_DECLAREE = "déclarée"
+CHANGEMENT_DEMANDEE = "demandée"
+ORIGINES = (ORIGINE_EN_VIGUEUR, ORIGINE_PROPOSEE, ORIGINE_ECARTEE, ORIGINE_RETIREE)
+ABSENT = "absent"
+
+
+class _Famille(NamedTuple):
+    """Ce qui distingue les trois familles en lignes à l'import."""
+
+    nom: str
+    feuille: str
+    colonnes: tuple[str, ...]
+    type: str
+    ref: str
+    en_famille: object
+
+
+FAMILLES = (
+    _Famille(FAMILLE_REFERENCES, FEUILLE_REFERENCES, COLONNES_REFERENCES, TYPE_REFERENCES,
+             REF_REFERENCES, _en_reference),
+    _Famille(FAMILLE_RENSEIGNEMENT, FEUILLE_RENSEIGNEMENT, COLONNES_RENSEIGNEMENT,
+             TYPE_RENSEIGNEMENT, REF_RENSEIGNEMENT, _en_renseignement),
+    _Famille(FAMILLE_PERIODES, FEUILLE_PERIODES, COLONNES_PERIODES, TYPE_PERIODES,
+             REF_PERIODES, _en_periode),
+)
+
+
+def _texte_cellule(valeur) -> str:
+    """Texte d'une cellule (un nombre entier saisi dans Excel s'écrit sans « .0 »)."""
+    if isinstance(valeur, float) and valeur.is_integer():
+        valeur = int(valeur)
+    return _texte(valeur)
+
+
+def _decouper(texte: str) -> list[str]:
+    """Valeurs d'une cellule « a, b », dans l'ordre, sans valeur vide."""
+    return [morceau.strip() for morceau in texte.split(",") if morceau.strip()]
+
+
+def _commentaire_saisi(valeur) -> str | None:
+    """Commentaire d'une cellule (retours à la ligne d'Excel ramenés à « \\n »), None
+    s'il est vide."""
+    texte = _texte_cellule(valeur).replace("\r\n", "\n").replace("\r", "\n")
+    return texte or None
+
+
+def _commentaire_regle(instance: dict) -> str | None:
+    commentaire = instance.get(CLE_COMMENTAIRE)
+    return _commentaire_saisi(commentaire) if commentaire is not None else None
+
+
+def _oui_non(valeur, nom: str) -> tuple[bool | None, str | None]:
+    """Choix oui ou non d'une cellule (vide vaut non), et le problème de la saisie."""
+    texte = _texte_cellule(valeur)
+    if texte in ("", NON):
+        return False, None
+    if texte == OUI:
+        return True, None
+    return None, f"{nom} : {OUI}, {NON} ou vide est attendu"
+
+
+def _filtre_ligne(ligne: dict) -> tuple[str, str]:
+    return _texte_cellule(ligne["filtre_colonne"]), _texte_cellule(ligne["filtre_valeurs"])
+
+
+def _filtre_regle(instance: dict) -> tuple[str, str]:
+    return _filtre_simple(instance) or ("", "")
+
+
+def _identite_ligne(famille: _Famille, ligne: dict) -> tuple:
+    """Colonnes qui désignent la règle d'une ligne (lecture seule), en textes."""
+    if famille.nom == FAMILLE_REFERENCES:
+        noms = ("table", "colonne", "table_reference", "colonne_reference")
+    elif famille.nom == FAMILLE_RENSEIGNEMENT:
+        noms = ("table", "colonne", "selon")
+    else:
+        noms = ("table", "colonne")
+    return tuple(_texte_cellule(ligne[nom]) for nom in noms) + _filtre_ligne(ligne)
+
+
+def _identite_regle(famille: _Famille, instance: dict) -> tuple:
+    if famille.nom == FAMILLE_REFERENCES:
+        cle = instance["cle"]
+        valeurs = (instance["table"], ", ".join(cle), instance["table_reference"],
+                   ", ".join(instance.get("cle_reference") or cle))
+    elif famille.nom == FAMILLE_RENSEIGNEMENT:
+        valeurs = (instance["table"], instance["colonne"], instance["selon"])
+    else:
+        valeurs = (instance["table"], instance["colonne"])
+    return tuple(_texte(v) for v in valeurs) + _filtre_regle(instance)
+
+
+def _designation(famille: _Famille, identite: tuple) -> str:
+    """Colonnes d'une règle de famille, pour le rapport des changements."""
+    if famille.nom == FAMILLE_REFERENCES:
+        texte = f"{identite[1]} vers {identite[2]}.{identite[3]}"
+    elif famille.nom == FAMILLE_RENSEIGNEMENT:
+        texte = f"{identite[1]} selon {identite[2]}"
+    else:
+        texte = identite[1]
+    filtre_colonne, filtre_valeurs = identite[-2:]
+    if filtre_colonne:
+        texte += f" (si {filtre_colonne} = {filtre_valeurs})"
+    return texte
+
+
+def _parametres_defaut(famille: _Famille) -> dict:
+    if famille.nom == FAMILLE_REFERENCES:
+        return {"cle_facultative": False, "comparaison": COMPARAISON_TELLE_QUELLE}
+    if famille.nom == FAMILLE_RENSEIGNEMENT:
+        return {"valeurs": [], "vide_sinon": False}
+    return {}
+
+
+def _parametres_regle(famille: _Famille, instance: dict) -> dict:
+    """Paramètres modifiables d'une règle, sous la forme comparée aux saisies."""
+    if famille.nom == FAMILLE_REFERENCES:
+        return {
+            "cle_facultative": bool(instance.get("cle_facultative")),
+            "comparaison": instance.get("comparaison", COMPARAISON_TELLE_QUELLE),
+        }
+    if famille.nom == FAMILLE_RENSEIGNEMENT:
+        return {
+            "valeurs": [str(v) for v in instance["valeurs"]],
+            "vide_sinon": bool(instance.get("vide_sinon")),
+        }
+    return {}
+
+
+def _parametres_saisis(famille: _Famille, ligne: dict) -> tuple[dict | None, list[str]]:
+    """Paramètres écrits dans les cellules modifiables d'une ligne, et les problèmes."""
+    if famille.nom == FAMILLE_REFERENCES:
+        facultative, probleme = _oui_non(ligne["clé_facultative"], "clé_facultative")
+        problemes = [probleme] if probleme else []
+        comparaison = _texte_cellule(ligne["comparaison"]) or COMPARAISON_TELLE_QUELLE
+        if comparaison not in COMPARAISONS:
+            problemes.append(
+                f"comparaison : {', '.join(COMPARAISONS)} ou vide est attendu"
+            )
+        if problemes:
+            return None, problemes
+        return {"cle_facultative": facultative, "comparaison": comparaison}, []
+    if famille.nom == FAMILLE_RENSEIGNEMENT:
+        vide_sinon, probleme = _oui_non(ligne["vide_sinon"], "vide_sinon")
+        if probleme:
+            return None, [probleme]
+        return {"valeurs": _decouper(_texte_cellule(ligne["valeurs"])),
+                "vide_sinon": vide_sinon}, []
+    return {}, []
+
+
+def _parametres_proposes(famille: _Famille, ligne: dict, base: dict) -> dict | None:
+    """Paramètres de la proposition d'une ligne (colonnes masquées), complétés par
+    `base`; None si la proposition est « aucune »."""
+    if _texte_cellule(ligne["proposition"]) in ("", AUCUNE):
+        return None
+    parametres = dict(base)
+    if famille.nom == FAMILLE_REFERENCES:
+        parametres["cle_facultative"] = (
+            _texte_cellule(ligne["proposition_clé_facultative"]) == OUI
+        )
+    elif famille.nom == FAMILLE_RENSEIGNEMENT:
+        valeurs = _decouper(_texte_cellule(ligne["proposition_valeurs"]))
+        if not valeurs:
+            return None
+        parametres["valeurs"] = valeurs
+        parametres["vide_sinon"] = _texte_cellule(ligne["proposition_vide_sinon"]) == OUI
+    return parametres
+
+
+def _exportes(famille: _Famille, ligne: dict, instance: dict | None) -> dict:
+    """Paramètres tels que l'export les a écrits dans les cellules modifiables."""
+    if instance is not None:
+        return _parametres_regle(famille, instance)
+    parametres = _parametres_defaut(famille)
+    if famille.nom == FAMILLE_REFERENCES:
+        parametres["cle_facultative"] = (
+            _texte_cellule(ligne["proposition_clé_facultative"]) == OUI
+        )
+    elif famille.nom == FAMILLE_RENSEIGNEMENT:
+        parametres["valeurs"] = _decouper(_texte_cellule(ligne["proposition_valeurs"]))
+        parametres["vide_sinon"] = _texte_cellule(ligne["proposition_vide_sinon"]) == OUI
+    return parametres
+
+
+def _avec_cle(instance: dict, cle: str, valeur, apres: str | None = None) -> dict:
+    """Copie d'une règle où `cle` vaut `valeur` : à sa place si elle y est, sinon
+    après la clé `apres` (à la fin si `apres` est absente)."""
+    if cle in instance:
+        return {**instance, cle: valeur}
+    nouvelle = {}
+    for nom, existante in instance.items():
+        nouvelle[nom] = existante
+        if nom == apres:
+            nouvelle[cle] = valeur
+    nouvelle.setdefault(cle, valeur)
+    return nouvelle
+
+
+def _sans_cle(instance: dict, cle: str) -> dict:
+    return {nom: valeur for nom, valeur in instance.items() if nom != cle}
+
+
+def _appliquer_parametres(famille: _Famille, instance: dict, parametres: dict) -> dict:
+    """Règle dont les paramètres modifiables prennent les valeurs données; un booléen
+    faux ou une comparaison telle quelle s'écrivent par l'absence de la clé."""
+    if parametres == _parametres_regle(famille, instance):
+        return instance
+    if famille.nom == FAMILLE_REFERENCES:
+        if parametres["comparaison"] == COMPARAISON_TELLE_QUELLE:
+            instance = _sans_cle(instance, "comparaison")
+        else:
+            apres = "cle_reference" if "cle_reference" in instance else "table_reference"
+            instance = _avec_cle(instance, "comparaison", parametres["comparaison"], apres)
+        if parametres["cle_facultative"]:
+            instance = _avec_cle(instance, "cle_facultative", True,
+                                 "comparaison" if "comparaison" in instance else None)
+        else:
+            instance = _sans_cle(instance, "cle_facultative")
+    elif famille.nom == FAMILLE_RENSEIGNEMENT:
+        if [str(v) for v in instance["valeurs"]] != parametres["valeurs"]:
+            instance = {**instance, "valeurs": list(parametres["valeurs"])}
+        if parametres["vide_sinon"]:
+            instance = _avec_cle(instance, "vide_sinon", True, "valeurs")
+        else:
+            instance = _sans_cle(instance, "vide_sinon")
+    return instance
+
+
+def _maj_descriptif(instance: dict, ref, libelle, issue, commentaire) -> dict:
+    """Règle dont la référence, le libellé, l'issue et le commentaire prennent les
+    valeurs saisies (None pour la référence ou le libellé : inchangés; issue None :
+    celle du type)."""
+    if ref is not None and ref != instance["ref"]:
+        instance = {**instance, "ref": ref}
+    if libelle is not None and libelle != instance["libelle"]:
+        instance = {**instance, "libelle": libelle}
+    defaut = TYPES[instance["type"]].issue
+    if (issue or defaut) != _issue(instance):
+        if (issue or defaut) == defaut:
+            instance = _sans_cle(instance, CLE_ISSUE)
+        else:
+            instance = _avec_cle(instance, CLE_ISSUE, issue)
+    if commentaire != _commentaire_regle(instance):
+        if commentaire is None:
+            instance = _sans_cle(instance, CLE_COMMENTAIRE)
+        else:
+            instance = _avec_cle(instance, CLE_COMMENTAIRE, commentaire, "libelle")
+    return instance
+
+
+def _filtre_saisi(table: str, colonne: str, valeurs: str, dictionnaire: dict, lieu: str,
+                  problemes: list, avertissements: list) -> list | None:
+    """Filtre d'une ligne d'ajout (une condition sur des valeurs), None sans filtre."""
+    if not colonne and not valeurs:
+        return None
+    if not colonne or not valeurs:
+        problemes.append(f"{lieu} : filtre_colonne et filtre_valeurs vont ensemble")
+        return None
+    if colonne not in dictionnaire.get(table, {}):
+        problemes.append(f"{lieu} : colonne de filtre {colonne!r} inconnue de la table {table}")
+        return None
+    choix = _decouper(valeurs)
+    liste = _liste_en_vigueur(dictionnaire, table, colonne)
+    if liste is not None:
+        hors = [v for v in choix if v not in liste]
+        if hors:
+            avertissements.append(
+                f"{lieu} : valeur de filtre hors de la liste en vigueur de {colonne} "
+                f"({', '.join(hors)})"
+            )
+    return [{"colonne": colonne, "valeurs": choix}]
+
+
+def _colonnes_connues(dictionnaire: dict, table: str, colonnes: list[str], nom: str,
+                      lieu: str, problemes: list) -> bool:
+    if table not in dictionnaire:
+        problemes.append(f"{lieu} : table {table!r} inconnue du dictionnaire")
+        return False
+    if not colonnes:
+        problemes.append(f"{lieu} : {nom} à remplir")
+        return False
+    inconnues = [c for c in colonnes if c not in dictionnaire[table]]
+    if inconnues:
+        problemes.append(
+            f"{lieu} : {nom}, colonne inconnue de la table {table} ({', '.join(inconnues)})"
+        )
+        return False
+    return True
+
+
+def _libelle_defaut(famille: _Famille, identite: tuple, parametres: dict) -> str:
+    if famille.nom == FAMILLE_REFERENCES:
+        return f"{identite[0]}.{identite[1]} connue de {identite[2]}.{identite[3]}"
+    if famille.nom == FAMILLE_RENSEIGNEMENT:
+        return _libelle_renseignement(identite[1], identite[2], parametres["valeurs"],
+                                      parametres["vide_sinon"])
+    return f"{identite[1]} dans la période de l'export"
+
+
+def _nouvelle_regle(famille: _Famille, identite: tuple, parametres: dict, filtre,
+                    ref: str, libelle: str, issue, commentaire) -> dict:
+    """Règle d'une famille construite d'après une ligne, clés dans l'ordre du type."""
+    instance = {"ref": ref, "libelle": libelle}
+    if commentaire is not None:
+        instance[CLE_COMMENTAIRE] = commentaire
+    instance.update({"type": famille.type, "table": identite[0]})
+    if famille.nom == FAMILLE_REFERENCES:
+        cle, cle_reference = _decouper(identite[1]), _decouper(identite[3])
+        instance.update({"cle": cle, "table_reference": identite[2]})
+        if cle_reference != cle:
+            instance["cle_reference"] = cle_reference
+        if parametres["comparaison"] != COMPARAISON_TELLE_QUELLE:
+            instance["comparaison"] = parametres["comparaison"]
+        if parametres["cle_facultative"]:
+            instance["cle_facultative"] = True
+    elif famille.nom == FAMILLE_RENSEIGNEMENT:
+        instance.update({"colonne": identite[1], "selon": identite[2],
+                         "valeurs": list(parametres["valeurs"])})
+        if parametres["vide_sinon"]:
+            instance["vide_sinon"] = True
+    else:
+        instance["colonne"] = identite[1]
+    if filtre:
+        instance[CLE_FILTRE] = filtre
+    if issue is not None and issue != TYPES[famille.type].issue:
+        instance[CLE_ISSUE] = issue
+    return instance
+
+
+def _texte_regle(instance: dict) -> str:
+    """Règle en clair pour le rapport : paramètres, filtre et issue."""
+    parties = [texte_parametres(instance)]
+    filtre = _texte_filtre(instance.get(CLE_FILTRE))
+    if filtre:
+        parties.append(f"filtre = {filtre}")
+    parties.append(f"issue = {_issue(instance)}")
+    return "; ".join(partie for partie in parties if partie)
+
+
+def _difference(avant: dict, apres: dict) -> tuple[str, str]:
+    """Clés qui changent entre deux versions d'une règle, en clair."""
+    noms = [cle for cle in avant if avant.get(cle, ABSENT) != apres.get(cle, ABSENT)]
+    noms += [cle for cle in apres if cle not in avant]
+
+    def ecrire(instance):
+        return "; ".join(
+            f"{nom} = {_texte_valeur(instance[nom])}" if nom in instance else f"{nom} {ABSENT}"
+            for nom in noms
+        )
+
+    return ecrire(avant), ecrire(apres)
+
+
+class _Etat:
+    """Décisions lues dans le classeur, appliquées ensuite au contenu."""
+
+    def __init__(self, contenu: dict):
+        self.regles = list(contenu.get(CLE_REGLES_GESTION) or [])
+        self.retirees = list(contenu.get(CLE_RETIREES) or [])
+        # Sort des règles désignées par une ligne : rang vers (action, règle).
+        self.sort_regles: dict[int, tuple[str, dict | None]] = {}
+        self.sort_retirees: dict[int, tuple[str, dict | None]] = {}
+        self.insertions: list[dict] = []
+        ecartees = contenu.get(CLE_ECARTEES) or {}
+        self.ecartees = {
+            famille.nom: list(ecartees.get(famille.nom) or []) for famille in FAMILLES
+        }
+        self.ecartees_retirees: dict[str, set[int]] = {f.nom: set() for f in FAMILLES}
+        self.ecartees_ajoutees: dict[str, list[dict]] = {f.nom: [] for f in FAMILLES}
+        self.ecartees_vues: dict[str, set[int]] = {f.nom: set() for f in FAMILLES}
+        self.changements: list[tuple] = []
+
+    def noter(self, feuille, ref, table, colonnes, changement, avant="", apres=""):
+        self.changements.append((feuille, ref, table, colonnes, changement, avant, apres))
+
+
+def _lire_rang(ligne: dict, origine: str, etat: _Etat, lieu: str,
+               problemes: list) -> tuple[list | None, int | None]:
+    """Liste (règles ou règles retirées) et rang désignés par la colonne masquée."""
+    source, deja = (
+        (etat.regles, etat.sort_regles) if origine == ORIGINE_EN_VIGUEUR
+        else (etat.retirees, etat.sort_retirees)
+    )
+    valeur = ligne["rang"]
+    if isinstance(valeur, float) and valeur.is_integer():
+        valeur = int(valeur)
+    if isinstance(valeur, str) and valeur.strip().isdigit():
+        valeur = int(valeur.strip())
+    if isinstance(valeur, bool) or not isinstance(valeur, int) or not 0 <= valeur < len(source):
+        problemes.append(f"{lieu} : colonne masquée rang illisible, formulaire à réexporter")
+        return None, None
+    if valeur in deja:
+        problemes.append(
+            f"{lieu} : règle déjà désignée par une autre ligne (ligne recopiée), formulaire à "
+            "réexporter"
+        )
+        return None, None
+    return source, valeur
+
+
+def _desaccord(lieu: str, rang: int, origine: str) -> str:
+    cle = CLE_REGLES_GESTION if origine == ORIGINE_EN_VIGUEUR else CLE_RETIREES
+    return (
+        f"{lieu} : la ligne ne correspond plus à la règle n° {rang + 1} de la clé {cle} "
+        "(ligne déplacée ou recopiée), formulaire à réexporter"
+    )
+
+
+def _issue_saisie(ligne: dict, lieu: str, problemes: list) -> tuple[str | None, bool]:
+    """Issue saisie (None : celle du type) et vrai si la saisie est lisible."""
+    issue = _texte_cellule(ligne["issue"])
+    if issue and issue not in ISSUES:
+        problemes.append(f"{lieu} : issue inconnue {issue!r} (issues possibles : "
+                         f"{', '.join(ISSUES)})")
+        return None, False
+    return issue or None, True
+
+
+def _verifier_valeurs(famille: _Famille, identite: tuple, parametres: dict,
+                      dictionnaire: dict, lieu: str, problemes: list,
+                      avertissements: list) -> None:
+    """Contrôle des valeurs d'une règle de renseignement nouvelle ou modifiée."""
+    if famille.nom != FAMILLE_RENSEIGNEMENT:
+        return
+    valeurs = parametres["valeurs"]
+    if not valeurs:
+        problemes.append(f"{lieu} : valeurs à remplir (séparées par une virgule)")
+        return
+    liste = _liste_en_vigueur(dictionnaire, identite[0], identite[2])
+    if liste is None:
+        avertissements.append(
+            f"{lieu} : {identite[2]} n'a pas de liste fermée en vigueur, valeurs non vérifiées"
+        )
+        return
+    hors = [v for v in valeurs if v not in liste]
+    if hors:
+        problemes.append(
+            f"{lieu} : valeurs hors de la liste en vigueur de {identite[2]} "
+            f"({', '.join(hors)})"
+        )
+
+
+def _identite_ajout(famille: _Famille, ligne: dict, dictionnaire: dict, lieu: str,
+                    problemes: list) -> tuple | None:
+    """Colonnes qui désignent la règle d'une ligne d'ajout, contrôlées contre le
+    dictionnaire (None si elles ne conviennent pas)."""
+    identite = _identite_ligne(famille, ligne)
+    table = identite[0]
+    if not table:
+        problemes.append(f"{lieu} : table à remplir")
+        return None
+    if famille.nom == FAMILLE_REFERENCES:
+        cle = _decouper(identite[1])
+        cle_reference = _decouper(identite[3]) or cle
+        if not _colonnes_connues(dictionnaire, table, cle, "colonne", lieu, problemes):
+            return None
+        if not identite[2]:
+            problemes.append(f"{lieu} : table_reference à remplir")
+            return None
+        if not _colonnes_connues(dictionnaire, identite[2], cle_reference,
+                                 "colonne_reference", lieu, problemes):
+            return None
+        if len(cle) != len(cle_reference):
+            problemes.append(
+                f"{lieu} : colonne et colonne_reference n'ont pas le même nombre de colonnes"
+            )
+            return None
+        return (table, ", ".join(cle), identite[2], ", ".join(cle_reference)) + identite[4:]
+    if famille.nom == FAMILLE_RENSEIGNEMENT:
+        if not _colonnes_connues(dictionnaire, table, [c for c in identite[1:3] if c] or [],
+                                 "colonne et selon", lieu, problemes):
+            return None
+        if not identite[1] or not identite[2]:
+            problemes.append(f"{lieu} : colonne et selon à remplir")
+            return None
+        return identite
+    if not _colonnes_connues(dictionnaire, table, [identite[1]] if identite[1] else [],
+                             "colonne", lieu, problemes):
+        return None
+    nature = dictionnaire[table][identite[1]]["nature"]["regle"]
+    if nature not in NATURES_DATE:
+        problemes.append(
+            f"{lieu} : {identite[1]} n'est pas une colonne de date (nature {nature})"
+        )
+        return None
+    return identite
+
+
+def _importer_famille(famille: _Famille, lignes: list[tuple[int, dict]], dictionnaire: dict,
+                      etat: _Etat, problemes: list, avertissements: list) -> None:
+    """Applique à `etat` les lignes de la feuille d'une famille (voir
+    `importer_formulaire_gestion`)."""
+    cles_ecartees = CLES_PROPOSITION_ECARTEE[famille.nom]
+    for numero, ligne in lignes:
+        lieu = f"feuille « {famille.feuille} », ligne {numero}"
+        origine, statut = _texte_cellule(ligne["origine"]), _texte_cellule(ligne["statut"])
+        if origine and origine not in ORIGINES:
+            problemes.append(f"{lieu} : origine {origine!r} inconnue, formulaire à réexporter")
+            continue
+        if statut not in STATUTS:
+            problemes.append(
+                f"{lieu} : statut {'absent' if not statut else repr(statut)} (statuts "
+                f"possibles : {', '.join(STATUTS)})"
+            )
+            continue
+        nombre = len(problemes)
+        issue, lisible = _issue_saisie(ligne, lieu, problemes)
+        ref, libelle = _texte_cellule(ligne["ref"]), _texte_cellule(ligne["libellé"])
+        commentaire = _commentaire_saisi(ligne["commentaire"])
+
+        if not origine:
+            # Ligne d'ajout.
+            if statut != STATUT_DOCUMENTE:
+                problemes.append(f"{lieu} : une ligne ajoutée doit être au statut documenté")
+                continue
+            identite = _identite_ajout(famille, ligne, dictionnaire, lieu, problemes)
+            saisis, erreurs = _parametres_saisis(famille, ligne)
+            problemes.extend(f"{lieu} : {erreur}" for erreur in erreurs)
+            if identite is None or saisis is None or not lisible:
+                continue
+            filtre = _filtre_saisi(identite[0], *identite[-2:], dictionnaire, lieu, problemes,
+                                   avertissements)
+            _verifier_valeurs(famille, identite, saisis, dictionnaire, lieu, problemes,
+                              avertissements)
+            if len(problemes) > nombre:
+                continue
+            instance = _nouvelle_regle(
+                famille, identite, saisis, filtre, ref or famille.ref,
+                libelle or _libelle_defaut(famille, identite, saisis), issue, commentaire,
+            )
+            etat.insertions.append(instance)
+            etat.noter(famille.feuille, instance["ref"], identite[0],
+                       _designation(famille, identite), CHANGEMENT_AJOUTEE,
+                       apres=_texte_regle(instance))
+            continue
+
+        identite = _identite_ligne(famille, ligne)
+        instance, source, rang = None, None, None
+        if origine in (ORIGINE_EN_VIGUEUR, ORIGINE_RETIREE):
+            source, rang = _lire_rang(ligne, origine, etat, lieu, problemes)
+            if source is None:
+                continue
+            instance = source[rang]
+            if (
+                not isinstance(instance, dict)
+                or instance.get("type") != famille.type
+                or not famille.en_famille(instance)
+                or _identite_regle(famille, instance) != identite
+            ):
+                problemes.append(_desaccord(lieu, rang, origine))
+                continue
+        rang_ecartee = None
+        if origine == ORIGINE_ECARTEE:
+            element = {cle: _texte_cellule(ligne[nom]) for cle, nom in zip(
+                cles_ecartees, ("table", "colonne", famille.colonnes[2], famille.colonnes[3])
+            )}
+            trouves = [i for i, e in enumerate(etat.ecartees[famille.nom]) if e == element]
+            if not trouves:
+                problemes.append(
+                    f"{lieu} : proposition écartée absente de config/gestion.yaml, formulaire à "
+                    "réexporter"
+                )
+                continue
+            rang_ecartee = trouves[0]
+            if rang_ecartee in etat.ecartees_vues[famille.nom]:
+                problemes.append(f"{lieu} : proposition écartée désignée deux fois")
+                continue
+            etat.ecartees_vues[famille.nom].add(rang_ecartee)
+
+        exportes = _exportes(famille, ligne, instance)
+        saisis, erreurs = _parametres_saisis(famille, ligne)
+        base = (
+            _parametres_regle(famille, instance) if instance is not None
+            else _parametres_defaut(famille)
+        )
+        proposes = _parametres_proposes(famille, ligne, base)
+        if statut == STATUT_DOCUMENTE:
+            problemes.extend(f"{lieu} : {erreur}" for erreur in erreurs)
+            parametres = saisis
+        elif statut == STATUT_VALIDE:
+            if proposes is None:
+                problemes.append(f"{lieu} : valide impossible, la proposition est « {AUCUNE} »")
+                continue
+            parametres = proposes
+            if saisis != proposes:
+                avertissements.append(
+                    f"{lieu} : valeurs saisies ignorées, valide adopte la proposition"
+                )
+        else:
+            parametres = None
+            if saisis != exportes:
+                avertissements.append(f"{lieu} : valeurs saisies ignorées (statut {statut})")
+        if len(problemes) > nombre or not lisible:
+            continue
+        retenue = statut in (STATUT_DOCUMENTE, STATUT_VALIDE)
+        if instance is not None and retenue and (not ref or not libelle):
+            problemes.append(f"{lieu} : ref et libellé à remplir")
+            continue
+        if retenue and parametres != base:
+            _verifier_valeurs(famille, identite, parametres, dictionnaire, lieu, problemes,
+                              avertissements)
+            if len(problemes) > nombre:
+                continue
+        designation = _designation(famille, identite)
+
+        if instance is not None:
+            ancienne = instance
+            if retenue or statut == STATUT_INVALIDE:
+                if retenue:
+                    instance = _appliquer_parametres(famille, instance, parametres)
+                instance = _maj_descriptif(instance, ref or None, libelle or None, issue,
+                                           commentaire)
+            if origine == ORIGINE_EN_VIGUEUR:
+                if retenue:
+                    etat.sort_regles[rang] = ("garder", instance)
+                    if instance != ancienne:
+                        etat.noter(famille.feuille, instance["ref"], identite[0], designation,
+                                   CHANGEMENT_MODIFIEE, *_difference(ancienne, instance))
+                elif statut == STATUT_INVALIDE:
+                    etat.sort_regles[rang] = ("retirer", instance)
+                    etat.noter(famille.feuille, instance["ref"], identite[0], designation,
+                               CHANGEMENT_RETIREE, avant=_texte_regle(ancienne))
+                else:
+                    etat.sort_regles[rang] = ("supprimer", None)
+                    avertissements.append(
+                        f"{lieu} : règle en vigueur remise à observé, supprimée sans être "
+                        "gardée parmi les règles retirées"
+                    )
+                    etat.noter(famille.feuille, ancienne["ref"], identite[0], designation,
+                               CHANGEMENT_SUPPRIMEE, avant=_texte_regle(ancienne))
+            else:
+                if retenue:
+                    etat.sort_retirees[rang] = ("retablir", None)
+                    etat.insertions.append(instance)
+                    etat.noter(famille.feuille, instance["ref"], identite[0], designation,
+                               CHANGEMENT_RETABLIE, apres=_texte_regle(instance))
+                elif statut == STATUT_INVALIDE:
+                    etat.sort_retirees[rang] = ("garder", instance)
+                else:
+                    etat.sort_retirees[rang] = ("supprimer", None)
+                    avertissements.append(
+                        f"{lieu} : règle retirée remise à observé, oubliée (elle ne pourra "
+                        "plus être rétablie)"
+                    )
+                    etat.noter(famille.feuille, ancienne["ref"], identite[0], designation,
+                               CHANGEMENT_SUPPRIMEE, avant=_texte_regle(ancienne))
+            continue
+
+        # Proposition, ou proposition écartée.
+        if retenue:
+            nouvelle = _nouvelle_regle(
+                famille, identite, parametres, None, ref or famille.ref,
+                libelle or _libelle_defaut(famille, identite, parametres), issue, commentaire,
+            )
+            etat.insertions.append(nouvelle)
+            etat.noter(famille.feuille, nouvelle["ref"], identite[0], designation,
+                       CHANGEMENT_AJOUTEE, apres=_texte_regle(nouvelle))
+            if rang_ecartee is not None:
+                etat.ecartees_retirees[famille.nom].add(rang_ecartee)
+            continue
+        if commentaire is not None:
+            avertissements.append(f"{lieu} : commentaire non conservé (aucune règle)")
+        if origine == ORIGINE_PROPOSEE and statut == STATUT_INVALIDE:
+            etat.ecartees_ajoutees[famille.nom].append({
+                cle: _texte_cellule(ligne[nom]) for cle, nom in zip(
+                    cles_ecartees, ("table", "colonne", famille.colonnes[2],
+                                    famille.colonnes[3])
+                )
+            })
+            etat.noter(famille.feuille, "", identite[0], designation, CHANGEMENT_ECARTEE)
+        elif origine == ORIGINE_ECARTEE and statut == STATUT_OBSERVE:
+            etat.ecartees_retirees[famille.nom].add(rang_ecartee)
+            etat.noter(famille.feuille, "", identite[0], designation, CHANGEMENT_REPROPOSEE)
+
+
+def _importer_autres(lignes: list[tuple[int, dict]], etat: _Etat, problemes: list,
+                     avertissements: list) -> None:
+    """Applique à `etat` les lignes de la feuille des autres règles."""
+    for numero, ligne in lignes:
+        lieu = f"feuille « {FEUILLE_AUTRES} », ligne {numero}"
+        origine, statut = _texte_cellule(ligne["origine"]), _texte_cellule(ligne["statut"])
+        if origine not in (ORIGINE_EN_VIGUEUR, ORIGINE_RETIREE):
+            problemes.append(
+                f"{lieu} : origine {origine!r} inattendue (pas de ligne d'ajout dans cette "
+                "feuille), formulaire à réexporter"
+            )
+            continue
+        if statut not in (STATUT_DOCUMENTE, STATUT_INVALIDE):
+            problemes.append(
+                f"{lieu} : statut {'absent' if not statut else repr(statut)}, documenté ou "
+                "invalide est attendu (pas de proposition dans cette feuille)"
+            )
+            continue
+        nombre = len(problemes)
+        source, rang = _lire_rang(ligne, origine, etat, lieu, problemes)
+        if source is None:
+            continue
+        instance = source[rang]
+        identite = tuple(_texte_cellule(ligne[nom]) for nom in ("type", "table", "paramètres",
+                                                                 "filtre"))
+        if (
+            not isinstance(instance, dict)
+            or any(famille.en_famille(instance) for famille in FAMILLES)
+            or identite != (
+                _texte(instance.get("type")), _texte(instance.get("table")),
+                _texte(texte_parametres(instance)),
+                _texte(_texte_filtre(instance.get(CLE_FILTRE))),
+            )
+        ):
+            problemes.append(_desaccord(lieu, rang, origine))
+            continue
+        issue, lisible = _issue_saisie(ligne, lieu, problemes)
+        libelle = _texte_cellule(ligne["libellé"])
+        if not libelle:
+            problemes.append(f"{lieu} : libellé à remplir")
+        if len(problemes) > nombre or not lisible:
+            continue
+        ancienne = instance
+        instance = _maj_descriptif(instance, None, libelle, issue,
+                                   _commentaire_saisi(ligne["commentaire"]))
+        colonnes = texte_parametres(ancienne)
+        if origine == ORIGINE_EN_VIGUEUR and statut == STATUT_DOCUMENTE:
+            etat.sort_regles[rang] = ("garder", instance)
+            if instance != ancienne:
+                etat.noter(FEUILLE_AUTRES, instance["ref"], instance["table"], colonnes,
+                           CHANGEMENT_MODIFIEE, *_difference(ancienne, instance))
+        elif origine == ORIGINE_EN_VIGUEUR:
+            etat.sort_regles[rang] = ("retirer", instance)
+            etat.noter(FEUILLE_AUTRES, instance["ref"], instance["table"], colonnes,
+                       CHANGEMENT_RETIREE, avant=_texte_regle(ancienne))
+        elif statut == STATUT_DOCUMENTE:
+            etat.sort_retirees[rang] = ("retablir", None)
+            etat.insertions.append(instance)
+            etat.noter(FEUILLE_AUTRES, instance["ref"], instance["table"], colonnes,
+                       CHANGEMENT_RETABLIE, apres=_texte_regle(instance))
+        else:
+            etat.sort_retirees[rang] = ("garder", instance)
+
+
+def _date_saisie(valeur) -> date | None:
+    """Date d'une cellule : date d'Excel, ou texte JJ/MM/AAAA ou AAAA-MM-JJ."""
+    if isinstance(valeur, dt.datetime):
+        return valeur.date()
+    if isinstance(valeur, date):
+        return valeur
+    texte = _texte_cellule(valeur)
+    for forme in ("%d/%m/%Y", "%Y-%m-%d"):
+        try:
+            return dt.datetime.strptime(texte, forme).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _jours_par_annee(jours: set[date]) -> dict[int, set[date]]:
+    annees: dict[int, set[date]] = {}
+    for jour in jours:
+        annees.setdefault(jour.year, set()).add(jour)
+    return annees
+
+
+def _ecrire_jours(original, jours: set[date]) -> dict:
+    """Jours fériés (année vers liste) d'après les dates retenues; une année dont les
+    dates ne changent pas garde sa liste telle quelle, une année déclarée sans date
+    retenue garde une liste vide."""
+    original = original if isinstance(original, dict) else {}
+    par_annee = _jours_par_annee(jours)
+    anciens = _jours_declares(original)
+    resultat = {}
+    for cle in original:
+        annee = _annee_feries(cle)
+        if annee is None:
+            continue
+        if set(anciens.get(annee, [])) == par_annee.get(annee, set()):
+            resultat[cle] = original[cle]
+        else:
+            resultat[cle] = [jour.isoformat() for jour in sorted(par_annee.get(annee, set()))]
+    for annee in sorted(set(par_annee) - set(anciens)):
+        resultat[annee] = [jour.isoformat() for jour in sorted(par_annee[annee])]
+    return resultat
+
+
+def _importer_feries(lignes: list[tuple[int, dict]], contenu: dict, etat: _Etat,
+                     problemes: list, avertissements: list) -> tuple[dict, dict]:
+    """Jours fériés déclarés et écartés après la revue de leur feuille."""
+    declares = {j for jours in _jours_declares(contenu.get(CLE_JOURS_FERIES)).values()
+                for j in jours}
+    ecartes = {j for jours in _jours_declares(_ecartees(contenu, FAMILLE_FERIES)).values()
+               for j in jours}
+    nouveaux_declares, nouveaux_ecartes, vus = set(declares), set(ecartes), set()
+    for numero, ligne in lignes:
+        lieu = f"feuille « {FEUILLE_FERIES} », ligne {numero}"
+        origine, statut = _texte_cellule(ligne["origine"]), _texte_cellule(ligne["statut"])
+        jour = _date_saisie(ligne["date"])
+        if jour is None:
+            problemes.append(f"{lieu} : date illisible (JJ/MM/AAAA attendu)")
+            continue
+        if origine and origine not in (ORIGINE_EN_VIGUEUR, ORIGINE_PROPOSEE, ORIGINE_ECARTEE):
+            problemes.append(f"{lieu} : origine {origine!r} inconnue, formulaire à réexporter")
+            continue
+        if statut not in STATUTS:
+            problemes.append(
+                f"{lieu} : statut {'absent' if not statut else repr(statut)} (statuts "
+                f"possibles : {', '.join(STATUTS)})"
+            )
+            continue
+        if not origine and statut != STATUT_DOCUMENTE:
+            problemes.append(f"{lieu} : une date ajoutée doit être au statut documenté")
+            continue
+        if jour in vus:
+            problemes.append(f"{lieu} : date {jour:%d/%m/%Y} déjà présente dans la feuille")
+            continue
+        vus.add(jour)
+        nouveaux_declares.discard(jour)
+        nouveaux_ecartes.discard(jour)
+        if statut in (STATUT_DOCUMENTE, STATUT_VALIDE):
+            nouveaux_declares.add(jour)
+        elif statut == STATUT_INVALIDE:
+            nouveaux_ecartes.add(jour)
+    absents = (declares | ecartes) - vus
+    if absents:
+        avertissements.append(
+            f"feuille « {FEUILLE_FERIES} » : {len(absents)} dates de config/gestion.yaml "
+            "absentes du formulaire, laissées telles quelles"
+        )
+
+    def etat_jour(jour, dans_declares, dans_ecartes):
+        return "déclarée" if jour in dans_declares else "écartée" if jour in dans_ecartes else ""
+
+    for jour in sorted(declares | ecartes | nouveaux_declares | nouveaux_ecartes):
+        avant = etat_jour(jour, declares, ecartes)
+        apres = etat_jour(jour, nouveaux_declares, nouveaux_ecartes)
+        if avant == apres:
+            continue
+        if apres == "déclarée":
+            changement = CHANGEMENT_DECLAREE
+        elif apres == "écartée":
+            changement = CHANGEMENT_ECARTEE
+        elif avant == "déclarée":
+            changement = CHANGEMENT_RETIREE
+        else:
+            changement = CHANGEMENT_REPROPOSEE
+        etat.noter(FEUILLE_FERIES, "", "", jour.isoformat(), changement, avant, apres)
+    if nouveaux_declares == declares:
+        jours_feries = contenu.get(CLE_JOURS_FERIES)
+    else:
+        jours_feries = _ecrire_jours(contenu.get(CLE_JOURS_FERIES), nouveaux_declares)
+    if nouveaux_ecartes == ecartes:
+        jours_ecartes = _ecartees(contenu, FAMILLE_FERIES)
+    else:
+        jours_ecartes = {
+            cle: liste for cle, liste in _ecrire_jours(
+                _ecartees(contenu, FAMILLE_FERIES), nouveaux_ecartes
+            ).items() if liste
+        }
+    return jours_feries, jours_ecartes
+
+
+def _demande_normalisee(demande: dict) -> dict:
+    return {
+        cle: _texte_cellule(valeur) for cle, valeur in demande.items()
+        if _texte_cellule(valeur)
+    }
+
+
+def _importer_nouvelles(lignes: list[tuple[int, dict]], contenu: dict, etat: _Etat,
+                        problemes: list) -> list:
+    """Règles demandées en texte libre, d'après la feuille des nouvelles règles."""
+    demandes = []
+    for numero, ligne in lignes:
+        demande = {
+            cle: _commentaire_saisi(ligne[nom]) for cle, nom in COLONNES_DEMANDE.items()
+        }
+        demande = {cle: valeur for cle, valeur in demande.items() if valeur is not None}
+        if "regle" not in demande:
+            problemes.append(
+                f"feuille « {FEUILLE_NOUVELLES} », ligne {numero} : colonne "
+                f"{COLONNES_DEMANDE['regle']} à remplir"
+            )
+            continue
+        demandes.append(demande)
+    anciennes = list(contenu.get(CLE_DEMANDES) or [])
+    normalisees = [_demande_normalisee(d) for d in anciennes if isinstance(d, dict)]
+    if normalisees == [_demande_normalisee(d) for d in demandes]:
+        return anciennes
+    restantes = list(normalisees)
+    for demande in demandes:
+        if _demande_normalisee(demande) in restantes:
+            restantes.remove(_demande_normalisee(demande))
+        else:
+            etat.noter(FEUILLE_NOUVELLES, "", demande.get("tables", ""),
+                       demande.get("colonnes", ""), CHANGEMENT_DEMANDEE,
+                       apres=demande["regle"])
+    for demande in restantes:
+        etat.noter(FEUILLE_NOUVELLES, "", demande.get("tables", ""),
+                   demande.get("colonnes", ""), CHANGEMENT_RETIREE, avant=demande["regle"])
+    return demandes
+
+
+def _regles_apres(etat: _Etat, avertissements: list) -> tuple[list, list]:
+    """Règles et règles retirées après la revue : les règles gardent l'ordre du
+    fichier; une règle nouvelle ou rétablie se place après la dernière règle du même
+    type (à la fin s'il n'y en a pas); une règle retirée s'ajoute à la fin des règles
+    retirées."""
+    absentes = (len(etat.regles) - len(etat.sort_regles)
+                + len(etat.retirees) - len(etat.sort_retirees))
+    if absentes:
+        avertissements.append(
+            f"{absentes} règles de config/gestion.yaml absentes du formulaire, laissées "
+            "telles quelles"
+        )
+    regles, retirees_nouvelles = [], []
+    for rang, instance in enumerate(etat.regles):
+        action, modifiee = etat.sort_regles.get(rang, ("garder", instance))
+        if action == "garder":
+            regles.append(modifiee)
+        elif action == "retirer":
+            retirees_nouvelles.append(modifiee)
+    for instance in etat.insertions:
+        rangs = [i for i, r in enumerate(regles)
+                 if isinstance(r, dict) and r.get("type") == instance["type"]]
+        regles.insert(rangs[-1] + 1 if rangs else len(regles), instance)
+    retirees = []
+    for rang, instance in enumerate(etat.retirees):
+        action, modifiee = etat.sort_retirees.get(rang, ("garder", instance))
+        if action == "garder":
+            retirees.append(modifiee)
+    return regles, retirees + retirees_nouvelles
+
+
+def _lire_empreinte_gestion(classeur) -> str:
+    """Empreinte de config/gestion.yaml inscrite dans le formulaire à l'export."""
+    if FEUILLE_MODE_EMPLOI not in classeur.sheetnames:
+        raise ValueError(f"feuille « {FEUILLE_MODE_EMPLOI} » absente")
+    for ligne in classeur[FEUILLE_MODE_EMPLOI].iter_rows(max_col=2, values_only=True):
+        if ligne and ligne[0] == REPERE_EMPREINTE:
+            empreinte = _texte(ligne[1] if len(ligne) > 1 else None)
+            if empreinte:
+                return empreinte
+            break
+    raise ValueError(
+        f"feuille « {FEUILLE_MODE_EMPLOI} » : repère de l'empreinte absent ou modifié, "
+        "formulaire à réexporter"
+    )
+
+
+def _remplacer(contenu: dict, cle: str, valeur) -> None:
+    """Met `valeur` sous `cle`, ou retire la clé si la valeur est vide (une clé déjà
+    présente avec une valeur vide est gardée telle quelle)."""
+    if valeur:
+        contenu[cle] = valeur
+    elif cle in contenu and contenu[cle]:
+        del contenu[cle]
+
+
+def importer_formulaire_gestion(
+    chemin: str | Path, dictionnaire: dict, contenu: dict, *, empreinte: str
+) -> Formulaire:
+    """Lit un formulaire des règles de gestion revu par le métier et contrôle chaque
+    ligne, sans rien écrire.
+
+    `contenu` est le contenu actuel de config/gestion.yaml
+    (`gestion.lire_fichier_gestion`) et `empreinte` son empreinte (`empreinte_gestion`) :
+    un formulaire exporté avant une modification du fichier est refusé.
+
+    Feuilles des familles, selon l'origine de la ligne. Règle en vigueur : documenté la
+    garde avec les modifications saisies, valide adopte la proposition, invalide la
+    passe sous `retirees` (en entier), observé la supprime sans la garder. Proposition :
+    documenté ou valide en fait une règle (valeurs saisies, ou proposition adoptée),
+    invalide la mémorise sous `ecartees`. Proposition écartée : documenté ou valide en
+    fait une règle, observé la retire de `ecartees`. Règle retirée : documenté ou valide
+    la rétablit, observé l'oublie. valide est refusé quand la proposition est
+    « aucune »; une valeur saisie qui ne sert pas est ignorée, avec un avertissement.
+    Une ligne ajoutée en bas d'une feuille doit être au statut documenté; sa référence
+    et son libellé laissés vides prennent ceux d'une proposition.
+
+    Feuille des autres règles : documenté garde ou rétablit la règle (libellé, issue et
+    commentaire modifiables), invalide la retire ou la laisse retirée. Feuille des jours
+    fériés : documenté ou valide déclare la date, invalide l'écarte, observé ne la
+    déclare ni ne l'écarte. Feuille des nouvelles règles : ses lignes remplacent les
+    règles demandées.
+
+    Les règles gardent l'ordre du fichier; une règle nouvelle ou rétablie se place après
+    la dernière règle en vigueur du même type. Tous les problèmes bloquants sont listés
+    en une fois dans une ValueError, avec la feuille et le numéro de ligne Excel. Rend
+    le nouveau contenu, le rapport des changements (`COLONNES_CHANGEMENTS_GESTION`) et
+    les avertissements.
+    """
+    chemin = Path(chemin)
+    classeur = load_workbook(chemin, read_only=True, data_only=True)
+    try:
+        try:
+            lignes = {
+                famille.nom: _lire_feuille(classeur, famille.feuille, famille.colonnes)
+                for famille in FAMILLES
+            }
+            lignes_feries = _lire_feuille(classeur, FEUILLE_FERIES, COLONNES_FERIES)
+            lignes_autres_regles = _lire_feuille(classeur, FEUILLE_AUTRES, COLONNES_AUTRES)
+            lignes_demandes = _lire_feuille(classeur, FEUILLE_NOUVELLES, COLONNES_NOUVELLES)
+            repere = _lire_empreinte_gestion(classeur)
+        except ValueError as erreur:
+            raise ValueError(f"Formulaire invalide ({chemin})\n  {erreur}") from None
+    finally:
+        classeur.close()
+    if repere != empreinte:
+        raise ValueError(
+            f"Formulaire périmé ({chemin}) : config/gestion.yaml a changé depuis son export "
+            f"(empreinte {repere} à l'export, {empreinte} aujourd'hui). Ce formulaire a "
+            "déjà été appliqué, ou le fichier a été modifié depuis : à réexporter."
+        )
+    problemes = problemes_contenu_formulaire(contenu)
+    if problemes:
+        raise ValueError(
+            "Fichier des règles de gestion invalide\n  " + "\n  ".join(problemes)
+        )
+
+    etat = _Etat(contenu)
+    problemes, avertissements = [], []
+    for famille in FAMILLES:
+        _importer_famille(famille, lignes[famille.nom], dictionnaire, etat, problemes,
+                          avertissements)
+    _importer_autres(lignes_autres_regles, etat, problemes, avertissements)
+    jours_feries, jours_ecartes = _importer_feries(lignes_feries, contenu, etat, problemes,
+                                                   avertissements)
+    demandes = _importer_nouvelles(lignes_demandes, contenu, etat, problemes)
+    if problemes:
+        raise ValueError(
+            f"Formulaire invalide ({chemin}), {len(problemes)} problèmes\n  "
+            + "\n  ".join(problemes)
+        )
+    regles, retirees = _regles_apres(etat, avertissements)
+
+    nouveau = copy.deepcopy(contenu)
+    _remplacer(nouveau, CLE_JOURS_FERIES, jours_feries)
+    _remplacer(nouveau, CLE_REGLES_GESTION, regles)
+    _remplacer(nouveau, CLE_RETIREES, retirees)
+    ecartees = dict(nouveau.get(CLE_ECARTEES) or {})
+    for famille in FAMILLES:
+        elements = [
+            e for i, e in enumerate(etat.ecartees[famille.nom])
+            if i not in etat.ecartees_retirees[famille.nom]
+        ] + etat.ecartees_ajoutees[famille.nom]
+        if elements != etat.ecartees[famille.nom]:
+            _remplacer(ecartees, famille.nom, elements)
+    _remplacer(ecartees, FAMILLE_FERIES, jours_ecartes)
+    _remplacer(nouveau, CLE_ECARTEES, ecartees)
+    _remplacer(nouveau, CLE_DEMANDES, demandes)
+    problemes = problemes_contenu_formulaire(nouveau)
+    if problemes:
+        raise ValueError(
+            f"Formulaire invalide ({chemin}), {len(problemes)} problèmes après la revue\n  "
+            + "\n  ".join(problemes)
+        )
+    changements = pd.DataFrame(etat.changements, columns=list(COLONNES_CHANGEMENTS_GESTION))
+    return Formulaire(nouveau, changements, avertissements)
+
+
+# --- Écriture de config/gestion.yaml ----------------------------------------------
+
+ENTETE_GESTION = """\
+# Règles de gestion propres au client, données par le métier.
+# Chaque règle est une instance d'un type du catalogue (voir frigeo.gestion.catalogue_types),
+# avec ref (référence de la règle), libelle (texte affiché), type, table, les paramètres du
+# type, et en option filtre, issue et commentaire. Une règle qui n'entre dans aucun type
+# demande un nouveau type générique dans src/.
+# Ce fichier est réécrit en entier par le formulaire des règles de gestion (notebook 05),
+# qui ne garde pas les lignes de commentaire écrites à la main; le commentaire d'une règle
+# s'écrit sous sa clé commentaire.
+"""
+COMMENTAIRE_JOURS_FERIES = """\
+# Jours fériés, repris par chaque règle d'horaires qui n'en déclare pas (clé feries).
+"""
+COMMENTAIRE_RETIREES = """\
+# Règles retirées par le métier, gardées en entier pour pouvoir les rétablir
+# (sans effet sur les contrôles).
+"""
+COMMENTAIRE_ECARTEES_GESTION = """\
+# Propositions du formulaire écartées par le métier, qui ne sont plus proposées
+# (sans effet sur les contrôles).
+"""
+COMMENTAIRE_DEMANDES = """\
+# Règles demandées par le métier en texte libre, que le consultant traduira en règles
+# du catalogue (sans effet sur les contrôles).
+"""
+# Nombre de dates par ligne dans les listes de jours fériés.
+DATES_PAR_LIGNE = 6
+# Colonne vers laquelle un commentaire de règle est replié.
+LARGEUR_COMMENTAIRE = 84
+_MOTIF_HEURE_TEXTE = re.compile(r"\d{1,2}:\d{2}")
+
+
+def _scalaire(valeur, cle=None) -> str:
+    """Valeur simple écrite en YAML, utilisable dans une liste ou un dictionnaire en
+    ligne; un motif et une heure sont écrits entre apostrophes."""
+    if isinstance(valeur, str) and (cle == "motif" or _MOTIF_HEURE_TEXTE.fullmatch(valeur)):
+        return "'" + valeur.replace("'", "''") + "'"
+    texte = yaml.safe_dump(
+        [valeur], default_flow_style=True, allow_unicode=True, width=10**9
+    ).strip()
+    if "\n" in texte:
+        texte = "[" + json.dumps(valeur, ensure_ascii=False) + "]"
+    return texte[1:-1]
+
+
+def _est_scalaire(valeur) -> bool:
+    return not isinstance(valeur, (list, dict))
+
+
+def _en_ligne(valeur, creneaux: bool = False) -> bool:
+    """Vrai si la valeur s'écrit sur une ligne : valeur simple, liste ou dictionnaire
+    de valeurs simples, et dans des horaires, liste de créneaux."""
+    if _est_scalaire(valeur):
+        return True
+    elements = valeur.values() if isinstance(valeur, dict) else valeur
+    if all(_est_scalaire(e) for e in elements):
+        return True
+    return creneaux and isinstance(valeur, list) and all(
+        isinstance(e, dict) and all(_est_scalaire(v) for v in e.values()) for e in valeur
+    )
+
+
+def _flux(valeur, cle=None) -> str:
+    """Valeur écrite en ligne (listes et dictionnaires entre crochets ou accolades)."""
+    if isinstance(valeur, list):
+        return "[" + ", ".join(_flux(v, cle) for v in valeur) + "]"
+    if isinstance(valeur, dict):
+        return "{" + ", ".join(
+            f"{_scalaire(k)}: {_flux(v, k)}" for k, v in valeur.items()
+        ) + "}"
+    return _scalaire(valeur, cle)
+
+
+def _scalaire_bloc(valeur, cle, retrait: int) -> str:
+    """Valeur simple d'une clé écrite en bloc (hors d'une liste en ligne) : un motif et
+    une heure entre apostrophes, un texte sur plusieurs lignes entre guillemets avec
+    « \n », un commentaire replié vers la centième colonne."""
+    if isinstance(valeur, str) and (cle == "motif" or _MOTIF_HEURE_TEXTE.fullmatch(valeur)):
+        return _scalaire(valeur, cle)
+    if cle == CLE_COMMENTAIRE and isinstance(valeur, str) and "\n" not in valeur:
+        largeur = max(40, LARGEUR_COMMENTAIRE - retrait - len(str(cle)) - 2)
+        texte = yaml.safe_dump(valeur, allow_unicode=True, width=largeur)
+        texte = texte.removesuffix("\n...\n").removesuffix("\n")
+        return texte.replace("\n  ", "\n" + " " * (retrait + 2))
+    return _yaml(valeur)
+
+
+def _lignes_valeur(cle, valeur, retrait: int, creneaux: bool = False) -> list[str]:
+    """Lignes d'une clé et de sa valeur, en bloc quand elle ne tient pas en ligne."""
+    marge = " " * retrait
+    if _est_scalaire(valeur):
+        return [f"{marge}{_scalaire(cle)}: {_scalaire_bloc(valeur, cle, retrait)}"]
+    if _en_ligne(valeur, creneaux):
+        return [f"{marge}{_scalaire(cle)}: {_flux(valeur, cle)}"]
+    lignes = [f"{marge}{_scalaire(cle)}:"]
+    if isinstance(valeur, dict):
+        for nom, element in valeur.items():
+            lignes += _lignes_valeur(nom, element, retrait + 2, creneaux)
+    else:
+        for element in valeur:
+            lignes += _lignes_element(element, retrait + 2)
+    return lignes
+
+
+def _lignes_element(element, retrait: int, creneaux: bool = False) -> list[str]:
+    """Lignes d'un élément de liste (« - ... ») : une condition (colonne et valeurs ou
+    motif) ou un dictionnaire qui ne tient pas en ligne s'écrit une clé par ligne."""
+    marge = " " * retrait
+    if isinstance(element, dict) and element and (
+        not _en_ligne(element) or _est_condition(element)
+    ):
+        lignes = []
+        for nom, valeur in element.items():
+            lignes += _lignes_valeur(nom, valeur, retrait + 2, creneaux)
+        return [f"{marge}- {lignes[0][retrait + 2:]}"] + lignes[1:]
+    return [f"{marge}- {_flux(element)}"]
+
+
+def _lignes_regle(instance: dict) -> list[str]:
+    """Lignes d'une règle : une clé par ligne, ses valeurs en ligne quand elles le
+    permettent (créneaux des horaires compris)."""
+    type_regle = TYPES.get(instance.get("type"))
+    genres = type_regle.parametres if type_regle is not None else {}
+    lignes = []
+    for nom, valeur in instance.items():
+        lignes += _lignes_valeur(nom, valeur, 4, genres.get(nom) == GENRE_HORAIRES)
+    return [f"  - {lignes[0][4:]}"] + lignes[1:]
+
+
+def _lignes_regles(regles: list) -> list[str]:
+    """Lignes d'une liste de règles, une ligne vide avant chaque changement de
+    référence."""
+    lignes, precedente = [], None
+    for instance in regles:
+        if precedente is not None and instance.get("ref") != precedente:
+            lignes.append("")
+        lignes += _lignes_regle(instance)
+        precedente = instance.get("ref")
+    return lignes
+
+
+def _lignes_jours(jours: dict, retrait: int) -> list[str]:
+    """Lignes de jours fériés (année vers liste), quelques dates par ligne."""
+    lignes = []
+    for annee, liste in jours.items():
+        debut = f"{' ' * retrait}{_scalaire(annee)}: ["
+        textes = [_scalaire(jour) for jour in liste]
+        paquets = [textes[i:i + DATES_PAR_LIGNE] for i in range(0, len(textes),
+                                                               DATES_PAR_LIGNE)] or [[]]
+        for rang, paquet in enumerate(paquets):
+            marge = debut if rang == 0 else " " * len(debut)
+            fin = "]" if rang == len(paquets) - 1 else ","
+            lignes.append(marge + ", ".join(paquet) + fin)
+    return lignes
+
+
+def texte_gestion(contenu: dict) -> str:
+    """Texte de config/gestion.yaml pour un contenu.
+
+    Un en-tête de commentaires standard, puis les jours fériés, les règles (une clé par
+    ligne, une ligne vide quand la référence change), les règles retirées, les
+    propositions écartées et les règles demandées. La relecture du texte redonne
+    exactement le contenu.
+    """
+    blocs = [ENTETE_GESTION]
+    jours_feries = contenu.get(CLE_JOURS_FERIES)
+    if jours_feries:
+        blocs.append(COMMENTAIRE_JOURS_FERIES + f"{CLE_JOURS_FERIES}:\n"
+                     + "\n".join(_lignes_jours(jours_feries, 2)) + "\n")
+    for cle, commentaire in ((CLE_REGLES_GESTION, ""), (CLE_RETIREES, COMMENTAIRE_RETIREES)):
+        regles = contenu.get(cle)
+        if regles:
+            blocs.append(commentaire + f"{cle}:\n" + "\n".join(_lignes_regles(regles)) + "\n")
+    ecartees = contenu.get(CLE_ECARTEES)
+    if ecartees:
+        lignes = [f"{CLE_ECARTEES}:"]
+        for famille, valeur in ecartees.items():
+            lignes.append(f"  {_scalaire(famille)}:")
+            if famille == FAMILLE_FERIES:
+                lignes += _lignes_jours(valeur, 4)
+            else:
+                lignes += [f"    - {_flux(element)}" for element in valeur]
+        blocs.append(COMMENTAIRE_ECARTEES_GESTION + "\n".join(lignes) + "\n")
+    demandes = contenu.get(CLE_DEMANDES)
+    if demandes:
+        lignes = [f"{CLE_DEMANDES}:"]
+        for demande in demandes:
+            sous = []
+            for nom, valeur in demande.items():
+                sous += _lignes_valeur(nom, valeur, 4)
+            lignes += [f"  - {sous[0][4:]}"] + sous[1:]
+        blocs.append(COMMENTAIRE_DEMANDES + "\n".join(lignes) + "\n")
+    texte = "\n".join(blocs)
+    attendu = {cle: valeur for cle, valeur in contenu.items() if valeur}
+    if (yaml.safe_load(texte) or {}) != attendu:
+        raise ValueError("relecture du fichier des règles de gestion écrit différente du contenu")
+    return texte
+
+
+def _problemes_fichier_gestion(contenu: dict) -> list[str]:
+    """Problèmes d'un contenu de config/gestion.yaml : clés, puis contenu des clés."""
+    problemes = [
+        f"clé inconnue {cle!r} du fichier des règles de gestion"
+        for cle in contenu
+        if cle not in CLES_FICHIER_GESTION
+    ]
+    return problemes + problemes_contenu_formulaire(contenu)
+
+
+class EcritureGestion(NamedTuple):
+    """Résultat de `ecrire_gestion` : le fichier, sa copie datée (None s'il n'y avait
+    pas de fichier ou si rien n'a changé), et s'il a été réécrit."""
+
+    chemin: Path
+    sauvegarde: Path | None
+    ecrit: bool
+
+
+def ecrire_gestion(
+    contenu: dict,
+    chemin: str | Path | None = None,
+    *,
+    empreinte: str,
+    dossier: str | Path | None = None,
+) -> EcritureGestion:
+    """Réécrit config/gestion.yaml avec le contenu donné (`Formulaire.contenu`).
+
+    `empreinte` est celle du fichier lue avant l'import du formulaire : si le fichier a
+    changé depuis, rien n'est écrit. L'ancien fichier est d'abord copié dans `dossier`
+    (par défaut data/config/sauvegardes, hors du dépôt), sous le nom
+    `gestion_<AAAA-MM-JJ>_<HHMMSS>.yaml`; une copie déjà présente sous ce nom n'est
+    jamais remplacée, et rien n'est alors écrit. Un contenu identique au fichier ne le
+    réécrit pas. Le fichier est écrit en UTF-8 avec des fins de ligne LF.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_regles_gestion()
+    actuelle = empreinte_gestion(chemin)
+    if actuelle != empreinte:
+        raise ValueError(
+            f"{chemin} a changé depuis la lecture du formulaire (empreinte {empreinte}, "
+            f"{actuelle} aujourd'hui) : écriture refusée, formulaire à réexporter"
+        )
+    problemes = _problemes_fichier_gestion(contenu)
+    if problemes:
+        raise ValueError(
+            "Contenu du fichier des règles de gestion invalide\n  " + "\n  ".join(problemes)
+        )
+    texte = texte_gestion(contenu)
+    if chemin.is_file() and chemin.read_bytes().replace(b"\r\n", b"\n") == texte.encode():
+        return EcritureGestion(chemin, None, False)
+    sauvegarde = None
+    if chemin.is_file():
+        dossier = Path(dossier) if dossier is not None else dossier_sauvegardes()
+        instant = module_dictionnaire._maintenant()
+        sauvegarde = dossier / f"{chemin.stem}_{instant:%Y-%m-%d_%H%M%S}{chemin.suffix}"
+        dossier.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(sauvegarde, "xb") as flux:
+                flux.write(chemin.read_bytes())
+        except FileExistsError:
+            raise FileExistsError(
+                f"{sauvegarde} existe déjà : écriture refusée, rien n'a été modifié "
+                "(relancer dans une seconde)"
+            ) from None
+    chemin.parent.mkdir(parents=True, exist_ok=True)
+    with open(chemin, "w", encoding="utf-8", newline="\n") as flux:
+        flux.write(texte)
+    return EcritureGestion(chemin, sauvegarde, True)
+
+
+def appliquer_formulaire_gestion(
+    formulaire: Formulaire,
+    chemin_formulaire: str | Path,
+    contenu: dict,
+    *,
+    empreinte: str,
+    chemin: str | Path | None = None,
+    dossier: str | Path | None = None,
+    dossier_archive: str | Path | None = None,
+) -> ApplicationFormulaire:
+    """Écrit les règles d'un formulaire importé, puis met le formulaire de côté.
+
+    `contenu` et `empreinte` sont ceux de config/gestion.yaml lus avant l'import. Si
+    le contenu du formulaire est celui du fichier (formulaire pas encore rempli), rien
+    n'est fait : le formulaire reste en place. Sinon, le formulaire est d'abord archivé
+    dans data/formulaires/appliques (un classeur ouvert dans Excel arrête tout, sans
+    rien modifier), puis le fichier est réécrit après sa copie datée
+    (`ecrire_gestion`); si l'écriture échoue, le formulaire est remis à sa place.
+    """
+    if formulaire.contenu == contenu:
+        return ApplicationFormulaire(False, None, None)
+    ecriture, archive = ecrire_et_archiver(
+        chemin_formulaire,
+        lambda: ecrire_gestion(formulaire.contenu, chemin, empreinte=empreinte, dossier=dossier),
+        dossier_archive,
+    )
+    return ApplicationFormulaire(ecriture.ecrit, ecriture.sauvegarde, archive)

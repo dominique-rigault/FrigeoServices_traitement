@@ -4,10 +4,12 @@ import datetime as dt
 
 import pandas as pd
 import pytest
+import yaml
 from openpyxl import load_workbook
 
 from frigeo.formulaire_gestion import (
     COLONNES_AUTRES,
+    COLONNES_CHANGEMENTS_GESTION,
     COLONNES_FERIES,
     COLONNES_NOUVELLES,
     COLONNES_PERIODES,
@@ -23,10 +25,13 @@ from frigeo.formulaire_gestion import (
     REPERE_EMPREINTE,
     _seuil_atteint,
     annees_des_exports,
+    appliquer_formulaire_gestion,
     cibles_references,
+    ecrire_gestion,
     empreinte_gestion,
     exporter_formulaire_gestion,
     feries_france,
+    importer_formulaire_gestion,
     lignes_autres,
     lignes_feries,
     lignes_minimales,
@@ -36,6 +41,7 @@ from frigeo.formulaire_gestion import (
     lignes_renseignement,
     problemes_contenu_formulaire,
     proposer_renseignement,
+    texte_gestion,
     texte_parametres,
 )
 from frigeo.gestion import lire_fichier_gestion
@@ -808,3 +814,730 @@ def test_export_references_et_renseignement(tmp_path):
     assert feuille.cell(row=2, column=COLONNES_AUTRES.index("paramètres") + 1).value == (
         "cle = client3; table_reference = c; cle_reference = code"
     )
+
+
+# --- Import, rédacteur et écriture (morceau c) ------------------------------------
+
+
+def _exporter_c(tmp_path, tables, dictionnaire, contenu, declarations=None,
+                nom="gestion_2026-03.xlsx"):
+    chemin = tmp_path / nom
+    exporter_formulaire_gestion(tables, dictionnaire, contenu, declarations, {}, "2026-03",
+                                chemin, empreinte="e")
+    return chemin
+
+
+def _saisir(chemin, nom_feuille, criteres, **valeurs):
+    """Écrit des valeurs dans une feuille du formulaire, sur la ligne qui répond aux
+    critères (noms de colonnes vers valeurs), ou sur la première ligne vide si
+    `criteres` vaut None."""
+    classeur = load_workbook(chemin)
+    feuille = classeur[nom_feuille]
+    entete = [cellule.value for cellule in feuille[1]]
+    if criteres is None:
+        numero = 2
+        while any(cellule.value not in (None, "") for cellule in feuille[numero]):
+            numero += 1
+    else:
+        trouvees = [
+            ligne[0].row for ligne in feuille.iter_rows(min_row=2)
+            if all(ligne[entete.index(nom)].value == valeur for nom, valeur in criteres.items())
+        ]
+        assert len(trouvees) == 1, (criteres, trouvees)
+        numero = trouvees[0]
+    for nom, valeur in valeurs.items():
+        feuille.cell(row=numero, column=entete.index(nom) + 1).value = valeur
+    classeur.save(chemin)
+    return numero
+
+
+def _importer_c(chemin, dictionnaire, contenu):
+    return importer_formulaire_gestion(chemin, dictionnaire, contenu, empreinte="e")
+
+
+def _changements(formulaire, *colonnes):
+    return [tuple(ligne) for ligne in formulaire.changements[list(colonnes)].itertuples(
+        index=False)]
+
+
+def _references_et_renseignement():
+    tables = {**_tables_references(), "k": _tables_renseignement()["c"]}
+    dictionnaire = {**_dictionnaire_references(), "k": _dictionnaire_renseignement()["c"]}
+    return tables, dictionnaire
+
+
+def test_import_sans_revue_rend_le_contenu(tmp_path):
+    tables, dictionnaire = _references_et_renseignement()
+    for nom, (t, d, contenu, declarations) in {
+        "a.xlsx": (_tables(), _dictionnaire(), _contenu(), {}),
+        "b.xlsx": (tables, dictionnaire, _contenu_references(), DECLARATIONS),
+    }.items():
+        chemin = _exporter_c(tmp_path, t, d, contenu, declarations, nom)
+        formulaire = _importer_c(chemin, d, contenu)
+        assert formulaire.contenu == contenu
+        assert formulaire.changements.empty
+        assert list(formulaire.changements.columns) == list(COLONNES_CHANGEMENTS_GESTION)
+        assert formulaire.avertissements == []
+    # Un formulaire exporté avant une modification du fichier est refusé.
+    with pytest.raises(ValueError, match="Formulaire périmé"):
+        importer_formulaire_gestion(chemin, dictionnaire, _contenu_references(), empreinte="f")
+
+
+def test_import_des_familles(tmp_path):
+    tables, dictionnaire = _references_et_renseignement()
+    contenu = _contenu_references()
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, DECLARATIONS)
+    feuille = FEUILLE_REFERENCES
+    _saisir(chemin, feuille, {"colonne": "client", "origine": "en vigueur"},
+            statut="documenté", clé_facultative="non", comparaison="telle quelle",
+            libellé="Client connu", issue="information", commentaire=None)
+    _saisir(chemin, feuille, {"colonne": "client, agence"}, statut="invalide",
+            commentaire="Plus utile")
+    _saisir(chemin, feuille, {"colonne": "precedente"}, statut="valide")
+    _saisir(chemin, feuille, {"colonne": "rang"}, statut="invalide")
+    _saisir(chemin, feuille, {"colonne": "agence", "origine": "retirée"}, statut="documenté")
+    _saisir(chemin, feuille, {"colonne": "client2"}, statut="documenté",
+            ref="existence_c", libellé=None)
+    feuille = FEUILLE_RENSEIGNEMENT
+    _saisir(chemin, feuille, {"colonne": "fin", "selon": "statut"}, statut="valide")
+    _saisir(chemin, feuille, {"colonne": "note", "selon": "categorie"}, statut="invalide")
+    formulaire = _importer_c(chemin, dictionnaire, contenu)
+    assert formulaire.avertissements == []
+    anciennes = contenu["regles"]
+    client = {
+        "ref": "existence", "libelle": "Client connu", "type": "existence_dans_reference",
+        "table": "f", "cle": ["client"], "table_reference": "c",
+        "filtre": [{"colonne": "n", "valeurs": ["1"]}], "cle_reference": ["code"],
+        "issue": "information",
+    }
+    agence = contenu["retirees"][0]
+    assert formulaire.contenu["regles"] == [
+        client,
+        anciennes[2],
+        # Les règles nouvelles ou rétablies suivent la dernière règle du même type.
+        {"ref": "existence", "libelle": "f.precedente connue de f.num",
+         "type": "existence_dans_reference", "table": "f", "cle": ["precedente"],
+         "table_reference": "f", "cle_reference": ["num"], "cle_facultative": True},
+        agence,
+        # Libellé effacé : celui de la proposition.
+        {"ref": "existence_c", "libelle": "f.client2 connue de c.code",
+         "type": "existence_dans_reference", "table": "f", "cle": ["client2"],
+         "table_reference": "c", "cle_reference": ["code"]},
+        {"ref": "renseignement", "libelle": "fin renseignée si statut vaut inactif, vide sinon",
+         "type": "renseignee_selon_valeur", "table": "k", "colonne": "fin", "selon": "statut",
+         "valeurs": ["inactif"], "vide_sinon": True},
+    ]
+    # La règle retirée l'est en entier, avec le commentaire saisi.
+    assert formulaire.contenu["retirees"] == [{**anciennes[1], "commentaire": "Plus utile"}]
+    assert formulaire.contenu["ecartees"] == {
+        "references": [{"table": "f", "colonne": "rang", "table_reference": "c",
+                        "colonne_reference": "siret"}],
+        "renseignement": [{"table": "k", "colonne": "note", "selon": "categorie"}],
+    }
+    assert _changements(formulaire, "feuille", "ref", "colonnes", "changement") == [
+        (FEUILLE_REFERENCES, "existence", "client vers c.code (si n = 1)", "modifiée"),
+        (FEUILLE_REFERENCES, "existence", "client, agence vers c.code, ville", "retirée"),
+        (FEUILLE_REFERENCES, "existence", "precedente vers f.num", "ajoutée"),
+        (FEUILLE_REFERENCES, "", "rang vers c.siret", "écartée"),
+        (FEUILLE_REFERENCES, "existence", "agence vers c.code", "rétablie"),
+        (FEUILLE_REFERENCES, "existence_c", "client2 vers c.code", "ajoutée"),
+        (FEUILLE_RENSEIGNEMENT, "renseignement", "fin selon statut", "ajoutée"),
+        (FEUILLE_RENSEIGNEMENT, "", "note selon categorie", "écartée"),
+    ]
+    modifiee = formulaire.changements.iloc[0]
+    assert modifiee["avant"] == (
+        "libelle = ['client'] connu; cle_facultative = true; comparaison = après "
+        "normalisation; commentaire = Vu; issue absent"
+    )
+    assert modifiee["apres"] == (
+        "libelle = Client connu; cle_facultative absent; comparaison absent; commentaire "
+        "absent; issue = information"
+    )
+    assert formulaire.changements.iloc[2]["apres"] == (
+        "cle = precedente; table_reference = f; cle_reference = num; cle_facultative = true; "
+        "issue = anomalie"
+    )
+    # Le contenu obtenu s'exporte de nouveau sans proposition des lignes traitées.
+    lignes = lignes_references(tables, dictionnaire, formulaire.contenu, DECLARATIONS)
+    assert _reduites(lignes, "colonne", "origine") == [
+        ("client", "en vigueur"), ("precedente", "en vigueur"), ("agence", "en vigueur"),
+        ("client2", "en vigueur"), ("n", "proposée"), ("client, agence", "retirée"),
+        ("rang", "écartée"),
+    ]
+
+
+def test_import_retraits_et_suppressions(tmp_path):
+    contenu = _contenu()
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu)
+    feuille = FEUILLE_PERIODES
+    numero = _saisir(chemin, feuille, {"colonne": "d", "filtre_colonne": None},
+                     statut="observé")
+    _saisir(chemin, feuille, {"colonne": "d", "filtre_colonne": "n"}, statut="documenté",
+            issue="information")
+    _saisir(chemin, feuille, {"colonne": "h"}, statut="documenté")
+    _saisir(chemin, feuille, {"colonne": "g"}, statut="observé")
+    _saisir(chemin, FEUILLE_AUTRES, {"ref": "R22"}, statut="documenté",
+            libellé="Distance imputée", commentaire="Chapitre 2\nligne 2")
+    _saisir(chemin, FEUILLE_AUTRES, {"paramètres": "colonne = e"}, statut="invalide")
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert formulaire.avertissements == [
+        f"feuille « périodes_export », ligne {numero} : règle en vigueur remise à observé, "
+        "supprimée sans être gardée parmi les règles retirées",
+    ]
+    anciennes = contenu["regles"]
+    assert formulaire.contenu["regles"] == [
+        {**anciennes[1], "libelle": "Distance imputée", "commentaire": "Chapitre 2\nligne 2"},
+        {**anciennes[2], "issue": "information"},
+        anciennes[4],
+        contenu["retirees"][0],
+    ]
+    assert list(formulaire.contenu["regles"][0]) == [
+        "ref", "libelle", "commentaire", "type", "table", "colonne", "min", "max",
+    ]
+    assert formulaire.contenu["retirees"] == [anciennes[3]]
+    # La proposition écartée est retirée de ecartees : elle sera proposée de nouveau.
+    assert formulaire.contenu["ecartees"] == {"jours_feries": {2025: ["2025-05-08"]}}
+    assert _changements(formulaire, "feuille", "changement") == [
+        (FEUILLE_PERIODES, "supprimée"), (FEUILLE_PERIODES, "modifiée"),
+        (FEUILLE_PERIODES, "rétablie"), (FEUILLE_PERIODES, "reproposée"),
+        (FEUILLE_AUTRES, "modifiée"), (FEUILLE_AUTRES, "retirée"),
+    ]
+
+
+
+def test_import_d_une_regle_retiree_remise_a_observe(tmp_path):
+    contenu = _contenu()
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu)
+    numero = _saisir(chemin, FEUILLE_PERIODES, {"colonne": "h"}, statut="observé")
+    _saisir(chemin, FEUILLE_AUTRES, {"ref": "R22"}, statut="invalide")
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert formulaire.avertissements == [
+        f"feuille « périodes_export », ligne {numero} : règle retirée remise à observé, "
+        "oubliée (elle ne pourra plus être rétablie)",
+    ]
+    assert formulaire.contenu["retirees"] == [contenu["regles"][1]]
+    assert [r["ref"] for r in formulaire.contenu["regles"]] == [
+        "decoupage", "autre", "decoupage", "decoupage",
+    ]
+    # Rétablie depuis la feuille des autres règles, la règle suit la dernière de son type.
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), formulaire.contenu,
+                         nom="b.xlsx")
+    _saisir(chemin, FEUILLE_AUTRES, {"ref": "R22"}, statut="documenté")
+    suite = _importer_c(chemin, _dictionnaire(), formulaire.contenu)
+    assert "retirees" not in suite.contenu
+    assert suite.contenu["regles"][-1] == contenu["regles"][1]
+
+
+def test_import_des_lignes_ajoutees(tmp_path):
+    tables, dictionnaire = _references_et_renseignement()
+    tables["t"], dictionnaire["t"] = _tables()["t"], _dictionnaire()["t"]
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, {}, DECLARATIONS)
+    _saisir(chemin, FEUILLE_REFERENCES, None, table="f", colonne="client, agence",
+            table_reference="c", colonne_reference="code, ville", statut="documenté",
+            clé_facultative="oui", comparaison="après normalisation", filtre_colonne="n",
+            filtre_valeurs="1, 3")
+    _saisir(chemin, FEUILLE_REFERENCES, None, table="f", colonne="n",
+            table_reference="t", statut="documenté", ref="R13", libellé="Numéro connu",
+            issue="à arbitrer", commentaire="Ajout")
+    _saisir(chemin, FEUILLE_RENSEIGNEMENT, None, table="k", colonne="note",
+            selon="statut", valeurs="actif, prospect", vide_sinon="oui", statut="documenté")
+    _saisir(chemin, FEUILLE_PERIODES, None, table="t", colonne="f", statut="documenté")
+    formulaire = _importer_c(chemin, dictionnaire, {})
+    assert formulaire.avertissements == []
+    assert formulaire.contenu["regles"] == [
+        {"ref": "existence", "libelle": "f.client, agence connue de c.code, ville",
+         "type": "existence_dans_reference", "table": "f", "cle": ["client", "agence"],
+         "table_reference": "c", "cle_reference": ["code", "ville"],
+         "comparaison": "après normalisation", "cle_facultative": True,
+         "filtre": [{"colonne": "n", "valeurs": ["1", "3"]}]},
+        # colonne_reference vide : les mêmes noms que colonne (pas de cle_reference).
+        {"ref": "R13", "libelle": "Numéro connu", "commentaire": "Ajout",
+         "type": "existence_dans_reference", "table": "f", "cle": ["n"],
+         "table_reference": "t", "issue": "à arbitrer"},
+        {"ref": "renseignement",
+         "libelle": "note renseignée si statut vaut actif ou prospect, vide sinon",
+         "type": "renseignee_selon_valeur", "table": "k", "colonne": "note",
+         "selon": "statut", "valeurs": ["actif", "prospect"], "vide_sinon": True},
+        {"ref": "decoupage", "libelle": "f dans la période de l'export",
+         "type": "date_dans_periode_export", "table": "t", "colonne": "f"},
+    ]
+
+
+def test_import_des_lignes_ajoutees_refusees(tmp_path):
+    tables, dictionnaire = _references_et_renseignement()
+    tables["t"], dictionnaire["t"] = _tables()["t"], _dictionnaire()["t"]
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, {}, DECLARATIONS)
+    lignes = [
+        _saisir(chemin, FEUILLE_REFERENCES, None, table="f", colonne="client",
+                table_reference="c", statut="valide"),
+        _saisir(chemin, FEUILLE_REFERENCES, None, table="f", colonne="client, zz",
+                table_reference="c", statut="documenté"),
+        _saisir(chemin, FEUILLE_REFERENCES, None, table="f", colonne="client, agence",
+                table_reference="c", colonne_reference="code", statut="documenté"),
+        _saisir(chemin, FEUILLE_REFERENCES, None, table="f", colonne="client",
+                table_reference="c", colonne_reference="code", statut="documenté",
+                filtre_colonne="n"),
+        _saisir(chemin, FEUILLE_REFERENCES, None, table="f", colonne="client",
+                table_reference="c", colonne_reference="code", statut="documenté",
+                clé_facultative="peut-être"),
+    ]
+    renseignement = _saisir(chemin, FEUILLE_RENSEIGNEMENT, None, table="k", colonne="note",
+                            selon="statut", valeurs="actif, Z", statut="documenté")
+    periode = _saisir(chemin, FEUILLE_PERIODES, None, table="t", colonne="n",
+                      statut="documenté")
+    with pytest.raises(ValueError) as erreur:
+        _importer_c(chemin, dictionnaire, {})
+    message = str(erreur.value)
+    assert "7 problèmes" in message
+    for numero, attendu in zip(lignes, (
+        "une ligne ajoutée doit être au statut documenté",
+        "colonne, colonne inconnue de la table f (zz)",
+        "colonne et colonne_reference n'ont pas le même nombre de colonnes",
+        "filtre_colonne et filtre_valeurs vont ensemble",
+        "clé_facultative : oui, non ou vide est attendu",
+    )):
+        assert f"feuille « références », ligne {numero} : {attendu}" in message
+    assert (
+        f"feuille « renseignement », ligne {renseignement} : valeurs hors de la liste en "
+        "vigueur de statut (Z)" in message
+    )
+    assert (
+        f"feuille « périodes_export », ligne {periode} : n n'est pas une colonne de date "
+        "(nature entier (texte))" in message
+    )
+
+
+def test_import_valide_et_saisies_ignorees(tmp_path):
+    tables, dictionnaire = _references_et_renseignement()
+    contenu = _contenu_references()
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, DECLARATIONS)
+    # valide sur une règle en vigueur adopte la proposition (clé facultative non) et
+    # ignore la comparaison saisie.
+    vigueur = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "client", "origine": "en vigueur"},
+                      statut="valide", comparaison="telle quelle")
+    proposee = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "n"}, statut="observé",
+                       clé_facultative="oui", commentaire="À voir")
+    ecartee = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "client2"}, statut="invalide",
+                      clé_facultative="oui")
+    formulaire = _importer_c(chemin, dictionnaire, contenu)
+    assert formulaire.avertissements == [
+        f"feuille « références », ligne {vigueur} : valeurs saisies ignorées, valide adopte "
+        "la proposition",
+        f"feuille « références », ligne {proposee} : valeurs saisies ignorées (statut "
+        "observé)",
+        f"feuille « références », ligne {proposee} : commentaire non conservé (aucune règle)",
+        f"feuille « références », ligne {ecartee} : valeurs saisies ignorées (statut "
+        "invalide)",
+    ]
+    assert formulaire.contenu["regles"][0] == {
+        key: valeur for key, valeur in contenu["regles"][0].items() if key != "cle_facultative"
+    }
+    # valide est refusé quand la proposition est « aucune ».
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, DECLARATIONS, "b.xlsx")
+    numero = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "client, agence"},
+                     statut="valide")
+    sans_statut = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "n"}, statut=None)
+    with pytest.raises(ValueError) as erreur:
+        _importer_c(chemin, dictionnaire, contenu)
+    message = str(erreur.value)
+    assert (
+        f"feuille « références », ligne {numero} : valide impossible, la proposition est "
+        "« aucune »" in message
+    )
+    assert f"feuille « références », ligne {sans_statut} : statut absent" in message
+
+
+def test_import_saisies_refusees_et_avertissements(tmp_path):
+    tables, dictionnaire = _references_et_renseignement()
+    contenu = {**_contenu_references(), "regles": _contenu_references()["regles"] + [
+        {**_renseignee("note", "statut", ["inactif"]), "table": "k"},
+        {**_renseignee("fin", "region", ["r1"]), "table": "k"},
+    ]}
+    dictionnaire["k"]["region"] = _texte("texte")
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, DECLARATIONS)
+    issue = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "client", "origine": "en vigueur"},
+                    issue="grave")
+    sans_ref = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "client, agence"}, ref=None)
+    origine = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "n"}, origine="nouvelle")
+    hors_liste = _saisir(chemin, FEUILLE_RENSEIGNEMENT,
+                         {"colonne": "note", "selon": "statut", "origine": "en vigueur"},
+                         valeurs="inactif, Inactif")
+    with pytest.raises(ValueError) as erreur:
+        _importer_c(chemin, dictionnaire, contenu)
+    message = str(erreur.value)
+    assert "4 problèmes" in message
+    assert (
+        f"feuille « références », ligne {issue} : issue inconnue 'grave' (issues possibles : "
+        "anomalie, à arbitrer, information)" in message
+    )
+    assert f"feuille « références », ligne {sans_ref} : ref et libellé à remplir" in message
+    assert (
+        f"feuille « références », ligne {origine} : origine 'nouvelle' inconnue, formulaire "
+        "à réexporter" in message
+    )
+    # Une valeur invalidée au dictionnaire n'est pas dans la liste en vigueur.
+    assert (
+        f"feuille « renseignement », ligne {hors_liste} : valeurs hors de la liste en vigueur "
+        "de statut (Inactif)" in message
+    )
+    # Sans liste fermée en vigueur sur la colonne selon, les valeurs ne sont pas
+    # vérifiées; une proposition écartée peut être validée, une règle retirée
+    # rétablie.
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, DECLARATIONS, "b.xlsx")
+    region = _saisir(chemin, FEUILLE_RENSEIGNEMENT, {"colonne": "fin", "selon": "region"},
+                     valeurs="r1, r2")
+    _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "client2"}, statut="valide")
+    _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "agence"}, statut="documenté")
+    _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "client, agence"}, issue="anomalie")
+    formulaire = _importer_c(chemin, dictionnaire, contenu)
+    assert formulaire.avertissements == [
+        f"feuille « renseignement », ligne {region} : region n'a pas de liste fermée en "
+        "vigueur, valeurs non vérifiées",
+    ]
+    assert formulaire.contenu["regles"][-1]["valeurs"] == ["r1", "r2"]
+    assert "ecartees" not in formulaire.contenu
+    assert "retirees" not in formulaire.contenu
+    # L'issue ramenée à celle du type s'écrit par l'absence de la clé.
+    assert "issue" not in formulaire.contenu["regles"][1]
+    assert [r["cle"] for r in formulaire.contenu["regles"][:5]] == [
+        ["client"], ["client", "agence"], ["client3"], ["agence"], ["client2"],
+    ]
+
+
+def test_import_lignes_qui_ne_correspondent_plus(tmp_path):
+    tables, dictionnaire = _references_et_renseignement()
+    contenu = _contenu_references()
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, DECLARATIONS)
+    deplacee = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "client, agence"}, rang=0)
+    illisible = _saisir(chemin, FEUILLE_REFERENCES, {"colonne": "agence"}, rang="x")
+    autre = _saisir(chemin, FEUILLE_AUTRES, {"rang": 2}, rang=1)
+    with pytest.raises(ValueError) as erreur:
+        _importer_c(chemin, dictionnaire, contenu)
+    message = str(erreur.value)
+    assert (
+        f"feuille « références », ligne {deplacee} : règle déjà désignée par une autre "
+        "ligne (ligne recopiée), formulaire à réexporter" in message
+    )
+    assert (
+        f"feuille « références », ligne {illisible} : colonne masquée rang illisible, "
+        "formulaire à réexporter" in message
+    )
+    assert (
+        f"feuille « autres_règles », ligne {autre} : la ligne ne correspond plus à la règle "
+        "n° 2 de la clé regles (ligne déplacée ou recopiée), formulaire à réexporter"
+        in message
+    )
+    # Deux lignes dont les rangs ont été échangés ne désignent plus leur règle.
+    contenu = _contenu()
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu, nom="c.xlsx")
+    premiere = _saisir(chemin, FEUILLE_PERIODES, {"colonne": "d", "filtre_colonne": None},
+                       rang=2)
+    seconde = _saisir(chemin, FEUILLE_PERIODES, {"colonne": "d", "filtre_colonne": "n"},
+                      rang=0)
+    with pytest.raises(ValueError) as erreur:
+        _importer_c(chemin, _dictionnaire(), contenu)
+    message = str(erreur.value)
+    assert "2 problèmes" in message
+    assert f"ligne {premiere} : la ligne ne correspond plus à la règle n° 3" in message
+    assert f"ligne {seconde} : la ligne ne correspond plus à la règle n° 1" in message
+    contenu = _contenu_references()
+    tables, dictionnaire = _references_et_renseignement()
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, DECLARATIONS, "b.xlsx")
+    # Une règle absente du classeur reste telle quelle, avec un avertissement.
+    classeur = load_workbook(chemin)
+    classeur[FEUILLE_AUTRES].delete_rows(2)
+    classeur.save(chemin)
+    formulaire = _importer_c(chemin, dictionnaire, contenu)
+    assert formulaire.contenu == contenu
+    assert formulaire.avertissements == [
+        "1 règles de config/gestion.yaml absentes du formulaire, laissées telles quelles",
+    ]
+
+
+def test_import_feuille_autres_refus(tmp_path):
+    contenu = _contenu()
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu)
+    numero = _saisir(chemin, FEUILLE_AUTRES, {"ref": "R22"}, statut="observé")
+    vide = _saisir(chemin, FEUILLE_AUTRES, {"paramètres": "colonne = e"}, libellé=None)
+    with pytest.raises(ValueError) as erreur:
+        _importer_c(chemin, _dictionnaire(), contenu)
+    message = str(erreur.value)
+    assert (
+        f"feuille « autres_règles », ligne {numero} : statut 'observé', documenté ou "
+        "invalide est attendu (pas de proposition dans cette feuille)" in message
+    )
+    assert f"feuille « autres_règles », ligne {vide} : libellé à remplir" in message
+
+
+def test_import_jours_feries(tmp_path):
+    contenu = _contenu()
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu)
+    feuille = FEUILLE_FERIES
+    _saisir(chemin, feuille, {"date": dt.datetime(2025, 12, 26)}, statut="invalide")
+    _saisir(chemin, feuille, {"date": dt.datetime(2025, 5, 8)}, statut="valide")
+    _saisir(chemin, feuille, {"date": dt.datetime(2025, 7, 14)}, statut="valide")
+    _saisir(chemin, feuille, {"date": dt.datetime(2026, 1, 1)}, statut="documenté")
+    _saisir(chemin, feuille, None, date=dt.datetime(2025, 12, 31), statut="documenté")
+    _saisir(chemin, feuille, None, date="02/01/2026", statut="documenté")
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert formulaire.avertissements == []
+    assert formulaire.contenu["jours_feries"] == {
+        2025: ["2025-01-01", "2025-05-08", "2025-07-14", "2025-12-31"],
+        2026: ["2026-01-01", "2026-01-02"],
+    }
+    assert formulaire.contenu["ecartees"] == {
+        "periodes_export": [{"table": "t", "colonne": "g"}],
+        "jours_feries": {2025: ["2025-12-26"]},
+    }
+    assert _changements(formulaire, "colonnes", "changement", "avant", "apres") == [
+        ("2025-05-08", "déclarée", "écartée", "déclarée"),
+        ("2025-07-14", "déclarée", "", "déclarée"),
+        ("2025-12-26", "écartée", "déclarée", "écartée"),
+        ("2025-12-31", "déclarée", "", "déclarée"),
+        ("2026-01-01", "déclarée", "", "déclarée"),
+        ("2026-01-02", "déclarée", "", "déclarée"),
+    ]
+    # Une année dont les dates ne changent pas garde sa liste telle qu'elle est écrite.
+    melange = {**contenu, "jours_feries": {2025: ["2025-12-26", dt.date(2025, 1, 1)]}}
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), melange, nom="m.xlsx")
+    _saisir(chemin, feuille, {"date": dt.datetime(2026, 1, 1)}, statut="valide")
+    formulaire = _importer_c(chemin, _dictionnaire(), melange)
+    assert formulaire.contenu["jours_feries"] == {
+        2025: ["2025-12-26", dt.date(2025, 1, 1)], 2026: ["2026-01-01"],
+    }
+    # Une date retirée sans être écartée; une année sans date déclarée reste vide.
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu, nom="b.xlsx")
+    _saisir(chemin, feuille, {"date": dt.datetime(2025, 1, 1)}, statut="observé")
+    _saisir(chemin, feuille, {"date": dt.datetime(2025, 12, 26)}, statut="observé")
+    _saisir(chemin, feuille, {"date": dt.datetime(2025, 5, 8)}, statut="observé")
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert formulaire.contenu["jours_feries"] == {2025: []}
+    assert formulaire.contenu["ecartees"] == {"periodes_export": [{"table": "t",
+                                                                   "colonne": "g"}]}
+    assert _changements(formulaire, "changement") == [
+        ("retirée",), ("reproposée",), ("retirée",),
+    ]
+    # Refus : date ajoutée sans le statut documenté, date en double, date illisible.
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu, nom="c.xlsx")
+    lignes = [
+        _saisir(chemin, feuille, None, date=dt.datetime(2025, 12, 31), statut="observé"),
+        _saisir(chemin, feuille, None, date=dt.datetime(2025, 1, 1), statut="documenté"),
+        _saisir(chemin, feuille, None, date="31/02/2025", statut="documenté"),
+    ]
+    with pytest.raises(ValueError) as erreur:
+        _importer_c(chemin, _dictionnaire(), contenu)
+    message = str(erreur.value)
+    for numero, attendu in zip(lignes, (
+        "une date ajoutée doit être au statut documenté",
+        "date 01/01/2025 déjà présente dans la feuille",
+        "date illisible (JJ/MM/AAAA attendu)",
+    )):
+        assert f"feuille « jours_fériés », ligne {numero} : {attendu}" in message
+
+
+def test_import_nouvelles_regles(tmp_path):
+    contenu = _contenu()
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu)
+    feuille = FEUILLE_NOUVELLES
+    _saisir(chemin, feuille, None, règle="Une facture a au moins une ligne",
+            tables="factures", tolérance_ou_délai=30)
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert formulaire.contenu["demandes"] == contenu["demandes"] + [
+        {"regle": "Une facture a au moins une ligne", "tables": "factures",
+         "tolerance": "30"},
+    ]
+    assert _changements(formulaire, "changement", "table", "apres") == [
+        ("demandée", "factures", "Une facture a au moins une ligne"),
+    ]
+    # Une ligne effacée retire la demande; une ligne sans règle est refusée.
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu, nom="b.xlsx")
+    _saisir(chemin, feuille, {"règle": "Un avoir suit sa facture"}, règle=None, tables=None,
+            issue_souhaitée=None)
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert "demandes" not in formulaire.contenu
+    assert _changements(formulaire, "changement", "avant") == [
+        ("retirée", "Un avoir suit sa facture"),
+    ]
+    numero = _saisir(chemin, feuille, None, tables="clients")
+    with pytest.raises(ValueError, match=f"ligne {numero} : colonne règle à remplir"):
+        _importer_c(chemin, _dictionnaire(), contenu)
+
+
+def test_export_d_une_valeur_qui_contient_une_virgule():
+    regles = [
+        _renseignee("note", "statut", ["actif, prospect"]),
+        _renseignee("fin", "statut", ["inactif"],
+                    filtre=[{"colonne": "categorie", "valeurs": ["A, B"]}]),
+        _renseignee("tel", "statut", ["inactif"]),
+    ]
+    tables, dictionnaire = _tables_renseignement(), _dictionnaire_renseignement()
+    lignes = lignes_renseignement(tables, dictionnaire, {"regles": regles})
+    assert ("tel", "en vigueur") in _reduites(lignes, "colonne", "origine")
+    assert ("note", "en vigueur") not in _reduites(lignes, "colonne", "origine")
+    assert [ligne["rang"] for ligne in lignes_autres({"regles": regles})] == [0, 1]
+
+
+CONTENU_ECRIT = {
+    "jours_feries": {
+        2025: ["2025-01-01", "2025-04-21", "2025-05-01", "2025-05-08", "2025-05-29",
+               "2025-06-09", "2025-07-14"],
+        2026: [],
+    },
+    "regles": [
+        {"ref": "R04", "libelle": "Horaires, et jours fériés", "type": "hors_horaires_selon_valeur",
+         "table": "t", "date": "d", "heure": "h",
+         "horaires": {"lundi": [{"debut": "07:30", "fin": "18:00"}]},
+         "feries": {2025: [dt.date(2025, 1, 1)]}, "colonne": "c", "valeurs": [],
+         "filtre": [{"colonne": "statut", "valeurs": ["Réalisée", "A, B"]},
+                    {"colonne": "num", "motif": "FA-.*"}]},
+        {"ref": "R04", "libelle": "Plages", "type": "plage_selon_valeur", "table": "t",
+         "colonne": "duree", "selon": "categorie",
+         "plages": {"Intervention préventive": {"min": 45, "max": 150}},
+         "commentaire": "Un commentaire assez long pour être replié vers la centième "
+                        "colonne du fichier, sur plusieurs lignes : il reste lisible.",
+         "issue": "à arbitrer"},
+        {"ref": "calcul", "libelle": "Montant", "type": "produit_calcule", "table": "t",
+         "cible": "m", "facteurs": ["q", {"colonne": "r", "constante": 1,
+                                         "coefficient": -0.01, "vide": 0}],
+         "tolerance": 0.005, "commentaire": "Deux lignes\nd'Excel"},
+        {"ref": "R20", "libelle": "Comptes", "type": "plage", "table": "t", "colonne": "x",
+         "min": 0, "filtre": [{"colonne": "compte", "valeurs": ["601100", "18:00"]}]},
+    ],
+    "retirees": [_periode("h", filtre=[{"colonne": "n", "valeurs": ["deux\nlignes"]}])],
+    "ecartees": {"periodes_export": [{"table": "t", "colonne": "g"}],
+                 "jours_feries": {2025: ["2025-05-08"]}},
+    "demandes": [{"regle": "Un avoir : suit sa facture", "tables": "f"}],
+}
+
+
+def test_texte_gestion():
+    texte = texte_gestion(CONTENU_ECRIT)
+    assert yaml.safe_load(texte) == CONTENU_ECRIT
+    # Le rédacteur appliqué au fichier qu'il a écrit le redonne à l'identique.
+    assert texte_gestion(yaml.safe_load(texte)) == texte
+    lignes = texte.splitlines()
+    assert lignes[0] == "# Règles de gestion propres au client, données par le métier."
+    debut = lignes.index("jours_feries:")
+    assert lignes[debut + 1:debut + 4] == [
+        "  2025: ['2025-01-01', '2025-04-21', '2025-05-01', '2025-05-08', '2025-05-29', "
+        "'2025-06-09',",
+        "         '2025-07-14']",
+        "  2026: []",
+    ]
+    debut = lignes.index("regles:")
+    assert lignes[debut + 1:debut + 19] == [
+        "  - ref: R04",
+        "    libelle: Horaires, et jours fériés",
+        "    type: hors_horaires_selon_valeur",
+        "    table: t",
+        "    date: d",
+        "    heure: h",
+        "    horaires:",
+        "      lundi: [{debut: '07:30', fin: '18:00'}]",
+        "    feries:",
+        "      2025: [2025-01-01]",
+        "    colonne: c",
+        "    valeurs: []",
+        "    filtre:",
+        "      - colonne: statut",
+        "        valeurs: [Réalisée, 'A, B']",
+        "      - colonne: num",
+        "        motif: 'FA-.*'",
+        "  - ref: R04",
+    ]
+    assert "    plages:" in lignes
+    assert "      Intervention préventive: {min: 45, max: 150}" in lignes
+    rang = next(i for i, ligne in enumerate(lignes) if "commentaire: 'Un" in ligne)
+    assert lignes[rang + 1].startswith("      ") and not lignes[rang + 1].startswith("       ")
+    assert all(len(ligne) <= 100 for ligne in lignes[rang:rang + 3])
+    assert '        valeurs: ["deux\\nlignes"]' in lignes
+    assert "      - q" in lignes
+    assert "      - {colonne: r, constante: 1, coefficient: -0.01, vide: 0}" in lignes
+    assert "    commentaire: \"Deux lignes\\nd'Excel\"" in lignes
+    # Une ligne vide quand la référence change, pas entre deux règles de même référence.
+    rang = lignes.index("  - ref: calcul")
+    assert lignes[rang - 1] == "" and lignes[rang - 2] != ""
+    assert "        valeurs: ['601100', '18:00']" in lignes
+    assert lignes[lignes.index("ecartees:") + 1:lignes.index("ecartees:") + 5] == [
+        "  periodes_export:",
+        "    - {table: t, colonne: g}",
+        "  jours_feries:",
+        "    2025: ['2025-05-08']",
+    ]
+    assert lignes[-2:] == ["  - regle: 'Un avoir : suit sa facture'", "    tables: f"]
+    for cle, commentaire in (("retirees", "# Règles retirées"), ("ecartees", "# Propositions"),
+                             ("demandes", "# Règles demandées")):
+        rang = lignes.index(f"{cle}:")
+        assert any(ligne.startswith(commentaire) for ligne in lignes[rang - 3:rang])
+    # Les clés vides ne sont pas écrites.
+    assert texte_gestion({"regles": [], "demandes": []}).splitlines()[-1].startswith("#")
+
+
+def test_ecrire_gestion(tmp_path, monkeypatch):
+    chemin = tmp_path / "config" / "gestion.yaml"
+    dossier = tmp_path / "sauvegardes"
+    with pytest.raises(ValueError, match="écriture refusée"):
+        ecrire_gestion(CONTENU_ECRIT, chemin, empreinte="abc", dossier=dossier)
+    # Sans fichier : écrit, sans copie datée.
+    resultat = ecrire_gestion(CONTENU_ECRIT, chemin, empreinte="absent", dossier=dossier)
+    assert resultat == (chemin, None, True)
+    assert lire_fichier_gestion(chemin) == CONTENU_ECRIT
+    assert b"\r\n" not in chemin.read_bytes()
+    # Contenu identique : rien n'est écrit, même si le fichier est en CRLF.
+    chemin.write_bytes(chemin.read_bytes().replace(b"\n", b"\r\n"))
+    empreinte = empreinte_gestion(chemin)
+    assert ecrire_gestion(CONTENU_ECRIT, chemin, empreinte=empreinte, dossier=dossier) == (
+        chemin, None, False
+    )
+    # Contenu changé : copie datée de l'ancien fichier, puis écriture.
+    monkeypatch.setattr("frigeo.dictionnaire._maintenant",
+                        lambda: dt.datetime(2026, 10, 30, 9, 5, 7))
+    ancien = chemin.read_bytes()
+    nouveau = {**CONTENU_ECRIT, "demandes": []}
+    resultat = ecrire_gestion(nouveau, chemin, empreinte=empreinte, dossier=dossier)
+    copie = dossier / "gestion_2026-10-30_090507.yaml"
+    assert resultat == (chemin, copie, True)
+    assert copie.read_bytes() == ancien
+    assert "demandes" not in lire_fichier_gestion(chemin)
+    # Une copie datée existante n'est jamais remplacée, et rien n'est écrit.
+    empreinte = empreinte_gestion(chemin)
+    ecrit = chemin.read_bytes()
+    with pytest.raises(FileExistsError, match="rien n'a été modifié"):
+        ecrire_gestion(CONTENU_ECRIT, chemin, empreinte=empreinte, dossier=dossier)
+    assert chemin.read_bytes() == ecrit
+    # Un contenu mal formé est refusé.
+    with pytest.raises(ValueError, match="clé inconnue 'autre'"):
+        ecrire_gestion({"autre": 1}, chemin, empreinte=empreinte, dossier=dossier)
+    with pytest.raises(ValueError, match="regles, règle n° 1"):
+        ecrire_gestion({"regles": [{"ref": "x"}]}, chemin, empreinte=empreinte,
+                       dossier=dossier)
+
+
+def test_appliquer_formulaire_gestion(tmp_path, monkeypatch):
+    monkeypatch.setattr("frigeo.dictionnaire._maintenant",
+                        lambda: dt.datetime(2026, 10, 30, 9, 5, 7))
+    fichier = tmp_path / "gestion.yaml"
+    fichier.write_text(texte_gestion(_contenu()), encoding="utf-8")
+    contenu, empreinte = lire_fichier_gestion(fichier), empreinte_gestion(fichier)
+    formulaires = tmp_path / "formulaires"
+    chemin = _exporter_c(formulaires, _tables(), _dictionnaire(), contenu)
+    options = {"empreinte": empreinte, "chemin": fichier, "dossier": tmp_path / "sauv"}
+    # Formulaire pas encore rempli : rien n'est fait, il reste en place.
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert appliquer_formulaire_gestion(formulaire, chemin, contenu, **options) == (
+        False, None, None
+    )
+    assert chemin.exists()
+    _saisir(chemin, FEUILLE_AUTRES, {"ref": "R22"}, statut="invalide")
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    # Écriture refusée (fichier modifié depuis) : le formulaire est remis en place.
+    with pytest.raises(ValueError, match="écriture refusée"):
+        appliquer_formulaire_gestion(formulaire, chemin, contenu,
+                                     **{**options, "empreinte": "autre"})
+    assert chemin.exists()
+    assert not any((formulaires / "appliques").glob("*"))
+    resultat = appliquer_formulaire_gestion(formulaire, chemin, contenu, **options)
+    archive = formulaires / "appliques" / "gestion_2026-03_2026-10-30_090507.xlsx"
+    assert resultat == (True, tmp_path / "sauv" / "gestion_2026-10-30_090507.yaml", archive)
+    assert archive.exists() and not chemin.exists()
+    assert lire_fichier_gestion(fichier)["retirees"][-1]["ref"] == "R22"
