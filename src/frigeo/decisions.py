@@ -47,7 +47,7 @@ from typing import NamedTuple
 import pandas as pd
 import yaml
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, Protection
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 from .anomalies import (
@@ -67,7 +67,7 @@ from .dictionnaire import (
     lire_instant,
 )
 from .doublons import SEPARATEUR, _texte
-from .formulaires import dossier_formulaires
+from .formulaires import FOND_MODIFIABLE, dossier_formulaires, rendre_modifiable, texte_entier
 from .nettoyage import _convertir
 from .profilage import _interpretations
 from .revue import _ecrire_texte, _est_vide, _menu
@@ -517,10 +517,11 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
     return [
         "Arbitrage des anomalies par le métier",
         f"Période de fin : {periode_fin}. Classeur généré le {date.today():%d/%m/%Y}.",
-        f"Contenu : {len(elements)} lignes dans la feuille « {FEUILLE_ARBITRAGE} », dont "
-        f"{par_sorte[SORTE_CELLULE]} cellules, {par_sorte[SORTE_LIGNE]} lignes et "
-        f"{par_sorte[SORTE_ECART]} écarts; {caduques} lignes avaient une décision devenue "
-        "caduque (la donnée a changé depuis).",
+        f"Contenu : {texte_entier(len(elements))} lignes dans la feuille "
+        f"« {FEUILLE_ARBITRAGE} », dont {texte_entier(par_sorte[SORTE_CELLULE])} cellules, "
+        f"{texte_entier(par_sorte[SORTE_LIGNE])} lignes et "
+        f"{texte_entier(par_sorte[SORTE_ECART])} écarts; {texte_entier(caduques)} lignes "
+        "avaient une décision devenue caduque (la donnée a changé depuis).",
         REPERE_IMPORTS,
         "",
         "Ce qui est attendu",
@@ -553,8 +554,8 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
         "recopié ailleurs.",
         "",
         "Règles à respecter pour que le classeur puisse être réimporté",
-        "Ne modifier que les colonnes decision, valeur_retenue et commentaire (les "
-        "autres cellules sont verrouillées).",
+        "Ne modifier que les colonnes decision, valeur_retenue et commentaire, "
+        f"{FOND_MODIFIABLE} (les autres cellules sont verrouillées).",
         "Ne pas renommer, déplacer ni supprimer de feuilles, de colonnes ou de lignes, "
         "et ne pas ajouter de lignes.",
         "Choisir les décisions dans le menu déroulant : une décision qui ne convient "
@@ -643,7 +644,7 @@ def exporter_arbitrage(
             else:
                 _ecrire_texte(cellule, None if _est_vide(valeur) else _texte(valeur))
             if nom in MODIFIABLES_ARBITRAGE:
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
         menus[element["sorte"]].add(feuille.cell(row=numero, column=colonne_decision))
     fin = max(len(a_arbitrer) + 1, 2)
     derniere = get_column_letter(len(COLONNES_ARBITRAGE))

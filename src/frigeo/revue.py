@@ -16,7 +16,7 @@ from typing import NamedTuple
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, Protection
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -43,7 +43,14 @@ from .dictionnaire import (
     horodater,
     problemes_dictionnaire,
 )
-from .formulaires import dossier_formulaires
+from .formulaires import (
+    FOND_MODIFIABLE,
+    FORMAT_EFFECTIF,
+    dossier_formulaires,
+    nombres_a_la_francaise,
+    rendre_modifiable,
+    texte_entier,
+)
 from .profilage import signature
 
 FEUILLE_MODE_EMPLOI = "mode_emploi"
@@ -112,6 +119,8 @@ GEL_REGLES = "D2"
 GEL_LISTE = "C2"
 # Colonnes que le métier peut modifier; les autres cellules sont verrouillées.
 MODIFIABLES_REGLES = ("statut", "regle_retenue", "commentaire")
+# Colonnes d'effectifs, affichées avec le séparateur des milliers.
+COLONNES_EFFECTIFS = ("effectif", "nb_a_arbitrer")
 MODIFIABLES_VALEURS = ("statut", "remplacement", "commentaire")
 MODIFIABLES_FORMES = ("statut", "commentaire")
 MODIFIABLES_LISTE = {"valeurs": MODIFIABLES_VALEURS, "format": MODIFIABLES_FORMES}
@@ -201,7 +210,7 @@ def _proposition_affichee(nom: str, regle: dict) -> str:
     proposees = sum(element["origine"] == ORIGINE_LISTE for element in regle["liste"])
     element = "valeur" if nom == "valeurs" else "forme"
     pluriel = "s" if proposees > 1 else ""
-    return f"{LISTE_FERMEE} ({proposees} {element}{pluriel} proposée{pluriel})"
+    return f"{LISTE_FERMEE} ({texte_entier(proposees)} {element}{pluriel} proposée{pluriel})"
 
 
 def _regle_affichee(nom: str, regle: str | None) -> str | None:
@@ -285,7 +294,7 @@ def lignes_regles(dictionnaire: dict) -> list[dict]:
                         "regle": nom,
                         "proposition": _proposition_affichee(nom, regle),
                         "regle_en_vigueur": regle["regle"],
-                        "motif": regle["motif"],
+                        "motif": nombres_a_la_francaise(regle["motif"]),
                         "nb_a_arbitrer": ecarts,
                         "statut": regle["statut"],
                         "regle_retenue": (
@@ -459,7 +468,9 @@ def reste_a_traiter(dictionnaire: dict) -> dict:
 
 def _reste_a_traiter(regles: list[dict], valeurs: list[dict], formes: list[dict]) -> list[str]:
     """Rubrique du mode d'emploi qui dit, à l'export, ce qui reste à revoir."""
-    reste = _compter_reste(regles, valeurs, formes)
+    reste = {
+        cle: texte_entier(nombre) for cle, nombre in _compter_reste(regles, valeurs, formes).items()
+    }
     return [
         "Ce qui reste à traiter",
         "Une ligne reste à traiter tant que son statut est « observé » : le filtre de "
@@ -505,9 +516,9 @@ def _mode_emploi(
     return [
         "Revue du dictionnaire des données",
         f"Période de fin : {periode_fin}. Classeur généré le {date.today():%d/%m/%Y}.",
-        f"Contenu : {len(regles)} lignes dans la feuille « {FEUILLE_REGLES} » (quatre "
-        f"par colonne des données), {len(valeurs)} lignes dans la feuille "
-        f"« {FEUILLE_VALEURS} », {len(formes)} lignes dans la feuille "
+        f"Contenu : {texte_entier(len(regles))} lignes dans la feuille « {FEUILLE_REGLES} » "
+        f"(quatre par colonne des données), {texte_entier(len(valeurs))} lignes dans la "
+        f"feuille « {FEUILLE_VALEURS} », {texte_entier(len(formes))} lignes dans la feuille "
         f"« {FEUILLE_FORMES} ».",
         REPERE_REVUES,
         "",
@@ -636,7 +647,7 @@ def _mode_emploi(
         "",
         "Règles à respecter pour que le classeur puisse être réimporté",
         "Ne modifier que les colonnes statut, règle_retenue, remplacement et "
-        "commentaire (les autres cellules sont verrouillées).",
+        f"commentaire, {FOND_MODIFIABLE} (les autres cellules sont verrouillées).",
         "Ne pas renommer, déplacer ni supprimer de feuilles, de colonnes ou de lignes "
         f"(la feuille masquée « {FEUILLE_LISTES} » alimente les menus des lignes "
         "ajoutées).",
@@ -730,17 +741,19 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, gel=GEL_LIS
             valeur = ligne.get(nom)
             if isinstance(valeur, int):
                 cellule.value = valeur
+                if nom in COLONNES_EFFECTIFS:
+                    cellule.number_format = FORMAT_EFFECTIF
             else:
                 _ecrire_texte(cellule, valeur)
             if nom in modifiables:
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
     fin = len(lignes) + 1
     for numero in range(fin + 1, fin + lignes_ajout + 1):
         for indice, nom in enumerate(colonnes, start=1):
             if nom in SAISIE_AJOUT:
                 cellule = feuille.cell(row=numero, column=indice)
                 cellule.number_format = "@"
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
     derniere = feuille.cell(row=1, column=len(colonnes)).column_letter
     feuille.freeze_panes = gel
     feuille.auto_filter.ref = f"A1:{derniere}{max(fin + lignes_ajout, 2)}"

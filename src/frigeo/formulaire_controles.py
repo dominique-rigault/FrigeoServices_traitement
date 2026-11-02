@@ -41,7 +41,7 @@ from typing import NamedTuple
 import pandas as pd
 import yaml
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, Protection
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter, quote_sheetname
 
 from . import dictionnaire as module_dictionnaire
@@ -64,7 +64,15 @@ from .controles import (
 )
 from .dictionnaire import STATUTS, _valeurs_renseignees, dossier_sauvegardes
 from .doublons import problemes_declarations_doublons
-from .formulaires import dossier_formulaires, ecrire_et_archiver
+from .formulaires import (
+    FOND_MODIFIABLE,
+    FORMAT_EFFECTIF,
+    dossier_formulaires,
+    ecrire_et_archiver,
+    rendre_modifiable,
+    separer_milliers,
+    texte_entier,
+)
 from .revue import _ecrire_texte, _menu
 from .typage import NATURES_NOMBRE
 
@@ -169,6 +177,9 @@ MODIFIABLES_DOUBLONS = ("type", "statut", "commentaire")
 SAISIE_AJOUT_DOUBLONS = ("table", "type", "colonnes", "statut", "commentaire")
 # Colonnes des nombres saisis, alignées à droite.
 COLONNES_A_DROITE = ("décimales", "min", "max")
+# Colonnes d'effectifs, affichées avec le séparateur des milliers (les nombres saisis
+# gardent le format standard, qui ne cache aucune décimale).
+COLONNES_EFFECTIFS = ("valeurs", "lignes")
 # Colonnes techniques, masquées : la proposition des bornes en nombres, relue à
 # l'import.
 COLONNES_MASQUEES = ("proposition_min", "proposition_max")
@@ -238,14 +249,16 @@ def _arrondi(nombre):
 
 def texte_regle(nom: str, parametre) -> str:
     """Texte d'une règle pour le formulaire et le rapport, nombres à la française
-    (« 0,1 à 1 exclu »)."""
-    return _parametre_en_texte(nom, parametre).replace(".", ",")
+    (« 0,1 à 1 exclu », « 27 000 à 76 999 »)."""
+    texte = _parametre_en_texte(nom, parametre).replace(".", ",")
+    return separer_milliers(texte) if nom == "bornes" else texte
 
 
 def texte_nombre(nombre) -> str:
-    """Nombre écrit à la française (virgule décimale), sans zéro inutile."""
+    """Nombre écrit à la française (virgule décimale, séparateur des milliers), sans
+    zéro inutile."""
     texte = format(Decimal(repr(_arrondi(nombre))).normalize(), "f")
-    return texte.replace(".", ",")
+    return separer_milliers(texte.replace(".", ","))
 
 
 def observer_nombres(serie: pd.Series) -> dict:
@@ -295,9 +308,12 @@ def observer_groupe(donnees: pd.DataFrame, colonnes: list[str]) -> dict:
 
 
 def _texte_groupe(observation: dict) -> str:
-    texte = f"{observation['renseignees']} lignes renseignées sur {observation['lignes']}"
+    texte = (
+        f"{texte_entier(observation['renseignees'])} lignes renseignées sur "
+        f"{texte_entier(observation['lignes'])}"
+    )
     if observation["repetees"]:
-        return f"{texte}, {observation['repetees']} lignes répétées"
+        return f"{texte}, {texte_entier(observation['repetees'])} lignes répétées"
     return f"{texte}, aucune répétition"
 
 
@@ -569,8 +585,9 @@ def lignes_motifs(contenu: dict) -> list[dict]:
 # --- Export ---------------------------------------------------------------------
 
 
-def _a_traiter(lignes: list[dict]) -> int:
-    return sum(ligne["statut"] == STATUT_OBSERVE for ligne in lignes)
+def _a_traiter(lignes: list[dict]) -> str:
+    """Nombre de lignes à « observé », écrit avec le séparateur des milliers."""
+    return texte_entier(sum(ligne["statut"] == STATUT_OBSERVE for ligne in lignes))
 
 
 def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
@@ -588,9 +605,10 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "",
         "Ce qui reste à traiter",
         f"Feuille « {FEUILLE_DECIMALES} » : {_a_traiter(decimales)} lignes à « observé » "
-        f"sur {len(decimales)}. Feuille « {FEUILLE_BORNES} » : {_a_traiter(bornes)} sur "
-        f"{len(bornes)}. Feuille « {FEUILLE_LUHN} » : {_a_traiter(luhn)} sur {len(luhn)}. "
-        f"Feuille « {FEUILLE_DOUBLONS} » : {_a_traiter(doublons)} sur {len(doublons)}.",
+        f"sur {texte_entier(len(decimales))}. Feuille « {FEUILLE_BORNES} » : "
+        f"{_a_traiter(bornes)} sur {texte_entier(len(bornes))}. Feuille « {FEUILLE_LUHN} » : "
+        f"{_a_traiter(luhn)} sur {texte_entier(len(luhn))}. Feuille « {FEUILLE_DOUBLONS} » : "
+        f"{_a_traiter(doublons)} sur {texte_entier(len(doublons))}.",
         "Une revue partielle est possible : une ligne laissée à « observé » est "
         "reprise telle quelle dans le formulaire suivant.",
         "",
@@ -654,7 +672,8 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "tels quels.",
         "",
         "Règles à respecter pour que le formulaire puisse être réimporté",
-        "Ne modifier que les cellules non verrouillées. Ne pas renommer, déplacer ni "
+        f"Ne modifier que les cellules non verrouillées, {FOND_MODIFIABLE}. Ne pas "
+        "renommer, déplacer ni "
         "supprimer de feuilles, de colonnes ou de lignes. Avant l'import : enregistrer "
         "puis fermer le classeur dans Excel. Un formulaire ne s'applique qu'une fois : "
         "après son import, ou après une modification du fichier des règles, il est à "
@@ -678,10 +697,12 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, saisie_ajou
             valeur = ligne.get(nom)
             if isinstance(valeur, (int, float)) and not isinstance(valeur, bool):
                 cellule.value = valeur
+                if nom in COLONNES_EFFECTIFS:
+                    cellule.number_format = FORMAT_EFFECTIF
             else:
                 _ecrire_texte(cellule, valeur)
             if nom in modifiables:
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
             if nom in COLONNES_A_DROITE:
                 cellule.alignment = Alignment(horizontal="right")
     fin = len(lignes) + 1
@@ -690,7 +711,7 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, saisie_ajou
             if nom in saisie_ajout:
                 cellule = feuille.cell(row=numero, column=indice)
                 cellule.number_format = "@"
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
     derniere = get_column_letter(len(colonnes))
     feuille.freeze_panes = "C2"
     feuille.auto_filter.ref = f"A1:{derniere}{max(fin + lignes_ajout, 2)}"

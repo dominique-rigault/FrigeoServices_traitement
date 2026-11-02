@@ -1,11 +1,13 @@
-# Règles de gestion propres au client, écrites à la main d'après ce que dit le métier.
-# Chaque règle est une instance d'un type du catalogue (voir frigeo.gestion.catalogue_types) :
-# ref (référence de la règle), libelle (texte affiché), type, table, puis les paramètres du type.
-# Une règle qui n'entre dans aucun type demande un nouveau type générique dans src/.
-# Une règle peut porter un commentaire (clé commentaire), sans effet sur les contrôles.
+# Règles de gestion propres au client, données par le métier.
+# Chaque règle est une instance d'un type du catalogue (voir frigeo.gestion.catalogue_types),
+# avec ref (référence de la règle), libelle (texte affiché), type, table, les paramètres du
+# type, et en option filtre, issue et commentaire. Une règle qui n'entre dans aucun type
+# demande un nouveau type générique dans src/.
+# Ce fichier est réécrit en entier par le formulaire des règles de gestion (notebook 05),
+# qui ne garde pas les lignes de commentaire écrites à la main; le commentaire d'une règle
+# s'écrit sous sa clé commentaire.
 
-# Jours fériés, liste à compléter chaque année, repris par chaque règle d'horaires qui
-# n'en déclare pas (clé feries).
+# Jours fériés, repris par chaque règle d'horaires qui n'en déclare pas (clé feries).
 jours_feries:
   2025: ['2025-01-01', '2025-04-21', '2025-05-01', '2025-05-08', '2025-05-29', '2025-06-09',
          '2025-07-14', '2025-08-15', '2025-11-01', '2025-11-11', '2025-12-25']
@@ -21,7 +23,7 @@ regles:
     table: interventions
     colonne: date_debut
   - ref: decoupage
-    libelle: Date de l'intervention dans la période de l'export
+    libelle: Date de sortie dans la période de l'export
     type: date_dans_periode_export
     table: pieces_interventions
     colonne: date_sortie
@@ -40,6 +42,21 @@ regles:
     type: date_dans_periode_export
     table: fec
     colonne: EcritureDate
+  - ref: decoupage
+    libelle: PieceDate dans la période de l'export
+    type: date_dans_periode_export
+    table: fec
+    colonne: PieceDate
+  - ref: decoupage
+    libelle: DateLet dans la période de l'export
+    type: date_dans_periode_export
+    table: fec
+    colonne: DateLet
+  - ref: decoupage
+    libelle: ValidDate dans la période de l'export
+    type: date_dans_periode_export
+    table: fec
+    colonne: ValidDate
 
   - ref: R02
     libelle: Durée sur site dans la plage de sa catégorie
@@ -57,6 +74,7 @@ regles:
       - colonne: statut
         valeurs: [Réalisée]
     issue: anomalie
+
   - ref: R22
     libelle: Distance imputée de 2 à 120 km
     type: plage
@@ -129,7 +147,6 @@ regles:
     filtre:
       - colonne: statut
         valeurs: [Réalisée]
-
   - ref: R04
     libelle: Intervention hors des horaires d'astreinte
     type: hors_horaires_selon_valeur
@@ -208,6 +225,7 @@ regles:
     debut: date_entree
     fin: date_sortie
     comparaison: mots dans le désordre
+
   - ref: R11
     libelle: Client connu et actif à la date de l'intervention
     type: date_dans_periode_reference
@@ -244,7 +262,6 @@ regles:
     table_reference: parametres_couts
     colonne_annee: annee
 
-  # Existence des codes dans leur référentiel (hors chapitre 5, R13, R19 et R20 en dépendent).
   - ref: existence
     libelle: Fournisseur de la facture d'achat connu
     type: existence_dans_reference
@@ -309,7 +326,6 @@ regles:
     cle: [code_client]
     table_reference: clients
 
-  # Avoirs et leur facture d'origine (dossier, 2.5 et 4.2).
   - ref: renseignement
     libelle: Facture d'origine renseignée pour un avoir, vide pour une facture
     type: renseignee_selon_valeur
@@ -318,6 +334,52 @@ regles:
     selon: type_piece
     valeurs: [Avoir]
     vide_sinon: true
+  - ref: renseignement
+    libelle: commentaire renseignée si statut vaut Annulée ou Reportée
+    type: renseignee_selon_valeur
+    table: interventions
+    colonne: commentaire
+    selon: statut
+    valeurs: [Annulée, Reportée]
+  - ref: renseignement
+    libelle: commentaire renseignée si facturable vaut N
+    type: renseignee_selon_valeur
+    table: interventions
+    colonne: commentaire
+    selon: facturable
+    valeurs: [N]
+  - ref: renseignement
+    libelle: ref_piece renseignée si code_article vaut PIECE ou FLUIDE, vide sinon
+    type: renseignee_selon_valeur
+    table: factures_lignes
+    colonne: ref_piece
+    selon: code_article
+    valeurs: [PIECE, FLUIDE]
+    vide_sinon: true
+  - ref: renseignement
+    libelle: ref_piece renseignée si unite vaut unité ou kg, vide sinon
+    type: renseignee_selon_valeur
+    table: factures_lignes
+    colonne: ref_piece
+    selon: unite
+    valeurs: [unité, kg]
+    vide_sinon: true
+  - ref: renseignement
+    libelle: ref_piece renseignée si unite vaut kg
+    type: renseignee_selon_valeur
+    table: achats_lignes
+    colonne: ref_piece
+    selon: unite
+    valeurs: [kg]
+  - ref: renseignement
+    libelle: date_fin_relation renseignée si statut vaut Inactif, vide sinon
+    type: renseignee_selon_valeur
+    table: clients
+    colonne: date_fin_relation
+    selon: statut
+    valeurs: [Inactif]
+    vide_sinon: true
+
   - ref: existence
     libelle: Facture d'origine d'un avoir connue des factures
     type: existence_dans_reference
@@ -326,6 +388,7 @@ regles:
     table_reference: factures_entetes
     cle_reference: [num_facture]
     cle_facultative: true
+
   - ref: avoir
     libelle: Facture d'origine d'un avoir de type Facture
     type: reference_conforme
@@ -348,7 +411,6 @@ regles:
     debut: date_facture
     cle_facultative: true
 
-  # Interventions et factures (R12, R13, R16), pratiques normales déclarées en exceptions.
   - ref: R12
     libelle: Intervention réalisée et facturable facturée une fois et une seule, 0 à 30 jours après sa date
     type: rattachement_unique_dans_delai
@@ -369,6 +431,7 @@ regles:
         valeurs: [Réalisée]
       - colonne: facturable
         valeurs: [O]
+
   - ref: R13
     libelle: Ligne de facture rattachée à une intervention réalisée et facturable
     type: reference_conforme
@@ -397,6 +460,7 @@ regles:
     cle_b: [num_facture]
     table_b: factures_entetes
     colonne_b: code_client
+
   - ref: R16
     libelle: Intervention annulée ou reportée non facturée
     type: sans_ligne_liee
@@ -414,7 +478,6 @@ regles:
           - colonne: factures_lignes.code_article
             valeurs: [DEPL]
 
-  # Contenu des factures (R17, R04 partie facture, R18).
   - ref: R17
     libelle: Ligne de forfait de contrôle rattachée à une intervention de contrôle
     type: reference_conforme
@@ -555,6 +618,7 @@ regles:
         valeurs: [O]
       - colonne: categorie
         valeurs: [Intervention préventive]
+
   - ref: R04
     libelle: Main d'oeuvre facturée en urgence hors des horaires ouvrés, au tarif normal dans ces horaires
     type: conforme_selon_horaires
@@ -579,6 +643,7 @@ regles:
     filtre:
       - colonne: code_article
         motif: 'MO-.*'
+
   - ref: R18
     libelle: Pièces posées sur une intervention facturable facturées avec la même référence et la même quantité
     type: quantites_concordantes
@@ -612,7 +677,6 @@ regles:
       - colonne: facturable
         valeurs: [N]
 
-  # Calculs et cohérence interne (montants des lignes, main d'oeuvre au quart d'heure, FEC).
   - ref: calcul
     libelle: Montant HT de la ligne de facture égal à quantité × prix unitaire × (1 - remise)
     type: produit_calcule
@@ -630,6 +694,7 @@ regles:
     cible: montant_ht
     facteurs: [quantite, pu_achat_ht]
     tolerance: 0.005
+
   - ref: grille
     libelle: Remise réservée à la main d'oeuvre
     type: plage
@@ -660,6 +725,7 @@ regles:
         valeurs: [Réalisée]
       - colonne: facturable
         valeurs: [O]
+
   - ref: fec
     libelle: Ligne d'écriture avec un débit ou un crédit, l'un des deux à zéro
     type: au_plus_une_non_nulle
@@ -667,7 +733,6 @@ regles:
     colonnes: [Debit, Credit]
     au_moins_une: true
 
-  # Ventes et achats face au FEC, pièce par pièce (R14, R20).
   - ref: R14
     libelle: Facture ou avoir comptabilisé en une écriture VT de même date et de mêmes montants
     type: sommes_liees_concordantes
@@ -697,6 +762,7 @@ regles:
           - colonne: CompteNum
             motif: '44571.*'
         termes: {Credit: 1, Debit: -1}
+
   - ref: R20
     libelle: Facture fournisseur comptabilisée en une écriture AC de même date et de mêmes montants
     type: sommes_liees_concordantes
@@ -726,6 +792,7 @@ regles:
           - colonne: CompteNum
             motif: '44566.*'
         termes: {Debit: 1, Credit: -1}
+
   - ref: existence
     libelle: Pièce d'une écriture de vente connue des factures
     type: existence_dans_reference
@@ -746,8 +813,20 @@ regles:
     filtre:
       - colonne: JournalCode
         valeurs: [AC]
+  - ref: existence
+    libelle: interventions.code_client connue de clients.code_client
+    type: existence_dans_reference
+    table: interventions
+    cle: [code_client]
+    table_reference: clients
+    cle_facultative: true
+  - ref: existence
+    libelle: pieces_interventions.libelle connue de catalogue_pieces.libelle
+    type: existence_dans_reference
+    table: pieces_interventions
+    cle: [libelle]
+    table_reference: catalogue_pieces
 
-  # Totaux par période face au FEC (R15, R20).
   - ref: R15
     libelle: Total HT des factures moins les avoirs égal au solde des comptes 706 à 708, par période
     type: totaux_par_periode
@@ -758,6 +837,7 @@ regles:
       - colonne: CompteNum
         motif: '70[678].*'
     termes_lignes: {Credit: 1, Debit: -1}
+
   - ref: R20
     libelle: Achats de pièces et de fluides égaux au solde des comptes 601100 et 601200, par période
     type: totaux_par_periode
@@ -774,11 +854,10 @@ regles:
       - colonne: compte_charge
         valeurs: ['601100', '601200']
 
-  # Stock théorique par référence (R19).
   - ref: R19
     libelle: Stock théorique d'une pièce jamais négatif (stock initial, achats et consommations)
-    commentaire: Le catalogue ne porte pas la date du stock initial (01/01/2025 selon le
-      dossier), d'où date_initial; achats avancés de 7 jours pour le réapprovisionnement
+    commentaire: Le catalogue ne porte pas la date du stock initial (01/01/2025 selon
+      le dossier), d'où date_initial; achats avancés de 7 jours pour le réapprovisionnement
       hebdomadaire (facture datée après la livraison).
     type: solde_jamais_negatif
     table: pieces_interventions
@@ -794,3 +873,10 @@ regles:
     lien_entrees: [num_piece_achat]
     date_en_tetes: date_facture
     avance_entrees: 7
+
+# Propositions du formulaire écartées par le métier, qui ne sont plus proposées
+# (sans effet sur les contrôles).
+ecartees:
+  periodes_export:
+    - {table: factures_entetes, colonne: date_echeance}
+    - {table: achats_entetes, colonne: date_echeance}

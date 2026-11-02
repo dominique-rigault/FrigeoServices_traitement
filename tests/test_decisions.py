@@ -22,6 +22,7 @@ from frigeo.decisions import (
     SORTE_CELLULE,
     SORTE_ECART,
     SORTE_LIGNE,
+    _mode_emploi,
     ajouter_decisions,
     charger_decisions,
     ecrire_decisions,
@@ -303,6 +304,23 @@ def _remplir(chemin, decisions):
     classeur.save(chemin)
 
 
+def _cellules_jaunes(classeur):
+    """Nombre de cellules au fond jaune clair; une cellule l'a si et seulement si elle
+    est modifiable."""
+    jaunes = 0
+    for feuille in classeur.worksheets:
+        for ligne in feuille.iter_rows():
+            for cellule in ligne:
+                jaune = cellule.fill.fill_type == "solid" and str(
+                    cellule.fill.fgColor.rgb
+                ).endswith("FFF2CC")
+                assert jaune == (not cellule.protection.locked), (
+                    feuille.title, cellule.coordinate
+                )
+                jaunes += jaune
+    return jaunes
+
+
 def test_export_du_classeur(tmp_path):
     chemin = tmp_path / "decisions" / "arbitrage_2026-03.xlsx"
     elements = elements_a_arbitrer(_tables(), _exemple(), AUCUNE_DECISION)
@@ -333,6 +351,9 @@ def test_export_du_classeur(tmp_path):
     assert feuille.cell(row=2, column=rang).number_format == "@"
     assert not feuille.cell(row=2, column=rang).protection.locked
     assert feuille.cell(row=2, column=1).protection.locked
+    assert _cellules_jaunes(classeur) == 3 * 8
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "commentaire, sur fond jaune clair (les autres cellules" in notice
     # Un menu par sorte.
     menus = {tuple(m.formula1.strip('"').split(",")): str(m.sqref)
              for m in feuille.data_validations.dataValidation}
@@ -711,3 +732,14 @@ def test_ajouter_decisions():
     assert par_id["g5"] is None
     assert par_id.drop(["f1", "d1"]).isna().all()
     assert list(anomalies.columns) == list(COLONNES_ANOMALIES)
+
+
+def test_mode_emploi_avec_separateur_des_milliers():
+    milliers = chr(160)
+    elements = pd.DataFrame({
+        "sorte": [SORTE_CELLULE] * 1200 + [SORTE_LIGNE] * 3 + [SORTE_ECART],
+        "etat_decision": [ETAT_CADUQUE] * 1001 + [ETAT_SANS_DECISION] * 203,
+    })
+    texte = " ".join(_mode_emploi("2026-03", elements))
+    assert f"Contenu : 1{milliers}204 lignes" in texte
+    assert f"dont 1{milliers}200 cellules, 3 lignes et 1 écarts; 1{milliers}001 lignes" in texte

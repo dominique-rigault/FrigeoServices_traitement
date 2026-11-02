@@ -41,7 +41,7 @@ from typing import NamedTuple
 import pandas as pd
 import yaml
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, Protection
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter, quote_sheetname
 
 from . import dictionnaire as module_dictionnaire
@@ -56,7 +56,14 @@ from .formulaire_controles import (
     _yaml,
     texte_nombre,
 )
-from .formulaires import dossier_formulaires, ecrire_et_archiver
+from .formulaires import (
+    FOND_MODIFIABLE,
+    FORMAT_EFFECTIF,
+    dossier_formulaires,
+    ecrire_et_archiver,
+    rendre_modifiable,
+    texte_entier,
+)
 from .gestion import (
     CLE_COMMENTAIRE,
     CLE_DEMANDES,
@@ -248,6 +255,8 @@ COLONNES_MASQUEES = (
     "rang", "proposition_clé_facultative", "proposition_valeurs", "proposition_vide_sinon",
 )
 FORMAT_DATE = "DD/MM/YYYY"
+# Colonnes d'effectifs, affichées avec le séparateur des milliers.
+COLONNES_EFFECTIFS = ("dates",)
 LARGEURS = {
     "table": 22,
     "colonne": 22,
@@ -553,7 +562,8 @@ def _ligne_periode(table, colonne, nature, observation) -> dict:
     lues, dans = observation["dates"], observation["dans"]
     if lues:
         observe = (
-            f"{dans} sur {lues} dans la période de l'export ({_pourcentage(dans / lues)} %)"
+            f"{texte_entier(dans)} sur {texte_entier(lues)} dans la période de l'export "
+            f"({_pourcentage(dans / lues)} %)"
         )
     else:
         observe = None
@@ -770,20 +780,43 @@ def observer_reference(
     return _compter_reference(cles, connues)
 
 
+def _effectif(nombre: int, mot: str) -> str:
+    """Nombre suivi d'un mot qui prend un s au pluriel (« 1 vide », « 5 vides »)."""
+    return f"{texte_entier(nombre)} {mot}{'s' if nombre > 1 else ''}"
+
+
+def _texte_reference(observation: dict) -> str:
+    """Observé d'une ligne de référence : « 10 196 lignes, dont 5 vides. 10 191
+    renseignées, dont 10 183 trouvées (99,9 %) et 8 introuvables »; sans vide, « 6 509
+    lignes renseignées, dont 6 509 trouvées (100 %) »."""
+    renseignees, trouvees, vides = (
+        observation["renseignees"], observation["trouvees"], observation["vides"]
+    )
+    total = renseignees + vides
+    if not total:
+        return "aucune ligne"
+    if not renseignees:
+        return f"{_effectif(total, 'ligne')}, toutes vides"
+    detail = (
+        f"dont {_effectif(trouvees, 'trouvée')} ({_pourcentage(trouvees / renseignees)} %)"
+    )
+    if renseignees > trouvees:
+        detail += f" et {_effectif(renseignees - trouvees, 'introuvable')}"
+    if not vides:
+        pluriel = "s" if renseignees > 1 else ""
+        return f"{_effectif(renseignees, 'ligne')} renseignée{pluriel}, {detail}"
+    return (
+        f"{_effectif(total, 'ligne')}, dont {_effectif(vides, 'vide')}. "
+        f"{_effectif(renseignees, 'renseignée')}, {detail}"
+    )
+
+
 def _colonnes_observation_reference(observation: dict | None) -> dict:
     """Colonnes observé, proposition et proposition_clé_facultative d'une ligne."""
     if observation is None:
         return {"observé": None, "proposition": AUCUNE, "proposition_clé_facultative": None}
     renseignees, trouvees = observation["renseignees"], observation["trouvees"]
-    if renseignees:
-        observe = (
-            f"{renseignees} lignes renseignées, {trouvees} trouvées "
-            f"({_pourcentage(trouvees / renseignees)} %)"
-        )
-    else:
-        observe = "aucune ligne renseignée"
-    if observation["vides"]:
-        observe += f", {observation['vides']} vides"
+    observe = _texte_reference(observation)
     proposee = (
         _seuil_atteint(trouvees, renseignees) and observation["distinctes"] >= MIN_DISTINCTES
     )
@@ -1009,18 +1042,25 @@ def proposer_renseignement(observation: dict, liste: list[str]) -> tuple[list[st
     return retenues, _seuil_atteint(vides_autres, autres)
 
 
-def _texte_renseignement(observation: dict, valeurs: list[str]) -> str:
-    """Observé d'une ligne : « Avoir 11 sur 11 renseignées; autres valeurs 0 sur 8596
-    renseignées »."""
+def _texte_renseignement(observation: dict, valeurs: list[str], selon: str) -> str:
+    """Observé d'une ligne : « Avoir 11 sur 11 renseignées; autres valeurs 0 sur 8 596
+    renseignées; type_piece vide sur 5 lignes (non évaluables) »."""
     lignes, renseignees = observation["lignes"], observation["renseignees"]
-    parties = [f"{v} {renseignees[v]} sur {lignes[v]} renseignées" for v in valeurs]
+    parties = [
+        f"{v} {texte_entier(renseignees[v])} sur {texte_entier(lignes[v])} renseignées"
+        for v in valeurs
+    ]
     autres = [v for v in lignes if v not in valeurs]
     parties.append(
-        f"autres valeurs {sum(renseignees[v] for v in autres)} sur "
-        f"{sum(lignes[v] for v in autres)} renseignées"
+        f"autres valeurs {texte_entier(sum(renseignees[v] for v in autres))} sur "
+        f"{texte_entier(sum(lignes[v] for v in autres))} renseignées"
     )
-    if observation["selon_vide"]:
-        parties.append(f"selon vide sur {observation['selon_vide']} lignes")
+    vides = observation["selon_vide"]
+    if vides:
+        parties.append(
+            f"{selon} vide sur {_effectif(vides, 'ligne')} "
+            f"({'non évaluables' if vides > 1 else 'non évaluable'})"
+        )
     return "; ".join(parties)
 
 
@@ -1060,7 +1100,7 @@ def _base_renseignement(tables, dictionnaire, sensibles, table, colonne, selon, 
         base["proposition_vide_sinon"] = OUI if vide_sinon else NON
     if valeurs is None:
         valeurs = proposition[0] if proposition is not None else []
-    base["observé"] = _texte_renseignement(observation, valeurs)
+    base["observé"] = _texte_renseignement(observation, valeurs, selon)
     return base, proposition
 
 
@@ -1156,7 +1196,7 @@ def lignes_renseignement(
                     "table": table,
                     "colonne": colonne,
                     "selon": selon,
-                    "observé": _texte_renseignement(observation, retenues),
+                    "observé": _texte_renseignement(observation, retenues, selon),
                     "proposition": ", ".join(retenues) + ("; vide sinon" if vide_sinon else ""),
                     "proposition_valeurs": ", ".join(retenues),
                     "proposition_vide_sinon": OUI if vide_sinon else NON,
@@ -1271,8 +1311,9 @@ def lignes_nouvelles(contenu: dict) -> list[dict]:
 # --- Classeur -------------------------------------------------------------------
 
 
-def _a_traiter(lignes: list[dict]) -> int:
-    return sum(ligne["statut"] == STATUT_OBSERVE for ligne in lignes)
+def _a_traiter(lignes: list[dict]) -> str:
+    """Nombre de lignes à « observé », écrit avec le séparateur des milliers."""
+    return texte_entier(sum(ligne["statut"] == STATUT_OBSERVE for ligne in lignes))
 
 
 def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
@@ -1291,12 +1332,13 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "",
         "Ce qui reste à traiter",
         f"Feuille « {FEUILLE_REFERENCES} » : {_a_traiter(references)} lignes à « observé » "
-        f"sur {len(references)}. Feuille « {FEUILLE_RENSEIGNEMENT} » : "
-        f"{_a_traiter(renseignement)} sur {len(renseignement)}. Feuille "
+        f"sur {texte_entier(len(references))}. Feuille « {FEUILLE_RENSEIGNEMENT} » : "
+        f"{_a_traiter(renseignement)} sur {texte_entier(len(renseignement))}. Feuille "
         f"« {FEUILLE_PERIODES} » : {_a_traiter(periodes)} sur "
-        f"{len(periodes)}. Feuille « {FEUILLE_FERIES} » : {_a_traiter(feries)} sur "
-        f"{len(feries)}. Feuille « {FEUILLE_AUTRES} » : {len(autres)} règles. Feuille "
-        f"« {FEUILLE_NOUVELLES} » : {len(nouvelles)} règles demandées.",
+        f"{texte_entier(len(periodes))}. Feuille « {FEUILLE_FERIES} » : {_a_traiter(feries)} "
+        f"sur {texte_entier(len(feries))}. Feuille « {FEUILLE_AUTRES} » : "
+        f"{texte_entier(len(autres))} règles. Feuille « {FEUILLE_NOUVELLES} » : "
+        f"{texte_entier(len(nouvelles))} règles demandées.",
         "Une revue partielle est possible : une ligne laissée à « observé » est reprise "
         "telle quelle dans le formulaire suivant.",
         "",
@@ -1383,7 +1425,8 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "la ligne d'une règle qui n'est plus voulue.",
         "",
         "Règles à respecter pour que le formulaire puisse être réimporté",
-        "Ne modifier que les cellules non verrouillées. Ne pas renommer, déplacer ni "
+        f"Ne modifier que les cellules non verrouillées, {FOND_MODIFIABLE}. Ne pas "
+        "renommer, déplacer ni "
         "supprimer de feuilles, de colonnes ou de lignes. Avant l'import : enregistrer puis "
         "fermer le classeur dans Excel. Un formulaire ne s'applique qu'une fois : après son "
         "import, ou après une modification du fichier des règles, il est à réexporter.",
@@ -1413,10 +1456,12 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, saisie_ajou
                 cellule.number_format = FORMAT_DATE
             elif isinstance(valeur, (int, float)) and not isinstance(valeur, bool):
                 cellule.value = valeur
+                if nom in COLONNES_EFFECTIFS:
+                    cellule.number_format = FORMAT_EFFECTIF
             else:
                 _ecrire_texte(cellule, valeur)
             if nom in modifiables:
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
             if nom in ("libellé", "paramètres", "règle", "commentaire"):
                 cellule.alignment = Alignment(wrap_text=True, vertical="top")
     fin = len(lignes) + 1
@@ -1425,7 +1470,7 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, saisie_ajou
             if nom in saisie_ajout:
                 cellule = feuille.cell(row=numero, column=indice)
                 cellule.number_format = FORMAT_DATE if nom == "date" else "@"
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
     derniere = get_column_letter(len(colonnes))
     feuille.freeze_panes = "C2"
     feuille.auto_filter.ref = f"A1:{derniere}{max(fin + lignes_ajout, 2)}"

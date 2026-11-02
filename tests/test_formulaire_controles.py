@@ -31,8 +31,10 @@ from frigeo.formulaire_controles import (
     observer_groupe,
     observer_luhn,
     observer_nombres,
+    _texte_groupe,
     texte_controles,
     texte_nombre,
+    texte_regle,
 )
 
 SIRET_VALIDES = ["73282932000074", "35600000000048", "44306184100047"]
@@ -105,6 +107,20 @@ def test_observations_des_nombres():
     }
     assert texte_nombre(181.45000000000002) == "181,45"
     assert (texte_nombre(3), texte_nombre(0.5), texte_nombre(2.0)) == ("3", "0,5", "2")
+
+
+def test_nombres_affiches_avec_separateur_des_milliers():
+    milliers = chr(160)
+    assert texte_nombre(27000) == f"27{milliers}000"
+    assert texte_nombre(-12345.25) == f"-12{milliers}345,25"
+    assert texte_nombre(0.12345) == "0,12345"
+    assert texte_regle("bornes", {"min": 27000, "max": 76999.5, "max_exclu": True}) == (
+        f"27{milliers}000 à 76{milliers}999,5 exclu"
+    )
+    assert texte_regle("decimales", 2) == "2"
+    assert _texte_groupe({"lignes": 12000, "renseignees": 11990, "repetees": 1500}) == (
+        f"11{milliers}990 lignes renseignées sur 12{milliers}000, 1{milliers}500 lignes répétées"
+    )
 
 
 def test_observations_des_cles_de_luhn_et_des_groupes():
@@ -276,8 +292,29 @@ def test_formulaire_exporte(tmp_path):
     assert "Feuille « doublons » : 1 sur 3" in texte
 
 
+def _cellules_jaunes(classeur):
+    """Nombre de cellules au fond jaune clair; une cellule l'a si et seulement si elle
+    est modifiable."""
+    jaunes = 0
+    for feuille in classeur.worksheets:
+        for ligne in feuille.iter_rows():
+            for cellule in ligne:
+                jaune = cellule.fill.fill_type == "solid" and str(
+                    cellule.fill.fgColor.rgb
+                ).endswith("FFF2CC")
+                assert jaune == (not cellule.protection.locked), (
+                    feuille.title, cellule.coordinate
+                )
+                jaunes += jaune
+    return jaunes
+
+
 def test_cellules_modifiables_et_menus(tmp_path):
     classeur = load_workbook(_exporter(tmp_path))
+    # Fond jaune clair sur les seules cellules modifiables, lignes d'ajout comprises.
+    assert _cellules_jaunes(classeur) > LIGNES_AJOUT
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "cellules non verrouillées, sur fond jaune clair" in notice
 
     def libres(feuille, numero):
         return {
@@ -296,6 +333,21 @@ def test_cellules_modifiables_et_menus(tmp_path):
     entete = [c.value for c in classeur["décimales"][1]]
     cellule = classeur["décimales"].cell(row=2, column=entete.index("décimales") + 1)
     assert cellule.alignment.horizontal == "right"
+    # Effectifs avec le séparateur des milliers; nombres saisis au format standard, qui
+    # ne cache aucune décimale.
+    assert classeur["décimales"].cell(row=2, column=entete.index("valeurs") + 1).number_format == (
+        "#,##0"
+    )
+    entete = [c.value for c in classeur["bornes"][1]]
+    remise = next(
+        i for i, ligne in enumerate(classeur["bornes"].iter_rows(values_only=True), start=1)
+        if ligne[1] == "remise"
+    )
+    for nom in ("min", "max"):
+        cellule = classeur["bornes"].cell(row=remise, column=entete.index(nom) + 1)
+        assert isinstance(cellule.value, int)
+        assert cellule.number_format == "General"
+    assert classeur["tables"]["B2"].number_format == "#,##0"
     assert libres(classeur["clé_luhn"], 2) == {"statut", "commentaire"}
     assert libres(classeur["doublons"], 2) == {"type", "statut", "commentaire"}
     # Lignes d'ajout en bas de la feuille des doublons.
