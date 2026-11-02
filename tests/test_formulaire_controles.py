@@ -292,8 +292,29 @@ def test_formulaire_exporte(tmp_path):
     assert "Feuille « doublons » : 1 sur 3" in texte
 
 
+def _cellules_jaunes(classeur):
+    """Nombre de cellules au fond jaune clair; une cellule l'a si et seulement si elle
+    est modifiable."""
+    jaunes = 0
+    for feuille in classeur.worksheets:
+        for ligne in feuille.iter_rows():
+            for cellule in ligne:
+                jaune = cellule.fill.fill_type == "solid" and str(
+                    cellule.fill.fgColor.rgb
+                ).endswith("FFF2CC")
+                assert jaune == (not cellule.protection.locked), (
+                    feuille.title, cellule.coordinate
+                )
+                jaunes += jaune
+    return jaunes
+
+
 def test_cellules_modifiables_et_menus(tmp_path):
     classeur = load_workbook(_exporter(tmp_path))
+    # Fond jaune clair sur les seules cellules modifiables, lignes d'ajout comprises.
+    assert _cellules_jaunes(classeur) > LIGNES_AJOUT
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "cellules non verrouillées, sur fond jaune clair" in notice
 
     def libres(feuille, numero):
         return {

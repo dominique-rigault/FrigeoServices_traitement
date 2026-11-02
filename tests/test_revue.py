@@ -190,9 +190,30 @@ def test_valeurs_conservees_comme_texte(tmp_path):
     assert all(isinstance(l["valeur"], str) for l in lues)
 
 
+def _cellules_jaunes(classeur):
+    """Nombre de cellules au fond jaune clair; une cellule l'a si et seulement si elle
+    est modifiable."""
+    jaunes = 0
+    for feuille in classeur.worksheets:
+        for ligne in feuille.iter_rows():
+            for cellule in ligne:
+                jaune = cellule.fill.fill_type == "solid" and str(
+                    cellule.fill.fgColor.rgb
+                ).endswith("FFF2CC")
+                assert jaune == (not cellule.protection.locked), (
+                    feuille.title, cellule.coordinate
+                )
+                jaunes += jaune
+    return jaunes
+
+
 def test_protection_et_menus(tmp_path):
     chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
     classeur = load_workbook(chemin)
+    # Fond jaune clair sur les seules cellules modifiables, signalé au mode d'emploi.
+    assert _cellules_jaunes(classeur) > 0
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "commentaire, sur fond jaune clair (les autres cellules" in notice
     regles, valeurs = classeur[FEUILLE_REGLES], classeur["valeurs"]
     assert regles.protection.sheet and valeurs.protection.sheet
     assert classeur["mode_emploi"].protection.sheet

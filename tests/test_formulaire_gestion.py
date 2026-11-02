@@ -342,6 +342,23 @@ def _verrouillee(feuille, ligne, nom, colonnes):
     return feuille.cell(row=ligne, column=colonnes.index(nom) + 1).protection.locked
 
 
+def _cellules_jaunes(classeur):
+    """Nombre de cellules au fond jaune clair; une cellule l'a si et seulement si elle
+    est modifiable."""
+    jaunes = 0
+    for feuille in classeur.worksheets:
+        for ligne in feuille.iter_rows():
+            for cellule in ligne:
+                jaune = cellule.fill.fill_type == "solid" and str(
+                    cellule.fill.fgColor.rgb
+                ).endswith("FFF2CC")
+                assert jaune == (not cellule.protection.locked), (
+                    feuille.title, cellule.coordinate
+                )
+                jaunes += jaune
+    return jaunes
+
+
 def test_export_du_classeur(tmp_path):
     chemin = tmp_path / "formulaires" / "gestion_2026-03.xlsx"
     assert exporter_formulaire_gestion(
@@ -363,6 +380,8 @@ def test_export_du_classeur(tmp_path):
         for texte in textes
     )
     assert any(texte and "moins de 19 lignes" in texte for texte in textes)
+    assert any(texte and "non verrouillées, sur fond jaune clair" in texte for texte in textes)
+    assert _cellules_jaunes(classeur) > 0
 
     feuille = classeur[FEUILLE_PERIODES]
     assert [c.value for c in feuille[1]] == list(COLONNES_PERIODES)
@@ -807,6 +826,7 @@ def test_export_references_et_renseignement(tmp_path):
         empreinte="abc",
     )
     classeur = load_workbook(chemin)
+    assert _cellules_jaunes(classeur) > 0
     textes = [ligne[0] for ligne in classeur[FEUILLE_MODE_EMPLOI].iter_rows(values_only=True)]
     assert any(
         texte and texte.startswith(

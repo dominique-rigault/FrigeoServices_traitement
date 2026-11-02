@@ -8,7 +8,8 @@ valeurs du client et sont rangés ensemble hors du dépôt, dans data/formulaire
 Un classeur appliqué est déplacé dans data/formulaires/appliques/, sous un nom qui
 porte l'heure de l'archivage : il garde la trace des décisions du métier, et
 l'export suivant repart d'un dossier où ne restent que les classeurs à traiter.
-Les nombres affichés dans ces classeurs portent un séparateur des milliers.
+Les nombres affichés dans ces classeurs portent un séparateur des milliers, et les
+cellules que le métier peut modifier ont un fond jaune clair.
 """
 
 from __future__ import annotations
@@ -16,6 +17,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 from typing import Callable, TypeVar
+
+from openpyxl.styles import PatternFill, Protection
 
 from . import dictionnaire as module_dictionnaire
 from . import racine_projet
@@ -26,6 +29,10 @@ SEPARATEUR_MILLIERS = chr(160)
 # Format d'affichage d'un effectif dans une cellule : Excel y met le séparateur des
 # milliers de sa langue (une espace en français), la valeur restant un nombre.
 FORMAT_EFFECTIF = "#,##0"
+# Fond des cellules modifiables (jaune clair), les autres cellules étant verrouillées.
+COULEUR_MODIFIABLE = "FFF2CC"
+# Mention du fond dans les modes d'emploi.
+FOND_MODIFIABLE = "sur fond jaune clair"
 # Entier d'au moins quatre chiffres qui n'est pas la partie décimale d'un nombre.
 _ENTIER_LONG = re.compile(r"(?<![\d,])\d{4,}")
 # Point décimal entre deux chiffres, hors d'un nombre plus long qui en aurait plusieurs.
@@ -39,6 +46,13 @@ def _grouper(chiffres: str) -> str:
     tete = len(chiffres) % 3 or 3
     groupes = [chiffres[:tete]] + [chiffres[i:i + 3] for i in range(tete, len(chiffres), 3)]
     return SEPARATEUR_MILLIERS.join(groupes)
+
+
+def rendre_modifiable(cellule) -> None:
+    """Déverrouille une cellule d'une feuille protégée et lui donne le fond des
+    cellules modifiables."""
+    cellule.protection = Protection(locked=False)
+    cellule.fill = PatternFill(fill_type="solid", fgColor=COULEUR_MODIFIABLE)
 
 
 def texte_entier(nombre: int) -> str:

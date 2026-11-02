@@ -16,7 +16,7 @@ from typing import NamedTuple
 
 import pandas as pd
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, Protection
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter, quote_sheetname
 from openpyxl.worksheet.datavalidation import DataValidation
 
@@ -43,7 +43,14 @@ from .dictionnaire import (
     horodater,
     problemes_dictionnaire,
 )
-from .formulaires import FORMAT_EFFECTIF, dossier_formulaires, nombres_a_la_francaise, texte_entier
+from .formulaires import (
+    FOND_MODIFIABLE,
+    FORMAT_EFFECTIF,
+    dossier_formulaires,
+    nombres_a_la_francaise,
+    rendre_modifiable,
+    texte_entier,
+)
 from .profilage import signature
 
 FEUILLE_MODE_EMPLOI = "mode_emploi"
@@ -640,7 +647,7 @@ def _mode_emploi(
         "",
         "Règles à respecter pour que le classeur puisse être réimporté",
         "Ne modifier que les colonnes statut, règle_retenue, remplacement et "
-        "commentaire (les autres cellules sont verrouillées).",
+        f"commentaire, {FOND_MODIFIABLE} (les autres cellules sont verrouillées).",
         "Ne pas renommer, déplacer ni supprimer de feuilles, de colonnes ou de lignes "
         f"(la feuille masquée « {FEUILLE_LISTES} » alimente les menus des lignes "
         "ajoutées).",
@@ -739,14 +746,14 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, gel=GEL_LIS
             else:
                 _ecrire_texte(cellule, valeur)
             if nom in modifiables:
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
     fin = len(lignes) + 1
     for numero in range(fin + 1, fin + lignes_ajout + 1):
         for indice, nom in enumerate(colonnes, start=1):
             if nom in SAISIE_AJOUT:
                 cellule = feuille.cell(row=numero, column=indice)
                 cellule.number_format = "@"
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
     derniere = feuille.cell(row=1, column=len(colonnes)).column_letter
     feuille.freeze_panes = gel
     feuille.auto_filter.ref = f"A1:{derniere}{max(fin + lignes_ajout, 2)}"

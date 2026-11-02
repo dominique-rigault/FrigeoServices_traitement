@@ -304,6 +304,23 @@ def _remplir(chemin, decisions):
     classeur.save(chemin)
 
 
+def _cellules_jaunes(classeur):
+    """Nombre de cellules au fond jaune clair; une cellule l'a si et seulement si elle
+    est modifiable."""
+    jaunes = 0
+    for feuille in classeur.worksheets:
+        for ligne in feuille.iter_rows():
+            for cellule in ligne:
+                jaune = cellule.fill.fill_type == "solid" and str(
+                    cellule.fill.fgColor.rgb
+                ).endswith("FFF2CC")
+                assert jaune == (not cellule.protection.locked), (
+                    feuille.title, cellule.coordinate
+                )
+                jaunes += jaune
+    return jaunes
+
+
 def test_export_du_classeur(tmp_path):
     chemin = tmp_path / "decisions" / "arbitrage_2026-03.xlsx"
     elements = elements_a_arbitrer(_tables(), _exemple(), AUCUNE_DECISION)
@@ -334,6 +351,9 @@ def test_export_du_classeur(tmp_path):
     assert feuille.cell(row=2, column=rang).number_format == "@"
     assert not feuille.cell(row=2, column=rang).protection.locked
     assert feuille.cell(row=2, column=1).protection.locked
+    assert _cellules_jaunes(classeur) == 3 * 8
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "commentaire, sur fond jaune clair (les autres cellules" in notice
     # Un menu par sorte.
     menus = {tuple(m.formula1.strip('"').split(",")): str(m.sqref)
              for m in feuille.data_validations.dataValidation}

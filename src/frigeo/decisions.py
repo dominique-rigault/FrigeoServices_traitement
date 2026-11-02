@@ -47,7 +47,7 @@ from typing import NamedTuple
 import pandas as pd
 import yaml
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, Protection
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 from .anomalies import (
@@ -67,7 +67,7 @@ from .dictionnaire import (
     lire_instant,
 )
 from .doublons import SEPARATEUR, _texte
-from .formulaires import dossier_formulaires, texte_entier
+from .formulaires import FOND_MODIFIABLE, dossier_formulaires, rendre_modifiable, texte_entier
 from .nettoyage import _convertir
 from .profilage import _interpretations
 from .revue import _ecrire_texte, _est_vide, _menu
@@ -554,8 +554,8 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
         "recopié ailleurs.",
         "",
         "Règles à respecter pour que le classeur puisse être réimporté",
-        "Ne modifier que les colonnes decision, valeur_retenue et commentaire (les "
-        "autres cellules sont verrouillées).",
+        "Ne modifier que les colonnes decision, valeur_retenue et commentaire, "
+        f"{FOND_MODIFIABLE} (les autres cellules sont verrouillées).",
         "Ne pas renommer, déplacer ni supprimer de feuilles, de colonnes ou de lignes, "
         "et ne pas ajouter de lignes.",
         "Choisir les décisions dans le menu déroulant : une décision qui ne convient "
@@ -644,7 +644,7 @@ def exporter_arbitrage(
             else:
                 _ecrire_texte(cellule, None if _est_vide(valeur) else _texte(valeur))
             if nom in MODIFIABLES_ARBITRAGE:
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
         menus[element["sorte"]].add(feuille.cell(row=numero, column=colonne_decision))
     fin = max(len(a_arbitrer) + 1, 2)
     derniere = get_column_letter(len(COLONNES_ARBITRAGE))

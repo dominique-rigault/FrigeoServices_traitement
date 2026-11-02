@@ -41,7 +41,7 @@ from typing import NamedTuple
 import pandas as pd
 import yaml
 from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Font, Protection
+from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter, quote_sheetname
 
 from . import dictionnaire as module_dictionnaire
@@ -56,7 +56,14 @@ from .formulaire_controles import (
     _yaml,
     texte_nombre,
 )
-from .formulaires import FORMAT_EFFECTIF, dossier_formulaires, ecrire_et_archiver, texte_entier
+from .formulaires import (
+    FOND_MODIFIABLE,
+    FORMAT_EFFECTIF,
+    dossier_formulaires,
+    ecrire_et_archiver,
+    rendre_modifiable,
+    texte_entier,
+)
 from .gestion import (
     CLE_COMMENTAIRE,
     CLE_DEMANDES,
@@ -1418,7 +1425,8 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "la ligne d'une règle qui n'est plus voulue.",
         "",
         "Règles à respecter pour que le formulaire puisse être réimporté",
-        "Ne modifier que les cellules non verrouillées. Ne pas renommer, déplacer ni "
+        f"Ne modifier que les cellules non verrouillées, {FOND_MODIFIABLE}. Ne pas "
+        "renommer, déplacer ni "
         "supprimer de feuilles, de colonnes ou de lignes. Avant l'import : enregistrer puis "
         "fermer le classeur dans Excel. Un formulaire ne s'applique qu'une fois : après son "
         "import, ou après une modification du fichier des règles, il est à réexporter.",
@@ -1453,7 +1461,7 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, saisie_ajou
             else:
                 _ecrire_texte(cellule, valeur)
             if nom in modifiables:
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
             if nom in ("libellé", "paramètres", "règle", "commentaire"):
                 cellule.alignment = Alignment(wrap_text=True, vertical="top")
     fin = len(lignes) + 1
@@ -1462,7 +1470,7 @@ def _remplir(feuille, colonnes, lignes, modifiables, lignes_ajout=0, saisie_ajou
             if nom in saisie_ajout:
                 cellule = feuille.cell(row=numero, column=indice)
                 cellule.number_format = FORMAT_DATE if nom == "date" else "@"
-                cellule.protection = Protection(locked=False)
+                rendre_modifiable(cellule)
     derniere = get_column_letter(len(colonnes))
     feuille.freeze_panes = "C2"
     feuille.auto_filter.ref = f"A1:{derniere}{max(fin + lignes_ajout, 2)}"
