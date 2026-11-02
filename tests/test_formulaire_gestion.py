@@ -23,7 +23,11 @@ from frigeo.formulaire_gestion import (
     FEUILLE_REFERENCES,
     FEUILLE_RENSEIGNEMENT,
     REPERE_EMPREINTE,
+    _ligne_periode,
+    _mode_emploi,
     _seuil_atteint,
+    _texte_reference,
+    _texte_renseignement,
     annees_des_exports,
     appliquer_formulaire_gestion,
     cibles_references,
@@ -364,6 +368,10 @@ def test_export_du_classeur(tmp_path):
     assert [c.value for c in feuille[1]] == list(COLONNES_PERIODES)
     assert feuille.column_dimensions["O"].hidden
     assert feuille.cell(row=2, column=15).value == 0
+    # Nombre de dates affiché avec le séparateur des milliers.
+    assert feuille.cell(row=2, column=COLONNES_PERIODES.index("dates") + 1).number_format == (
+        "#,##0"
+    )
     assert _verrouillee(feuille, 2, "table", COLONNES_PERIODES)
     assert _verrouillee(feuille, 2, "filtre_colonne", COLONNES_PERIODES)
     assert not _verrouillee(feuille, 2, "statut", COLONNES_PERIODES)
@@ -380,6 +388,9 @@ def test_export_du_classeur(tmp_path):
     feuille = classeur[FEUILLE_FERIES]
     assert feuille.cell(row=2, column=2).value == dt.datetime(2025, 1, 1)
     assert feuille.cell(row=2, column=2).number_format == "DD/MM/YYYY"
+    # Une année n'est pas un effectif : pas de séparateur des milliers.
+    assert feuille.cell(row=2, column=1).value == 2025
+    assert feuille.cell(row=2, column=1).number_format == "General"
     # 12 dates en 2025, 11 en 2026, puis les lignes d'ajout.
     assert feuille.max_row == 1 + 23 + 50
     assert not _verrouillee(feuille, 25, "date", COLONNES_FERIES)
@@ -409,6 +420,54 @@ def test_export_du_classeur(tmp_path):
         ecraser=True,
     )
     assert load_workbook(chemin)[FEUILLE_AUTRES].max_row == 1
+
+
+def test_textes_observes_avec_separateur_des_milliers():
+    milliers = chr(160)
+
+    def m(texte):
+        return texte.replace("~", milliers)
+
+    def reference(renseignees, trouvees, vides):
+        return _texte_reference(
+            {"renseignees": renseignees, "trouvees": trouvees, "vides": vides}
+        )
+
+    assert reference(10191, 10183, 5) == m(
+        "10~196 lignes, dont 5 vides. 10~191 renseignées, dont 10~183 trouvées (99,9 %) "
+        "et 8 introuvables"
+    )
+    assert reference(6509, 6509, 0) == m("6~509 lignes renseignées, dont 6~509 trouvées (100 %)")
+    # Arrondi à 100 % : les introuvables restent visibles.
+    assert reference(10000, 9999, 1) == m(
+        "10~001 lignes, dont 1 vide. 10~000 renseignées, dont 9~999 trouvées (100 %) et "
+        "1 introuvable"
+    )
+    assert reference(1, 1, 0) == "1 ligne renseignée, dont 1 trouvée (100 %)"
+    assert reference(0, 0, 5) == "5 lignes, toutes vides"
+    assert reference(0, 0, 0) == "aucune ligne"
+
+    observation = {
+        "lignes": {"Facture": 8596, "Avoir": 11},
+        "renseignees": {"Facture": 0, "Avoir": 11},
+        "selon_vide": 1234,
+    }
+    assert _texte_renseignement(observation, ["Avoir"], "type_piece") == m(
+        "Avoir 11 sur 11 renseignées; autres valeurs 0 sur 8~596 renseignées; type_piece "
+        "vide sur 1~234 lignes (non évaluables)"
+    )
+    ligne = _ligne_periode("t", "d", "date native", {"dates": 8607, "dans": 6418})
+    assert ligne["observé"] == m("6~418 sur 8~607 dans la période de l'export (74,6 %)")
+    assert ligne["dates"] == 8607
+
+    observees = [{"statut": "observé"}] * 1001 + [{"statut": "documenté"}] * 1000
+    lignes = {cle: observees for cle in ("references", "renseignement", "periodes", "feries")}
+    texte = " ".join(_mode_emploi("2026-03", {**lignes, "autres": [{}] * 1500,
+                                              "nouvelles": [{}] * 1200}))
+    assert m("Feuille « références » : 1~001 lignes à « observé » sur 2~001.") in texte
+    assert m("« jours_fériés » : 1~001 sur 2~001.") in texte
+    assert m("« autres_règles » : 1~500 règles.") in texte
+    assert m("« nouvelles_règles » : 1~200 règles demandées.") in texte
 
 
 # --- Seuil, références et renseignement (morceau b2) ------------------------------
@@ -554,14 +613,15 @@ def test_lignes_references():
     ]
     assert _reduites(lignes, "observé", "proposition", "proposition_clé_facultative") == [
         # Filtre appliqué : les 20 lignes où n vaut 1.
-        ("20 lignes renseignées, 20 trouvées (100 %)", "oui", "non"),
-        ("24 lignes renseignées, 0 trouvées (0 %), 1 vides", "aucune", "oui"),
-        ("20 lignes renseignées, 20 trouvées (100 %), 5 vides", "oui", "oui"),
-        ("25 lignes renseignées, 25 trouvées (100 %)", "oui", "non"),
-        ("25 lignes renseignées, 25 trouvées (100 %)", "oui", "non"),
+        ("20 lignes renseignées, dont 20 trouvées (100 %)", "oui", "non"),
+        ("25 lignes, dont 1 vide. 24 renseignées, dont 0 trouvée (0 %) et 24 introuvables",
+         "aucune", "oui"),
+        ("25 lignes, dont 5 vides. 20 renseignées, dont 20 trouvées (100 %)", "oui", "oui"),
+        ("25 lignes renseignées, dont 25 trouvées (100 %)", "oui", "non"),
+        ("25 lignes renseignées, dont 25 trouvées (100 %)", "oui", "non"),
         # Un seul client distinct trouvé : pas de proposition.
-        ("25 lignes renseignées, 25 trouvées (100 %)", "aucune", "non"),
-        ("25 lignes renseignées, 25 trouvées (100 %)", "oui", "non"),
+        ("25 lignes renseignées, dont 25 trouvées (100 %)", "aucune", "non"),
+        ("25 lignes renseignées, dont 25 trouvées (100 %)", "oui", "non"),
     ]
     assert lignes[0]["libellé"] == "['client'] connu"
     assert lignes[0]["commentaire"] == "Vu"
@@ -601,7 +661,8 @@ def test_lignes_references():
     lignes = lignes_references(_tables_references(), _dictionnaire_references(), contenu, {})
     assert _reduites(lignes, "table", "colonne", "table_reference", "observé",
                      "proposition") == [
-        ("c", "ville", "f", "30 lignes renseignées, 0 trouvées (0 %)", "aucune"),
+        ("c", "ville", "f", "30 lignes renseignées, dont 0 trouvée (0 %) et 30 introuvables",
+         "aucune"),
         ("f", "zz", "c", None, "aucune"),
         ("f", "client", "zz", None, "aucune"),
     ]
@@ -694,13 +755,13 @@ def test_lignes_renseignement():
         ("inactif 20 sur 20 renseignées; autres valeurs 2 sur 2 renseignées", "aucune",
          None, None),
         # Les statuts hors liste, renseignés, ne comptent pas pour vide_sinon.
-        ("inactif 20 sur 20 renseignées; autres valeurs 2 sur 25 renseignées; selon vide "
-         "sur 1 lignes", "inactif; vide sinon", "inactif", "oui"),
+        ("inactif 20 sur 20 renseignées; autres valeurs 2 sur 25 renseignées; statut vide "
+         "sur 1 ligne (non évaluable)", "inactif; vide sinon", "inactif", "oui"),
         ("A 22 sur 22 renseignées; autres valeurs 12 sur 24 renseignées", "A", "A", "non"),
         ("A 22 sur 22 renseignées; autres valeurs 0 sur 24 renseignées", "A; vide sinon", "A",
          "oui"),
-        ("autres valeurs 44 sur 45 renseignées; selon vide sur 1 lignes", "aucune", None,
-         None),
+        ("autres valeurs 44 sur 45 renseignées; statut vide sur 1 ligne (non évaluable)",
+         "aucune", None, None),
     ]
     assert _reduites(lignes, "ref", "libellé", "issue") == [
         ("renseignement", "note selon statut", "anomalie"),

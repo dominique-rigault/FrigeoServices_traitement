@@ -22,6 +22,7 @@ from frigeo.decisions import (
     SORTE_CELLULE,
     SORTE_ECART,
     SORTE_LIGNE,
+    _mode_emploi,
     ajouter_decisions,
     charger_decisions,
     ecrire_decisions,
@@ -711,3 +712,14 @@ def test_ajouter_decisions():
     assert par_id["g5"] is None
     assert par_id.drop(["f1", "d1"]).isna().all()
     assert list(anomalies.columns) == list(COLONNES_ANOMALIES)
+
+
+def test_mode_emploi_avec_separateur_des_milliers():
+    milliers = chr(160)
+    elements = pd.DataFrame({
+        "sorte": [SORTE_CELLULE] * 1200 + [SORTE_LIGNE] * 3 + [SORTE_ECART],
+        "etat_decision": [ETAT_CADUQUE] * 1001 + [ETAT_SANS_DECISION] * 203,
+    })
+    texte = " ".join(_mode_emploi("2026-03", elements))
+    assert f"Contenu : 1{milliers}204 lignes" in texte
+    assert f"dont 1{milliers}200 cellules, 3 lignes et 1 écarts; 1{milliers}001 lignes" in texte

@@ -160,6 +160,29 @@ def test_classeur_ecrit_et_relu(tmp_path):
     assert "réimporté" in notice
 
 
+def test_nombres_du_classeur_avec_separateur_des_milliers(tmp_path):
+    milliers = chr(160)
+    dictionnaire = _dictionnaire()
+    valeurs = dictionnaire["clients"]["statut"]["valeurs"]
+    valeurs["motif"] = "2 valeurs principales couvrant 99.25 % des 12345 valeurs renseignées"
+    valeurs["liste"][0]["effectif"] = 12345
+    lignes = {(l["colonne"], l["regle"]): l for l in lignes_regles(dictionnaire)}
+    # Le motif du dictionnaire est affiché à la française, sans être modifié.
+    assert lignes[("statut", "valeurs")]["motif"] == (
+        f"2 valeurs principales couvrant 99,25 % des 12{milliers}345 valeurs renseignées"
+    )
+    assert valeurs["motif"].startswith("2 valeurs principales couvrant 99.25 %")
+    classeur = load_workbook(
+        exporter_revue(dictionnaire, "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
+    )
+    entete = [c.value for c in classeur["valeurs"][1]]
+    cellule = classeur["valeurs"].cell(row=2, column=entete.index("effectif") + 1)
+    assert (cellule.value, cellule.number_format) == (12345, "#,##0")
+    regles = classeur[FEUILLE_REGLES]
+    entete = [c.value for c in regles[1]]
+    assert regles.cell(row=2, column=entete.index("nb_à_arbitrer") + 1).number_format == "#,##0"
+
+
 def test_valeurs_conservees_comme_texte(tmp_path):
     chemin = exporter_revue(_dictionnaire(), "2026-03", tmp_path / "revue.xlsx", nb_revues=0)
     lues = [l for l in _lire(load_workbook(chemin)["valeurs"]) if l["colonne"] == "code"]

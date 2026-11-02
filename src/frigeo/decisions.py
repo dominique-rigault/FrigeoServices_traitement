@@ -67,7 +67,7 @@ from .dictionnaire import (
     lire_instant,
 )
 from .doublons import SEPARATEUR, _texte
-from .formulaires import dossier_formulaires
+from .formulaires import dossier_formulaires, texte_entier
 from .nettoyage import _convertir
 from .profilage import _interpretations
 from .revue import _ecrire_texte, _est_vide, _menu
@@ -517,10 +517,11 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
     return [
         "Arbitrage des anomalies par le métier",
         f"Période de fin : {periode_fin}. Classeur généré le {date.today():%d/%m/%Y}.",
-        f"Contenu : {len(elements)} lignes dans la feuille « {FEUILLE_ARBITRAGE} », dont "
-        f"{par_sorte[SORTE_CELLULE]} cellules, {par_sorte[SORTE_LIGNE]} lignes et "
-        f"{par_sorte[SORTE_ECART]} écarts; {caduques} lignes avaient une décision devenue "
-        "caduque (la donnée a changé depuis).",
+        f"Contenu : {texte_entier(len(elements))} lignes dans la feuille "
+        f"« {FEUILLE_ARBITRAGE} », dont {texte_entier(par_sorte[SORTE_CELLULE])} cellules, "
+        f"{texte_entier(par_sorte[SORTE_LIGNE])} lignes et "
+        f"{texte_entier(par_sorte[SORTE_ECART])} écarts; {texte_entier(caduques)} lignes "
+        "avaient une décision devenue caduque (la donnée a changé depuis).",
         REPERE_IMPORTS,
         "",
         "Ce qui est attendu",

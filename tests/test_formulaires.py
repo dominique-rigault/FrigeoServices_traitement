@@ -12,6 +12,9 @@ from frigeo.formulaires import (
     dossier_archives,
     dossier_formulaires,
     ecrire_et_archiver,
+    nombres_a_la_francaise,
+    separer_milliers,
+    texte_entier,
 )
 from frigeo.revue import chemin_revue
 
@@ -91,3 +94,20 @@ def test_ecriture_echouee_classeur_remis_en_place(tmp_path, monkeypatch):
         ecrire_et_archiver(chemin, echouer)
     assert chemin.read_bytes() == b"classeur"
     assert not list((tmp_path / "appliques").iterdir())
+
+
+def test_nombres_avec_separateur_des_milliers():
+    milliers = chr(160)
+    assert texte_entier(999) == "999"
+    assert texte_entier(10191) == f"10{milliers}191"
+    assert texte_entier(-1234567) == f"-1{milliers}234{milliers}567"
+    # La partie décimale n'est pas groupée, un nombre de moins de quatre chiffres non plus.
+    assert separer_milliers("7531 lignes, 0,12345 et 120") == (
+        f"7{milliers}531 lignes, 0,12345 et 120"
+    )
+    assert separer_milliers("-12345,5 à 76999") == f"-12{milliers}345,5 à 76{milliers}999"
+    assert nombres_a_la_francaise("12345 valeurs, 98.50 % des valeurs") == (
+        f"12{milliers}345 valeurs, 98,50 % des valeurs"
+    )
+    # Un texte à plusieurs points n'est pas un nombre décimal.
+    assert nombres_a_la_francaise("version 1.2.3") == "version 1.2.3"
