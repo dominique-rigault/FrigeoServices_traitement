@@ -48,6 +48,23 @@ def _grouper(chiffres: str) -> str:
     return SEPARATEUR_MILLIERS.join(groupes)
 
 
+def exiger_variables(espace: dict, noms: list[str], cellules: str) -> None:
+    """Arrête une cellule de notebook dont les variables viennent de cellules
+    précédentes restées non exécutées (noyau redémarré, cellule lancée seule), avec un
+    message qui dit quoi exécuter d'abord, au lieu d'une NameError.
+
+    `espace` est le dictionnaire des variables du notebook (`globals()`), `cellules` le
+    texte qui nomme les cellules à exécuter (« la cellule des paramètres, puis
+    # CHARGEMENT »).
+    """
+    absentes = [nom for nom in noms if nom not in espace]
+    if absentes:
+        pluriel = "s" if len(absentes) > 1 else ""
+        raise RuntimeError(
+            f"Exécuter d'abord {cellules} ({', '.join(absentes)} non défini{pluriel})."
+        )
+
+
 def rendre_modifiable(cellule) -> None:
     """Déverrouille une cellule d'une feuille protégée et lui donne le fond des
     cellules modifiables."""

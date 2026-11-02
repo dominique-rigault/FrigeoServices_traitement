@@ -12,6 +12,7 @@ from frigeo.formulaires import (
     dossier_archives,
     dossier_formulaires,
     ecrire_et_archiver,
+    exiger_variables,
     nombres_a_la_francaise,
     separer_milliers,
     texte_entier,
@@ -111,3 +112,14 @@ def test_nombres_avec_separateur_des_milliers():
     )
     # Un texte à plusieurs points n'est pas un nombre décimal.
     assert nombres_a_la_francaise("version 1.2.3") == "version 1.2.3"
+
+
+def test_cellule_de_notebook_lancee_sans_les_precedentes():
+    espace = {"PERIODE_FIN": "2026-03", "tables": {}}
+    exiger_variables(espace, ["PERIODE_FIN", "tables"], "# CHARGEMENT")
+    with pytest.raises(RuntimeError, match=r"^Exécuter d'abord la cellule des paramètres, "
+                       r"puis # CHARGEMENT \(dictionnaire non défini\)\.$"):
+        exiger_variables(espace, ["PERIODE_FIN", "dictionnaire"],
+                         "la cellule des paramètres, puis # CHARGEMENT")
+    with pytest.raises(RuntimeError, match=r"\(PERIODE_FIN, tables non définis\)"):
+        exiger_variables({}, ["PERIODE_FIN", "tables"], "la cellule des paramètres")

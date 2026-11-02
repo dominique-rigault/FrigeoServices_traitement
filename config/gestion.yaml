@@ -814,13 +814,6 @@ regles:
       - colonne: JournalCode
         valeurs: [AC]
   - ref: existence
-    libelle: interventions.code_client connue de clients.code_client
-    type: existence_dans_reference
-    table: interventions
-    cle: [code_client]
-    table_reference: clients
-    cle_facultative: true
-  - ref: existence
     libelle: pieces_interventions.libelle connue de catalogue_pieces.libelle
     type: existence_dans_reference
     table: pieces_interventions
@@ -873,6 +866,17 @@ regles:
     lien_entrees: [num_piece_achat]
     date_en_tetes: date_facture
     avance_entrees: 7
+
+# Règles retirées par le métier, gardées en entier pour pouvoir les rétablir
+# (sans effet sur les contrôles).
+retirees:
+  - ref: existence
+    libelle: interventions.code_client connue de clients.code_client
+    type: existence_dans_reference
+    table: interventions
+    cle: [code_client]
+    table_reference: clients
+    cle_facultative: true
 
 # Propositions du formulaire écartées par le métier, qui ne sont plus proposées
 # (sans effet sur les contrôles).

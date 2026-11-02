@@ -90,6 +90,7 @@ doublons:
       - [code_fournisseur, ref_facture_fournisseur]
   achats_lignes:
     cle: [num_piece_achat, num_ligne]
+    identique_hors_cle: false
   intervenants:
     cle: [matricule, date_entree]
     identique_hors_cle: false
