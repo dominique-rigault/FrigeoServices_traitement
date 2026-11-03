@@ -48,6 +48,7 @@ from frigeo.gestion import (
     CONSTAT_SANS_LIGNE,
     CONSTAT_SOMME_DIFFERENTE,
     CONSTAT_SOLDE_NEGATIF,
+    CONSTAT_SOLDE_TOUJOURS_NEGATIF,
     CONSTAT_SOMMES_DIFFERENTES,
     CONSTAT_SUPERIEURE,
     CONSTAT_TOTAL_DIFFERENT,
@@ -3531,22 +3532,29 @@ def _stock_et_mouvements():
 
 def test_solde_cumule_jamais_negatif_porte_par_la_sortie_qui_le_rend_negatif():
     ecarts, bilan = _controler_tables(_stock_et_mouvements(), NATURES_SOLDE, [_solde()])
-    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
-        (3, CONSTAT_SOLDE_NEGATIF,
+    # Les sorties qui suivent, tant que le solde reste négatif, sont en information,
+    # avec le lignage de la sortie qui porte l'écart.
+    assert _lignes(ecarts, "num_ligne_source", "issue", "constat", "valeur") == [
+        (3, "anomalie", CONSTAT_SOLDE_NEGATIF,
          "solde -1 au 11/01/2025 (solde initial 2 au 01/01/2025, entrées 0, sorties 3), "
          "puis 1 sortie en solde négatif avant le retour à un solde positif ou nul"),
+        (4, "information", CONSTAT_SOLDE_TOUJOURS_NEGATIF,
+         "solde -2 au 12/01/2025 (négatif depuis t.csv, ligne 3)"),
         # L'entrée négative (avoir) rend le solde négatif : la sortie suivante porte l'écart.
-        (6, CONSTAT_SOLDE_NEGATIF,
+        (6, "anomalie", CONSTAT_SOLDE_NEGATIF,
          "solde -5 au 05/03/2025 (solde initial 2 au 01/01/2025, entrées -1, sorties 6), "
          "aucune autre sortie jusqu'à la fin des données"),
-        (7, CONSTAT_SOLDE_NEGATIF,
+        (7, "anomalie", CONSTAT_SOLDE_NEGATIF,
          "solde -0,5 au 05/02/2025 (solde initial 0 au 01/01/2025, entrées 0, sorties 0,5), "
          "puis 1 sortie en solde négatif jusqu'à la fin des données"),
+        (11, "information", CONSTAT_SOLDE_TOUJOURS_NEGATIF,
+         "solde -1,5 au 06/02/2025 (négatif depuis t.csv, ligne 7)"),
     ]
     resume = _bilan(bilan)
     assert (resume["lignes"], resume["ecartees_doublons"], resume["hors_champ"],
             resume["non_evaluables"], resume["controlees"], resume["anomalies"],
             resume["avertissements"]) == (10, 0, 0, 0, 10, 3, None)
+    assert resume["informations"] == 2
     assert resume["colonnes"] == "r, d, q, c.r, c.s, l.r, l.q, l.n, e.n, e.f"
     # Colonne sensible dans une table liée : valeur masquée.
     ecarts, _ = _controler_tables(_stock_et_mouvements(), NATURES_SOLDE, [_solde()],

@@ -2325,6 +2325,7 @@ def _totaux_par_periode(donnees, parametres, natures, liee: Liee) -> Constats:
 
 
 CONSTAT_SOLDE_NEGATIF = "solde cumulé devenu négatif après cette sortie"
+CONSTAT_SOLDE_TOUJOURS_NEGATIF = "solde toujours négatif après cette sortie"
 # Raisons d'inutilisabilité d'une ligne de la table du solde initial et d'une entrée.
 RAISONS_INITIAL = ("clé vide", "clé répétée", "solde vide", "solde illisible",
                    "solde négatif", "date vide", "date illisible")
@@ -2351,7 +2352,10 @@ def _solde_jamais_negatif(donnees, parametres, natures, liees) -> Constats:
     ou nul après le mouvement précédent ou depuis le dernier écart (un solde rendu
     négatif par une entrée négative est porté par la sortie suivante). La valeur donne
     le solde, ce qui l'a formé et le nombre de sorties qui suivent avant le retour à
-    un solde positif ou nul.
+    un solde positif ou nul. Chacune de ces sorties suivantes est signalée en
+    information (constat « solde toujours négatif »), avec son solde et le lignage de
+    la sortie qui porte l'écart : elle n'est pas comptée parmi les anomalies, mais une
+    revue ligne à ligne la retrouve.
 
     Hors champ : sortie datée avant la date du solde initial de sa clé (aucun contrôle
     avant cette date, avec un avertissement). Non évaluable : sortie à clé vide ou
@@ -2504,6 +2508,7 @@ def _solde_jamais_negatif(donnees, parametres, natures, liees) -> Constats:
     )
     constats = pd.Series(None, index=donnees.index, dtype=object)
     affichees = pd.Series(None, index=donnees.index, dtype=object)
+    issues = pd.Series(None, index=donnees.index, dtype=object)
     for cle, liste in mouvements.items():
         if cle not in depart or cle in bloquees:
             continue
@@ -2531,11 +2536,17 @@ def _solde_jamais_negatif(donnees, parametres, natures, liees) -> Constats:
                 )
             else:
                 suivantes += 1
+                constats.loc[position] = CONSTAT_SOLDE_TOUJOURS_NEGATIF
+                issues.loc[position] = ISSUE_INFORMATION
+                affichees.loc[position] = (
+                    f"solde {_ecrire_nombre(solde)} au {_jour(date)} (négatif depuis "
+                    f"{_reperer_ligne(donnees, ecart)})"
+                )
         if ecart is not None:
             affichees.loc[ecart] += _suite_negative(suivantes, fin=True)
     return Constats(
         evaluables,
-        _ecarts(constats, valeurs=affichees),
+        _ecarts(constats, valeurs=affichees, issues=issues),
         tuple(avertissements),
         hors_champ=hors_champ,
     )
@@ -3298,8 +3309,9 @@ TYPES = {
             "ou date_en_tetes de l'en-tête de table_en_tetes que désigne lien_entrees "
             "(cle_en_tetes, par défaut les colonnes de lien_entrees); elle est avancée de "
             "avance_entrees jours (0 par défaut). L'écart est porté par la sortie après "
-            "laquelle le solde devient négatif. Rien n'est contrôlé avant la date du solde "
-            "initial."
+            "laquelle le solde devient négatif; les sorties suivantes, tant que le solde "
+            "reste négatif, sont signalées en information. Rien n'est contrôlé avant la "
+            "date du solde initial."
         ),
         parametres={
             "cle": GENRE_COLONNES,
