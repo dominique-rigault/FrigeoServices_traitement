@@ -38,6 +38,18 @@ Le mode opératoire d'un cycle de traitement (qui fait quoi et dans quel ordre, 
 - **Données et secrets hors dépôt.** Les fichiers de données et les identifiants ne sont jamais versionnés (`.gitignore`, variables d'environnement).
 - **Configuration propre au client séparée du code générique.** src/ ne contient aucun nom de fichier ni de colonne d'un client, et config/ porte tout ce qui change d'un client à l'autre.
 
+## Lire les résultats
+
+Les fichiers écrits dans `data/anomalies/` se lisent avec les conventions suivantes.
+
+- **Registre de référence.** C'est la table des anomalies après nettoyage (`anomalies_nettoyees_AAAA-MM.csv`), à présenter au métier : les défauts corrigés sans ambiguïté et leurs conséquences sur les autres lignes en ont disparu. La table des données brutes (`anomalies_AAAA-MM.csv`) sert à mesurer ce que le nettoyage résout.
+- **Issues.** Seules les lignes « anomalie » sont comptées. Une ligne « à arbitrer » attend la décision du métier (classeur d'arbitrage). Une ligne « information » n'est pas une anomalie : pratique normale décrite par le client (annulation sur place facturée, délai non échu), ou suite d'un écart déjà signalé.
+- **Un écart, une ligne.** Un rapprochement entre deux tables est porté par la ligne de la table de la règle, pas forcément par celle qui porte l'erreur. Un stock qui devient négatif est porté par la sortie qui le fait passer sous zéro, les sorties suivantes restant en information tant qu'il est négatif. Un chevauchement d'interventions est porté par celle qui commence le plus tard, comparée à l'intervention précédente qui finit le plus tard.
+- **Cascades.** Un défaut sur une ligne peut produire des écarts sur les lignes qui s'y rattachent : une durée aberrante fait chevaucher les interventions suivantes du même intervenant, une date de création de client fausse fait échouer le contrôle de toutes ses interventions, une catégorie mal écrite celui des lignes de sa facture. La valeur affichée et la colonne `champ` disent quelle autre table ou quelle autre ligne est en cause.
+- **Lignes non évaluables.** Une ligne qu'une règle de gestion ne peut pas juger (valeur vide ou illisible, ligne liée absente ou inutilisable) n'est pas dans la table des anomalies. Elle figure, avec son lignage et sans aucune valeur, dans `non_evaluables_AAAA-MM.csv` (et `non_evaluables_nettoyees_AAAA-MM.csv` après nettoyage), qui distingue « contrôlé sans écart » de « non contrôlable ». La cause n'y est pas encore donnée ligne par ligne. Une date facultative vide (date de lettrage d'une écriture non lettrée, par exemple) laisse la ligne hors champ, pas non évaluable.
+- **Doublons.** Toutes les lignes d'un groupe sont listées, la première occurrence comprise, à la suite. Pour un doublon exact, la ligne en surnombre est celle que le nettoyage retire.
+- **Masquage.** La valeur d'une colonne sensible, et la clé d'une ligne dont une colonne de clé est sensible, s'écrivent « masqué ».
+
 ## Limites et adaptation à un autre client
 
 Les notebooks 01 à 07 ne contiennent aucun nom de table, de colonne ni de valeur propre à Frigéo Services. Hors de ces notebooks, tout ce qui est propre au client tient dans les cinq fichiers de `config/` (`sources.yaml`, `sensibilite.yaml`, `controles.yaml`, `gestion.yaml`, `anomalies.yaml`), dans le dictionnaire revu par le métier et dans ses décisions ligne par ligne (`data/config/decisions.yaml`). Le code porte cependant l'empreinte des données rencontrées sur quelques points :
@@ -98,7 +110,7 @@ data/
   referentiels/     intervenants, clients, fournisseurs, catalogue, paramètres
   config/           dictionnaire généré (contient des valeurs observées) et décisions du métier
   formulaires/      classeurs remplis par le métier (revue du dictionnaire, règles de contrôle, règles de gestion, arbitrage des anomalies), et appliques/ pour les classeurs appliqués
-  anomalies/        table des anomalies et bilan par contrôle en CSV (étape 5, et après nettoyage à l'étape 6)
+  anomalies/        table des anomalies, bilan par contrôle et lignes non évaluables en CSV (étape 5, et après nettoyage à l'étape 6)
   nettoyage/        journal et bilan du nettoyage en CSV (étape 6)
 ```
 

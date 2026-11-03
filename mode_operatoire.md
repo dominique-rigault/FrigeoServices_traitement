@@ -124,7 +124,7 @@ Repères pour la phase 5 :
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
-| 6.1 | Mettre `PERIODE_FIN` à jour, exécuter `# CHARGEMENT` puis `# EXPORT FORMULAIRE`, qui écrit `data/formulaires/gestion_AAAA-MM.xlsx` : les règles en vigueur dans `config/gestion.yaml` (statut documenté) et les propositions tirées des données (statut observé) pour trois familles de règles qui tiennent sur une ligne (valeur connue d'une colonne de référence, colonne renseignée selon la valeur d'une autre, date dans la période de son export), les jours fériés légaux de la France pour chaque année des données, les autres règles écrites en clair et les règles demandées | C | notebook 05 | opérationnel |
+| 6.1 | Mettre `PERIODE_FIN` à jour, exécuter `# CHARGEMENT` puis `# EXPORT FORMULAIRE`, qui écrit `data/formulaires/gestion_AAAA-MM.xlsx` : les règles en vigueur dans `config/gestion.yaml` (statut documenté) et les propositions tirées des données (statut observé) pour trois familles de règles qui tiennent sur une ligne (valeur connue d'une colonne de référence, colonne renseignée selon la valeur d'une autre, date dans la période de son export, avec `vide_hors_champ` pour une date facultative dont l'absence est normale), les jours fériés légaux de la France pour chaque année des données, les autres règles écrites en clair et les règles demandées | C | notebook 05 | opérationnel |
 | 6.2 | Revoir le formulaire avec le métier (mode d'emploi dans la première feuille) : un statut par ligne (valide adopte la proposition, documenté prend les valeurs saisies, invalide retire la règle ou écarte la proposition), un commentaire si besoin; une règle utile mais trop rare pour être proposée, ou une clé de plusieurs colonnes, s'ajoute en bas de sa feuille; un jour propre à l'entreprise (pont, fermeture) s'ajoute en bas de la feuille `jours_fériés`; pour les autres règles, changer le libellé ou l'issue (une pratique normale en information) ou retirer la règle; les règles voulues en plus se décrivent en clair dans la feuille `nouvelles_règles` (tables, tolérance ou délai, issue); une revue partielle suffit pour avancer | M avec C | Excel | opérationnel |
 | 6.3 | Enregistrer et fermer le formulaire, exécuter `# IMPORT FORMULAIRE` (rapport des changements et avertissements; un formulaire mal rempli arrête la cellule avec la liste des lignes à corriger), puis `# ECRITURE FORMULAIRE`, qui copie l'ancien fichier dans `data/config/sauvegardes/`, archive le formulaire dans `data/formulaires/appliques/` et réécrit `config/gestion.yaml` | C | notebook 05 | opérationnel |
 | 6.4 | Commiter `config/gestion.yaml` | C | Git | opérationnel |
@@ -154,7 +154,7 @@ Le code d'un type nouveau va dans `src/`, jamais dans le notebook ni dans une fo
 | 7.3 | Exécuter le notebook en entier (il relance les contrôles des notebooks 04 et 05, environ 45 secondes) et vérifier : 0 ligne dont la valeur ou la clé sensible n'est pas masquée, nombres d'indicateurs, de colonnes déclarées et d'exceptions lus (emplacement attendu), avertissements, contrôles non qualifiés, colonnes non déclarées | C | notebook 06 | opérationnel |
 | 7.4 | Déclarer les colonnes non déclarées et qualifier les contrôles non qualifiés dans `config/anomalies.yaml`, puis relancer la cellule `# GRAVITE ET INDICATEURS` et les suivantes | A, puis C | liste de la cellule `# GRAVITE ET INDICATEURS` | opérationnel |
 | 7.5 | Lire le bilan avec le métier (anomalies par étape et par gravité, contrôles aux plus forts taux) et nuancer par des exceptions une gravité par défaut trop grossière | M avec C | bilan, `config/anomalies.yaml` | opérationnel |
-| 7.6 | Écrire la table et le bilan en CSV dans `data/anomalies/` (cellule `# ECRITURE`); un CSV ouvert dans Excel bloque l'écriture sans rien modifier : le fermer et relancer la cellule | C | notebook 06 | opérationnel |
+| 7.6 | Écrire la table, le bilan et les lignes non évaluables des règles de gestion en CSV dans `data/anomalies/` (cellule `# ECRITURE`); un CSV ouvert dans Excel bloque l'écriture sans rien modifier : le fermer et relancer la cellule | C | notebook 06 | opérationnel |
 | 7.7 | Ouvrir les CSV dans Excel par Données, À partir d'un fichier texte/CSV, détection du type de données réglée sur « Ne pas détecter les types de données » | C, M | Excel | opérationnel |
 
 Repères pour la phase 7 :
@@ -163,7 +163,7 @@ Repères pour la phase 7 :
 - les indicateurs affectés sont une déclaration du consultant, validée par le métier, et non un calcul; la gravité par défaut est « majeure » dès qu'une colonne alimente un indicateur, « mineure » sinon, et « bloquante » seulement par exception;
 - les CSV portent des valeurs du client (valeurs constatées, clés) : ils restent hors dépôt et ne se collent pas dans la conversation; seuls les décomptes du bilan se transmettent;
 - ouvert par double-clic, Excel retire les zéros en tête, écrit un SIRET en notation scientifique, lit `2026-03` comme une date et une valeur commençant par `=` comme une formule, d'où l'étape 7.7;
-- l'écriture refuse une table où une valeur sensible serait visible, ou qui n'est pas passée par `qualifier`; les deux fichiers sont réécrits à chaque exécution, sans copie de sauvegarde.
+- l'écriture refuse une table où une valeur sensible serait visible, ou qui n'est pas passée par `qualifier`; les trois fichiers sont réécrits à chaque exécution, sans copie de sauvegarde.
 
 ### Phase 8, nettoyage et décisions du métier (notebook 07)
 
@@ -175,7 +175,7 @@ Repères pour la phase 7 :
 | 8.4 | Trancher les lignes du classeur dans la colonne `decision` (corriger avec la valeur retenue, garder ou retirer, selon la sorte), mode d'emploi dans la première feuille; une ligne sans décision sera proposée de nouveau | M avec C | Excel | opérationnel |
 | 8.5 | Enregistrer et fermer le classeur, puis `# IMPORT ARBITRAGE` (tous les problèmes listés en une fois, décisions enregistrées dans `data/config/decisions.yaml` avec une copie datée, classeur archivé dans `data/formulaires/appliques/`) | C | notebook 07 | opérationnel |
 | 8.6 | Relancer le notebook en entier : `# NETTOYAGE` applique les décisions, et le classeur suivant ne propose que les éléments restants | C | notebook 07 | opérationnel |
-| 8.7 | Écrire le journal et le bilan du nettoyage dans `data/nettoyage/`, et la table des anomalies après nettoyage avec la décision du métier, et son bilan, dans `data/anomalies/` (cellule `# ECRITURE`); un CSV ouvert dans Excel bloque l'écriture sans rien modifier | C | notebook 07 | opérationnel |
+| 8.7 | Écrire le journal et le bilan du nettoyage dans `data/nettoyage/`, et la table des anomalies après nettoyage avec la décision du métier, son bilan et les lignes non évaluables, dans `data/anomalies/` (cellule `# ECRITURE`); un CSV ouvert dans Excel bloque l'écriture sans rien modifier | C | notebook 07 | opérationnel |
 
 Repères pour la phase 8 :
 
@@ -185,6 +185,7 @@ Repères pour la phase 8 :
 - le classeur porte des valeurs du client, colonnes sensibles comprises : il reste dans `data/formulaires/` et ne se colle pas dans la conversation; le journal du nettoyage masque les colonnes sensibles;
 - une année écrite sur deux chiffres est complétée en 20AA si la date ne dépasse pas la date de coupure; ces conversions sont visibles au journal (« siècle 20 ajouté ») et sont à faire vérifier par le métier quand une règle de gestion les signale;
 - le jeu nettoyé n'est pas écrit : il se recalcule à chaque exécution à partir des fichiers bruts, des règles et des décisions.
+- la table à présenter au métier est celle après nettoyage (`anomalies_nettoyees_AAAA-MM.csv`), lue avec les conventions de la section « Lire les résultats » du README; le fichier des lignes non évaluables (`non_evaluables_nettoyees_AAAA-MM.csv`) dit ce qui n'a pas pu être contrôlé, et le tableau « avant, après » de la cellule `# COMPARAISON` ce que le nettoyage a rendu contrôlable.
 
 ## Cycle mensuel (un mois de plus)
 
@@ -197,7 +198,7 @@ Repères pour la phase 8 :
 | M.5 | Régénérer le dictionnaire : cellules jusqu'à `# ECRITURE APRES FUSION`, lire le rapport de `# FUSION` (événements « à regarder ») | C | notebook 03 | opérationnel |
 | M.6 | Revue si de nouvelles valeurs ou formes sont à arbitrer (phase 4, étapes 4.3 à 4.5) | M avec C | Excel, notebook 03 | opérationnel |
 | M.7 | Exécuter les notebooks 04 puis 05 en entier; si `# EXPORT FORMULAIRE` signale des lignes à « observé » nouvelles (une colonne, un groupe ou une proposition de plus), faire revoir le formulaire du mois (phase 5, actions 5.2 à 5.4, ou phase 6, actions 6.2 à 6.4) | C, M | notebooks 04, 05, Excel | opérationnel |
-| M.8 | Exécuter le notebook 06 en entier : il relance les contrôles et réécrit les deux CSV de la période dans `data/anomalies/` | C | notebook 06 | opérationnel |
+| M.8 | Exécuter le notebook 06 en entier : il relance les contrôles et réécrit les trois CSV de la période dans `data/anomalies/` (table des anomalies, bilan, lignes non évaluables) | C | notebook 06 | opérationnel |
 | M.9 | Revoir `config/anomalies.yaml` quand une colonne ou un indicateur change (le notebook 06 liste les colonnes non déclarées et les contrôles non qualifiés) | A, puis C | `config/anomalies.yaml` | opérationnel |
 | M.10 | Exécuter le notebook 07 en entier, puis l'arbitrage si des éléments sont à trancher (phase 8, étapes 8.3 à 8.7) | C, M | notebook 07, Excel | opérationnel |
 
