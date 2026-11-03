@@ -52,6 +52,7 @@ regles:
     type: date_dans_periode_export
     table: fec
     colonne: DateLet
+    vide_hors_champ: true
   - ref: decoupage
     libelle: ValidDate dans la période de l'export
     type: date_dans_periode_export
