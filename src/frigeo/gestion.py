@@ -281,6 +281,14 @@ COLONNES_BILAN_GESTION = (
     "informations",
     "avertissements",
 )
+COLONNES_NON_EVALUABLES_GESTION = (
+    "table",
+    *COLONNES_LIGNAGE_ECART,
+    "ref",
+    "type",
+    "libelle",
+    "cle",
+)
 COLONNES_CATALOGUE = ("type", "description", "parametres", "vue", "issue")
 
 
@@ -4273,7 +4281,9 @@ def controler_gestion(
     doublons: pd.DataFrame | None = None,
     sensibles: dict[str, frozenset[str]] | None = None,
     date_coupure: dt.date | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    *,
+    avec_non_evaluables: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame] | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Applique les règles de gestion et rend les écarts et le bilan.
 
     `dictionnaire` est le dictionnaire enregistré : la nature en vigueur de chaque
@@ -4316,7 +4326,16 @@ def controler_gestion(
     quatre nombres font le total), d'anomalies, d'écarts à arbitrer et
     d'informations, et les avertissements de la règle (par exemple une année des
     données sans jours fériés déclarés), séparés par « ; », None s'il n'y en a pas.
-    Les arguments ne sont pas modifiés.
+
+    Avec `avec_non_evaluables=True`, la fonction rend en plus la table des lignes
+    non évaluables (`COLONNES_NON_EVALUABLES_GESTION`) : une ligne par règle et par
+    ligne source que le type n'a pas pu juger (valeur vide ou illisible, ligne liée
+    absente ou inutilisable...), avec le lignage, la référence, le type, le libellé
+    de la règle et la clé de la ligne (« masqué » si une colonne de la clé est
+    sensible), sans aucune valeur. Ce sont exactement les lignes comptées dans
+    `non_evaluables` au bilan : ni les doublons en surnombre, ni les lignes hors
+    champ n'y figurent. Elles suivent l'ordre des règles, puis celui des lignes
+    sources. Les arguments ne sont pas modifiés.
     """
     if sensibles is None:
         sensibles = charger_sensibilite()
@@ -4344,7 +4363,7 @@ def controler_gestion(
     if doublons is None and any(TYPES[r["type"]].vue == VUE_SANS_SURNOMBRE for r in regles):
         doublons, _ = detecter_doublons(tables, declarations, sensibles)
 
-    bilan, morceaux = [], []
+    bilan, morceaux, morceaux_non_evaluables = [], [], []
     for rang, instance in enumerate(regles):
         table = instance["table"]
         type_regle = TYPES[instance["type"]]
@@ -4420,6 +4439,7 @@ def controler_gestion(
         hors_type = constats.hors_champ
         if hors_type is None:
             hors_type = pd.Series(False, index=constats.evaluables.index, dtype=bool)
+        non_evaluables = ~constats.evaluables & ~hors_type
         commun = {
             "ref": instance["ref"],
             "type": instance["type"],
@@ -4435,7 +4455,7 @@ def controler_gestion(
                 "lignes": len(donnees),
                 "ecartees_doublons": len(ecartees),
                 "hors_champ": hors_champ + int(hors_type.sum()),
-                "non_evaluables": int((~constats.evaluables & ~hors_type).sum()),
+                "non_evaluables": int(non_evaluables.sum()),
                 "controlees": int(constats.evaluables.sum()),
                 "anomalies": int((toutes_issues == ISSUE_ANOMALIE).sum()),
                 "a_arbitrer": int((toutes_issues == ISSUE_A_ARBITRER).sum()),
@@ -4470,20 +4490,35 @@ def controler_gestion(
             morceau_periodes["_regle"] = rang
             morceau_periodes["_sans_ligne"] = 1
             morceaux.append(morceau_periodes)
+        cle = declarations.get(table, {}).get("cle", [])
+        if avec_non_evaluables and non_evaluables.any():
+            positions_non_evaluables = non_evaluables.index[non_evaluables.to_numpy()]
+            morceau_non_evaluables = pd.DataFrame(
+                {
+                    "_position": positions_non_evaluables,
+                    **commun,
+                    "cle": pd.Series(
+                        _cles_des_lignes(
+                            donnees, positions_non_evaluables, cle, sensibles, table,
+                            regles_colonnes,
+                        ),
+                        dtype=object,
+                    ).to_numpy(),
+                }
+            )
+            for lignage in COLONNES_LIGNAGE_ECART:
+                morceau_non_evaluables[lignage] = (
+                    donnees[lignage].loc[positions_non_evaluables].to_numpy()
+                    if lignage in donnees.columns
+                    else None
+                )
+            morceau_non_evaluables["_regle"] = rang
+            morceaux_non_evaluables.append(morceau_non_evaluables)
         if ecarts.empty:
             continue
 
         positions = ecarts.index
-        cle = declarations.get(table, {}).get("cle", [])
-        if not cle:
-            cles = [None] * len(positions)
-        elif _sensible(sensibles, table, regles_colonnes, cle):
-            cles = [VALEUR_MASQUEE] * len(positions)
-        else:
-            cles = [
-                SEPARATEUR.join(_texte(v) for v in ligne)
-                for ligne in donnees.loc[positions, cle].itertuples(index=False)
-            ]
+        cles = _cles_des_lignes(donnees, positions, cle, sensibles, table, regles_colonnes)
         if sensible:
             valeurs = [VALEUR_MASQUEE] * len(positions)
             propositions = [
@@ -4534,4 +4569,31 @@ def controler_gestion(
         ecarts = ecarts[list(COLONNES_ECARTS_GESTION)].reset_index(drop=True)
     else:
         ecarts = pd.DataFrame(columns=list(COLONNES_ECARTS_GESTION))
-    return ecarts, pd.DataFrame(bilan, columns=list(COLONNES_BILAN_GESTION))
+    bilan = pd.DataFrame(bilan, columns=list(COLONNES_BILAN_GESTION))
+    if not avec_non_evaluables:
+        return ecarts, bilan
+    if morceaux_non_evaluables:
+        non_evaluables = pd.concat(morceaux_non_evaluables, ignore_index=True).sort_values(
+            ["_regle", *COLONNES_LIGNAGE_ECART, "_position"],
+            kind="stable",
+            na_position="first",
+        )
+        non_evaluables = non_evaluables[list(COLONNES_NON_EVALUABLES_GESTION)].reset_index(
+            drop=True
+        )
+    else:
+        non_evaluables = pd.DataFrame(columns=list(COLONNES_NON_EVALUABLES_GESTION))
+    return ecarts, bilan, non_evaluables
+
+
+def _cles_des_lignes(donnees, positions, cle, sensibles, table, regles_colonnes) -> list:
+    """Clé déclarée de chaque ligne : vide sans clé déclarée, « masqué » si une de ses
+    colonnes est sensible, sinon les textes de ses colonnes reliés par « | »."""
+    if not cle:
+        return [None] * len(positions)
+    if _sensible(sensibles, table, regles_colonnes, cle):
+        return [VALEUR_MASQUEE] * len(positions)
+    return [
+        SEPARATEUR.join(_texte(v) for v in ligne)
+        for ligne in donnees.loc[positions, cle].itertuples(index=False)
+    ]

@@ -12,6 +12,7 @@ from frigeo.gestion import (
     COLONNES_BILAN_GESTION,
     COLONNES_CATALOGUE,
     COLONNES_ECARTS_GESTION,
+    COLONNES_NON_EVALUABLES_GESTION,
     CONSTAT_ABSENTE,
     CONSTAT_ANNEE_ABSENTE,
     CONSTAT_AUCUNE_LIGNE_CONFORME,
@@ -3917,3 +3918,112 @@ def test_table_qui_se_prend_pour_reference():
     ecarts, _ = _controler(_factures_et_avoirs(), NATURES_FACTURES, regles=regles[:1],
                            sensibles={"t": frozenset({"o"})})
     assert _lignes(ecarts, "valeur") == [(VALEUR_MASQUEE,)]
+
+
+# Lignes non évaluables rendues à part (correction de l'évaluation, morceau C2a).
+
+
+def test_non_evaluables_rendues_sur_demande_comme_au_bilan():
+    donnees, reference = _personnes_et_periodes()
+    donnees["n"] = [f"N{rang}" for rang in range(len(donnees))]
+    natures, natures_reference = NATURES_PERIODES
+    natures = {**natures, "n": "texte"}
+    tables = {"t": donnees, "r": reference}
+    dictionnaire = {**_dictionnaire("t", **natures), **_dictionnaire("r", **natures_reference)}
+    regles = [
+        _periodes(fin="s"),
+        {**_periodes(fin="s"), "ref": "R10b", "filtre": [{"colonne": "i", "valeurs": ["A"]}]},
+        {**_periodes(fin="s"), "ref": "R10c", "cle_facultative": True},
+    ]
+    declarations = {"t": {"cle": ["n"]}}
+    sans = controler_gestion(tables, dictionnaire, regles, declarations, None, AUCUNE_SENSIBLE)
+    assert len(sans) == 2
+    ecarts, bilan, non_evaluables = controler_gestion(
+        tables, dictionnaire, regles, declarations, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    # Les écarts et le bilan ne changent pas.
+    pd.testing.assert_frame_equal(ecarts, sans[0])
+    pd.testing.assert_frame_equal(bilan, sans[1])
+    assert list(non_evaluables.columns) == list(COLONNES_NON_EVALUABLES_GESTION)
+    # Ligne 7 : hors de la période utilisable de B, dont l'autre période est illisible;
+    # ligne 8 : C n'a qu'une période inutilisable; ligne 13 : fin illisible de F; puis
+    # date vide, clé vide, date illisible. La ligne 6 tombe dans la période utilisable
+    # de B et reste évaluable. Avec le filtre sur A, restent la date vide et la date
+    # illisible. Avec une clé facultative, la clé vide est hors champ.
+    assert _lignes(non_evaluables, "ref", "num_ligne_source", "cle") == [
+        ("R10", 7, "N5"), ("R10", 8, "N6"), ("R10", 10, "N8"), ("R10", 11, "N9"),
+        ("R10", 12, "N10"), ("R10", 13, "N11"),
+        ("R10b", 10, "N8"), ("R10b", 12, "N10"),
+        ("R10c", 7, "N5"), ("R10c", 8, "N6"), ("R10c", 10, "N8"), ("R10c", 12, "N10"),
+        ("R10c", 13, "N11"),
+    ]
+    assert bilan["hors_champ"].tolist() == [0, 6, 1]
+    assert non_evaluables.groupby("ref", sort=False).size().tolist() == (
+        bilan["non_evaluables"].tolist()
+    )
+    assert set(zip(non_evaluables["table"], non_evaluables["fichier_source"],
+                   non_evaluables["type"])) == {("t", "t.csv", "date_dans_periode_reference")}
+    assert set(non_evaluables["feuille_source"].isna()) == {True}
+    assert non_evaluables["libelle"].tolist() == [regles[0]["libelle"]] * 13
+    # Clé d'une colonne sensible : masquée; sans clé déclarée : vide.
+    _, _, masquees = controler_gestion(
+        tables, dictionnaire, regles, declarations, None, {"t": frozenset({"n"})},
+        avec_non_evaluables=True,
+    )
+    assert set(masquees["cle"]) == {VALEUR_MASQUEE}
+    _, _, sans_cle = controler_gestion(
+        tables, dictionnaire, regles, {}, None, AUCUNE_SENSIBLE, avec_non_evaluables=True
+    )
+    assert set(sans_cle["cle"].isna()) == {True}
+    assert len(sans_cle) == 13
+
+
+def test_non_evaluables_sans_les_doublons_en_surnombre_ni_les_lignes_hors_champ():
+    donnees = _table(
+        g=["A", "A", "A", "B", "A"],
+        d=["14/03/2025"] * 5,
+        h=["08:00", "25:00", "25:00", "09:00", "11:00"],
+        m=["60", "30", "30", "30", ""],
+    )
+    regle = _intervalles(filtre=[{"colonne": "g", "valeurs": ["A"]}])
+    dictionnaire = _dictionnaire(**NATURES_INTERVALLES)
+    _, bilan, non_evaluables = controler_gestion(
+        {"t": donnees}, dictionnaire, [regle], {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    # Ligne 4 : copie exacte de la ligne 3, écartée; ligne 5 : hors du filtre.
+    resume = _bilan(bilan)
+    assert (resume["ecartees_doublons"], resume["hors_champ"], resume["non_evaluables"]) == (
+        1, 1, 2,
+    )
+    assert _lignes(non_evaluables, "num_ligne_source") == [(3,), (6,)]
+    # Aucune ligne non évaluable : table vide, avec ses colonnes.
+    _, bilan, vide = controler_gestion(
+        {"t": donnees.iloc[[0, 3]]}, dictionnaire, [regle], {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    assert _bilan(bilan)["non_evaluables"] == 0
+    assert vide.empty and list(vide.columns) == list(COLONNES_NON_EVALUABLES_GESTION)
+
+
+def test_non_evaluables_dans_l_ordre_des_regles_puis_des_lignes():
+    donnees = pd.concat(
+        [
+            _table("t_2026-01.csv", "2026-01", km=["", "5,0"]),
+            _table("t_2025.csv", "2025", km=["x", "abc"]),
+        ],
+        ignore_index=True,
+    )
+    regles = [
+        _instance(colonne="km", min=2, ref="R30"), _instance(colonne="km", max=100, ref="R29")
+    ]
+    _, bilan, non_evaluables = controler_gestion(
+        {"t": donnees}, _dictionnaire(km=DECIMAL), regles, {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    assert _lignes(non_evaluables, "ref", "fichier_source", "num_ligne_source") == [
+        ("R30", "t_2025.csv", 2), ("R30", "t_2025.csv", 3), ("R30", "t_2026-01.csv", 2),
+        ("R29", "t_2025.csv", 2), ("R29", "t_2025.csv", 3), ("R29", "t_2026-01.csv", 2),
+    ]
+    assert bilan["non_evaluables"].tolist() == [3, 3]

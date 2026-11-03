@@ -65,7 +65,12 @@ from .doublons import (
     _texte,
     charger_declarations_doublons,
 )
-from .gestion import COLONNES_BILAN_GESTION, COLONNES_ECARTS_GESTION, ISSUE_INFORMATION
+from .gestion import (
+    COLONNES_BILAN_GESTION,
+    COLONNES_ECARTS_GESTION,
+    COLONNES_NON_EVALUABLES_GESTION,
+    ISSUE_INFORMATION,
+)
 
 # Famille du contrôle, dans l'ordre de la table et du bilan.
 ETAPE_FORMAT = "format"
@@ -120,6 +125,17 @@ COLONNES_BILAN_ANOMALIES = (
     "lignes_distinctes",
     "gravite",
     "indicateurs",
+)
+# Lignes que les règles de gestion n'ont pas pu juger, écrites à part de la table
+# des anomalies (voir `lignes_non_evaluables`).
+COLONNES_NON_EVALUABLES = (
+    "etape",
+    "controle",
+    "ref",
+    "table",
+    *COLONNES_LIGNAGE_ECART,
+    COLONNE_PERIODE,
+    "cle",
 )
 
 
@@ -567,6 +583,62 @@ def _colonnes_du_champ(table: str, champ) -> list[tuple[str, str]]:
         else:
             colonnes.append((table, morceau))
     return colonnes
+
+
+def lignes_non_evaluables(
+    tables: dict[str, pd.DataFrame], non_evaluables: pd.DataFrame
+) -> pd.DataFrame:
+    """Lignes non évaluables des règles de gestion, sous la forme où elles sont écrites.
+
+    `non_evaluables` vient de `gestion.controler_gestion(..., avec_non_evaluables=True)`.
+    Table rendue (`COLONNES_NON_EVALUABLES`) : une ligne par règle et par ligne source,
+    avec l'étape (gestion), le contrôle nommé comme dans la table des anomalies
+    (« référence libellé »), la référence, la table, le lignage, la période d'export
+    de la ligne source (retrouvée par le lignage, vide si la ligne est introuvable) et
+    la clé telle que `controler_gestion` l'a rendue (déjà masquée si une colonne de
+    la clé est sensible). Aucune valeur des données. L'ordre est conservé.
+
+    Refuse (`ValueError`) une table dont les colonnes ne sont pas celles de
+    `COLONNES_NON_EVALUABLES_GESTION`. Les arguments ne sont pas modifiés.
+    """
+    problemes = _verifier_colonnes(
+        "table des lignes non évaluables", non_evaluables, COLONNES_NON_EVALUABLES_GESTION
+    )
+    if problemes:
+        raise ValueError("Table inattendue\n  " + "\n  ".join(problemes))
+    index = {}
+    for table in set(non_evaluables["table"]):
+        if table in tables:
+            donnees = tables[table].reset_index(drop=True)
+            index[table] = (_index_lignage(donnees), donnees)
+
+    lignes = []
+    for ligne in non_evaluables.itertuples(index=False):
+        reperes, donnees = index.get(ligne.table, ({}, None))
+        position = reperes.get(
+            _repere(ligne.fichier_source, ligne.feuille_source, ligne.num_ligne_source)
+        )
+        periode = None
+        if position is not None and COLONNE_PERIODE in donnees.columns:
+            periode = _texte(donnees.at[position, COLONNE_PERIODE]) or None
+        lignes.append(
+            {
+                "etape": ETAPE_GESTION,
+                "controle": _controle_gestion(ligne.ref, ligne.libelle),
+                "ref": ligne.ref,
+                "table": ligne.table,
+                "fichier_source": ligne.fichier_source,
+                "feuille_source": ligne.feuille_source,
+                "num_ligne_source": ligne.num_ligne_source,
+                COLONNE_PERIODE: periode,
+                "cle": ligne.cle,
+            }
+        )
+    sortie = pd.DataFrame(lignes, columns=list(COLONNES_NON_EVALUABLES))
+    sortie["num_ligne_source"] = pd.array(
+        [_numero(n) for n in sortie["num_ligne_source"]], dtype="Int64"
+    )
+    return sortie
 
 
 def anomalies_non_masquees(
@@ -1072,6 +1144,8 @@ PREFIXE_FICHIER_ANOMALIES = "anomalies_"
 PREFIXE_FICHIER_BILAN = "bilan_"
 PREFIXE_FICHIER_ANOMALIES_NETTOYEES = "anomalies_nettoyees_"
 PREFIXE_FICHIER_BILAN_NETTOYEES = "bilan_nettoyees_"
+PREFIXE_FICHIER_NON_EVALUABLES = "non_evaluables_"
+PREFIXE_FICHIER_NON_EVALUABLES_NETTOYEES = "non_evaluables_nettoyees_"
 SUFFIXE_PROVISOIRE = ".tmp"
 _MOTIF_PERIODE_FIN = re.compile(r"\d{4}-(0[1-9]|1[0-2])")
 _COLONNES_ENTIERES_BILAN = (
@@ -1102,6 +1176,66 @@ def chemins_anomalies(
     else:
         prefixes = (PREFIXE_FICHIER_ANOMALIES, PREFIXE_FICHIER_BILAN)
     return tuple(dossier / f"{prefixe}{periode_fin}.csv" for prefixe in prefixes)
+
+
+def chemin_non_evaluables(
+    periode_fin: str, dossier: str | Path | None = None, nettoyees: bool = False
+) -> Path:
+    """Chemin de la table des lignes non évaluables d'une période (AAAA-MM).
+
+    `non_evaluables_AAAA-MM.csv`, ou avec `nettoyees=True`
+    `non_evaluables_nettoyees_AAAA-MM.csv`, à côté de la table des anomalies.
+    """
+    dossier = dossier_anomalies() if dossier is None else Path(dossier)
+    prefixe = (
+        PREFIXE_FICHIER_NON_EVALUABLES_NETTOYEES if nettoyees else PREFIXE_FICHIER_NON_EVALUABLES
+    )
+    return dossier / f"{prefixe}{periode_fin}.csv"
+
+
+def _problemes_non_evaluables(non_evaluables, bilan, sensibles, declarations) -> list[str]:
+    """Tous les problèmes qui empêchent d'écrire la table des lignes non évaluables."""
+    if list(non_evaluables.columns) != list(COLONNES_NON_EVALUABLES):
+        return [
+            "table des lignes non évaluables : colonnes attendues, dans cet ordre, "
+            + ", ".join(COLONNES_NON_EVALUABLES)
+            + " (voir lignes_non_evaluables)"
+        ]
+    if sensibles is None:
+        sensibles = charger_sensibilite()
+    if declarations is None:
+        declarations = charger_declarations_doublons()
+    problemes = []
+    au_bilan = set(zip(bilan["etape"], bilan["controle"]))
+    absents = sorted(
+        {
+            f"{etape} : {controle}"
+            for etape, controle in zip(non_evaluables["etape"], non_evaluables["controle"])
+            if (etape, controle) not in au_bilan
+        }
+    )
+    if absents:
+        problemes.append(
+            "contrôles de la table des lignes non évaluables absents du bilan : "
+            + ", ".join(absents)
+        )
+    visibles = sorted(
+        {
+            table
+            for table, cle in zip(non_evaluables["table"], non_evaluables["cle"])
+            if _texte(cle) not in ("", VALEUR_MASQUEE)
+            and any(
+                est_sensible(sensibles, table, c)
+                for c in declarations.get(table, {}).get("cle", [])
+            )
+        }
+    )
+    if visibles:
+        problemes.append(
+            "lignes non évaluables dont la clé d'une colonne sensible n'est pas masquée "
+            f"(tables : {', '.join(visibles)})"
+        )
+    return problemes
 
 
 def _problemes_ecriture(
@@ -1292,6 +1426,7 @@ def ecrire_anomalies(
     declarations: dict | None = None,
     *,
     nettoyees: bool = False,
+    non_evaluables: pd.DataFrame | None = None,
 ) -> tuple[Path, Path]:
     """Écrit la table des anomalies et le bilan par contrôle en CSV.
 
@@ -1324,15 +1459,28 @@ def ecrire_anomalies(
     la colonne `decision_metier` en dernier (`COLONNES_ANOMALIES_NETTOYEES`), et les
     fichiers sont `anomalies_nettoyees_AAAA-MM.csv` et `bilan_nettoyees_AAAA-MM.csv`,
     à côté de ceux des données brutes.
+
+    Avec `non_evaluables` (table rendue par `lignes_non_evaluables`), un troisième
+    fichier est écrit dans la même opération tout ou rien, à l'emplacement que
+    donne `chemin_non_evaluables` (`non_evaluables_AAAA-MM.csv`, ou
+    `non_evaluables_nettoyees_AAAA-MM.csv` avec `nettoyees=True`), au même format.
+    Sont refusés en plus : des colonnes autres que `COLONNES_NON_EVALUABLES`, un
+    contrôle absent du bilan, une clé d'une colonne sensible non masquée. Les
+    chemins rendus restent ceux de la table des anomalies et du bilan.
     """
     problemes = _problemes_ecriture(
         anomalies, bilan, periode_fin, sensibles, declarations, nettoyees
     )
+    if non_evaluables is not None and not problemes:
+        problemes = _problemes_non_evaluables(non_evaluables, bilan, sensibles, declarations)
     if problemes:
         raise ValueError("Écriture refusée\n  " + "\n  ".join(problemes))
 
     chemins = chemins_anomalies(periode_fin, dossier, nettoyees)
-    _ecrire_fichiers(
-        [(_table_ecrite(anomalies), chemins[0]), (_bilan_ecrit(bilan), chemins[1])]
-    )
+    sorties = [(_table_ecrite(anomalies), chemins[0]), (_bilan_ecrit(bilan), chemins[1])]
+    if non_evaluables is not None:
+        sorties.append(
+            (_table_ecrite(non_evaluables), chemin_non_evaluables(periode_fin, dossier, nettoyees))
+        )
+    _ecrire_fichiers(sorties)
     return chemins
