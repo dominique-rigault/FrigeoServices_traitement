@@ -449,11 +449,14 @@ def _date_dans_periode_export(donnees, parametres, natures) -> Constats:
     """Date de référence de chaque ligne dans la période de son export.
 
     La correction proposée remplace l'année par celle de l'export, quand la date
-    obtenue tombe dans la période.
+    obtenue tombe dans la période. Avec `vide_hors_champ`, une date vide laisse la
+    ligne hors champ (date facultative, par exemple une date de lettrage); sinon,
+    comme une date illisible, elle la rend non évaluable.
     """
     colonne = parametres["colonne"]
     nature = natures[colonne]
-    dates = lire(donnees[colonne], nature).valeurs
+    lecture = lire(donnees[colonne], nature)
+    dates = lecture.valeurs
     bornes = [_bornes_periode(valeur) for valeur in donnees[COLONNE_PERIODE]]
     evaluables = dates.notna() & pd.Series(
         [periode is not None for periode in bornes], index=donnees.index, dtype=bool
@@ -475,7 +478,10 @@ def _date_dans_periode_export(donnees, parametres, natures) -> Constats:
             corrigee = None
         if corrigee is not None and debut <= corrigee < fin:
             propositions.loc[position] = ecrire_date(corrigee, nature)
-    return Constats(evaluables, _ecarts(constats, propositions))
+    hors_champ = None
+    if parametres.get("vide_hors_champ"):
+        hors_champ = (lecture.etats == ETAT_VIDE).astype(bool)
+    return Constats(evaluables, _ecarts(constats, propositions), hors_champ=hors_champ)
 
 
 CONSTAT_INFERIEURE = "inférieure au minimum"
@@ -2662,11 +2668,14 @@ TYPES = {
     "date_dans_periode_export": TypeRegle(
         description=(
             "La date de référence de chaque ligne tombe dans la période de son "
-            "export (année ou mois, lue dans periode_export)."
+            "export (année ou mois, lue dans periode_export). Avec vide_hors_champ, une "
+            "date vide laisse la ligne hors champ (date facultative) au lieu de la "
+            "rendre non évaluable."
         ),
-        parametres={"colonne": GENRE_COLONNE_DATE},
+        parametres={"colonne": GENRE_COLONNE_DATE, "vide_hors_champ": GENRE_BOOLEEN},
         vue=VUE_TOUTES,
         controler=_date_dans_periode_export,
+        facultatifs=("vide_hors_champ",),
         prerequis=_prerequis_export,
         issue=ISSUE_A_ARBITRER,
     ),

@@ -95,7 +95,7 @@ from .gestion import (
     problemes_regles_gestion,
 )
 from .revue import FEUILLE_LISTES, _ecrire_texte, _feuille_listes, _menu, _menus_d_ajout
-from .typage import NATURES_DATE, lire
+from .typage import ETAT_VIDE, NATURES_DATE, lire
 
 FEUILLE_MODE_EMPLOI = "mode_emploi"
 FEUILLE_REFERENCES = "références"
@@ -134,6 +134,8 @@ REF_RENSEIGNEMENT = "renseignement"
 FAMILLE_PERIODES = "periodes_export"
 TYPE_PERIODES = "date_dans_periode_export"
 REF_PERIODES = "decoupage"
+# Règles obligatoire du dictionnaire pour lesquelles une date vide est proposée hors champ.
+FACULTATIVES = ("facultatif", "toujours vide")
 FAMILLE_FERIES = CLE_JOURS_FERIES
 FAMILLES_ECARTEES = (FAMILLE_REFERENCES, FAMILLE_RENSEIGNEMENT, FAMILLE_PERIODES, FAMILLE_FERIES)
 # Clés d'une proposition écartée, par famille (liste de dictionnaires de textes);
@@ -220,15 +222,17 @@ COLONNES_PERIODES = (
     "ref",
     "libellé",
     "issue",
+    "vide_hors_champ",
     "filtre_colonne",
     "filtre_valeurs",
     "commentaire",
     "rang",
+    "proposition_vide_hors_champ",
 )
-MODIFIABLES_PERIODES = ("statut", "ref", "libellé", "issue", "commentaire")
+MODIFIABLES_PERIODES = ("statut", "ref", "libellé", "issue", "vide_hors_champ", "commentaire")
 SAISIE_AJOUT_PERIODES = (
-    "table", "colonne", "statut", "ref", "libellé", "issue", "filtre_colonne",
-    "filtre_valeurs", "commentaire",
+    "table", "colonne", "statut", "ref", "libellé", "issue", "vide_hors_champ",
+    "filtre_colonne", "filtre_valeurs", "commentaire",
 )
 COLONNES_FERIES = ("année", "date", "jour", "fête", "origine", "statut")
 MODIFIABLES_FERIES = ("statut",)
@@ -253,6 +257,7 @@ COLONNES_NOUVELLES = tuple(COLONNES_DEMANDE.values())
 # retirée), et les paramètres proposés, que le statut valide adopte.
 COLONNES_MASQUEES = (
     "rang", "proposition_clé_facultative", "proposition_valeurs", "proposition_vide_sinon",
+    "proposition_vide_hors_champ",
 )
 FORMAT_DATE = "DD/MM/YYYY"
 # Colonnes d'effectifs, affichées avec le séparateur des milliers.
@@ -270,6 +275,8 @@ LARGEURS = {
     "proposition_clé_facultative": 10,
     "proposition_valeurs": 10,
     "proposition_vide_sinon": 10,
+    "vide_hors_champ": 10,
+    "proposition_vide_hors_champ": 10,
     "nature": 18,
     "dates": 9,
     "observé": 40,
@@ -541,40 +548,50 @@ def _en_periode(instance: dict) -> bool:
 
 
 def observer_periodes(donnees: pd.DataFrame, colonne: str, nature: str) -> dict:
-    """Dates lues d'une colonne d'un export, et celles qui tombent dans la période de
-    leur export (une ligne sans période lisible n'est pas comptée)."""
-    dates = lire(donnees[colonne], nature).valeurs
-    lues = dans = 0
-    for jour, periode in zip(dates, donnees[COLONNE_PERIODE]):
+    """Dates lues d'une colonne d'un export, celles qui tombent dans la période de leur
+    export, et les dates vides (une ligne sans période lisible n'est pas comptée)."""
+    lecture = lire(donnees[colonne], nature)
+    lues = dans = vides = 0
+    for jour, etat, periode in zip(lecture.valeurs, lecture.etats, donnees[COLONNE_PERIODE]):
         bornes = _bornes_periode(periode)
-        if pd.isna(jour) or bornes is None:
+        if bornes is None:
+            continue
+        if etat == ETAT_VIDE:
+            vides += 1
+        if pd.isna(jour):
             continue
         lues += 1
         dans += bornes[0] <= jour < bornes[1]
-    return {"dates": lues, "dans": dans}
+    return {"dates": lues, "dans": dans, "vides": vides}
 
 
 def _pourcentage(part: float) -> str:
     return texte_nombre(round(100 * part, 1))
 
 
-def _ligne_periode(table, colonne, nature, observation) -> dict:
+def _ligne_periode(table, colonne, nature, observation, facultative=False) -> dict:
+    """Colonnes observées d'une colonne de date. Une date vide hors champ est proposée
+    quand la colonne est facultative au dictionnaire (ou toujours vide)."""
     lues, dans = observation["dates"], observation["dans"]
+    vides = observation.get("vides", 0)
+    morceaux = []
     if lues:
-        observe = (
+        morceaux.append(
             f"{texte_entier(dans)} sur {texte_entier(lues)} dans la période de l'export "
             f"({_pourcentage(dans / lues)} %)"
         )
-    else:
-        observe = None
+    if vides:
+        pluriel = "s" if vides > 1 else ""
+        morceaux.append(f"{texte_entier(vides)} date{pluriel} vide{pluriel}")
     proposition = OUI if _seuil_atteint(dans, lues) else AUCUNE
     return {
         "table": table,
         "colonne": colonne,
         "nature": nature,
         "dates": lues,
-        "observé": observe,
+        "observé": ", ".join(morceaux) or None,
         "proposition": proposition,
+        "proposition_vide_hors_champ": OUI if facultative else NON,
     }
 
 
@@ -587,6 +604,7 @@ def _ligne_regle_periode(base: dict, instance: dict, rang: int, origine: str) ->
         "ref": instance["ref"],
         "libellé": instance["libelle"],
         "issue": _issue(instance),
+        "vide_hors_champ": OUI if instance.get("vide_hors_champ") else NON,
         "filtre_colonne": filtre_colonne or None,
         "filtre_valeurs": filtre_valeurs or None,
         "commentaire": instance.get(CLE_COMMENTAIRE),
@@ -602,9 +620,11 @@ def lignes_periodes(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
     propositions (observé, « oui » quand au moins `SEUIL_PROPOSITION` des dates
     tombent dans la période de leur export, seuil compté avec une date hors période de
     plus), puis les règles retirées et les
-    propositions écartées (invalide). Une colonne qui a une règle de la famille, en
-    vigueur ou retirée (y compris une règle à filtre complexe, affichée dans la
-    feuille des autres règles), ou une proposition écartée, n'a pas de proposition.
+    propositions écartées (invalide). vide_hors_champ d'une proposition vaut « oui »
+    quand la colonne est facultative (ou toujours vide) au dictionnaire. Une colonne
+    qui a une règle de la famille, en vigueur ou retirée (y compris une règle à filtre
+    complexe, affichée dans la feuille des autres règles), ou une proposition écartée,
+    n'a pas de proposition.
     """
     ecartees = {
         (element["table"], element["colonne"])
@@ -633,7 +653,10 @@ def lignes_periodes(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
 
     def base(table, colonne):
         if (table, colonne) not in observations:
-            nature = dictionnaire.get(table, {}).get(colonne, {}).get("nature", {}).get("regle")
+            regles_colonne = dictionnaire.get(table, {}).get(colonne, {})
+            nature = regles_colonne.get("nature", {}).get("regle")
+            obligatoire = regles_colonne.get("obligatoire", {}).get("regle")
+            facultative = obligatoire in FACULTATIVES
             if (
                 table in tables
                 and _prerequis_export(tables[table]) is None
@@ -643,7 +666,7 @@ def lignes_periodes(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
                 observation = observer_periodes(tables[table], colonne, nature)
             else:
                 observation = {"dates": 0, "dans": 0}
-            ligne = _ligne_periode(table, colonne, nature, observation)
+            ligne = _ligne_periode(table, colonne, nature, observation, facultative)
             if not observation["dates"]:
                 ligne["dates"] = None
             observations[(table, colonne)] = ligne
@@ -672,6 +695,9 @@ def lignes_periodes(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
                     "ref": REF_PERIODES,
                     "libellé": f"{colonne} dans la période de l'export",
                     "issue": TYPES[TYPE_PERIODES].issue,
+                    "vide_hors_champ": observations[(table, colonne)][
+                        "proposition_vide_hors_champ"
+                    ],
                 })
         for instance, rang in retirees:
             if instance["table"] == table:
@@ -687,6 +713,9 @@ def lignes_periodes(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
                     "ref": REF_PERIODES,
                     "libellé": f"{colonne} dans la période de l'export",
                     "issue": TYPES[TYPE_PERIODES].issue,
+                    "vide_hors_champ": observations[(table, colonne)][
+                        "proposition_vide_hors_champ"
+                    ],
                 })
     return lignes
 
@@ -1399,7 +1428,9 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "Une ligne par colonne de date d'un fichier exporté chaque mois ou chaque année. "
         "La règle est proposée quand au moins "
         f"{_pourcentage(SEUIL_PROPOSITION)} % des dates observées tombent dans la période "
-        "de leur export.",
+        f"de leur export. vide_hors_champ à « {OUI} » : une ligne sans date n'est pas "
+        "contrôlée (sinon, elle ne peut pas être évaluée); il est proposé quand la colonne "
+        "est facultative au dictionnaire, par exemple une date de lettrage.",
         "Pour ajouter une règle dans l'une de ces trois feuilles : sur une ligne vide en "
         "bas de la feuille, choisir la table et les colonnes dans les menus, remplir les "
         "autres cellules, et choisir le statut documenté. ref et libellé laissés vides "
@@ -1603,6 +1634,7 @@ def exporter_formulaire_gestion(
     derniere = len(periodes) + 1 + LIGNES_AJOUT
     _ajouter_menu(_menu(feuille, STATUTS), COLONNES_PERIODES, "statut", 2, derniere)
     _ajouter_menu(_menu(feuille, ISSUES), COLONNES_PERIODES, "issue", 2, derniere)
+    _ajouter_menu(_menu(feuille, (OUI, NON)), COLONNES_PERIODES, "vide_hors_champ", 2, derniere)
     _menus_d_ajout(feuille, COLONNES_PERIODES, len(dictionnaire), len(periodes) + 2, derniere)
 
     feuille = classeur.create_sheet(FEUILLE_FERIES)
@@ -1755,7 +1787,7 @@ def _parametres_defaut(famille: _Famille) -> dict:
         return {"cle_facultative": False, "comparaison": COMPARAISON_TELLE_QUELLE}
     if famille.nom == FAMILLE_RENSEIGNEMENT:
         return {"valeurs": [], "vide_sinon": False}
-    return {}
+    return {"vide_hors_champ": False}
 
 
 def _parametres_regle(famille: _Famille, instance: dict) -> dict:
@@ -1770,7 +1802,7 @@ def _parametres_regle(famille: _Famille, instance: dict) -> dict:
             "valeurs": [str(v) for v in instance["valeurs"]],
             "vide_sinon": bool(instance.get("vide_sinon")),
         }
-    return {}
+    return {"vide_hors_champ": bool(instance.get("vide_hors_champ"))}
 
 
 def _parametres_saisis(famille: _Famille, ligne: dict) -> tuple[dict | None, list[str]]:
@@ -1792,7 +1824,10 @@ def _parametres_saisis(famille: _Famille, ligne: dict) -> tuple[dict | None, lis
             return None, [probleme]
         return {"valeurs": _decouper(_texte_cellule(ligne["valeurs"])),
                 "vide_sinon": vide_sinon}, []
-    return {}, []
+    hors_champ, probleme = _oui_non(ligne["vide_hors_champ"], "vide_hors_champ")
+    if probleme:
+        return None, [probleme]
+    return {"vide_hors_champ": hors_champ}, []
 
 
 def _parametres_proposes(famille: _Famille, ligne: dict, base: dict) -> dict | None:
@@ -1811,6 +1846,10 @@ def _parametres_proposes(famille: _Famille, ligne: dict, base: dict) -> dict | N
             return None
         parametres["valeurs"] = valeurs
         parametres["vide_sinon"] = _texte_cellule(ligne["proposition_vide_sinon"]) == OUI
+    else:
+        parametres["vide_hors_champ"] = (
+            _texte_cellule(ligne["proposition_vide_hors_champ"]) == OUI
+        )
     return parametres
 
 
@@ -1826,6 +1865,10 @@ def _exportes(famille: _Famille, ligne: dict, instance: dict | None) -> dict:
     elif famille.nom == FAMILLE_RENSEIGNEMENT:
         parametres["valeurs"] = _decouper(_texte_cellule(ligne["proposition_valeurs"]))
         parametres["vide_sinon"] = _texte_cellule(ligne["proposition_vide_sinon"]) == OUI
+    else:
+        parametres["vide_hors_champ"] = (
+            _texte_cellule(ligne["proposition_vide_hors_champ"]) == OUI
+        )
     return parametres
 
 
@@ -1870,6 +1913,10 @@ def _appliquer_parametres(famille: _Famille, instance: dict, parametres: dict) -
             instance = _avec_cle(instance, "vide_sinon", True, "valeurs")
         else:
             instance = _sans_cle(instance, "vide_sinon")
+    elif parametres["vide_hors_champ"]:
+        instance = _avec_cle(instance, "vide_hors_champ", True, "colonne")
+    else:
+        instance = _sans_cle(instance, "vide_hors_champ")
     return instance
 
 
@@ -1967,6 +2014,8 @@ def _nouvelle_regle(famille: _Famille, identite: tuple, parametres: dict, filtre
             instance["vide_sinon"] = True
     else:
         instance["colonne"] = identite[1]
+        if parametres["vide_hors_champ"]:
+            instance["vide_hors_champ"] = True
     if filtre:
         instance[CLE_FILTRE] = filtre
     if issue is not None and issue != TYPES[famille.type].issue:

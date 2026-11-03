@@ -251,7 +251,7 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "renseignee_selon_valeur)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, commentaire, "
-        "colonne)",
+        "colonne, vide_hors_champ)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
         "règle n° 6 (decoupage), libelle : un texte non vide est attendu",
         "règle n° 7 (decoupage), table : un texte non vide est attendu",
@@ -444,7 +444,9 @@ def test_catalogue_des_types():
     assert list(catalogue.columns) == list(COLONNES_CATALOGUE)
     assert list(catalogue["type"]) == list(gestion.TYPES)
     ligne = catalogue.iloc[0].to_dict()
-    assert ligne["parametres"] == "colonne (colonne de date)"
+    assert ligne["parametres"] == (
+        "colonne (colonne de date), vide_hors_champ (true ou false, facultatif)"
+    )
     assert ligne["vue"] == VUE_TOUTES
     assert ligne["issue"] == "à arbitrer"
     plage = catalogue.set_index("type").loc["plage"].to_dict()
@@ -4027,3 +4029,37 @@ def test_non_evaluables_dans_l_ordre_des_regles_puis_des_lignes():
         ("R29", "t_2025.csv", 2), ("R29", "t_2025.csv", 3), ("R29", "t_2026-01.csv", 2),
     ]
     assert bilan["non_evaluables"].tolist() == [3, 3]
+
+
+# Date facultative hors champ quand elle est vide (correction de l'évaluation).
+
+
+def test_date_vide_hors_champ_si_declaree_facultative():
+    donnees = _table(
+        "a.csv", "2025", d=["14/03/2025", "", "  ", "2025-03-14", "14/03/2052", None]
+    )
+    natures = {"d": "date JJ/MM/AAAA"}
+    ecarts, bilan, non_evaluables = controler_gestion(
+        {"t": donnees}, _dictionnaire(**natures), [_regle()], {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (0, 4, 2)
+    facultative = _regle(vide_hors_champ=True)
+    ecarts_f, bilan_f, non_evaluables_f = controler_gestion(
+        {"t": donnees}, _dictionnaire(**natures), [facultative], {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    # Les trois dates vides sortent du champ; la date illisible reste non évaluable,
+    # et les écarts ne changent pas.
+    resume = _bilan(bilan_f)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (3, 1, 2)
+    assert _lignes(non_evaluables_f, "num_ligne_source") == [(5,)]
+    assert _lignes(non_evaluables, "num_ligne_source") == [(3,), (4,), (5,), (7,)]
+    pd.testing.assert_frame_equal(ecarts_f, ecarts)
+    assert _lignes(ecarts_f, "num_ligne_source", "constat") == [(6, CONSTAT_DATE_POSTERIEURE)]
+    # false vaut l'absence du paramètre; une autre valeur est refusée.
+    _, bilan_faux = _controler(donnees, natures, regles=[_regle(vide_hors_champ=False)])
+    assert _bilan(bilan_faux)["non_evaluables"] == 4
+    with pytest.raises(ValueError, match="vide_hors_champ"):
+        _controler(donnees, natures, regles=[_regle(vide_hors_champ="oui")])
