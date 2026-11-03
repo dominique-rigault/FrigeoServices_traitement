@@ -38,17 +38,24 @@ Chaque règle s'applique aux valeurs laissées par les règles précédentes.
 
 `nettoyer` rend les tables nettoyées, le journal des corrections (une ligne par
 cellule modifiée, avec sa valeur avant et après) et un bilan par règle et par
-colonne. `comparer_anomalies` compare, contrôle par contrôle, la table des
-anomalies des tables brutes et celle des tables nettoyées. `ecrire_nettoyage`
-écrit le journal et le bilan en CSV dans data/nettoyage/; c'est la seule fonction
-du module qui écrit sur disque.
+colonne. Une valeur d'une colonne sensible est masquée au journal et remplacée par
+son empreinte (`empreinte_valeur`), hachage à clé secrète qui permet de vérifier une
+correction sans révéler la valeur. `comparer_anomalies` compare, contrôle par
+contrôle, la table des anomalies des tables brutes et celle des tables nettoyées.
+`ecrire_nettoyage` écrit le journal et le bilan en CSV dans data/nettoyage/.
+Seules deux fonctions du module écrivent sur disque : `ecrire_nettoyage`, et
+`charger_cle_empreintes`, qui crée la clé des empreintes à son premier appel.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import hmac
 import numbers
 import re
+import secrets
+import warnings
 from collections import Counter, namedtuple
 from decimal import Decimal
 
@@ -166,6 +173,8 @@ COLONNES_JOURNAL = (
     "source",
     "valeur_avant",
     "valeur_apres",
+    "empreinte_avant",
+    "empreinte_apres",
     "detail",
 )
 COLONNES_BILAN_NETTOYAGE = (
@@ -245,6 +254,103 @@ la réparation est refusée; `raison` dit pourquoi elle l'est (None sinon);
 `passes` est le nombre de passes qui ont modifié le texte; `encodages` les encodages
 qui ont repéré au moins une séquence, dans l'ordre de `ENCODAGES_SUSPECTS`.
 """
+
+
+# --------------------------------------------------------------------------------
+# Empreintes des valeurs masquées au journal
+
+LONGUEUR_EMPREINTE_JOURNAL = 16
+NOM_FICHIER_CLE_EMPREINTES = "cle_empreintes.txt"
+_MOTIF_CLE_EMPREINTES = re.compile(r"[0-9a-f]{64}")
+_MOTIF_EMPREINTE_JOURNAL = re.compile(r"[0-9a-f]{16}")
+ENTETE_CLE_EMPREINTES = (
+    "# Clé secrète des empreintes du journal du nettoyage (frigeo.nettoyage).\n"
+    "# À garder avec les données du client, hors du dépôt. Ne la transmettre qu'à une\n"
+    "# personne qui a déjà accès aux données (un évaluateur par exemple) : elle permet\n"
+    "# de vérifier les valeurs masquées. La remplacer rend les empreintes des journaux\n"
+    "# suivants incomparables aux anciennes.\n"
+)
+
+CleEmpreintes = namedtuple("CleEmpreintes", ["cle", "chemin", "creee"])
+CleEmpreintes.__doc__ = """Résultat de `charger_cle_empreintes`.
+
+`cle` est la clé (64 chiffres hexadécimaux), `chemin` le fichier qui la porte,
+`creee` vaut vrai si le fichier vient d'être créé par cet appel.
+"""
+
+
+def chemin_cle_empreintes() -> Path:
+    """Emplacement par défaut de la clé des empreintes : data/config/cle_empreintes.txt,
+    hors du dépôt, à côté du dictionnaire et des décisions du métier."""
+    return racine_projet() / "data" / "config" / NOM_FICHIER_CLE_EMPREINTES
+
+
+def probleme_cle_empreintes(cle) -> str | None:
+    """Problème d'une clé des empreintes, None si elle est valable."""
+    if not isinstance(cle, str) or not _MOTIF_CLE_EMPREINTES.fullmatch(cle):
+        return "clé des empreintes : 64 chiffres hexadécimaux (0 à 9, a à f) attendus"
+    return None
+
+
+def charger_cle_empreintes(chemin: str | Path | None = None) -> CleEmpreintes:
+    """Lit la clé des empreintes, et la crée si le fichier n'existe pas.
+
+    `chemin` vaut `chemin_cle_empreintes()` par défaut. Le fichier porte la clé sur une
+    seule ligne, après des lignes de commentaire (« # »). À la création, la clé est
+    tirée au hasard (`secrets`), écrite avec un commentaire qui dit son usage, et
+    `creee` vaut vrai : c'est le seul cas où la fonction écrit sur disque, et un fichier
+    existant n'est jamais remplacé. Un fichier mal formé lève `ValueError` sans être
+    modifié.
+    """
+    chemin = chemin_cle_empreintes() if chemin is None else Path(chemin)
+    creee = False
+    if not chemin.exists():
+        chemin.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(chemin, "x", encoding="utf-8") as fichier:
+                fichier.write(ENTETE_CLE_EMPREINTES + secrets.token_hex(32) + "\n")
+            creee = True
+        except FileExistsError:
+            pass
+    lignes = [ligne.strip() for ligne in chemin.read_text(encoding="utf-8-sig").splitlines()]
+    cles = [ligne.lower() for ligne in lignes if ligne and not ligne.startswith("#")]
+    cle = cles[0] if len(cles) == 1 else None
+    if probleme_cle_empreintes(cle) is not None:
+        raise ValueError(
+            f"Fichier de la clé des empreintes invalide ({chemin}) : une seule ligne de 64 "
+            "chiffres hexadécimaux attendue, hors commentaires. Le restaurer depuis une "
+            "sauvegarde; le supprimer fait créer une clé nouvelle au prochain nettoyage, "
+            "dont les empreintes ne se comparent pas aux anciennes."
+        )
+    return CleEmpreintes(cle, chemin, creee)
+
+
+def _empreinte_journal(valeur, octets_cle: bytes) -> str:
+    # Import local : decisions.py importe ce module.
+    from .decisions import _forme
+
+    code = hmac.new(octets_cle, _forme(valeur).encode("utf-8"), hashlib.sha256)
+    return code.hexdigest()[:LONGUEUR_EMPREINTE_JOURNAL]
+
+
+def empreinte_valeur(valeur, cle: str) -> str:
+    """Empreinte d'une valeur, telle qu'au journal du nettoyage pour une valeur masquée.
+
+    HMAC-SHA256, de clé `cle` (64 chiffres hexadécimaux, lus comme 32 octets), du
+    texte UTF-8 de la valeur sous la forme qu'emploient les décisions du métier
+    (`decisions._forme`) : « vide » pour une cellule sans valeur, « texte: » suivi du
+    texte, « nombre: » suivi du nombre écrit en flottant par `repr` (2500 donne
+    « nombre:2500.0 »), « date: » suivi de la date au format ISO
+    (« date:2025-03-12T00:00:00 »), « booléen: » suivi de True ou False. L'empreinte
+    est faite des 16 premiers chiffres hexadécimaux. Un texte et un nombre de même
+    écriture n'ont donc pas la même empreinte. Sans la clé, l'empreinte ne permet pas
+    de retrouver une valeur, même peu variée; avec elle, on vérifie qu'une valeur
+    connue est celle du journal.
+    """
+    probleme = probleme_cle_empreintes(cle)
+    if probleme is not None:
+        raise ValueError(probleme)
+    return _empreinte_journal(valeur, bytes.fromhex(cle))
 
 
 def catalogue_nettoyage() -> pd.DataFrame:
@@ -809,6 +915,7 @@ def nettoyer(
     declarations: dict | None = None,
     date_coupure=None,
     decisions: dict | None = None,
+    cle_empreinte: str | None = None,
 ) -> Nettoyage:
     """Applique les règles de nettoyage et rend les tables nettoyées, le journal des
     corrections et le bilan.
@@ -824,7 +931,9 @@ def nettoyer(
     pas; sans elle, ces dates ne sont pas converties, et le bilan le dit.
     `decisions` (contenu rendu par `decisions.charger_decisions`, fichier
     data/config/decisions.yaml par défaut, aucune décision s'il est absent) sert à
-    la règle `decision`.
+    la règle `decision`. `cle_empreinte` (64 chiffres hexadécimaux) est la clé des
+    empreintes des valeurs masquées; par défaut, celle de `charger_cle_empreintes`,
+    qui la crée au premier nettoyage (un avertissement donne alors son emplacement).
 
     Tables nettoyées : copies des tables reçues, mêmes colonnes, mêmes types de
     colonnes, lignage compris; seules les cellules corrigées changent, et les lignes
@@ -838,7 +947,9 @@ def nettoyer(
     déclarée de la ligne, lue dans la table reçue (vide sans clé déclarée, « masqué »
     si une colonne de la clé est sensible); `valeur_avant` et `valeur_apres` valent
     « masqué » pour une colonne sensible, la valeur brute restant retrouvable par le
-    lignage; `valeur_avant` est la valeur laissée par les règles précédentes;
+    lignage; `empreinte_avant` et `empreinte_apres` portent alors l'empreinte de
+    chacune des deux valeurs (`empreinte_valeur`), et restent vides sur toute autre
+    ligne; `valeur_avant` est la valeur laissée par les règles précédentes;
     `detail` précise la correction (pour l'encodage, les encodages qui ont repéré
     une séquence et le nombre de passes; pour un remplacement, la date de la revue
     qui a invalidé la valeur; pour la nature, la forme lue, « forme masquée » pour
@@ -879,6 +990,30 @@ def nettoyer(
     problemes = problemes_decisions(decisions)
     if problemes:
         raise ValueError("Décisions invalides\n  " + "\n  ".join(problemes))
+    if cle_empreinte is None:
+        lue = charger_cle_empreintes()
+        cle_empreinte = lue.cle
+        if lue.creee:
+            warnings.warn(
+                f"Clé des empreintes créée dans {lue.chemin} : la garder avec les données "
+                "du client, hors du dépôt.",
+                stacklevel=2,
+            )
+    probleme = probleme_cle_empreintes(cle_empreinte)
+    if probleme is not None:
+        raise ValueError(probleme)
+    octets_cle = bytes.fromhex(cle_empreinte)
+
+    def empreintes(masquee: bool, avant, apres) -> dict:
+        """Empreintes d'une valeur modifiée, vides si la valeur n'est pas masquée."""
+        if not masquee:
+            return {"empreinte_avant": None, "empreinte_apres": None}
+        return {
+            "empreinte_avant": _empreinte_journal(avant, octets_cle),
+            "empreinte_apres": _empreinte_journal(apres, octets_cle),
+        }
+
+    sans_empreinte = {"empreinte_avant": None, "empreinte_apres": None}
 
     nettoyees = {table: donnees.copy() for table, donnees in tables.items()}
     brutes = {table: donnees.reset_index(drop=True) for table, donnees in tables.items()}
@@ -930,6 +1065,8 @@ def nettoyer(
                     or est_masquee(regles["valeurs"])
                     or est_masquee(regles["format"])
                 )
+                # Empreintes des valeurs telles que dans les tables (type compris).
+                hachees = empreintes(masquee, avant, apres)
                 avant = _valeur_constatee(avant)
                 journal.append(
                     ligne_du_journal(
@@ -942,6 +1079,7 @@ def nettoyer(
                         source=SOURCE_DECISION,
                         valeur_avant=VALEUR_MASQUEE if masquee else avant,
                         valeur_apres=VALEUR_MASQUEE if masquee else apres,
+                        **hachees,
                         detail=detail,
                         _colonne=list(_colonnes_de_donnees(brutes[table])).index(colonne),
                     )
@@ -958,6 +1096,7 @@ def nettoyer(
                         source=SOURCE_DECISION,
                         valeur_avant=None,
                         valeur_apres=None,
+                        **sans_empreinte,
                         detail=detail,
                         _colonne=len(brutes[table].columns),
                     )
@@ -994,6 +1133,7 @@ def nettoyer(
                             source=SOURCE_GENERIQUE,
                             valeur_avant=None,
                             valeur_apres=None,
+                            **sans_empreinte,
                             detail=detail,
                             _colonne=-1,
                         )
@@ -1038,6 +1178,7 @@ def nettoyer(
                 nettoyees[table].isetitem(nettoyees[table].columns.get_loc(colonne), nouvelle)
                 for position in positions:
                     valeur_apres, detail = acceptees[position]
+                    hachees = empreintes(masquee, courante.iloc[position], valeur_apres)
                     avant = _valeur_constatee(courante.iloc[position])
                     journal.append(
                         ligne_du_journal(
@@ -1050,6 +1191,7 @@ def nettoyer(
                             source=source,
                             valeur_avant=VALEUR_MASQUEE if masquee else avant,
                             valeur_apres=VALEUR_MASQUEE if masquee else valeur_apres,
+                            **hachees,
                             detail=detail,
                             _colonne=rang_colonne,
                         )
@@ -1207,6 +1349,30 @@ def journal_non_masque(
     return journal.iloc[fautives]
 
 
+def empreintes_incoherentes(journal: pd.DataFrame) -> pd.DataFrame:
+    """Lignes du journal dont les empreintes ne suivent pas le masquage.
+
+    Une valeur modifiée masquée (« masqué » avant et après) porte ses deux
+    empreintes, de 16 chiffres hexadécimaux chacune; toute autre ligne (valeur
+    visible, ligne retirée) n'en porte aucune. Une table vide est attendue.
+    """
+    fautives = []
+    for position, ligne in enumerate(journal.itertuples(index=False)):
+        masquee = (
+            ligne.action == ACTION_MODIFIEE
+            and _texte(ligne.valeur_avant) == VALEUR_MASQUEE
+            and _texte(ligne.valeur_apres) == VALEUR_MASQUEE
+        )
+        hachees = [_texte(ligne.empreinte_avant), _texte(ligne.empreinte_apres)]
+        if masquee:
+            coherente = all(_MOTIF_EMPREINTE_JOURNAL.fullmatch(e) for e in hachees)
+        else:
+            coherente = hachees == ["", ""]
+        if not coherente:
+            fautives.append(position)
+    return journal.iloc[fautives]
+
+
 def ecrire_nettoyage(
     journal: pd.DataFrame,
     bilan: pd.DataFrame,
@@ -1230,7 +1396,8 @@ def ecrire_nettoyage(
     Refuse (`ValueError`, tous les problèmes listés, sans rien écrire) : une période
     qui n'est pas de la forme AAAA-MM, des colonnes autres que `COLONNES_JOURNAL`
     et `COLONNES_BILAN_NETTOYAGE` (dans cet ordre), une valeur ou une clé d'une
-    colonne sensible non masquée (`journal_non_masque`). Écriture tout ou rien;
+    colonne sensible non masquée (`journal_non_masque`), des empreintes qui ne suivent
+    pas le masquage (`empreintes_incoherentes`). Écriture tout ou rien;
     un fichier ouvert dans Excel arrête l'écriture sans rien modifier.
     """
     problemes = []
@@ -1249,6 +1416,12 @@ def ecrire_nettoyage(
             problemes.append(
                 f"{len(fautives)} lignes du journal dont une valeur ou la clé d'une colonne "
                 f"sensible n'est pas masquée ({', '.join(colonnes)})"
+            )
+        incoherentes = empreintes_incoherentes(journal)
+        if not incoherentes.empty:
+            problemes.append(
+                f"{len(incoherentes)} lignes du journal dont les empreintes ne suivent pas "
+                "le masquage (deux empreintes pour une valeur masquée, aucune sinon)"
             )
     if problemes:
         raise ValueError("Écriture refusée\n  " + "\n  ".join(problemes))

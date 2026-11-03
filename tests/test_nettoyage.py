@@ -1,5 +1,9 @@
 """Tests des règles de nettoyage (frigeo.nettoyage)."""
 
+import hashlib
+import hmac
+import re
+import warnings
 from collections import Counter
 from copy import deepcopy
 from datetime import date, datetime
@@ -8,6 +12,7 @@ import pandas as pd
 import pytest
 
 import frigeo.decisions as module_decisions
+import frigeo.nettoyage as module_nettoyage
 
 from frigeo.controles import _REPERTOIRE, VALEUR_MASQUEE, constats_encodage, controler
 from frigeo.dictionnaire import MOTIF_SENSIBLE
@@ -22,15 +27,19 @@ from frigeo.nettoyage import (
     RAISON_REMPLACEMENT,
     Reparation,
     catalogue_nettoyage,
+    charger_cle_empreintes,
+    empreinte_valeur,
     nettoyer,
     reparer_encodage,
 )
+from frigeo.nettoyage import chemin_cle_empreintes as chemin_cle_du_poste
 
 AUCUNE_SENSIBLE = {}
 AUCUNE_DECLARATION = {}
 INSECABLE = chr(160)
 REMPLACEMENT = chr(0xFFFD)
 TOUS = ("cp1252", "iso8859_15", "latin_1")
+CLE = "0123456789abcdef" * 4
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +48,15 @@ def sans_fichier_de_decisions(tmp_path, monkeypatch):
     monkeypatch.setattr(
         module_decisions, "chemin_decisions", lambda: tmp_path / "decisions_absent.yaml"
     )
+
+
+@pytest.fixture(autouse=True)
+def cle_des_empreintes(tmp_path_factory, monkeypatch):
+    """La clé des empreintes du poste n'est jamais lue ni créée par ces tests : ils
+    lisent la clé CLE, dans un dossier à part (tmp_path reste vide)."""
+    fichier = tmp_path_factory.mktemp("cle") / "cle_empreintes.txt"
+    fichier.write_text(CLE + "\n", encoding="utf-8")
+    monkeypatch.setattr(module_nettoyage, "chemin_cle_empreintes", lambda: fichier)
 
 
 def _mal(texte, encodage="cp1252", fois=1):
@@ -1222,6 +1240,13 @@ def test_ecrire_nettoyage(tmp_path):
         ["doublons", "4", "", "", ""],
         ["decision", "2", "j", "2025-01-01 00:00:00", "2025-02-01 00:00:00"],
     ]
+    # Empreintes sur la seule valeur masquée.
+    assert journal[["empreinte_avant", "empreinte_apres"]].values.tolist() == [
+        ["", ""],
+        [empreinte_valeur(_mal("Rue Été"), CLE), empreinte_valeur("Rue Été", CLE)],
+        ["", ""],
+        ["", ""],
+    ]
     # Un numéro de ligne lu 2.0 (classeur Excel) s'écrit 2.
     flottants = resultat.journal.copy()
     flottants["num_ligne_source"] = [float(n) for n in flottants["num_ligne_source"]]
@@ -1277,3 +1302,186 @@ def test_ecrire_nettoyage_refusee(tmp_path, monkeypatch):
         ecrire_nettoyage(resultat.journal.iloc[:1], resultat.bilan, "2026-03", tmp_path,
                          sensibles, declarations)
     assert {f.name: f.read_bytes() for f in tmp_path.iterdir()} == avant
+
+
+# --- empreintes des valeurs masquées -------------------------------------------
+
+
+def _hmac(texte, cle=CLE):
+    """Calcul indépendant du module, tel que la note d'évaluation le décrit."""
+    return hmac.new(bytes.fromhex(cle), texte.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+def test_empreinte_valeur():
+    assert empreinte_valeur("Café", CLE) == _hmac("texte:Café")
+    assert empreinte_valeur(2500, CLE) == _hmac("nombre:2500.0")
+    assert empreinte_valeur(2500.0, CLE) == empreinte_valeur(2500, CLE)
+    # Un texte et un nombre de même écriture n'ont pas la même empreinte.
+    assert empreinte_valeur("2500", CLE) == _hmac("texte:2500")
+    assert empreinte_valeur("2500", CLE) != empreinte_valeur(2500, CLE)
+    assert empreinte_valeur(pd.Timestamp(2025, 3, 12), CLE) == _hmac("date:2025-03-12T00:00:00")
+    assert empreinte_valeur(datetime(2025, 3, 12), CLE) == _hmac("date:2025-03-12T00:00:00")
+    assert empreinte_valeur(True, CLE) == _hmac("booléen:True")
+    assert empreinte_valeur(None, CLE) == _hmac("vide")
+    assert empreinte_valeur(float("nan"), CLE) == _hmac("vide")
+    assert empreinte_valeur("", CLE) == _hmac("texte:")
+    assert re.fullmatch("[0-9a-f]{16}", empreinte_valeur("x", CLE))
+    # L'empreinte dépend de la clé, et n'est pas le hachage sans clé des décisions.
+    assert empreinte_valeur("Café", "f" * 64) == _hmac("texte:Café", "f" * 64)
+    assert empreinte_valeur("Café", "f" * 64) != empreinte_valeur("Café", CLE)
+    assert empreinte_valeur("Café", CLE) != _empreinte_cellule("Café")
+    for invalide in ("abc", CLE + "0", "g" * 64, CLE.upper(), None, 12):
+        with pytest.raises(ValueError, match="64 chiffres hexadécimaux"):
+            empreinte_valeur("x", invalide)
+
+
+def test_empreintes_des_valeurs_masquees():
+    tables = {
+        "t": _table(
+            code=["a", "b"],
+            nom=[_mal("Café"), "x"],
+            adresse=[_mal("rue Élise"), "y"],
+            ville=[_mal("Évreux"), "z"],
+            salaire=["2 500", 3000],
+            entree=[datetime(2025, 3, 12), "01/01/2025"],
+        )
+    }
+    dictionnaire = _dictionnaire(
+        tables,
+        **{"t.adresse": _colonne(motif_valeurs=MOTIF_SENSIBLE),
+           "t.salaire": _colonne("nombre natif"),
+           "t.entree": _colonne("date JJ/MM/AAAA")},
+    )
+    sensibles = {"t": frozenset({"nom", "salaire", "entree"})}
+    resultat = nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}})
+    assert resultat.tables["t"].at[0, "salaire"] == 2500
+    assert resultat.tables["t"].at[0, "entree"] == "12/03/2025"
+    # Classification ou dictionnaire : la valeur est masquée et remplacée par son
+    # empreinte, calculée sur la valeur telle que dans la table (texte avant, nombre
+    # après la mise en conformité, date native avant et texte après); une valeur
+    # visible n'a pas d'empreinte.
+    assert _lignes(resultat.journal, "regle_nettoyage", "colonne", "valeur_avant",
+                   "valeur_apres", "empreinte_avant", "empreinte_apres") == [
+        ("encodage", "nom", VALEUR_MASQUEE, VALEUR_MASQUEE, _hmac("texte:" + _mal("Café")),
+         _hmac("texte:Café")),
+        ("encodage", "adresse", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         _hmac("texte:" + _mal("rue Élise")), _hmac("texte:rue Élise")),
+        ("encodage", "ville", _mal("Évreux"), "Évreux", None, None),
+        ("nature", "salaire", VALEUR_MASQUEE, VALEUR_MASQUEE, _hmac("texte:2 500"),
+         _hmac("nombre:2500.0")),
+        ("nature", "entree", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         _hmac("date:2025-03-12T00:00:00"), _hmac("texte:12/03/2025")),
+    ]
+    # Une autre clé donne d'autres empreintes, sans rien changer d'autre.
+    autre = nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}},
+                     cle_empreinte="f" * 64)
+    assert autre.journal.at[0, "empreinte_apres"] == _hmac("texte:Café", "f" * 64)
+    assert autre.journal.at[0, "empreinte_apres"] != resultat.journal.at[0, "empreinte_apres"]
+    sans = ["empreinte_avant", "empreinte_apres"]
+    assert autre.journal.drop(columns=sans).equals(resultat.journal.drop(columns=sans))
+
+
+def test_empreintes_des_decisions_et_lignes_retirees():
+    tables = {"t": _table(code=["a", "b", "b", "d"], salaire=[2500, 3000, 3000, 4000])}
+    dictionnaire = _dictionnaire(tables, **{"t.salaire": _colonne("nombre natif")})
+    decisions = _decisions(
+        a1=_decision(2, "salaire", "corriger", _empreinte_cellule(2500), 2600, "nombre natif"),
+        a2=_decision(5, None, "retirer", _empreinte_ligne(code="d", salaire=4000)),
+    )
+    resultat = _nettoyer_avec(tables, decisions, dictionnaire, {"t": frozenset({"salaire"})})
+    # Une ligne retirée, comme doublon ou par décision, n'a ni valeur ni empreinte.
+    assert _lignes(resultat.journal, "regle_nettoyage", "num_ligne_source", "colonne",
+                   "valeur_avant", "valeur_apres", "empreinte_avant", "empreinte_apres") == [
+        ("doublons", 4, None, None, None, None, None),
+        ("decision", 2, "salaire", VALEUR_MASQUEE, VALEUR_MASQUEE, _hmac("nombre:2500.0"),
+         _hmac("nombre:2600.0")),
+        ("decision", 5, None, None, None, None, None),
+    ]
+
+
+def test_charger_cle_empreintes(tmp_path):
+    from frigeo.nettoyage import ENTETE_CLE_EMPREINTES
+
+    assert chemin_cle_du_poste().parts[-3:] == ("data", "config", "cle_empreintes.txt")
+    fichier = tmp_path / "config" / "cle_empreintes.txt"
+    creee = charger_cle_empreintes(fichier)
+    assert creee.creee and creee.chemin == fichier
+    assert re.fullmatch("[0-9a-f]{64}", creee.cle)
+    assert fichier.read_text(encoding="utf-8") == ENTETE_CLE_EMPREINTES + creee.cle + "\n"
+    # Relue sans être remplacée.
+    assert charger_cle_empreintes(fichier) == (creee.cle, fichier, False)
+    assert fichier.read_text(encoding="utf-8") == ENTETE_CLE_EMPREINTES + creee.cle + "\n"
+    # Tirée au hasard : deux créations donnent deux clés.
+    assert charger_cle_empreintes(tmp_path / "autre.txt").cle != creee.cle
+    # Marque d'ordre des octets, lignes vides, majuscules et fins de ligne CRLF admises.
+    fichier.write_bytes((chr(0xFEFF) + "# commentaire\r\n\r\n  " + CLE.upper() + "  \r\n")
+                        .encode("utf-8"))
+    assert charger_cle_empreintes(fichier) == (CLE, fichier, False)
+    for contenu in ("", "# seul commentaire\n", CLE + "\n" + CLE + "\n", CLE[:-1] + "\n",
+                    CLE + "z\n", "g" * 64 + "\n"):
+        fichier.write_text(contenu, encoding="utf-8")
+        with pytest.raises(ValueError, match="Fichier de la clé des empreintes invalide"):
+            charger_cle_empreintes(fichier)
+        assert fichier.read_text(encoding="utf-8") == contenu
+
+
+def test_nettoyer_cle_par_defaut(tmp_path, monkeypatch):
+    tables = {"t": _table(code=["a"], nom=[_mal("Café")])}
+    dictionnaire = _dictionnaire(tables)
+    sensibles = {"t": frozenset({"nom"})}
+    # Clé lue dans le fichier par défaut (ici celui de la fixture, qui porte CLE).
+    defaut = nettoyer(tables, dictionnaire, sensibles, {})
+    assert defaut.journal.equals(nettoyer(tables, dictionnaire, sensibles, {},
+                                          cle_empreinte=CLE).journal)
+    # Fichier absent : la clé est créée, un avertissement donne son emplacement.
+    fichier = tmp_path / "data" / "config" / "cle_empreintes.txt"
+    monkeypatch.setattr(module_nettoyage, "chemin_cle_empreintes", lambda: fichier)
+    with pytest.warns(UserWarning, match="Clé des empreintes créée dans .*cle_empreintes"):
+        premier = nettoyer(tables, dictionnaire, sensibles, {})
+    cle = charger_cle_empreintes(fichier).cle
+    assert premier.journal.at[0, "empreinte_apres"] == empreinte_valeur("Café", cle)
+    # Second nettoyage : la même clé, sans avertissement.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        second = nettoyer(tables, dictionnaire, sensibles, {})
+    assert second.journal.equals(premier.journal)
+    for invalide in ("abc", CLE.upper()):
+        with pytest.raises(ValueError, match="64 chiffres hexadécimaux"):
+            nettoyer(tables, dictionnaire, sensibles, {}, cle_empreinte=invalide)
+
+
+def test_ecrire_nettoyage_refuse_des_empreintes_incoherentes(tmp_path):
+    from frigeo.nettoyage import ecrire_nettoyage, empreintes_incoherentes
+
+    resultat = _journal_exemple()
+    sensibles = {"t": frozenset({"adresse"})}
+    declarations = {"t": {"cle": ["code"]}}
+    journal = resultat.journal
+    # Lignes : 0 valeur visible, 1 valeur masquée, 2 ligne retirée, 3 valeur visible.
+    assert list(journal["action"]) == ["valeur modifiée", "valeur modifiée", "ligne retirée",
+                                       "valeur modifiée"]
+    assert empreintes_incoherentes(journal).empty
+    fautifs = []
+    for ligne, colonne, valeur in (
+        (1, "empreinte_apres", None),          # valeur masquée sans son empreinte
+        (1, "empreinte_avant", ""),
+        (1, "empreinte_avant", "0" * 15),      # empreinte mal formée
+        (1, "empreinte_apres", "x" * 16),
+        (0, "empreinte_avant", "0" * 16),      # empreinte d'une valeur visible
+        (3, "empreinte_apres", "0" * 16),
+        (2, "empreinte_avant", "0" * 16),      # empreinte d'une ligne retirée
+    ):
+        fautif = journal.copy()
+        fautif.loc[ligne, colonne] = valeur
+        fautifs.append(fautif)
+    # Une valeur visible au lieu de « masqué » rend aussi ses empreintes incohérentes.
+    visible = journal.copy()
+    visible.loc[1, "valeur_avant"] = _mal("Rue Été")
+    fautifs.append(visible)
+    for fautif in fautifs:
+        assert len(empreintes_incoherentes(fautif)) == 1
+        with pytest.raises(ValueError, match="1 lignes du journal dont les empreintes ne "
+                                             "suivent pas le masquage"):
+            ecrire_nettoyage(fautif, resultat.bilan, "2026-03", tmp_path, sensibles,
+                             declarations)
+    assert not any(tmp_path.iterdir())
