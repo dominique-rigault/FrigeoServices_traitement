@@ -30,6 +30,7 @@ from frigeo.nettoyage import (
     charger_cle_empreintes,
     empreinte_valeur,
     nettoyer,
+    normaliser_espaces,
     reparer_encodage,
 )
 from frigeo.nettoyage import chemin_cle_empreintes as chemin_cle_du_poste
@@ -382,16 +383,18 @@ def test_catalogue_nettoyage():
     assert list(catalogue.columns) == list(COLONNES_CATALOGUE_NETTOYAGE)
     assert _lignes(catalogue, "rang", "regle_nettoyage", "source") == [
         (1, "encodage", "règle générique"),
-        (2, "remplacement", "dictionnaire"),
-        (3, "nature", "règle générique"),
-        (4, "doublons", "règle générique"),
-        (5, "decision", "décision du métier"),
+        (2, "espaces", "règle générique"),
+        (3, "remplacement", "dictionnaire"),
+        (4, "nature", "règle générique"),
+        (5, "doublons", "règle générique"),
+        (6, "decision", "décision du métier"),
     ]
     assert "caractère de remplacement" in catalogue.at[0, "ne_corrige_jamais"]
-    assert "hors liste" in catalogue.at[1, "ne_corrige_jamais"]
-    assert "date impossible" in catalogue.at[2, "ne_corrige_jamais"]
-    assert "identiques hors clé" in catalogue.at[3, "ne_corrige_jamais"]
-    assert "décidé de garder" in catalogue.at[4, "ne_corrige_jamais"]
+    assert "saut de ligne" in catalogue.at[1, "ne_corrige_jamais"]
+    assert "hors liste" in catalogue.at[2, "ne_corrige_jamais"]
+    assert "date impossible" in catalogue.at[3, "ne_corrige_jamais"]
+    assert "identiques hors clé" in catalogue.at[4, "ne_corrige_jamais"]
+    assert "décidé de garder" in catalogue.at[5, "ne_corrige_jamais"]
 
 
 # --- remplacement -------------------------------------------------------------
@@ -532,12 +535,15 @@ COUPURE = date(2026, 3, 31)
 
 def _nature(valeurs, nature, sensibles=AUCUNE_SENSIBLE, date_coupure=COUPURE):
     """Nettoie une colonne « v » de la nature donnée; rend (valeurs nettoyées,
-    journal, bilan). La colonne « n » rend les lignes toutes différentes : sans
-    elle, deux valeurs converties en la même deviendraient des doublons exacts."""
+    journal, bilan), réduits à la règle `nature`. La colonne « n » rend les lignes
+    toutes différentes : sans elle, deux valeurs converties en la même deviendraient
+    des doublons exacts."""
     tables = {"t": _table(v=list(valeurs), n=list(range(len(valeurs))))}
     dictionnaire = _dictionnaire(tables, **{"t.v": _colonne(nature)})
     resultat = nettoyer(tables, dictionnaire, sensibles, AUCUNE_DECLARATION, date_coupure)
-    return list(resultat.tables["t"]["v"]), resultat.journal, resultat.bilan, (
+    journal = resultat.journal[resultat.journal["regle_nettoyage"] == "nature"]
+    bilan = resultat.bilan[resultat.bilan["regle_nettoyage"] == "nature"]
+    return list(resultat.tables["t"]["v"]), journal, bilan, (
         tables, dictionnaire, resultat.tables
     )
 
@@ -638,8 +644,10 @@ def test_nature_nombre_natif():
         (3, "forme lue 999,99 €"),
         (4, "forme lue 999.99"),
         (5, "forme lue 9 999,99"),
-        (6, "forme lue 9" + INSECABLE + "999,99 €"),
-        (7, "forme lue 9" + chr(0x202F) + "999"),
+        # Insécable et espace fine, devenues des espaces ordinaires par la règle des
+        # espaces, appliquée avant.
+        (6, "forme lue 9 999,99 €"),
+        (7, "forme lue 9 999"),
         (8, "forme lue -99,9"),
         (9, "forme lue 99"),
         (15, "forme lue 99,9€"),
@@ -712,7 +720,7 @@ def test_doublons_exacts_retires_premiere_occurrence_gardee():
     clients = _table(
         "clients.csv",
         code=["C1", "C2", "C1", "C3", "C3", "C4", "C5", "C1"],
-        nom=["Café", "Bar", "Café", "Épicerie", "Epicerie ", "Bar", "Bar", "Café"],
+        nom=["Café", "Bar", "Café", "Épicerie", "Epicerie", "Bar", "Bar", "Café"],
         ville=["Rouen", "Évreux", "Rouen", "Vernon", "vernon", "Évreux", "Évreux", "Rouen"],
     )
     clients.index = range(10, 18)
@@ -728,7 +736,7 @@ def test_doublons_exacts_retires_premiere_occurrence_gardee():
     declarations = {"clients": {"cle": ["code"]}, "factures": {"cle": ["num"]}}
     resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, declarations)
     # Lignes 4 et 9 : copies de la ligne 2; ligne 6 : copie de la ligne 5 après
-    # normalisation (casse, accents, espaces). C4 et C5 sont identiques à C2 hors clé :
+    # normalisation (casse, accents). C4 et C5 sont identiques à C2 hors clé :
     # à arbitrer, gardées. La facture F2 est en double entre deux exports.
     assert list(resultat.tables["clients"].index) == [10, 11, 13, 15, 16]
     assert list(resultat.tables["clients"]["num_ligne_source"]) == [2, 3, 5, 7, 8]
@@ -1485,3 +1493,86 @@ def test_ecrire_nettoyage_refuse_des_empreintes_incoherentes(tmp_path):
             ecrire_nettoyage(fautif, resultat.bilan, "2026-03", tmp_path, sensibles,
                              declarations)
     assert not any(tmp_path.iterdir())
+
+
+# --- espaces --------------------------------------------------------------------
+
+
+def test_normaliser_espaces():
+    import random
+
+    from frigeo.controles import ESPACES_HORIZONTALES, SAUTS_DE_LIGNE, constats_espaces
+
+    fine = chr(0x202F)
+    assert normaliser_espaces(" Rouen ") == "Rouen"
+    assert normaliser_espaces("Rue  de" + INSECABLE + "la" + chr(9) + chr(9) + "Paix") == (
+        "Rue de la Paix"
+    )
+    assert normaliser_espaces("1" + fine + "234,50") == "1 234,50"
+    assert normaliser_espaces("ligne 1  \n  ligne 2 ") == "ligne 1 \n ligne 2"
+    assert normaliser_espaces("\nRouen\n") == "\nRouen\n"
+    assert normaliser_espaces("Rouen") == "Rouen"
+    # Sur des textes tirés au hasard : plus aucun constat, rien d'autre que les
+    # espaces horizontales ne change, et une seconde passe ne change rien.
+    alphabet = sorted(ESPACES_HORIZONTALES) + sorted(SAUTS_DE_LIGNE) + list("ab")
+    tirage = random.Random(6)
+    for _ in range(3000):
+        texte = "".join(tirage.choice(alphabet) for _ in range(tirage.randint(1, 8)))
+        normalise = normaliser_espaces(texte)
+        assert constats_espaces(normalise) == (), repr(texte)
+        assert normaliser_espaces(normalise) == normalise
+        sans = [c for c in texte if c not in ESPACES_HORIZONTALES]
+        assert [c for c in normalise if c not in ESPACES_HORIZONTALES] == sans
+        assert set(normalise) - set(sans) <= {" "}
+
+
+def test_espaces_corriges_apres_l_encodage():
+    tables = {
+        "t": _table(
+            code=["a", "b", "c", "d", "e", "f"],
+            nom=[" Rouen", _mal("Café") + "  ", _mal("voilà"), "Rue  de" + INSECABLE + "Paix",
+                 "  ", 12],
+            adresse=["x", "y ", "z", "w", "v", "u"],
+        )
+    }
+    dictionnaire = _dictionnaire(tables)
+    sensibles = {"t": frozenset({"adresse"})}
+    resultat = nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}})
+    # « voilà » mal décodé finit par une insécable : réparé par l'encodage, qui passe
+    # avant, il n'a plus d'espace à retirer. Une cellule d'espaces et un nombre ne sont
+    # pas visés.
+    assert list(resultat.tables["t"]["nom"]) == [
+        "Rouen", "Café", "voilà", "Rue de Paix", "  ", 12
+    ]
+    assert list(resultat.tables["t"]["adresse"]) == ["x", "y", "z", "w", "v", "u"]
+    assert _lignes(resultat.journal, "regle_nettoyage", "num_ligne_source", "colonne",
+                   "source", "valeur_avant", "valeur_apres", "detail") == [
+        ("encodage", 3, "nom", "règle générique", _mal("Café") + "  ", "Café  ",
+         "repéré en cp1252, iso8859_15, latin_1; 1 passe"),
+        ("encodage", 4, "nom", "règle générique", _mal("voilà"), "voilà",
+         "repéré en cp1252, iso8859_15, latin_1; 1 passe"),
+        ("espaces", 2, "nom", "règle générique", " Rouen", "Rouen",
+         "espace en début ou en fin"),
+        ("espaces", 3, "nom", "règle générique", "Café  ", "Café",
+         "espace en début ou en fin; espaces répétées"),
+        ("espaces", 3, "adresse", "règle générique", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         "espace en début ou en fin"),
+        ("espaces", 5, "nom", "règle générique", "Rue  de" + INSECABLE + "Paix", "Rue de Paix",
+         "espaces répétées; espace spéciale"),
+    ]
+    # Valeur masquée : ses empreintes, avant et après.
+    masquee = resultat.journal[resultat.journal["colonne"] == "adresse"].iloc[0]
+    assert (masquee["empreinte_avant"], masquee["empreinte_apres"]) == (
+        empreinte_valeur("y ", CLE), empreinte_valeur("y", CLE)
+    )
+    assert _lignes(_du_regle(resultat.bilan, "espaces"), "table", "colonne", "visees",
+                   "corrigees", "non_corrigees", "raisons") == [
+        ("t", "nom", 3, 3, 0, None),
+        ("t", "adresse", 1, 1, 0, None),
+    ]
+    # Après nettoyage, la règle des espaces de l'étape 3 ne signale plus rien.
+    ecarts, _ = controler(resultat.tables, dictionnaire, sensibles, {})
+    assert not (ecarts["regle"] == "espaces").any()
+    # Avant, 8 constats, dont 2 sur « voilà » mal décodé, signalé aussi par l'encodage.
+    ecarts, _ = controler(tables, dictionnaire, sensibles, {})
+    assert (ecarts["regle"] == "espaces").sum() == 8

@@ -13,10 +13,12 @@ from frigeo.controles import (
     CONSTAT_DECODAGE,
     CONSTAT_REMPLACEMENT,
     REGLE_ENCODAGE,
+    REGLE_ESPACES,
     VALEUR_MASQUEE,
     charger_dictionnaire_enregistre,
     charger_regles_complementaires,
     constats_encodage,
+    constats_espaces,
     controler,
     problemes_regles_complementaires,
     regles_sans_controle,
@@ -90,12 +92,13 @@ def _table(fichier="t.csv", premiere_ligne=2, **colonnes) -> pd.DataFrame:
 
 
 def _controler(
-    donnees, colonnes, sensibles=AUCUNE_SENSIBLE, complementaires=None, avec_encodage=False
+    donnees, colonnes, sensibles=AUCUNE_SENSIBLE, complementaires=None, avec_encodage=False,
+    avec_espaces=False,
 ):
     """Contrôle d'une table « t », sans règle complémentaire sauf celles de la table.
 
-    Sauf demande, le bilan est rendu sans les lignes de la règle `encodage`, qui
-    s'applique à toute colonne de texte et a ses propres tests.
+    Sauf demande, le bilan est rendu sans les lignes des règles `encodage` et
+    `espaces`, qui s'appliquent à toute colonne de texte et ont leurs propres tests.
     """
     ecarts, bilan = controler(
         {"t": donnees},
@@ -105,6 +108,8 @@ def _controler(
     )
     if not avec_encodage:
         bilan = bilan[bilan["regle"] != REGLE_ENCODAGE].reset_index(drop=True)
+    if not avec_espaces:
+        bilan = bilan[bilan["regle"] != REGLE_ESPACES].reset_index(drop=True)
     return ecarts, bilan
 
 
@@ -225,8 +230,10 @@ def test_liste_fermee_et_ses_trois_issues():
         (5, "valeur invalide", "anomalie", "rouen"),
         (6, "valeur à arbitrer", "à arbitrer", "Elbeuf"),
         (7, "valeur hors liste", "anomalie", "Paris"),
-        # Les valeurs sont comparées telles quelles, espaces compris.
+        # Les valeurs sont comparées telles quelles, espaces compris; l'espace en fin
+        # est aussi signalée par la règle des espaces.
         (8, "valeur hors liste", "anomalie", "Rouen "),
+        (8, "espace en début ou en fin", "anomalie", "Rouen "),
     ]
     ligne = bilan.iloc[0]
     assert (ligne["controlees"], ligne["anomalies"], ligne["a_arbitrer"]) == (7, 3, 1)
@@ -792,4 +799,123 @@ def test_encodage_apres_les_autres_regles_et_colonne_sensible_masquee():
         ("code", "format", 3, 1),
         ("code", "motif", 3, 1),
         ("code", "encodage", 3, 1),
+    ]
+
+
+# --- règle des espaces --------------------------------------------------------
+
+BORD = "espace en début ou en fin"
+REPETEES = "espaces répétées"
+SPECIALE = "espace spéciale"
+
+
+def test_constats_espaces():
+    fine = chr(0x202F)
+    assert constats_espaces("") == ()
+    assert constats_espaces("Rue de la Paix") == ()
+    assert constats_espaces(" Rouen") == (BORD,)
+    assert constats_espaces("Rouen ") == (BORD,)
+    assert constats_espaces("Rue  de la Paix") == (REPETEES,)
+    assert constats_espaces("N°" + INSECABLE + "12") == (SPECIALE,)
+    assert constats_espaces("1" + fine + "234") == (SPECIALE,)
+    assert constats_espaces("a\tb") == (SPECIALE,)
+    assert constats_espaces("Rouen\t") == (BORD, SPECIALE)
+    assert constats_espaces("a" + INSECABLE + " b") == (REPETEES, SPECIALE)
+    assert constats_espaces(" a  b" + INSECABLE) == (BORD, REPETEES, SPECIALE)
+    # Un saut de ligne n'est ni signalé ni compté comme une espace.
+    for texte in ("ligne 1\nligne 2", "ligne 1 \n ligne 2", "\nRouen", "Rouen\r\n", "a\n\nb",
+                  "a" + chr(0x2028) + "b", "a\x0bb", "a\x0cb", "a" + chr(0x85) + "b"):
+        assert constats_espaces(texte) == (), repr(texte)
+    assert constats_espaces("ligne 1  \nligne 2") == (REPETEES,)
+
+
+def test_espaces_horizontales_et_sauts_de_ligne():
+    from frigeo.controles import ESPACES_HORIZONTALES, SAUTS_DE_LIGNE
+
+    tous = {chr(c) for c in range(0x110000) if chr(c).isspace()}
+    # Partition des caractères d'espacement Unicode, sauts de ligne de splitlines.
+    assert ESPACES_HORIZONTALES | SAUTS_DE_LIGNE == tous
+    assert not ESPACES_HORIZONTALES & SAUTS_DE_LIGNE
+    assert SAUTS_DE_LIGNE == {c for c in tous if len(("a" + c + "b").splitlines()) == 2}
+    assert {" ", "\t", INSECABLE, chr(0x202F), chr(0x2007), chr(0x3000)} <= ESPACES_HORIZONTALES
+    # Chaque espace est reconnue, seule l'espace ordinaire n'est pas spéciale.
+    for c in ESPACES_HORIZONTALES:
+        attendu = () if c == " " else (SPECIALE,)
+        assert constats_espaces("a" + c + "b") == attendu, hex(ord(c))
+        assert constats_espaces(c + "a")[0] == BORD, hex(ord(c))
+        assert constats_espaces("a" + c + c + "b")[0] == REPETEES, hex(ord(c))
+    for c in SAUTS_DE_LIGNE:
+        assert constats_espaces(c + "a" + c + c + "b" + c) == (), hex(ord(c))
+
+
+def test_espaces_sur_toutes_les_cellules_de_texte():
+    donnees = _table(
+        nom=[
+            "Rouen",
+            "Rouen ",
+            None,
+            "",
+            "  ",
+            12,
+            datetime(2025, 3, 14),
+            " Rue  de" + INSECABLE + "la Paix",
+            "ligne 1\nligne 2",
+            "CafÃ©  ",
+        ],
+        quantite=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+    )
+    colonnes = {"nom": _colonne(), "quantite": _colonne(nature="nombre natif")}
+    ecarts, bilan = _controler(donnees, colonnes, avec_encodage=True, avec_espaces=True)
+    # Les constats d'une cellule se suivent, après ceux de l'encodage.
+    assert _lignes(
+        ecarts, "num_ligne_source", "colonne", "regle", "regle_en_vigueur", "statut_regle",
+        "issue", "constat", "valeur",
+    ) == [
+        (3, "nom", "espaces", "sans espace superflue", None, "anomalie", BORD, "Rouen "),
+        (9, "nom", "espaces", "sans espace superflue", None, "anomalie", BORD,
+         " Rue  de" + INSECABLE + "la Paix"),
+        (9, "nom", "espaces", "sans espace superflue", None, "anomalie", REPETEES,
+         " Rue  de" + INSECABLE + "la Paix"),
+        (9, "nom", "espaces", "sans espace superflue", None, "anomalie", SPECIALE,
+         " Rue  de" + INSECABLE + "la Paix"),
+        (11, "nom", "encodage", "sans séquence suspecte", None, "anomalie",
+         "séquence d'un mauvais décodage", "CafÃ©  "),
+        (11, "nom", "espaces", "sans espace superflue", None, "anomalie", BORD, "CafÃ©  "),
+        (11, "nom", "espaces", "sans espace superflue", None, "anomalie", REPETEES,
+         "CafÃ©  "),
+    ]
+    # Seules les cellules renseignées dont la valeur est un texte sont contrôlées
+    # (une cellule d'espaces est vide), et une colonne sans texte n'a pas de ligne.
+    assert _lignes(bilan, "colonne", "regle", "controlees", "anomalies", "a_arbitrer") == [
+        # Une cellule compte autant d'anomalies que de constats, comme pour l'encodage.
+        ("nom", "encodage", 5, 1, 0),
+        ("nom", "espaces", 5, 6, 0),
+        ("quantite", "nature", 10, 0, 0),
+    ]
+
+
+def test_espaces_apres_les_autres_regles_et_colonne_sensible_masquee():
+    donnees = _table(client=["A", " B", "C"], code=["X1", "X2 ", "X3"])
+    colonnes = {
+        "client": _colonne(obligatoire="obligatoire"),
+        "code": _colonne(formes=[_forme("A9")]),
+    }
+    ecarts, bilan = _controler(
+        donnees, colonnes, {"t": frozenset({"client"})}, {"code": {"motif": "[A-Z][0-9]"}},
+        avec_encodage=True, avec_espaces=True,
+    )
+    assert _lignes(ecarts, "num_ligne_source", "colonne", "regle", "constat", "valeur") == [
+        (3, "client", "espaces", BORD, VALEUR_MASQUEE),
+        (3, "code", "format", "forme hors liste", "X2 "),
+        (3, "code", "motif", "hors motif", "X2 "),
+        (3, "code", "espaces", BORD, "X2 "),
+    ]
+    assert _lignes(bilan, "colonne", "regle", "controlees", "anomalies") == [
+        ("client", "obligatoire", 3, 0),
+        ("client", "encodage", 3, 0),
+        ("client", "espaces", 3, 1),
+        ("code", "format", 3, 1),
+        ("code", "motif", 3, 1),
+        ("code", "encodage", 3, 0),
+        ("code", "espaces", 3, 1),
     ]

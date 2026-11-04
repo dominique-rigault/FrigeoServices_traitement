@@ -21,6 +21,9 @@ Règles, dans l'ordre (voir `catalogue_nettoyage`) :
 - `encodage` : réparation des textes UTF-8 relus dans un encodage d'un octet
   (Windows-1252, ISO-8859-15 ou Latin-1), repérés comme à l'étape 3 par
   `controles.constats_encodage` (voir `reparer_encodage`);
+- `espaces` : les espaces en début et en fin de texte sont retirées, et toute suite
+  d'espaces (insécable, fine, tabulation comprises) devient une espace ordinaire,
+  les sauts de ligne restant en place (voir `normaliser_espaces`);
 - `remplacement` : une valeur invalidée par le métier dans la liste fermée de sa
   colonne et qui porte un remplacement au dictionnaire reçoit ce remplacement;
 - `nature` : une valeur hors de la nature de date, d'heure ou de nombre de sa
@@ -68,10 +71,12 @@ from .confidentialite import charger_sensibilite, est_sensible, verifier_sensibi
 from .controles import (
     CARACTERE_REMPLACEMENT,
     COLONNES_LIGNAGE_ECART,
+    ESPACE_ORDINAIRE,
     ENCODAGES_SUSPECTS,
     ISSUE_A_ARBITRER,
     ISSUE_ANOMALIE,
     VALEUR_MASQUEE,
+    _CLASSE_ESPACES,
     _REPERTOIRE,
     _SEQUENCE_UTF8,
     _colonnes_de_donnees,
@@ -80,6 +85,7 @@ from .controles import (
     _problemes_de_correspondance,
     _valeur_constatee,
     constats_encodage,
+    constats_espaces,
 )
 from .dictionnaire import (
     LISTE_FERMEE,
@@ -107,12 +113,18 @@ from .profilage import _interpretations, signature
 from .typage import NATURES_DATE, NATURES_HEURE, NATURES_LISIBLES, ecrire_date
 
 REGLE_ENCODAGE = "encodage"
+REGLE_ESPACES = "espaces"
 REGLE_REMPLACEMENT = "remplacement"
 REGLE_NATURE = "nature"
 REGLE_DOUBLONS = "doublons"
 REGLE_DECISION = "decision"
 REGLES_NETTOYAGE = (
-    REGLE_ENCODAGE, REGLE_REMPLACEMENT, REGLE_NATURE, REGLE_DOUBLONS, REGLE_DECISION
+    REGLE_ENCODAGE,
+    REGLE_ESPACES,
+    REGLE_REMPLACEMENT,
+    REGLE_NATURE,
+    REGLE_DOUBLONS,
+    REGLE_DECISION,
 )
 
 ACTION_MODIFIEE = "valeur modifiée"
@@ -197,6 +209,14 @@ _CATALOGUE = {
         "une cellule qui contient le caractère de remplacement (information perdue); "
         "une portion de texte que deux encodages réparent en deux caractères "
         f"différents; une séquence encore présente après {MAX_PASSES} passes",
+    ),
+    REGLE_ESPACES: (
+        SOURCE_GENERIQUE,
+        "toute cellule de texte signalée par la règle espaces de l'étape 3 : les espaces "
+        "en début et en fin sont retirées, et toute suite d'espaces (insécable, fine, "
+        "tabulation comprises) devient une seule espace ordinaire",
+        "un saut de ligne, laissé en place; une cellule faite seulement d'espaces "
+        "(cellule vide)",
     ),
     REGLE_REMPLACEMENT: (
         SOURCE_DICTIONNAIRE,
@@ -487,6 +507,39 @@ def _encodage(serie: pd.Series, regles: dict, contexte: dict):
     return list(visees.index), acceptees, raisons
 
 
+_MOTIF_SUITE_ESPACES = re.compile(f"[{_CLASSE_ESPACES}]+")
+
+
+def normaliser_espaces(texte: str) -> str:
+    """Texte sans espace en début ni en fin, chaque suite d'espaces horizontales
+    (`controles.ESPACES_HORIZONTALES`) remplacée par une espace ordinaire. Les sauts
+    de ligne restent en place. Le texte rendu n'a plus aucun constat de la règle
+    `espaces` (`controles.constats_espaces`)."""
+    return _MOTIF_SUITE_ESPACES.sub(ESPACE_ORDINAIRE, texte).strip(ESPACE_ORDINAIRE)
+
+
+def _espaces(serie: pd.Series, regles: dict, contexte: dict):
+    """Règle `espaces` sur une colonne indexée par la position des lignes.
+
+    Rendu comme `_encodage`. Les cellules visées sont les cellules de texte que la
+    règle `espaces` de l'étape 3 signale; toutes sont corrigées par
+    `normaliser_espaces`, le détail donnant les constats corrigés. `regles` et
+    `contexte` ne servent pas à cette règle.
+    """
+    presentes = _valeurs_renseignees(serie)
+    textes = presentes[[isinstance(v, str) for v in presentes]]
+    verdicts = {v: constats_espaces(v) for v in textes.unique()}
+    suspects = {v for v, constats in verdicts.items() if constats}
+    if not suspects:
+        return None
+    visees = textes[textes.isin(suspects)]
+    acceptees = {
+        position: (normaliser_espaces(valeur), "; ".join(verdicts[valeur]))
+        for position, valeur in visees.items()
+    }
+    return list(visees.index), acceptees, Counter()
+
+
 def _remplacement(serie: pd.Series, regles: dict, contexte: dict):
     """Règle `remplacement` sur une colonne indexée par la position des lignes.
 
@@ -709,6 +762,7 @@ def _nature(serie: pd.Series, regles: dict, contexte: dict):
 
 _REGLES = {
     REGLE_ENCODAGE: (_encodage, SOURCE_GENERIQUE, RAISONS_ENCODAGE),
+    REGLE_ESPACES: (_espaces, SOURCE_GENERIQUE, ()),
     REGLE_REMPLACEMENT: (_remplacement, SOURCE_DICTIONNAIRE, RAISONS_REMPLACEMENT),
     REGLE_NATURE: (_nature, SOURCE_GENERIQUE, RAISONS_NATURE),
 }
@@ -951,7 +1005,8 @@ def nettoyer(
     chacune des deux valeurs (`empreinte_valeur`), et restent vides sur toute autre
     ligne; `valeur_avant` est la valeur laissée par les règles précédentes;
     `detail` précise la correction (pour l'encodage, les encodages qui ont repéré
-    une séquence et le nombre de passes; pour un remplacement, la date de la revue
+    une séquence et le nombre de passes; pour les espaces, les constats corrigés;
+    pour un remplacement, la date de la revue
     qui a invalidé la valeur; pour la nature, la forme lue, « forme masquée » pour
     une colonne sensible, et l'ajout du siècle; pour une ligne retirée comme
     doublon, la ligne gardée du même groupe; pour une décision, sa date, son
