@@ -24,6 +24,10 @@ Règles, dans l'ordre (voir `catalogue_nettoyage`) :
 - `espaces` : les espaces en début et en fin de texte sont retirées, et toute suite
   d'espaces (insécable, fine, tabulation comprises) devient une espace ordinaire,
   les sauts de ligne restant en place (voir `normaliser_espaces`);
+- `referentiel` : une clé qu'une règle de gestion rapproche d'un référentiel après
+  normalisation ou mots dans le désordre, écrite autrement que le référentiel, reçoit
+  la forme du référentiel, si elle est unique et déjà celle de presque toutes les
+  lignes de la même clé (voir `SEUIL_REFERENTIEL`);
 - `remplacement` : une valeur invalidée par le métier dans la liste fermée de sa
   colonne et qui porte un remplacement au dictionnaire reçoit ce remplacement;
 - `nature` : une valeur hors de la nature de date, d'heure ou de nombre de sa
@@ -99,10 +103,20 @@ from .anomalies import (
     _index_lignage,
 )
 from .anomalies import _numero as _numero_entier
-from .gestion import ISSUE_INFORMATION
+from .gestion import (
+    ISSUE_INFORMATION,
+    TYPES_AVEC_REFERENTIEL,
+    _comparable,
+    _textes_des_cles,
+    charger_regles_gestion,
+    formes_de_la_cle,
+    formes_du_referentiel,
+    problemes_regles_gestion,
+)
 from .anomalies import _repere as _repere_anomalie
 from .doublons import (
     COMPARAISON_NORMALISEE,
+    COMPARAISON_TELLE_QUELLE,
     CONSTAT_EXACT,
     SEPARATEUR,
     _texte,
@@ -114,6 +128,7 @@ from .typage import NATURES_DATE, NATURES_HEURE, NATURES_LISIBLES, ecrire_date
 
 REGLE_ENCODAGE = "encodage"
 REGLE_ESPACES = "espaces"
+REGLE_REFERENTIEL = "referentiel"
 REGLE_REMPLACEMENT = "remplacement"
 REGLE_NATURE = "nature"
 REGLE_DOUBLONS = "doublons"
@@ -121,6 +136,7 @@ REGLE_DECISION = "decision"
 REGLES_NETTOYAGE = (
     REGLE_ENCODAGE,
     REGLE_ESPACES,
+    REGLE_REFERENTIEL,
     REGLE_REMPLACEMENT,
     REGLE_NATURE,
     REGLE_DOUBLONS,
@@ -132,6 +148,7 @@ ACTION_RETIREE = "ligne retirée"
 SOURCE_GENERIQUE = "règle générique"
 SOURCE_DICTIONNAIRE = "dictionnaire"
 SOURCE_DECISION = "décision du métier"
+SOURCE_GESTION = "règle de gestion"
 
 RAISON_REMPLACEMENT = "caractère de remplacement"
 RAISON_DESACCORD = "encodages en désaccord"
@@ -172,6 +189,15 @@ RAISON_SOURCE_MODIFIEE = "source modifiée depuis la décision"
 RAISON_INTROUVABLE = "ligne source introuvable"
 RAISON_ILLISIBLE = "valeur retenue illisible dans la nature en vigueur"
 RAISONS_DECISION = (RAISON_SOURCE_MODIFIEE, RAISON_INTROUVABLE, RAISON_ILLISIBLE)
+
+RAISON_FORME_NON_UNIQUE = "forme du référentiel non unique"
+RAISON_FORME_MINORITAIRE = "forme du référentiel minoritaire dans la table"
+RAISONS_REFERENTIEL = (RAISON_FORME_NON_UNIQUE, RAISON_FORME_MINORITAIRE, RAISON_NON_TEXTUELLE)
+# Part des lignes d'une clé déjà écrites dans la forme du référentiel au-delà de
+# laquelle une variante est corrigée sans arbitrage, comptée au seuil robuste
+# (favorables / (lignes + 1)) : une variante isolée demande ainsi 38 lignes au moins
+# déjà écrites dans la forme. En deçà, le référentiel est peut-être à corriger.
+SEUIL_REFERENTIEL = 0.95
 
 COLONNE_PERIODE = "periode_export"
 COLONNES_JOURNAL = (
@@ -217,6 +243,17 @@ _CATALOGUE = {
         "tabulation comprises) devient une seule espace ordinaire",
         "un saut de ligne, laissé en place; une cellule faite seulement d'espaces "
         "(cellule vide)",
+    ),
+    REGLE_REFERENTIEL: (
+        SOURCE_GESTION,
+        "toute clé d'une colonne qu'une règle de gestion de config/gestion.yaml rapproche "
+        "d'un référentiel après normalisation ou mots dans le désordre, trouvée mais "
+        "écrite autrement que le référentiel : elle reçoit la forme du référentiel (mots "
+        "dans l'ordre de la cellule), quand cette forme est unique et que 95 % au moins "
+        "des lignes de la même clé l'emploient déjà (seuil robuste)",
+        "une clé de plusieurs colonnes; une forme du référentiel non unique; une forme "
+        "employée par moins de 95 % des lignes de la même clé (le référentiel est peut-"
+        "être à corriger); une cellule qui n'est pas un texte",
     ),
     REGLE_REMPLACEMENT: (
         SOURCE_DICTIONNAIRE,
@@ -538,6 +575,86 @@ def _espaces(serie: pd.Series, regles: dict, contexte: dict):
         for position, valeur in visees.items()
     }
     return list(visees.index), acceptees, Counter()
+
+
+def _regles_referentiel(regles_gestion: list) -> list[dict]:
+    """Règles de gestion que corrige la règle `referentiel`, dans l'ordre du fichier."""
+    return [
+        regle
+        for regle in regles_gestion
+        if regle.get("type") in TYPES_AVEC_REFERENTIEL
+        and regle.get("comparaison", COMPARAISON_TELLE_QUELLE)
+        != COMPARAISON_TELLE_QUELLE
+        and len(regle.get("cle", [])) == 1
+    ]
+
+
+def _problemes_referentiel(regles: list[dict], tables: dict) -> list[str]:
+    """Tables et colonnes de ces règles absentes des données chargées."""
+    problemes = []
+    for regle in regles:
+        table, reference = regle.get("table"), regle.get("table_reference")
+        attendues = [(table, regle["cle"]),
+                     (reference, regle.get("cle_reference", regle["cle"]))]
+        for nom, colonnes in attendues:
+            if nom not in tables:
+                problemes.append(f"{regle['ref']} : table {nom} absente des données")
+                continue
+            for colonne in colonnes:
+                if colonne not in _colonnes_de_donnees(tables[nom]):
+                    problemes.append(f"{regle['ref']} : colonne {nom}.{colonne} absente")
+    return problemes
+
+
+def _referentiel(nettoyees: dict, regle: dict):
+    """Règle `referentiel` pour une règle de gestion, sur sa table telle que les règles
+    précédentes l'ont laissée.
+
+    Rendu comme `_encodage` (positions des lignes dans la table). Les cellules visées
+    sont celles dont la clé est trouvée dans le référentiel selon la comparaison de la
+    règle, mais égale à aucune de ses formes (`gestion.formes_de_la_cle`), comme pour
+    le constat « trouvée après normalisation seulement ». Une cellule est corrigée si la
+    forme est unique et si les lignes de la même clé comparée déjà écrites dans une
+    forme du référentiel atteignent `SEUIL_REFERENTIEL` au seuil robuste.
+    """
+    comparaison = regle["comparaison"]
+    colonne = regle["cle"][0]
+    donnees = nettoyees[regle["table"]].reset_index(drop=True)
+    reference = nettoyees[regle["table_reference"]].reset_index(drop=True)
+    formes = formes_du_referentiel(
+        reference, regle.get("cle_reference", regle["cle"]), comparaison
+    )
+    textes = _textes_des_cles(donnees, [colonne])
+    par_cle: dict[str, list[int]] = {}
+    variantes = []
+    for position, texte in textes.items():
+        candidates = formes_de_la_cle(texte, formes, comparaison)
+        if candidates is None:
+            continue
+        compte = par_cle.setdefault(_comparable(texte, comparaison), [0, 0])
+        compte[0] += 1
+        if texte in candidates:
+            compte[1] += 1
+        else:
+            variantes.append((position, texte, candidates))
+    if not variantes:
+        return None
+    acceptees, raisons = {}, Counter()
+    for position, texte, candidates in variantes:
+        lignes, favorables = par_cle[_comparable(texte, comparaison)]
+        if len(candidates) != 1 or None in candidates:
+            raisons[RAISON_FORME_NON_UNIQUE] += 1
+        elif favorables / (lignes + 1) < SEUIL_REFERENTIEL:
+            raisons[RAISON_FORME_MINORITAIRE] += 1
+        elif not isinstance(donnees.at[position, colonne], str):
+            raisons[RAISON_NON_TEXTUELLE] += 1
+        else:
+            acceptees[position] = (
+                next(iter(candidates)),
+                f"forme de {regle['table_reference']} ({regle['ref']}), {favorables} lignes "
+                f"sur {lignes} déjà écrites ainsi",
+            )
+    return [position for position, _, _ in variantes], acceptees, raisons
 
 
 def _remplacement(serie: pd.Series, regles: dict, contexte: dict):
@@ -970,6 +1087,7 @@ def nettoyer(
     date_coupure=None,
     decisions: dict | None = None,
     cle_empreinte: str | None = None,
+    regles_gestion: list | None = None,
 ) -> Nettoyage:
     """Applique les règles de nettoyage et rend les tables nettoyées, le journal des
     corrections et le bilan.
@@ -988,6 +1106,8 @@ def nettoyer(
     la règle `decision`. `cle_empreinte` (64 chiffres hexadécimaux) est la clé des
     empreintes des valeurs masquées; par défaut, celle de `charger_cle_empreintes`,
     qui la crée au premier nettoyage (un avertissement donne alors son emplacement).
+    `regles_gestion` (règles de config/gestion.yaml par défaut) sert à la règle
+    `referentiel`.
 
     Tables nettoyées : copies des tables reçues, mêmes colonnes, mêmes types de
     colonnes, lignage compris; seules les cellules corrigées changent, et les lignes
@@ -1037,6 +1157,17 @@ def nettoyer(
         )
     if declarations is None:
         declarations = charger_declarations_doublons()
+    if regles_gestion is None:
+        regles_gestion = charger_regles_gestion()
+    problemes = problemes_regles_gestion(regles_gestion)
+    if problemes:
+        raise ValueError("Règles de gestion invalides\n  " + "\n  ".join(problemes))
+    regles_referentiel = _regles_referentiel(regles_gestion)
+    problemes = _problemes_referentiel(regles_referentiel, tables)
+    if problemes:
+        raise ValueError(
+            "Règles de gestion inconnues des données chargées\n  " + "\n  ".join(problemes)
+        )
     # Import local : decisions.py importe ce module.
     from .decisions import charger_decisions, problemes_decisions
 
@@ -1195,6 +1326,63 @@ def nettoyer(
                     )
                 donnees = nettoyees[table]
                 nettoyees[table] = donnees.drop(index=donnees.index[sorted(retirees)])
+            continue
+
+        if regle_nettoyage == REGLE_REFERENTIEL:
+            # Avant les doublons et les décisions : aucune ligne n'est encore retirée,
+            # la position dans la table nettoyée est celle de la table reçue.
+            for regle in regles_referentiel:
+                table, colonne = regle["table"], regle["cle"][0]
+                resultat = _referentiel(nettoyees, regle)
+                if resultat is None:
+                    continue
+                visees, acceptees, raisons = resultat
+                bilan.append(
+                    {
+                        "regle_nettoyage": regle_nettoyage,
+                        "table": table,
+                        "colonne": colonne,
+                        "visees": len(visees),
+                        "corrigees": len(acceptees),
+                        "non_corrigees": len(visees) - len(acceptees),
+                        "raisons": _texte_raisons(raisons, RAISONS_REFERENTIEL),
+                    }
+                )
+                if not acceptees:
+                    continue
+                regles = dictionnaire[table][colonne]
+                masquee = (
+                    est_sensible(sensibles, table, colonne)
+                    or est_masquee(regles["valeurs"])
+                    or est_masquee(regles["format"])
+                )
+                courante = nettoyees[table][colonne].reset_index(drop=True)
+                nouvelle = nettoyees[table][colonne].copy()
+                for position, (valeur_apres, _) in acceptees.items():
+                    nouvelle.iloc[position] = valeur_apres
+                nettoyees[table].isetitem(nettoyees[table].columns.get_loc(colonne), nouvelle)
+                rang_table = list(tables).index(table)
+                rang_colonne = list(_colonnes_de_donnees(brutes[table])).index(colonne)
+                for position in sorted(acceptees):
+                    valeur_apres, detail = acceptees[position]
+                    hachees = empreintes(masquee, courante.iloc[position], valeur_apres)
+                    avant = _valeur_constatee(courante.iloc[position])
+                    journal.append(
+                        ligne_du_journal(
+                            rang_regle,
+                            rang_table,
+                            table,
+                            position,
+                            colonne=colonne,
+                            action=ACTION_MODIFIEE,
+                            source=SOURCE_GESTION,
+                            valeur_avant=VALEUR_MASQUEE if masquee else avant,
+                            valeur_apres=VALEUR_MASQUEE if masquee else valeur_apres,
+                            **hachees,
+                            detail=detail,
+                            _colonne=rang_colonne,
+                        )
+                    )
             continue
 
         appliquer_regle, source, ordre_raisons = _REGLES[regle_nettoyage]

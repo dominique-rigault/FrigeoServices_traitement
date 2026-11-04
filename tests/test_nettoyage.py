@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 
 import frigeo.decisions as module_decisions
+import frigeo.gestion as module_gestion
 import frigeo.nettoyage as module_nettoyage
 
 from frigeo.controles import _REPERTOIRE, VALEUR_MASQUEE, constats_encodage, controler
@@ -49,6 +50,14 @@ def sans_fichier_de_decisions(tmp_path, monkeypatch):
     monkeypatch.setattr(
         module_decisions, "chemin_decisions", lambda: tmp_path / "decisions_absent.yaml"
     )
+
+
+@pytest.fixture(autouse=True)
+def sans_regles_de_gestion(tmp_path_factory, monkeypatch):
+    """Les règles de gestion du poste (config/gestion.yaml) ne sont jamais lues par
+    ces tests : sauf règles passées, aucune."""
+    absent = tmp_path_factory.mktemp("gestion") / "gestion_absent.yaml"
+    monkeypatch.setattr(module_gestion, "chemin_regles_gestion", lambda: absent)
 
 
 @pytest.fixture(autouse=True)
@@ -384,17 +393,19 @@ def test_catalogue_nettoyage():
     assert _lignes(catalogue, "rang", "regle_nettoyage", "source") == [
         (1, "encodage", "règle générique"),
         (2, "espaces", "règle générique"),
-        (3, "remplacement", "dictionnaire"),
-        (4, "nature", "règle générique"),
-        (5, "doublons", "règle générique"),
-        (6, "decision", "décision du métier"),
+        (3, "referentiel", "règle de gestion"),
+        (4, "remplacement", "dictionnaire"),
+        (5, "nature", "règle générique"),
+        (6, "doublons", "règle générique"),
+        (7, "decision", "décision du métier"),
     ]
     assert "caractère de remplacement" in catalogue.at[0, "ne_corrige_jamais"]
     assert "saut de ligne" in catalogue.at[1, "ne_corrige_jamais"]
-    assert "hors liste" in catalogue.at[2, "ne_corrige_jamais"]
-    assert "date impossible" in catalogue.at[3, "ne_corrige_jamais"]
-    assert "identiques hors clé" in catalogue.at[4, "ne_corrige_jamais"]
-    assert "décidé de garder" in catalogue.at[5, "ne_corrige_jamais"]
+    assert "forme du référentiel non unique" in catalogue.at[2, "ne_corrige_jamais"]
+    assert "hors liste" in catalogue.at[3, "ne_corrige_jamais"]
+    assert "date impossible" in catalogue.at[4, "ne_corrige_jamais"]
+    assert "identiques hors clé" in catalogue.at[5, "ne_corrige_jamais"]
+    assert "décidé de garder" in catalogue.at[6, "ne_corrige_jamais"]
 
 
 # --- remplacement -------------------------------------------------------------
@@ -1576,3 +1587,141 @@ def test_espaces_corriges_apres_l_encodage():
     # Avant, 8 constats, dont 2 sur « voilà » mal décodé, signalé aussi par l'encodage.
     ecarts, _ = controler(tables, dictionnaire, sensibles, {})
     assert (ecarts["regle"] == "espaces").sum() == 8
+
+
+# --- referentiel ----------------------------------------------------------------
+
+
+def _regle_referentiel(**autres):
+    return {
+        "ref": "R10", "libelle": "Intervenant connu", "type": "existence_dans_reference",
+        "table": "t", "cle": ["nom"], "table_reference": "r", "cle_reference": ["n", "p"],
+        "comparaison": "mots dans le désordre", **autres,
+    }
+
+
+def _intervenants():
+    """60 lignes « Jean Dupont », 1 « Dupont Jean » (ordre toléré), 2 variantes; Curie
+    trop rare pour une correction sans arbitrage; Martin écrit de deux façons au
+    référentiel; Inconnu absent du référentiel."""
+    noms = (["Jean Dupont"] * 60 + ["Dupont Jean", "jean dupont", "JEAN  DUPONT"]
+            + ["Marie Curie"] * 3 + ["marie curie", "paul martin", "Inconnu"])
+    tables = {
+        "t": _table(code=[f"I{i}" for i in range(len(noms))], nom=noms),
+        "r": _table("r.csv", n=["Dupont", "Curie", "Martin", "MARTIN"],
+                    p=["Jean", "Marie", "Paul", "Paul"], m=["1", "2", "3", "4"]),
+    }
+    return tables, _dictionnaire(tables)
+
+
+def test_referentiel_corrige_les_variantes():
+    tables, dictionnaire = _intervenants()
+    sensibles = {"t": frozenset({"nom"})}
+    resultat = nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}},
+                        regles_gestion=[_regle_referentiel()])
+    noms = list(resultat.tables["t"]["nom"])
+    # Les deux variantes de Jean Dupont (la seconde après la règle des espaces) sont
+    # corrigées, « Dupont Jean » garde son ordre; les autres restent.
+    assert noms[60:] == ["Dupont Jean", "Jean Dupont", "Jean Dupont", "Marie Curie",
+                         "Marie Curie", "Marie Curie", "marie curie", "paul martin", "Inconnu"]
+    referentiel = _du_regle(resultat.journal, "referentiel")
+    assert _lignes(referentiel, "num_ligne_source", "colonne", "source", "valeur_avant",
+                   "valeur_apres", "detail") == [
+        (63, "nom", "règle de gestion", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         "forme de r (R10), 61 lignes sur 63 déjà écrites ainsi"),
+        (64, "nom", "règle de gestion", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         "forme de r (R10), 61 lignes sur 63 déjà écrites ainsi"),
+    ]
+    # Empreintes de la valeur laissée par la règle des espaces, puis de la forme.
+    assert list(referentiel["empreinte_avant"]) == [
+        empreinte_valeur("jean dupont", CLE), empreinte_valeur("JEAN DUPONT", CLE)
+    ]
+    assert set(referentiel["empreinte_apres"]) == {empreinte_valeur("Jean Dupont", CLE)}
+    assert _lignes(_du_regle(resultat.bilan, "referentiel"), "table", "colonne", "visees",
+                   "corrigees", "non_corrigees", "raisons") == [
+        ("t", "nom", 4, 2, 2,
+         "forme du référentiel non unique 1; forme du référentiel minoritaire dans la table 1"),
+    ]
+    # Ordre des règles : espaces, puis référentiel.
+    assert list(resultat.journal["regle_nettoyage"]) == ["espaces", "referentiel", "referentiel"]
+    # Cohérent avec le contrôle des règles de gestion : avant nettoyage, quatre clés
+    # trouvées après normalisation seulement; après, les deux qui restent à arbitrer.
+    from frigeo.gestion import CONSTAT_APRES_NORMALISATION, controler_gestion
+
+    def variantes(donnees):
+        ecarts, _ = controler_gestion(donnees, dictionnaire, [_regle_referentiel()], {}, None,
+                                      sensibles)
+        return list(ecarts.loc[ecarts["constat"] == CONSTAT_APRES_NORMALISATION,
+                               "num_ligne_source"])
+
+    assert variantes(tables) == [63, 64, 68, 69]
+    assert variantes(resultat.tables) == [68, 69]
+
+
+def test_referentiel_seuil_robuste():
+    from frigeo.nettoyage import SEUIL_REFERENTIEL
+
+    assert SEUIL_REFERENTIEL == 0.95
+    for exactes, corrigee in ((37, False), (38, True)):
+        noms = ["Jean Dupont"] * exactes + ["jean dupont"]
+        tables = {
+            "t": _table(code=[f"I{i}" for i in range(len(noms))], nom=noms),
+            "r": _table("r.csv", n=["Dupont"], p=["Jean"]),
+        }
+        resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, {},
+                            regles_gestion=[_regle_referentiel()])
+        # 38 / 40 = 0,95 atteint le seuil, 37 / 39 non.
+        assert (resultat.tables["t"]["nom"].iloc[-1] == "Jean Dupont") is corrigee, exactes
+
+
+def test_referentiel_regles_concernees():
+    tables, dictionnaire = _intervenants()
+    regles = [
+        _regle_referentiel(comparaison="telle quelle"),
+        _regle_referentiel(ref="R99", cle=["nom", "code"], cle_reference=["n", "p"]),
+        {"ref": "R22", "libelle": "x", "type": "plage", "table": "t", "colonne": "code",
+         "min": 0, "max": 1},
+    ]
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {}, regles_gestion=regles)
+    # Comparaison telle quelle, clé de deux colonnes, autre type : rien n'est visé.
+    assert _du_regle(resultat.bilan, "referentiel").empty
+    # Après normalisation, sans remise en ordre : « Dupont Jean » est la forme exacte,
+    # et les autres écritures de Jean Dupont sont absentes du référentiel : rien à corriger.
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {},
+                        regles_gestion=[_regle_referentiel(comparaison="après normalisation")])
+    assert _du_regle(resultat.bilan, "referentiel").empty
+    # Par défaut, les règles de config/gestion.yaml (ici absent : aucune).
+    assert _du_regle(nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {}).bilan,
+                     "referentiel").empty
+    with pytest.raises(ValueError, match="R10 : table x absente des données"):
+        nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {},
+                 regles_gestion=[_regle_referentiel(table_reference="x")])
+    with pytest.raises(ValueError, match="Règles de gestion invalides"):
+        nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {}, regles_gestion={"R10": 1})
+
+
+def test_referentiel_rend_caduque_une_decision_sur_la_variante():
+    tables, dictionnaire = _intervenants()
+    # Le métier avait corrigé la variante autrement que le référentiel.
+    decisions = _decisions(
+        a1=_decision(63, "nom", "corriger", _empreinte_cellule("jean dupont"), "Jean DUPONT",
+                     "texte"),
+    )
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {}, None, decisions,
+                        regles_gestion=[_regle_referentiel()])
+    assert resultat.tables["t"].at[61, "nom"] == "Jean Dupont"
+    assert _lignes(_du_regle(resultat.bilan), "colonne", "visees", "corrigees", "raisons") == [
+        ("nom", 1, 0, "source modifiée depuis la décision 1"),
+    ]
+
+
+def test_referentiel_regles_lues_par_defaut(tmp_path, monkeypatch):
+    import yaml
+
+    tables, dictionnaire = _intervenants()
+    fichier = tmp_path / "gestion.yaml"
+    fichier.write_text(yaml.safe_dump({"regles": [_regle_referentiel()]}, allow_unicode=True),
+                       encoding="utf-8")
+    monkeypatch.setattr(module_gestion, "chemin_regles_gestion", lambda: fichier)
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {})
+    assert _lignes(_du_regle(resultat.bilan, "referentiel"), "visees", "corrigees") == [(4, 2)]

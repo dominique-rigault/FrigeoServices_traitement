@@ -4133,6 +4133,15 @@ def test_trouvee_apres_normalisation_seulement():
     ]
     resume = _bilan(bilan)
     assert (resume["controlees"], resume["anomalies"], resume["a_arbitrer"]) == (7, 2, 3)
+    # La variante affiche sa propre règle; le bilan garde le type de la règle.
+    assert _lignes(ecarts, "constat", "type") == [
+        (CONSTAT_APRES_NORMALISATION, "forme du référentiel, mots dans le désordre"),
+        (CONSTAT_HORS_PERIODES, "date_dans_periode_reference"),
+        (CONSTAT_APRES_NORMALISATION, "forme du référentiel, mots dans le désordre"),
+        (CONSTAT_APRES_NORMALISATION, "forme du référentiel, mots dans le désordre"),
+        (CONSTAT_ABSENTE, "date_dans_periode_reference"),
+    ]
+    assert resume["type"] == "date_dans_periode_reference"
     # Après normalisation, sans remise en ordre : « Dupont Jean » est la forme exacte,
     # et « Jean Dupont » n'est plus trouvée.
     regle = _periodes(cle_reference=["n", "p"], comparaison="après normalisation")

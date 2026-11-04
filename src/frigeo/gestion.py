@@ -310,7 +310,8 @@ class Constats:
     `issue`, facultative, donne l'issue d'un écart quand elle n'est pas vide (par
     exemple « information » pour une pratique normale déclarée en exception). Une
     colonne `colonnes`, facultative, remplace les colonnes de la règle pour un écart
-    quand elle n'est pas vide (colonnes de la table de la règle, séparées par « , »).
+    quand elle n'est pas vide (colonnes de la table de la règle, séparées par « , »);
+    une colonne `type`, facultative, remplace de même le type affiché de l'écart.
     `ecarts_periodes`, facultatif : écarts qui n'appartiennent à aucune ligne source
     (par exemple un total de période), une ligne par écart, avec les colonnes
     `constat`, `cle` (par exemple la période) et `valeur`, et une colonne `issue`
@@ -1104,6 +1105,12 @@ def _equilibre_par_groupe(donnees, parametres, natures) -> Constats:
 CONSTAT_ABSENTE = "absente de la table de référence"
 CONSTAT_HORS_PERIODES = "date hors des périodes de la table de référence"
 CONSTAT_APRES_NORMALISATION = "trouvée après normalisation seulement"
+# Règle affichée d'un écart « trouvée après normalisation seulement », suivie de la
+# comparaison de la règle.
+REGLE_FORME_REFERENTIEL = "forme du référentiel"
+# Types qui rapprochent une clé d'un référentiel, et cherchent les clés trouvées après
+# normalisation seulement (voir `_ecarts_apres_normalisation`).
+TYPES_AVEC_REFERENTIEL = ("existence_dans_reference", "date_dans_periode_reference")
 CONSTAT_PERIODE_NON_COUVERTE = "début de période non couvert par un palier"
 CONSTAT_ANNEE_ABSENTE = "année absente de la table de référence"
 # Raisons pour lesquelles une ligne d'un référentiel est inutilisable, dans l'ordre
@@ -1178,24 +1185,13 @@ def _ecarts_apres_normalisation(
     comparaison = parametres.get("comparaison", COMPARAISON_TELLE_QUELLE)
     if comparaison == COMPARAISON_TELLE_QUELLE:
         return None
-    formes = {}
-    for brut in _textes_des_cles(liee.donnees, parametres["cle_reference"]):
-        if brut is not None:
-            formes.setdefault(_comparable(brut, comparaison), set()).add(brut)
+    formes = formes_du_referentiel(liee.donnees, parametres["cle_reference"], comparaison)
     textes = _textes_des_cles(donnees, parametres["cle"])
     constats = pd.Series(None, index=donnees.index, dtype=object)
     propositions = pd.Series(None, index=donnees.index, dtype=object)
     for position, texte in textes.items():
-        if texte is None:
-            continue
-        compare = _comparable(texte, comparaison)
-        if compare not in formes:
-            continue
-        if comparaison == COMPARAISON_MOTS:
-            candidates = {_remise_en_ordre(forme, texte) for forme in formes[compare]}
-        else:
-            candidates = set(formes[compare])
-        if texte in candidates:
+        candidates = formes_de_la_cle(texte, formes, comparaison)
+        if candidates is None or texte in candidates:
             continue
         constats.loc[position] = CONSTAT_APRES_NORMALISATION
         if len(candidates) == 1 and None not in candidates and len(parametres["cle"]) == 1:
@@ -1203,7 +1199,36 @@ def _ecarts_apres_normalisation(
     issues = pd.Series(ISSUE_A_ARBITRER, index=donnees.index, dtype=object)
     ecarts = _ecarts(constats, propositions, valeurs=textes, issues=issues)
     ecarts["colonnes"] = ", ".join(parametres["cle"])
+    ecarts["type"] = f"{REGLE_FORME_REFERENTIEL}, {comparaison}"
     return ecarts
+
+
+def formes_du_referentiel(
+    reference: pd.DataFrame, cle_reference: list[str], comparaison: str
+) -> dict[str, set[str]]:
+    """Formes du référentiel par clé comparée : textes des clés de `reference` (colonnes
+    de `cle_reference` reliées par une espace), regroupés selon `comparaison`."""
+    formes = {}
+    for brut in _textes_des_cles(reference, cle_reference):
+        if brut is not None:
+            formes.setdefault(_comparable(brut, comparaison), set()).add(brut)
+    return formes
+
+
+def formes_de_la_cle(texte, formes: dict[str, set[str]], comparaison: str) -> set | None:
+    """Formes du référentiel d'une clé écrite `texte` (None si la clé est vide ou
+    absente du référentiel) : en « mots dans le désordre », chaque forme a ses mots
+    remis dans l'ordre de ceux de `texte` (None pour une forme dont les mots ne se
+    correspondent pas un à un). La clé est écrite dans la forme du référentiel si
+    `texte` est l'une d'elles."""
+    if texte is None:
+        return None
+    compare = _comparable(texte, comparaison)
+    if compare not in formes:
+        return None
+    if comparaison == COMPARAISON_MOTS:
+        return {_remise_en_ordre(forme, texte) for forme in formes[compare]}
+    return set(formes[compare])
 
 
 def _avec_ecarts(ecarts: pd.DataFrame, autres: pd.DataFrame | None) -> pd.DataFrame:
@@ -4676,6 +4701,10 @@ def controler_gestion(
                 if lignage in donnees.columns
                 else None
             )
+        if "type" in ecarts.columns:
+            morceau["type"] = [
+                texte if _renseignee(texte) else instance["type"] for texte in ecarts["type"]
+            ]
         morceau["_regle"] = rang
         morceau["_sans_ligne"] = 0
         morceaux.append(morceau)
