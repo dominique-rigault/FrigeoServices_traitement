@@ -308,7 +308,9 @@ class Constats:
     son champ (par exemple une clé facultative vide); elle est comptée avec les
     lignes hors du filtre, et non parmi les lignes non évaluables. Une colonne
     `issue`, facultative, donne l'issue d'un écart quand elle n'est pas vide (par
-    exemple « information » pour une pratique normale déclarée en exception).
+    exemple « information » pour une pratique normale déclarée en exception). Une
+    colonne `colonnes`, facultative, remplace les colonnes de la règle pour un écart
+    quand elle n'est pas vide (colonnes de la table de la règle, séparées par « , »).
     `ecarts_periodes`, facultatif : écarts qui n'appartiennent à aucune ligne source
     (par exemple un total de période), une ligne par écart, avec les colonnes
     `constat`, `cle` (par exemple la période) et `valeur`, et une colonne `issue`
@@ -1101,6 +1103,7 @@ def _equilibre_par_groupe(donnees, parametres, natures) -> Constats:
 
 CONSTAT_ABSENTE = "absente de la table de référence"
 CONSTAT_HORS_PERIODES = "date hors des périodes de la table de référence"
+CONSTAT_APRES_NORMALISATION = "trouvée après normalisation seulement"
 CONSTAT_PERIODE_NON_COUVERTE = "début de période non couvert par un palier"
 CONSTAT_ANNEE_ABSENTE = "année absente de la table de référence"
 # Raisons pour lesquelles une ligne d'un référentiel est inutilisable, dans l'ordre
@@ -1111,23 +1114,105 @@ RAISONS_PALIER = ("clé vide", "date vide", "date illisible")
 RAISONS_ANNEE = ("année vide", "année illisible")
 
 
-def _cles_comparees(
-    donnees: pd.DataFrame, colonnes: list[str], comparaison: str = COMPARAISON_TELLE_QUELLE
-) -> pd.Series:
-    """Clé de chaque ligne : textes de ses colonnes reliés par une espace, sous la forme
-    où ils sont comparés; None si l'une des colonnes est vide ou faite d'espaces."""
+def _textes_des_cles(donnees: pd.DataFrame, colonnes: list[str]) -> pd.Series:
+    """Clé de chaque ligne telle qu'écrite : textes de ses colonnes reliés par une
+    espace; None si l'une des colonnes est vide ou faite d'espaces."""
 
     def cle(ligne):
         textes = [_valeur_constatee(valeur) for valeur in ligne]
         if any(texte is None or not texte.strip() for texte in textes):
             return None
-        return _comparable(" ".join(textes), comparaison)
+        return " ".join(textes)
 
     return pd.Series(
         [cle(ligne) for ligne in donnees[colonnes].itertuples(index=False)],
         index=donnees.index,
         dtype=object,
     )
+
+
+def _cles_comparees(
+    donnees: pd.DataFrame, colonnes: list[str], comparaison: str = COMPARAISON_TELLE_QUELLE
+) -> pd.Series:
+    """Clé de chaque ligne : textes de ses colonnes reliés par une espace, sous la forme
+    où ils sont comparés; None si l'une des colonnes est vide ou faite d'espaces."""
+    textes = _textes_des_cles(donnees, colonnes)
+    return pd.Series(
+        [None if texte is None else _comparable(texte, comparaison) for texte in textes],
+        index=donnees.index,
+        dtype=object,
+    )
+
+
+def _remise_en_ordre(forme: str, texte: str) -> str | None:
+    """Mots de `forme` (texte d'une clé du référentiel) remis dans l'ordre des mots de
+    `texte`, chaque mot de `texte` prenant le mot de `forme` qui lui est égal après
+    normalisation; None si les mots ne se correspondent pas un à un."""
+    restants = forme.split()
+    mots = []
+    for mot in texte.split():
+        cible = normaliser(mot)
+        trouve = next((m for m in restants if normaliser(m) == cible), None)
+        if trouve is None:
+            return None
+        restants.remove(trouve)
+        mots.append(trouve)
+    return " ".join(mots) if not restants else None
+
+
+def _ecarts_apres_normalisation(
+    donnees: pd.DataFrame, parametres: dict, liee: Liee
+) -> pd.DataFrame | None:
+    """Écarts « trouvée après normalisation seulement » d'une règle de rapprochement
+    avec un référentiel, None si sa comparaison est « telle quelle ».
+
+    Une forme du référentiel est le texte d'une de ses clés (colonnes de
+    `cle_reference` reliées par une espace); en « mots dans le désordre », ses mots
+    sont remis dans l'ordre de ceux de la clé de la ligne (l'ordre des mots est la
+    tolérance déclarée par la règle, la casse, les accents et les espaces ne le sont
+    pas). Une clé trouvée selon la comparaison de la règle mais égale à aucune forme
+    est un écart à arbitrer, porté par les seules colonnes de `cle`, avec pour valeur
+    la clé et pour proposition la forme du référentiel, si elle est unique et si la
+    clé tient en une colonne.
+    """
+    comparaison = parametres.get("comparaison", COMPARAISON_TELLE_QUELLE)
+    if comparaison == COMPARAISON_TELLE_QUELLE:
+        return None
+    formes = {}
+    for brut in _textes_des_cles(liee.donnees, parametres["cle_reference"]):
+        if brut is not None:
+            formes.setdefault(_comparable(brut, comparaison), set()).add(brut)
+    textes = _textes_des_cles(donnees, parametres["cle"])
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    propositions = pd.Series(None, index=donnees.index, dtype=object)
+    for position, texte in textes.items():
+        if texte is None:
+            continue
+        compare = _comparable(texte, comparaison)
+        if compare not in formes:
+            continue
+        if comparaison == COMPARAISON_MOTS:
+            candidates = {_remise_en_ordre(forme, texte) for forme in formes[compare]}
+        else:
+            candidates = set(formes[compare])
+        if texte in candidates:
+            continue
+        constats.loc[position] = CONSTAT_APRES_NORMALISATION
+        if len(candidates) == 1 and None not in candidates and len(parametres["cle"]) == 1:
+            propositions.loc[position] = next(iter(candidates))
+    issues = pd.Series(ISSUE_A_ARBITRER, index=donnees.index, dtype=object)
+    ecarts = _ecarts(constats, propositions, valeurs=textes, issues=issues)
+    ecarts["colonnes"] = ", ".join(parametres["cle"])
+    return ecarts
+
+
+def _avec_ecarts(ecarts: pd.DataFrame, autres: pd.DataFrame | None) -> pd.DataFrame:
+    """Écarts d'un type suivis d'autres écarts (une ligne peut en porter plusieurs)."""
+    if autres is None or autres.empty:
+        return ecarts
+    if ecarts.empty:
+        return autres
+    return pd.concat([ecarts, autres])
 
 
 def _hors_champ_cle(cles: pd.Series, parametres: dict) -> pd.Series:
@@ -1181,7 +1266,10 @@ def _existence_dans_reference(donnees, parametres, natures, liee: Liee) -> Const
     constats = cles.map(lambda cle: None if cle is None or cle in connues else CONSTAT_ABSENTE)
     return Constats(
         cles.notna().astype(bool),
-        _ecarts(constats.astype(object)),
+        _avec_ecarts(
+            _ecarts(constats.astype(object)),
+            _ecarts_apres_normalisation(donnees, parametres, liee),
+        ),
         hors_champ=_hors_champ_cle(cles, parametres),
     )
 
@@ -1257,7 +1345,10 @@ def _date_dans_periode_reference(donnees, parametres, natures, liee: Liee) -> Co
         affichees.loc[position] = f"{_jour(date)} ({_ecrire_periodes(liste)})"
     return Constats(
         evaluables,
-        _ecarts(constats, valeurs=affichees),
+        _avec_ecarts(
+            _ecarts(constats, valeurs=affichees),
+            _ecarts_apres_normalisation(donnees, parametres, liee),
+        ),
         tuple(_inutilisables(liee.table, raisons)),
         hors_champ=_hors_champ_cle(cles, parametres),
     )
@@ -2871,8 +2962,10 @@ TYPES = {
             "La clé de chaque ligne (cle, une ou plusieurs colonnes, textes reliés par "
             "une espace) existe dans table_reference, sous les colonnes de "
             "cle_reference (par défaut celles de cle). comparaison vaut telle quelle "
-            "(par défaut), après normalisation ou mots dans le désordre. Une clé vide "
-            "rend la ligne non évaluable, ou hors champ si cle_facultative vaut true."
+            "(par défaut), après normalisation ou mots dans le désordre; une clé trouvée "
+            "seulement grâce à cette comparaison est à arbitrer, avec la forme du "
+            "référentiel en correction proposée. Une clé vide rend la ligne non "
+            "évaluable, ou hors champ si cle_facultative vaut true."
         ),
         parametres={
             "cle": GENRE_COLONNES,
@@ -2891,9 +2984,10 @@ TYPES = {
         description=(
             "La date de chaque ligne tombe dans l'une des périodes (debut à fin, "
             "incluses; fin vide ou absente : période ouverte) que table_reference donne "
-            "pour sa clé (voir existence_dans_reference). Une clé absente du référentiel "
-            "est un écart; une ligne du référentiel inutilisable (début vide ou "
-            "illisible, fin illisible, début après fin) est signalée au bilan et rend "
+            "pour sa clé (voir existence_dans_reference, comparaison comprise). Une clé "
+            "absente du référentiel est un écart; une ligne du référentiel inutilisable "
+            "(début vide ou illisible, fin illisible, début après fin) est signalée au "
+            "bilan et rend "
             "non évaluables les dates hors des autres périodes de sa clé."
         ),
         parametres={
@@ -4559,13 +4653,18 @@ def controler_gestion(
                     for valeur, donnee in zip(valeurs, ecarts["valeur"])
                 ]
             propositions = list(ecarts["proposition"])
+        colonnes_ecarts = [texte_colonnes] * len(positions)
+        if "colonnes" in ecarts.columns:
+            colonnes_ecarts = [
+                texte if _renseignee(texte) else texte_colonnes for texte in ecarts["colonnes"]
+            ]
         morceau = pd.DataFrame(
             {
                 "_position": positions,
                 **commun,
                 "issue": issues.to_numpy(),
                 "constat": ecarts["constat"].to_numpy(),
-                "colonnes": texte_colonnes,
+                "colonnes": pd.Series(colonnes_ecarts, dtype=object).to_numpy(),
                 "cle": pd.Series(cles, dtype=object).to_numpy(),
                 "valeur": pd.Series(valeurs, dtype=object).to_numpy(),
                 "proposition": pd.Series(propositions, dtype=object).to_numpy(),

@@ -285,6 +285,55 @@ def test_coherence_avec_les_controles():
     assert (elements["etat_decision"] == ETAT_SANS_DECISION).all()
 
 
+def test_cle_trouvee_apres_normalisation_arbitree_comme_une_cellule():
+    """Une clé trouvée dans le référentiel après normalisation seulement est soumise
+    au métier comme une cellule, avec la forme du référentiel en proposition."""
+    tables = {
+        "t": _table(id=["A1", "A2"], nom=["Jean Dupont", "jean DUPONT"], q=["1", "2"]),
+        "r": _table("r.csv", n=["Dupont"], p=["Jean"]),
+    }
+
+    def colonne():
+        return {
+            regle: {"regle": valeur, "proposition": valeur, "statut": "observé", "motif": "m",
+                    "a_arbitrer": {}, "commentaire": "", "revu_le": None,
+                    **({"liste": []} if regle in ("valeurs", "format") else {})}
+            for regle, valeur in (("obligatoire", "facultatif"), ("nature", "texte"),
+                                  ("valeurs", "aucune"), ("format", "aucune"))
+        }
+
+    dictionnaire = {
+        "t": {"id": colonne(), "nom": colonne(), "q": colonne()},
+        "r": {"n": colonne(), "p": colonne()},
+    }
+    regle = {"ref": "R10", "libelle": "Intervenant connu", "type": "existence_dans_reference",
+             "table": "t", "cle": ["nom"], "table_reference": "r", "cle_reference": ["n", "p"],
+             "comparaison": "mots dans le désordre"}
+    declarations = {"t": {"cle": ["id"]}}
+    ecarts, bilan = controler(tables, dictionnaire, {}, {})
+    doublons, bilan_doublons = detecter_doublons(tables, declarations, {})
+    ecarts_gestion, bilan_gestion = controler_gestion(
+        tables, dictionnaire, [regle], declarations, doublons, {}
+    )
+    anomalies = reunir_anomalies(
+        tables, ecarts, doublons, ecarts_gestion, bilan, bilan_doublons, bilan_gestion,
+        declarations, {},
+    )
+    elements = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION)
+    assert _lignes_elements(elements) == [
+        (SORTE_CELLULE, 3, "nom", "jean DUPONT", "trouvée après normalisation seulement",
+         "Jean Dupont"),
+    ]
+
+
+def _lignes_elements(elements):
+    return [
+        (ligne.sorte, ligne.num_ligne_source, ligne.champ, ligne.valeur, ligne.constat,
+         ligne.proposition)
+        for ligne in elements.itertuples(index=False)
+    ]
+
+
 # --- classeur d'arbitrage -----------------------------------------------------
 
 

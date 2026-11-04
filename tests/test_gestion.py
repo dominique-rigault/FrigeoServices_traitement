@@ -14,6 +14,7 @@ from frigeo.gestion import (
     COLONNES_ECARTS_GESTION,
     COLONNES_NON_EVALUABLES_GESTION,
     CONSTAT_ABSENTE,
+    CONSTAT_APRES_NORMALISATION,
     CONSTAT_ANNEE_ABSENTE,
     CONSTAT_AUCUNE_LIGNE_CONFORME,
     CONSTAT_ANNEE_DU_NUMERO,
@@ -1527,12 +1528,20 @@ def test_existence_dans_reference():
     resume = _bilan(bilan)
     assert (resume["vue"], resume["hors_champ"], resume["non_evaluables"],
             resume["controlees"], resume["anomalies"]) == (VUE_TOUTES, 0, 2, 5, 3)
-    # Après normalisation, « a1 » rejoint « A1 ».
-    ecarts, _ = _controler_reference(
+    # Après normalisation, « a1 » rejoint « A1 » : la ligne n'est plus absente, mais
+    # sa clé est à arbitrer, portée par sa seule colonne, avec la forme du référentiel.
+    ecarts, bilan = _controler_reference(
         donnees, reference, natures, {"c": "texte"},
         [_existence(comparaison="après normalisation")],
     )
-    assert _lignes(ecarts, "num_ligne_source") == [(5,), (8,)]
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur",
+                   "proposition") == [
+        (5, CONSTAT_ABSENTE, "anomalie", "c, r.c", "Z9", None),
+        (6, CONSTAT_APRES_NORMALISATION, "à arbitrer", "c", "a1 ", "A1"),
+        (8, CONSTAT_ABSENTE, "anomalie", "c, r.c", "Z9", None),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["anomalies"], resume["a_arbitrer"]) == (5, 2, 1)
     # Clé facultative : les clés vides sont hors champ, comptées avec celles du filtre.
     ecarts, bilan = _controler_reference(
         donnees, reference, natures, {"c": "texte"},
@@ -1555,12 +1564,21 @@ def test_existence_cle_de_plusieurs_colonnes_et_mots_dans_le_desordre():
         ecarts, _ = _controler_reference(
             donnees, reference, natures, natures_reference, [regle]
         )
-        return [ligne for (ligne,) in _lignes(ecarts, "num_ligne_source")]
+        constats = _lignes(ecarts, "num_ligne_source", "constat", "proposition")
+        return (
+            [ligne for ligne, constat, _ in constats if constat == CONSTAT_ABSENTE],
+            [(ligne, proposition) for ligne, constat, proposition in constats
+             if constat == CONSTAT_APRES_NORMALISATION],
+        )
 
     # Le prénom vide de DUPONT rend sa clé vide : elle n'est rattachée à rien.
-    assert absentes("telle quelle") == [3, 4, 5, 6]
-    assert absentes("après normalisation") == [3, 5, 6]
-    assert absentes("mots dans le désordre") == [5, 6]
+    assert absentes("telle quelle") == ([3, 4, 5, 6], [])
+    assert absentes("après normalisation") == ([3, 5, 6], [(4, "LEROUX Mathieu")])
+    # En mots dans le désordre, la forme du référentiel suit l'ordre des mots de la
+    # ligne : « Mathieu Leroux » ne diffère que par la casse de « Mathieu LEROUX ».
+    assert absentes("mots dans le désordre") == (
+        [5, 6], [(3, "Mathieu LEROUX"), (4, "LEROUX Mathieu")]
+    )
     regle = _reference("existence_dans_reference", cle=["nom"], cle_reference=["n", "p"])
     ecarts, _ = _controler_reference(
         donnees, reference, natures, natures_reference, [regle], sensibles={"r": {"n"}}
@@ -4071,3 +4089,85 @@ def test_date_vide_hors_champ_si_declaree_facultative():
     assert _bilan(bilan_faux)["non_evaluables"] == 4
     with pytest.raises(ValueError, match="vide_hors_champ"):
         _controler(donnees, natures, regles=[_regle(vide_hors_champ="oui")])
+
+
+
+# --- clés trouvées après normalisation seulement (B2) ----------------------------
+
+
+def _variantes():
+    jour = dt.datetime
+    reference = _table(
+        "r.xlsx",
+        n=["Dupont", "Martin", "Curie", "CURIE"],
+        p=["Jean", "Jérôme", "Marie", "Marie"],
+        e=[jour(2020, 1, 1), jour(2020, 1, 1), jour(2020, 1, 1), jour(2024, 1, 1)],
+    )
+    donnees = _table(
+        i=["Jean Dupont", "jean dupont", "Jérome Martin", "Marie Curie", "marie curie",
+           "Paul Inconnu", "Dupont Jean"],
+        d=["15/03/2025", "15/03/2025", "15/03/2019", "15/03/2025", "15/03/2025", "15/03/2025",
+           "15/03/2025"],
+    )
+    natures = ({"i": "texte", "d": DATE}, {"n": "texte", "p": "texte", "e": NATIVE})
+    return donnees, reference, natures
+
+
+def test_trouvee_apres_normalisation_seulement():
+    donnees, reference, natures = _variantes()
+    regle = _periodes(cle_reference=["n", "p"], comparaison="mots dans le désordre")
+    ecarts, bilan = _controler_reference(donnees, reference, *natures, [regle])
+    # Ligne 3 : casse; ligne 4 : accent, et date hors période (deux écarts, le contrôle
+    # principal d'abord); ligne 6 : deux formes du référentiel (Curie et CURIE), pas de
+    # proposition; ligne 5 : égale à l'une des deux formes; ligne 8 : ordre des mots,
+    # toléré par la comparaison.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur",
+                   "proposition") == [
+        (3, CONSTAT_APRES_NORMALISATION, "à arbitrer", "i", "jean dupont", "Jean Dupont"),
+        (4, CONSTAT_HORS_PERIODES, "anomalie", "i, d, r.n, r.p, r.e",
+         "15/03/2019 (période depuis le 01/01/2020)", None),
+        (4, CONSTAT_APRES_NORMALISATION, "à arbitrer", "i", "Jérome Martin", "Jérôme Martin"),
+        (6, CONSTAT_APRES_NORMALISATION, "à arbitrer", "i", "marie curie", None),
+        (7, CONSTAT_ABSENTE, "anomalie", "i, d, r.n, r.p, r.e", "Paul Inconnu | 15/03/2025",
+         None),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["anomalies"], resume["a_arbitrer"]) == (7, 2, 3)
+    # Après normalisation, sans remise en ordre : « Dupont Jean » est la forme exacte,
+    # et « Jean Dupont » n'est plus trouvée.
+    regle = _periodes(cle_reference=["n", "p"], comparaison="après normalisation")
+    ecarts, _ = _controler_reference(donnees, reference, *natures, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "proposition") == [
+        (2, CONSTAT_ABSENTE, None),
+        (3, CONSTAT_ABSENTE, None),
+        (4, CONSTAT_ABSENTE, None),
+        (5, CONSTAT_ABSENTE, None),
+        (6, CONSTAT_ABSENTE, None),
+        (7, CONSTAT_ABSENTE, None),
+    ]
+    # Telle quelle (par défaut) : aucune variante n'est cherchée.
+    regle = _periodes(cle_reference=["n", "p"])
+    ecarts, _ = _controler_reference(donnees, reference, *natures, [regle])
+    assert CONSTAT_APRES_NORMALISATION not in set(ecarts["constat"])
+
+
+def test_apres_normalisation_cle_de_plusieurs_colonnes_et_colonne_sensible():
+    donnees = _table(a=["Jean", "JEAN", "Marie"], b=["Dupont", "Dupont", "Curie"])
+    reference = _table("r.csv", n=["Dupont", "Curie"], p=["Jean", "Marie"])
+    natures, natures_reference = {"a": "texte", "b": "texte"}, {"n": "texte", "p": "texte"}
+    regle = _reference("existence_dans_reference", cle=["a", "b"], cle_reference=["p", "n"],
+                       comparaison="après normalisation")
+    ecarts, _ = _controler_reference(donnees, reference, natures, natures_reference, [regle])
+    # Clé de deux colonnes : écart porté par les deux, sans proposition.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "colonnes", "valeur",
+                   "proposition") == [
+        (3, CONSTAT_APRES_NORMALISATION, "a, b", "JEAN Dupont", None),
+    ]
+    regle = _reference("existence_dans_reference", cle=["a"], cle_reference=["p"],
+                       comparaison="après normalisation")
+    ecarts, _ = _controler_reference(donnees, reference, natures, natures_reference, [regle],
+                                     sensibles={"t": {"a"}})
+    assert _lignes(ecarts, "num_ligne_source", "constat", "colonnes", "valeur",
+                   "proposition") == [
+        (3, CONSTAT_APRES_NORMALISATION, "a", VALEUR_MASQUEE, VALEUR_MASQUEE),
+    ]
