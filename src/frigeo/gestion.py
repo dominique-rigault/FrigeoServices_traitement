@@ -487,6 +487,57 @@ def _date_dans_periode_export(donnees, parametres, natures) -> Constats:
     return Constats(evaluables, _ecarts(constats, propositions), hors_champ=hors_champ)
 
 
+CONSTAT_FIN_AVANT_DEBUT = "date de fin antérieure à la date de début"
+CONSTAT_DELAI_INFERIEUR = "délai inférieur au minimum"
+CONSTAT_DELAI_SUPERIEUR = "délai supérieur au maximum"
+
+
+def _jours(nombre: int) -> str:
+    """Nombre de jours, au singulier de -1 à 1."""
+    return f"{nombre} {'jour' if abs(nombre) <= 1 else 'jours'}"
+
+
+def _dates_ordonnees(donnees, parametres, natures) -> Constats:
+    """Date de fin au plus tôt le jour de la date de début, dans un délai borné.
+
+    Le délai est le nombre de jours calendaires de la date de début à la date de fin,
+    heures ignorées. Une date de fin antérieure à la date de début est un écart, de
+    même qu'un délai inférieur à `delai_min` (0 par défaut) ou supérieur à
+    `delai_max` (sans maximum par défaut). Une date vide ou illisible rend la ligne
+    non évaluable; avec `vide_hors_champ`, une date de fin vide laisse la ligne hors
+    champ (date facultative, par exemple une date de sortie), quelle que soit la date
+    de début. La valeur affichée donne les deux dates et le délai.
+    """
+    debut, fin = parametres["debut"], parametres["fin"]
+    lecture_debut = lire(donnees[debut], natures[debut])
+    lecture_fin = lire(donnees[fin], natures[fin])
+    dates_debut = lecture_debut.valeurs.dt.normalize()
+    dates_fin = lecture_fin.valeurs.dt.normalize()
+    evaluables = (dates_debut.notna() & dates_fin.notna()).astype(bool)
+    mini, maxi = parametres.get("delai_min", 0), parametres.get("delai_max")
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position in donnees.index[evaluables.to_numpy()]:
+        date_debut, date_fin = dates_debut.loc[position], dates_fin.loc[position]
+        delai = (date_fin - date_debut).days
+        if delai < 0:
+            constat = CONSTAT_FIN_AVANT_DEBUT
+        elif delai < mini:
+            constat = CONSTAT_DELAI_INFERIEUR
+        elif maxi is not None and delai > maxi:
+            constat = CONSTAT_DELAI_SUPERIEUR
+        else:
+            continue
+        constats.loc[position] = constat
+        affichees.loc[position] = (
+            f"début {_jour(date_debut)}, fin {_jour(date_fin)}, délai de {_jours(delai)}"
+        )
+    hors_champ = None
+    if parametres.get("vide_hors_champ"):
+        hors_champ = (lecture_fin.etats == ETAT_VIDE).astype(bool)
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees), hors_champ=hors_champ)
+
+
 CONSTAT_INFERIEURE = "inférieure au minimum"
 CONSTAT_SUPERIEURE = "supérieure au maximum"
 CONSTAT_RAPPORT_INFERIEUR = "rapport inférieur au minimum"
@@ -2784,6 +2835,23 @@ def _verifier_renseignee(parametres: dict) -> list[str]:
     return problemes
 
 
+def _verifier_dates_ordonnees(parametres: dict) -> list[str]:
+    problemes = []
+    if parametres["debut"] == parametres["fin"]:
+        problemes.append("debut et fin : deux colonnes différentes sont attendues")
+    for nom in ("delai_min", "delai_max"):
+        if nom in parametres and (
+            not float(parametres[nom]).is_integer() or parametres[nom] < 0
+        ):
+            problemes.append(f"{nom} : un nombre entier de jours, positif ou nul, est attendu")
+    mini = parametres.get("delai_min", 0)
+    if not problemes and "delai_max" in parametres and mini > parametres["delai_max"]:
+        problemes.append(
+            f"delai_min ({mini}) supérieur à delai_max ({parametres['delai_max']})"
+        )
+    return problemes
+
+
 def _verifier_rapport(parametres: dict) -> list[str]:
     problemes = _problemes_bornes(parametres)
     if parametres.get("facteur") == 0:
@@ -3491,6 +3559,26 @@ TYPES = {
         controler=_renseignee_selon_valeur,
         facultatifs=("vide_sinon",),
         verifier=_verifier_renseignee,
+    ),
+    "dates_ordonnees": TypeRegle(
+        description=(
+            "La date de fin (fin) de chaque ligne n'est pas antérieure à sa date de "
+            "début (debut), et le délai qui les sépare, en jours calendaires, est compris "
+            "entre delai_min (0 par défaut) et delai_max (inclus, sans maximum par "
+            "défaut). Avec vide_hors_champ, une date de fin vide laisse la ligne hors "
+            "champ (date facultative) au lieu de la rendre non évaluable."
+        ),
+        parametres={
+            "debut": GENRE_COLONNE_DATE,
+            "fin": GENRE_COLONNE_DATE,
+            "delai_min": GENRE_NOMBRE,
+            "delai_max": GENRE_NOMBRE,
+            "vide_hors_champ": GENRE_BOOLEEN,
+        },
+        vue=VUE_TOUTES,
+        controler=_dates_ordonnees,
+        facultatifs=("delai_min", "delai_max", "vide_hors_champ"),
+        verifier=_verifier_dates_ordonnees,
     ),
 }
 

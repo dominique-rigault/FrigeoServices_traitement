@@ -26,8 +26,11 @@ from frigeo.gestion import (
     CONSTAT_DATE_DIFFERENTE,
     CONSTAT_DATE_POSTERIEURE,
     CONSTAT_DELAI_NON_ECHU,
+    CONSTAT_DELAI_INFERIEUR,
+    CONSTAT_DELAI_SUPERIEUR,
     CONSTAT_DESEQUILIBRE,
     CONSTAT_ECART_CALCUL,
+    CONSTAT_FIN_AVANT_DEBUT,
     CONSTAT_HORS_DELAI,
     CONSTAT_HORS_HORAIRES,
     CONSTAT_HORS_PERIODES,
@@ -250,7 +253,7 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
         "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle, "
         "sommes_liees_concordantes, totaux_par_periode, solde_jamais_negatif, "
-        "renseignee_selon_valeur)",
+        "renseignee_selon_valeur, dates_ordonnees)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, commentaire, "
         "colonne, vide_hors_champ)",
@@ -4180,3 +4183,121 @@ def test_apres_normalisation_cle_de_plusieurs_colonnes_et_colonne_sensible():
                    "proposition") == [
         (3, CONSTAT_APRES_NORMALISATION, "a", VALEUR_MASQUEE, VALEUR_MASQUEE),
     ]
+
+
+# --- dates ordonnées (B3) --------------------------------------------------------
+
+
+def _ordre(ref="ordre", **autres):
+    return {"ref": ref, "libelle": "Fin au plus tôt le jour du début",
+            "type": "dates_ordonnees", "table": "t", "debut": "d", "fin": "f", **autres}
+
+
+NATURES_ORDRE = {"d": "date native", "f": "date JJ/MM/AAAA"}
+
+
+def _donnees_ordre():
+    jour = pd.Timestamp("2025-01-01")
+    return _table(
+        d=[jour, jour, jour, pd.Timestamp("2025-03-12"), pd.Timestamp("2025-01-01 23:30"),
+           None, jour, jour, jour, "x"],
+        f=["31/01/2025", "30/01/2025", "01/02/2025", "01/02/2025", "31/01/2025",
+           "31/01/2025", "", "1/2/2025", "02/01/2025", ""],
+    )
+
+
+def test_dates_ordonnees_ordre_delai_et_valeur_affichee():
+    donnees = _donnees_ordre()
+    ecarts, bilan = _controler(donnees, NATURES_ORDRE, regles=[_ordre()])
+    # Sans délai déclaré, seule la fin antérieure au début est un écart; les heures
+    # sont ignorées (ligne 6, 30 jours et non 29).
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (5, CONSTAT_FIN_AVANT_DEBUT, "anomalie", "d, f",
+         "début 12/03/2025, fin 01/02/2025, délai de -39 jours"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["non_evaluables"], resume["hors_champ"]) == (6, 4, 0)
+    ecarts, bilan = _controler(donnees, NATURES_ORDRE,
+                               regles=[_ordre(delai_min=30, delai_max=30)])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (3, CONSTAT_DELAI_INFERIEUR, "début 01/01/2025, fin 30/01/2025, délai de 29 jours"),
+        (4, CONSTAT_DELAI_SUPERIEUR, "début 01/01/2025, fin 01/02/2025, délai de 31 jours"),
+        (5, CONSTAT_FIN_AVANT_DEBUT, "début 12/03/2025, fin 01/02/2025, délai de -39 jours"),
+        (10, CONSTAT_DELAI_INFERIEUR, "début 01/01/2025, fin 02/01/2025, délai de 1 jour"),
+    ]
+    # Bornes incluses : un délai de 0 est admis par défaut, un maximum seul est possible.
+    ecarts, _ = _controler(donnees, NATURES_ORDRE, regles=[_ordre(delai_max=30)])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (4, CONSTAT_DELAI_SUPERIEUR), (5, CONSTAT_FIN_AVANT_DEBUT),
+    ]
+    egales = _table(d=[pd.Timestamp("2025-01-01")], f=["01/01/2025"])
+    ecarts, bilan = _controler(egales, NATURES_ORDRE, regles=[_ordre()])
+    assert ecarts.empty and _bilan(bilan)["controlees"] == 1
+    # Même jour, fin à une heure plus matinale que le début : pas d'écart.
+    heures = _table(d=[pd.Timestamp("2025-01-01 10:00")], f=[pd.Timestamp("2025-01-01 08:00")])
+    ecarts, _ = _controler(heures, {"d": "date native", "f": "date native"}, regles=[_ordre()])
+    assert ecarts.empty
+    # Toutes les lignes, comme pour une plage : un doublon exact porte aussi l'écart.
+    doubles = _table(d=[pd.Timestamp("2025-03-12")] * 2, f=["01/02/2025"] * 2)
+    ecarts, _ = _controler(doubles, NATURES_ORDRE, regles=[_ordre()])
+    assert _lignes(ecarts, "num_ligne_source") == [(2,), (3,)]
+
+
+def test_dates_ordonnees_fin_vide_hors_champ_si_declaree():
+    donnees = _donnees_ordre()
+    ecarts, bilan, non_evaluables = controler_gestion(
+        {"t": donnees}, _dictionnaire(**NATURES_ORDRE), [_ordre()], {}, None,
+        AUCUNE_SENSIBLE, avec_non_evaluables=True,
+    )
+    assert _lignes(non_evaluables, "num_ligne_source") == [(7,), (8,), (9,), (11,)]
+    ecarts_f, bilan_f, non_evaluables_f = controler_gestion(
+        {"t": donnees}, _dictionnaire(**NATURES_ORDRE), [_ordre(vide_hors_champ=True)], {},
+        None, AUCUNE_SENSIBLE, avec_non_evaluables=True,
+    )
+    # La fin vide sort du champ, même avec un début illisible (ligne 11); un début
+    # vide et une fin illisible restent non évaluables, et les écarts ne changent pas.
+    resume = _bilan(bilan_f)
+    assert (resume["controlees"], resume["non_evaluables"], resume["hors_champ"]) == (6, 2, 2)
+    assert _lignes(non_evaluables_f, "num_ligne_source") == [(7,), (9,)]
+    pd.testing.assert_frame_equal(ecarts_f, ecarts)
+    _, bilan_faux = _controler(donnees, NATURES_ORDRE, regles=[_ordre(vide_hors_champ=False)])
+    assert _bilan(bilan_faux)["non_evaluables"] == 4
+
+
+def test_dates_ordonnees_issue_declaree_et_colonne_sensible():
+    donnees = _donnees_ordre()
+    ecarts, _ = _controler(donnees, NATURES_ORDRE, regles=[_ordre(issue="information")])
+    assert _lignes(ecarts, "num_ligne_source", "issue") == [(5, "information")]
+    ecarts, _ = _controler(donnees, NATURES_ORDRE, regles=[_ordre()],
+                           sensibles={"t": {"f"}})
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (5, CONSTAT_FIN_AVANT_DEBUT, VALEUR_MASQUEE),
+    ]
+
+
+def test_dates_ordonnees_parametres_refuses():
+    regles = [
+        _ordre(fin="d"),
+        _ordre(delai_min=-1),
+        _ordre(delai_max=2.5),
+        _ordre(delai_min=31, delai_max=30),
+        _ordre(delai_min=5),
+        _ordre(vide_hors_champ="oui"),
+        _ordre(debut=None),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (ordre) : debut et fin : deux colonnes différentes sont attendues",
+        "règle n° 2 (ordre) : delai_min : un nombre entier de jours, positif ou nul, est "
+        "attendu",
+        "règle n° 3 (ordre) : delai_max : un nombre entier de jours, positif ou nul, est "
+        "attendu",
+        "règle n° 4 (ordre) : delai_min (31) supérieur à delai_max (30)",
+        "règle n° 6 (ordre), vide_hors_champ : true ou false est attendu",
+        "règle n° 7 (ordre), debut : un nom de colonne est attendu (colonne de date)",
+    ]
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["dates_ordonnees", "parametres"] == (
+        "debut (colonne de date), fin (colonne de date), delai_min (nombre, facultatif), "
+        "delai_max (nombre, facultatif), vide_hors_champ (true ou false, facultatif)"
+    )
+    assert catalogue.loc["dates_ordonnees", "issue"] == "anomalie"
