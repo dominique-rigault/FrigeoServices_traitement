@@ -38,6 +38,16 @@ from frigeo.gestion import controler_gestion
 AUCUNE_DECISION = {"meta": {"structure": 1, "imports": []}, "decisions": {}}
 
 
+@pytest.fixture(autouse=True)
+def sans_regles_de_gestion(tmp_path_factory, monkeypatch):
+    """Les règles de gestion du poste (config/gestion.yaml) ne sont jamais lues par
+    ces tests : sauf règles passées, aucune."""
+    import frigeo.gestion as module_gestion
+
+    absent = tmp_path_factory.mktemp("gestion") / "gestion_absent.yaml"
+    monkeypatch.setattr(module_gestion, "chemin_regles_gestion", lambda: absent)
+
+
 def _table(fichier="t.csv", premiere_ligne=2, **colonnes) -> pd.DataFrame:
     """Table fictive avec son lignage (première ligne de données en ligne 2)."""
     nombre = len(next(iter(colonnes.values())))
@@ -930,3 +940,106 @@ def test_problemes_des_retraits():
     assert problemes_decisions(
         {"meta": {"structure": 1, "imports": [], "retraits": [r1]}, "decisions": {}}
     ) == []
+
+
+# --- forme du référentiel proposée dans le classeur ----------------------------
+
+
+APRES_NORMALISATION = "trouvée après normalisation seulement"
+
+
+def _regle_referentiel(ref="R10", comparaison="mots dans le désordre", **autres):
+    return {
+        "ref": ref, "libelle": "Intervenant connu", "type": "existence_dans_reference",
+        "table": "t", "cle": ["nom"], "table_reference": "r", "cle_reference": ["nom"],
+        "comparaison": comparaison, **autres,
+    }
+
+
+def _variante(ligne, identifiant, ref="R10", proposition="masqué", constat=APRES_NORMALISATION):
+    from frigeo.anomalies import _controle_gestion
+
+    return _anomalie(
+        "gestion", "à arbitrer", ligne, "nom", controle=_controle_gestion(ref, "Intervenant connu"),
+        valeur="masqué", id_anomalie=identifiant, proposition=proposition, constat=constat,
+    )
+
+
+def test_forme_du_referentiel_proposee_quand_masquee(tmp_path):
+    tables = {
+        "t": _table(id=["A1", "A2", "A3", "A4", "A5", "A6", "A7"],
+                    nom=["dupont jean", "martin paul", "durand luc", "petit", "dupont jean",
+                         "petit", "dupont jean"]),
+        "r": _table("r.csv", id=["1", "2", "3", "4", "5"],
+                    nom=["Jean Dupont", "Paul Martin", "Luc Durand", "LUC DURAND", "Petit"]),
+    }
+    anomalies = _anomalies(
+        # Forme unique, remise dans l'ordre des mots de la clé.
+        _variante(2, "v1"),
+        # Proposition déjà en clair (colonne non sensible) : gardée telle quelle.
+        _variante(3, "v2", proposition="proposition en clair"),
+        # Deux formes au référentiel : pas de proposition.
+        _variante(4, "v3"),
+        # Règle inconnue, règle « telle quelle », autre constat : rien.
+        _variante(5, "v4", ref="R99"),
+        _variante(6, "v5", ref="R11"),
+        _variante(7, "v6", constat="absente de la table de référence"),
+        # Règle d'un type que la règle de nettoyage referentiel ne corrige pas : rien.
+        _variante(8, "v7", ref="R12"),
+    )
+    regles = [
+        _regle_referentiel(),
+        _regle_referentiel("R11", "telle quelle"),
+        _regle_referentiel("R12", type="concordance_entre_references"),
+    ]
+    elements = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION, regles)
+    assert dict(zip(elements["id_anomalie"], elements["proposition"])) == {
+        "v1": "Dupont Jean", "v2": "proposition en clair", "v3": "masqué", "v4": "masqué",
+        "v5": "masqué", "v6": "masqué", "v7": "masqué",
+    }
+    # La table des anomalies reçue n'est pas modifiée.
+    assert list(anomalies["proposition"]) == ["masqué", "proposition en clair"] + ["masqué"] * 5
+    chemin = exporter_arbitrage(elements, "2026-03", tmp_path / "a.xlsx", nb_imports=0)
+    classeur = load_workbook(chemin)
+    notice = [ligne[0] or "" for ligne in classeur["mode_emploi"].iter_rows(values_only=True)]
+    assert sum("forme du référentiel, y compris sur une colonne sensible" in texte
+               for texte in notice) == 1
+    lignes = list(classeur[FEUILLE_ARBITRAGE].iter_rows(values_only=True))
+    par_id = {
+        ligne[COLONNES_ARBITRAGE.index("id_anomalie")]: (
+            ligne[COLONNES_ARBITRAGE.index("valeur_retenue")],
+            ligne[COLONNES_ARBITRAGE.index("decision")],
+        )
+        for ligne in lignes[1:]
+    }
+    assert par_id == {
+        "v1": ("Dupont Jean", None), "v2": ("proposition en clair", None),
+        "v3": (None, None), "v4": (None, None), "v5": (None, None), "v6": (None, None),
+        "v7": (None, None),
+    }
+    # Sans règle passée, celles de config/gestion.yaml (absent ici) : rien.
+    defaut = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION)
+    assert list(defaut["proposition"]) == list(anomalies["proposition"])
+
+
+def test_forme_du_referentiel_lue_dans_les_tables_recues():
+    # Référentiel absent, colonne de référence absente, clé vide ou devenue la forme
+    # du référentiel (nettoyée) : pas de proposition.
+    tables = {
+        "t": _table(id=["A1", "A2", "A3"], nom=["dupont jean", " ", "Jean Dupont"]),
+        "r": _table("r.csv", id=["1"], nom=["Jean Dupont"]),
+    }
+    anomalies = _anomalies(_variante(2, "v1"), _variante(3, "v2"), _variante(4, "v3"))
+    propositions = elements_a_arbitrer(
+        tables, anomalies, AUCUNE_DECISION, [_regle_referentiel()]
+    )["proposition"]
+    assert list(propositions) == ["Dupont Jean", "masqué", "masqué"]
+    for regle in (_regle_referentiel(table_reference="absente"),
+                  _regle_referentiel(cle_reference=["absente"]),
+                  _regle_referentiel(table="autre")):
+        propositions = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION, [regle])
+        assert list(propositions["proposition"]) == ["masqué"] * 3
+    # Sans cle_reference, celle de la table (même nom de colonne).
+    sans = {k: v for k, v in _regle_referentiel().items() if k != "cle_reference"}
+    propositions = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION, [sans])
+    assert list(propositions["proposition"]) == ["Dupont Jean", "masqué", "masqué"]

@@ -57,6 +57,7 @@ from .anomalies import (
     ETAPE_DOUBLONS,
     ETAPE_FORMAT,
     ETAPE_GESTION,
+    _controle_gestion,
     _index_lignage,
     _repere,
 )
@@ -69,7 +70,13 @@ from .dictionnaire import (
 )
 from .doublons import SEPARATEUR, _texte
 from .formulaires import FOND_MODIFIABLE, dossier_formulaires, rendre_modifiable, texte_entier
-from .nettoyage import _convertir
+from .gestion import (
+    CONSTAT_APRES_NORMALISATION,
+    charger_regles_gestion,
+    formes_de_la_cle,
+    formes_du_referentiel,
+)
+from .nettoyage import _convertir, _regles_referentiel
 from .profilage import _interpretations
 from .revue import _ecrire_texte, _est_vide, _menu
 from .typage import NATURES_LISIBLES, ecrire_date
@@ -384,10 +391,46 @@ def _sorte(ligne, donnees: pd.DataFrame | None) -> str | None:
     return None
 
 
+def _formes_proposees(tables: dict[str, pd.DataFrame], regles_gestion: list):
+    """Fonction qui rend la forme du référentiel d'une clé « trouvée après
+    normalisation seulement », lue dans une ligne de sa table, ou None si la règle
+    n'est pas une de celles que corrige la règle de nettoyage `referentiel`, si la
+    clé n'est plus trouvée ou si le référentiel en a plusieurs formes."""
+    regles = {
+        _controle_gestion(regle["ref"], regle["libelle"]): regle
+        for regle in _regles_referentiel(regles_gestion)
+    }
+    formes_par_controle = {}
+
+    def forme(ligne, source) -> str | None:
+        regle = regles.get(ligne.controle)
+        if regle is None or regle["table"] != ligne.table or regle["cle"] != [ligne.champ]:
+            return None
+        cle_reference = regle.get("cle_reference", regle["cle"])
+        reference = tables.get(regle["table_reference"])
+        if reference is None or any(c not in reference.columns for c in cle_reference):
+            return None
+        comparaison = regle["comparaison"]
+        if ligne.controle not in formes_par_controle:
+            formes_par_controle[ligne.controle] = formes_du_referentiel(
+                reference.reset_index(drop=True), cle_reference, comparaison
+            )
+        texte = _valeur_constatee(source[ligne.champ])
+        if texte is None or not texte.strip():
+            return None
+        candidates = formes_de_la_cle(texte, formes_par_controle[ligne.controle], comparaison)
+        if not candidates or len(candidates) != 1 or None in candidates or texte in candidates:
+            return None
+        return next(iter(candidates))
+
+    return forme
+
+
 def elements_a_arbitrer(
     tables: dict[str, pd.DataFrame],
     anomalies: pd.DataFrame,
     decisions: dict | None = None,
+    regles_gestion: list | None = None,
 ) -> pd.DataFrame:
     """Éléments soumis au métier, avec l'état de leur décision.
 
@@ -415,6 +458,13 @@ def elements_a_arbitrer(
     valable », ou « ligne source introuvable » (lignage absent ou en double dans la
     table : l'élément ne peut pas être arbitré). Seuls les deux premiers états sont
     exportés dans le classeur.
+
+    `proposition` est celle de la table des anomalies, sauf pour une clé « trouvée
+    après normalisation seulement » dont la proposition y est masquée (colonne
+    sensible) : elle vaut alors la forme du référentiel, en clair, lue dans les
+    tables reçues comme le fait la règle de nettoyage `referentiel`, si cette forme
+    est unique (sinon elle reste masquée). `regles_gestion` (règles de
+    config/gestion.yaml par défaut) donne le référentiel de chaque règle.
     """
     manquantes = [c for c in COLONNES_ANOMALIES if c not in anomalies.columns]
     if manquantes:
@@ -424,6 +474,9 @@ def elements_a_arbitrer(
     if decisions is None:
         decisions = charger_decisions()
     enregistrees = decisions["decisions"]
+    if regles_gestion is None:
+        regles_gestion = charger_regles_gestion()
+    forme_proposee = _formes_proposees(tables, regles_gestion)
     index = {}
     for table, donnees in tables.items():
         donnees = donnees.reset_index(drop=True)
@@ -440,9 +493,16 @@ def elements_a_arbitrer(
             position = reperes.get(
                 _repere(ligne.fichier_source, ligne.feuille_source, ligne.num_ligne_source)
             )
-        valeur, empreinte = ligne.valeur, None
+        valeur, empreinte, proposition = ligne.valeur, None, ligne.proposition
         if position is not None:
             source = donnees.iloc[position]
+            if (
+                sorte == SORTE_CELLULE
+                and ligne.etape == ETAPE_GESTION
+                and ligne.constat == CONSTAT_APRES_NORMALISATION
+                and proposition == VALEUR_MASQUEE
+            ):
+                proposition = forme_proposee(ligne, source) or proposition
             colonnes = _colonnes_locales(ligne.champ, donnees)
             if sorte == SORTE_LIGNE:
                 empreinte = _empreinte(
@@ -497,7 +557,7 @@ def elements_a_arbitrer(
                 "regle": ligne.regle,
                 "constat": ligne.constat,
                 "detail": ligne.detail,
-                "proposition": ligne.proposition,
+                "proposition": proposition,
                 "empreinte": empreinte,
             }
         )
@@ -571,7 +631,9 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
         "valeurs ne changent pas).",
         "La colonne valeur_retenue est préremplie avec la correction proposée par "
         "l'outil quand il en propose une : la vérifier avant de choisir corriger. Elle "
-        "n'est lue qu'avec la décision corriger.",
+        "n'est lue qu'avec la décision corriger. Pour une clé écrite autrement que dans "
+        "son référentiel (constat « trouvée après normalisation seulement »), c'est la "
+        "forme du référentiel, y compris sur une colonne sensible.",
         "Écrire la valeur retenue comme dans le fichier source. Une date peut s'écrire "
         "JJ/MM/AAAA, JJ.MM.AAAA, JJ-MM-AAAA, AAAA-MM-JJ ou AAAAMMJJ, un nombre avec une "
         "virgule ou un point décimal; une année sur deux chiffres est refusée. La "
