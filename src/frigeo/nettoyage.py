@@ -224,6 +224,15 @@ COLONNES_BILAN_NETTOYAGE = (
     "non_corrigees",
     "raisons",
 )
+COLONNES_DECISIONS_CADUQUES = (
+    "id_anomalie",
+    "sorte",
+    "table",
+    "champ",
+    "decision",
+    "decide_le",
+    "classeur",
+)
 COLONNES_CATALOGUE_NETTOYAGE = ("rang", "regle_nettoyage", "source", "corrige", "ne_corrige_jamais")
 
 _CATALOGUE = {
@@ -300,8 +309,9 @@ _CATALOGUE = {
     ),
 }
 
-Nettoyage = namedtuple("Nettoyage", ["tables", "journal", "bilan"])
-Nettoyage.__doc__ = """Résultat de `nettoyer` : tables nettoyées, journal et bilan."""
+Nettoyage = namedtuple("Nettoyage", ["tables", "journal", "bilan", "caduques"])
+Nettoyage.__doc__ = """Résultat de `nettoyer` : tables nettoyées, journal, bilan et décisions
+caduques."""
 
 Reparation = namedtuple("Reparation", ["texte", "raison", "passes", "encodages"])
 Reparation.__doc__ = """Résultat de `reparer_encodage`.
@@ -948,10 +958,11 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
     """Règle `decision` : applique aux tables nettoyées (modifiées sur place) les
     décisions « corriger » puis « retirer » du métier.
 
-    Rend (corrections, retraits, lignes du bilan) : une correction est (table,
-    étiquette de la ligne, colonne, valeur avant, valeur après, détail), un retrait
-    (table, étiquette, détail). Les décisions sont prises de la plus ancienne à la
-    plus récente. Une décision ne s'applique que si sa ligne est retrouvée par son
+    Rend (corrections, retraits, lignes du bilan, caduques) : une correction est
+    (table, étiquette de la ligne, colonne, valeur avant, valeur après, détail), un
+    retrait (table, étiquette, détail), une décision caduque (identifiant, décision),
+    écartée parce que sa donnée a changé depuis la décision. Les décisions sont
+    prises de la plus ancienne à la plus récente. Une décision ne s'applique que si sa ligne est retrouvée par son
     lignage et si l'empreinte calculée comme à l'export (`decisions.elements_a_arbitrer`)
     est la sienne : valeur de la cellule pour une correction, ligne entière hors
     lignage, après les corrections, pour un retrait. Une valeur retenue est écrite
@@ -986,7 +997,7 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
             )
         )
 
-    corrections = []
+    corrections, caduques = [], []
     for identifiant, decision in ordonnees:
         if decision["decision"] != DECISION_CORRIGER:
             continue
@@ -1002,6 +1013,7 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
         avant = donnees.iat[position, rang]
         if _empreinte([_forme(avant)]) != decision["empreinte"]:
             compte[2][RAISON_SOURCE_MODIFIEE] += 1
+            caduques.append((identifiant, decision))
             continue
         valeur = decision["valeur_retenue"]
         nature = dictionnaire[table][colonne]["nature"]["regle"]
@@ -1037,6 +1049,7 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
         )
         if empreinte != decision["empreinte"]:
             compte[2][RAISON_SOURCE_MODIFIEE] += 1
+            caduques.append((identifiant, decision))
             continue
         compte[1] += 1
         etiquette = donnees.index[position]
@@ -1071,7 +1084,7 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
                 "raisons": _texte_raisons(raisons, RAISONS_DECISION),
             }
         )
-    return corrections, retraits, lignes
+    return corrections, retraits, lignes, caduques
 
 
 def _texte_raisons(raisons: Counter, ordre) -> str | None:
@@ -1138,6 +1151,14 @@ def nettoyer(
     retraits décidés par le métier), avec les
     cellules (ou lignes) visées, corrigées, non corrigées, et le décompte des raisons
     de non-correction (textes séparés par « ; »).
+
+    Décisions caduques (`COLONNES_DECISIONS_CADUQUES`) : une ligne par décision
+    « corriger » ou « retirer » écartée parce que sa donnée a changé depuis la
+    décision (raison « source modifiée depuis la décision » du bilan), dans l'ordre
+    où la règle `decision` les examine; elles ne peuvent plus s'appliquer, et
+    `decisions.retirer_decisions` les retire du fichier des décisions. Aucune valeur
+    n'y figure. Une décision « garder », une ligne source introuvable ou une valeur
+    retenue illisible n'y sont pas.
     """
     if sensibles is None:
         sensibles = charger_sensibilite()
@@ -1207,7 +1228,7 @@ def nettoyer(
     for table, donnees in brutes.items():
         cle = [c for c in declarations.get(table, {}).get("cle", []) if c in donnees.columns]
         cles[table] = (cle, any(est_sensible(sensibles, table, c) for c in cle))
-    journal, bilan = [], []
+    journal, bilan, caduques = [], [], []
 
     def ligne_du_journal(rang_regle, rang_table, table, position, **champs) -> dict:
         """Ligne du journal pour la ligne source de la table reçue à cette position."""
@@ -1235,7 +1256,7 @@ def nettoyer(
 
     for rang_regle, regle_nettoyage in enumerate(REGLES_NETTOYAGE):
         if regle_nettoyage == REGLE_DECISION:
-            corrections, retraits, lignes_bilan = _regle_decision(
+            corrections, retraits, lignes_bilan, caduques = _regle_decision(
                 nettoyees, decisions["decisions"], dictionnaire, list(tables)
             )
             bilan.extend(lignes_bilan)
@@ -1451,7 +1472,13 @@ def nettoyer(
         journal = pd.DataFrame(columns=list(COLONNES_JOURNAL), dtype=object)
     bilan = pd.DataFrame(bilan, columns=list(COLONNES_BILAN_NETTOYAGE), dtype=object)
     bilan = bilan.astype({"visees": int, "corrigees": int, "non_corrigees": int})
-    return Nettoyage(nettoyees, journal, bilan)
+    champs = COLONNES_DECISIONS_CADUQUES[1:]
+    caduques = pd.DataFrame(
+        [{"id_anomalie": i, **{c: d[c] for c in champs}} for i, d in caduques],
+        columns=list(COLONNES_DECISIONS_CADUQUES),
+        dtype=object,
+    )
+    return Nettoyage(nettoyees, journal, bilan, caduques)
 
 
 COLONNES_COMPARAISON = (

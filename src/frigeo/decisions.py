@@ -27,8 +27,9 @@ Fichiers, tous hors du dépôt :
 - data/formulaires/arbitrage_AAAA-MM.xlsx : le classeur d'arbitrage
   (`exporter_arbitrage`, `importer_arbitrage`); il porte des valeurs du client, y
   compris celles des colonnes sensibles;
-- data/config/decisions.yaml : les décisions enregistrées et le journal des
-  imports (`charger_decisions`, `ecrire_decisions`), avec une copie datée dans
+- data/config/decisions.yaml : les décisions enregistrées, le journal des
+  imports et celui des retraits de décisions caduques (`charger_decisions`,
+  `ecrire_decisions`, `retirer_decisions`), avec une copie datée dans
   data/config/sauvegardes/ avant chaque écriture.
 
 L'application des décisions aux tables nettoyées relève du morceau 6e2.
@@ -183,6 +184,8 @@ CHAMPS_DECISION = (
     "classeur",
 )
 CHAMPS_IMPORT = ("date", "classeur", "periode_fin", "decisions", "remplacees", *DECISIONS)
+CHAMPS_RETRAIT = ("date", "periode_fin", "decisions", "identifiants")
+CLES_META = ("structure", "imports", "retraits")
 COLONNES_DECISIONS_LUES = (
     "id_anomalie",
     "sorte",
@@ -239,6 +242,9 @@ def problemes_decisions(contenu) -> list[str]:
     if not isinstance(meta, dict) or meta.get("structure") != STRUCTURE_DECISIONS:
         problemes.append(f"meta : structure {STRUCTURE_DECISIONS} attendue")
         meta = {}
+    inconnues = [str(cle) for cle in meta if cle not in CLES_META]
+    if inconnues:
+        problemes.append(f"meta : clés inconnues {', '.join(inconnues)}")
     imports = meta.get("imports", [])
     if not isinstance(imports, list):
         problemes.append("meta : imports doit être une liste")
@@ -254,6 +260,32 @@ def problemes_decisions(contenu) -> list[str]:
             problemes.append(f"{ou} : date 'AAAA-MM-JJ HH:MM:SS' attendue")
         elif precedent is not None and instant <= precedent:
             problemes.append(f"{ou} : date antérieure ou égale à celle de l'import précédent")
+        precedent = instant or precedent
+    retraits = meta.get("retraits", [])
+    if not isinstance(retraits, list):
+        problemes.append("meta : retraits doit être une liste")
+        retraits = []
+    precedent = None
+    for rang, entree in enumerate(retraits, start=1):
+        ou = f"meta, retrait {rang}"
+        if not isinstance(entree, dict) or set(entree) != set(CHAMPS_RETRAIT):
+            problemes.append(f"{ou} : champs attendus {', '.join(CHAMPS_RETRAIT)}")
+            continue
+        identifiants = entree["identifiants"]
+        if (
+            not isinstance(identifiants, list)
+            or not identifiants
+            or not all(isinstance(i, str) for i in identifiants)
+            or entree["decisions"] != len(identifiants)
+        ):
+            problemes.append(
+                f"{ou} : identifiants attendus, liste de textes de longueur decisions"
+            )
+        instant = lire_instant(entree["date"])
+        if instant is None:
+            problemes.append(f"{ou} : date 'AAAA-MM-JJ HH:MM:SS' attendue")
+        elif precedent is not None and instant <= precedent:
+            problemes.append(f"{ou} : date antérieure ou égale à celle du retrait précédent")
         precedent = instant or precedent
     decisions = contenu["decisions"]
     if not isinstance(decisions, dict):
@@ -921,7 +953,8 @@ def ecrire_decisions(
 
     Une décision remplace celle du même identifiant (décision caduque). Le
     journal des imports reçoit une entrée (date, classeur, période, nombre de
-    décisions, de décisions remplacées, et par décision). Rien n'est écrit si le
+    décisions, de décisions remplacées, et par décision); celui des retraits est
+    gardé tel quel. Rien n'est écrit si le
     classeur ne porte aucune décision (entrée None) : le classeur reste alors
     importable.
 
@@ -967,13 +1000,84 @@ def ecrire_decisions(
         **{choix: int(nombres[choix]) for choix in DECISIONS},
     }
     nouveau = {
-        "meta": {"structure": STRUCTURE_DECISIONS, "imports": [*imports, entree]},
+        "meta": {**contenu["meta"], "imports": [*imports, entree]},
         "decisions": decisions,
     }
+    _ecrire_contenu(chemin, nouveau, periode_fin)
+    return chemin, entree
+
+
+def retirer_decisions(
+    identifiants,
+    periode_fin: str,
+    lues: dict,
+    chemin: str | Path | None = None,
+) -> tuple[Path, dict | None]:
+    """Retire des décisions caduques du fichier des décisions et rend le chemin et
+    l'entrée du journal des retraits.
+
+    `identifiants` : identifiants des décisions à retirer, en pratique la colonne
+    id_anomalie des décisions caduques rendues par `nettoyage.nettoyer`; `lues` : le
+    contenu du fichier tel que passé à `nettoyer` (`charger_decisions`). Rien n'est
+    écrit sans identifiant (entrée None).
+
+    Refusé, sans rien écrire, si le fichier a changé depuis la lecture de `lues` (un
+    import ou un retrait entre-temps : relancer le nettoyage), si un identifiant n'y
+    figure pas ou est donné deux fois, ou si la date du retrait n'est pas
+    postérieure à celle du précédent. Le journal des retraits (meta, retraits) reçoit
+    une entrée : date, période, nombre de décisions et identifiants retirés. Le
+    journal des imports n'est pas touché, si bien qu'un classeur d'arbitrage exporté
+    avant le retrait reste importable. Le fichier en place est d'abord copié dans
+    data/config/sauvegardes/, comme pour `ecrire_decisions`.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_decisions()
+    identifiants = list(identifiants)
+    contenu = charger_decisions(chemin)
+    if contenu != lues:
+        raise ValueError(
+            f"{chemin} a changé depuis sa lecture par le nettoyage : relancer le "
+            "nettoyage. Rien n'est retiré."
+        )
+    if not identifiants:
+        return chemin, None
+    doubles = sorted(str(i) for i, n in Counter(identifiants).items() if n > 1)
+    absents = sorted({str(i) for i in identifiants if i not in contenu["decisions"]})
+    problemes = []
+    if doubles:
+        problemes.append(f"identifiants donnés plusieurs fois : {', '.join(doubles)}")
+    if absents:
+        problemes.append(f"identifiants absents de {chemin.name} : {', '.join(absents)}")
+    if problemes:
+        raise ValueError("Rien n'est retiré\n  " + "\n  ".join(problemes))
+    retraits = contenu["meta"].get("retraits", [])
+    instant = horodater()
+    if retraits and lire_instant(instant) <= lire_instant(retraits[-1]["date"]):
+        raise ValueError(
+            f"{chemin} : le retrait ({instant}) doit être postérieur au précédent "
+            f"({retraits[-1]['date']}); relancer le retrait"
+        )
+    entree = {
+        "date": instant,
+        "periode_fin": periode_fin,
+        "decisions": len(identifiants),
+        "identifiants": sorted(identifiants),
+    }
+    retirees = set(identifiants)
+    nouveau = {
+        "meta": {**contenu["meta"], "retraits": [*retraits, entree]},
+        "decisions": {i: d for i, d in contenu["decisions"].items() if i not in retirees},
+    }
+    _ecrire_contenu(chemin, nouveau, periode_fin)
+    return chemin, entree
+
+
+def _ecrire_contenu(chemin: Path, nouveau: dict, periode_fin: str) -> None:
+    """Écrit le fichier des décisions : contrôle du contenu, copie datée du fichier en
+    place, écriture dans un fichier provisoire, relu et comparé, qui remplace enfin
+    le fichier en place."""
     problemes = problemes_decisions(nouveau)
     if problemes:
         raise ValueError("Décisions invalides, rien n'est écrit\n  " + "\n  ".join(problemes))
-
     chemin.parent.mkdir(parents=True, exist_ok=True)
     if chemin.exists():
         _sauvegarder(chemin, periode_fin)
@@ -989,5 +1093,4 @@ def ecrire_decisions(
         os.replace(provisoire, chemin)
     finally:
         provisoire.unlink(missing_ok=True)
-    return chemin, entree
 

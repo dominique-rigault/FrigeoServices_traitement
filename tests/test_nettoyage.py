@@ -1725,3 +1725,77 @@ def test_referentiel_regles_lues_par_defaut(tmp_path, monkeypatch):
     monkeypatch.setattr(module_gestion, "chemin_regles_gestion", lambda: fichier)
     resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {})
     assert _lignes(_du_regle(resultat.bilan, "referentiel"), "visees", "corrigees") == [(4, 2)]
+
+
+# --- décisions caduques -----------------------------------------------------------
+
+
+def test_decisions_caduques():
+    # Seules les décisions « corriger » et « retirer » dont la donnée a changé depuis
+    # la décision sont caduques; une décision appliquée, « garder » ou introuvable ne
+    # l'est pas.
+    from frigeo.nettoyage import COLONNES_DECISIONS_CADUQUES
+
+    tables = {"t": _table(code=["a", "b", "c", "d"], nom=["x", "y", "z", "w"])}
+    decisions = _decisions(
+        c1=_decision(2, "nom", "corriger", _empreinte_cellule("x"), "v", "texte"),
+        c2=_decision(3, "nom", "corriger", _empreinte_cellule("ancien"), "v", "texte",
+                     decide_le="2026-10-21 10:00:00"),
+        c3=_decision(9, "nom", "corriger", _empreinte_cellule("x"), "v", "texte"),
+        g1=_decision(4, "nom", "garder", _empreinte_cellule("ancien")),
+        r1=_decision(5, "code", "retirer", _empreinte_ligne(code="d", nom="autre")),
+        r2=_decision(4, "code", "retirer", _empreinte_ligne(code="c", nom="z")),
+    )
+    resultat = _nettoyer_avec(tables, decisions)
+    caduques = resultat.caduques
+    assert list(caduques.columns) == list(COLONNES_DECISIONS_CADUQUES)
+    # Dans l'ordre d'examen : corrections (de la plus ancienne), puis retraits.
+    assert _lignes(caduques, *COLONNES_DECISIONS_CADUQUES) == [
+        ("c2", "cellule", "t", "nom", "corriger", "2026-10-21 10:00:00",
+         "arbitrage_2026-03.xlsx"),
+        ("r1", "ligne", "t", "code", "retirer", "2026-10-20 10:00:00",
+         "arbitrage_2026-03.xlsx"),
+    ]
+    assert _lignes(_du_regle(resultat.bilan), "colonne", "visees", "corrigees", "raisons") == [
+        ("nom", 3, 1, "source modifiée depuis la décision 1; ligne source introuvable 1"),
+        (None, 2, 1, "source modifiée depuis la décision 1"),
+    ]
+    assert list(resultat.tables["t"]["num_ligne_source"]) == [2, 3, 5]
+    # Sans décision : aucune ligne, mêmes colonnes.
+    vide = _nettoyer_avec(tables, AUCUNE_DECISION).caduques
+    assert vide.empty and list(vide.columns) == list(COLONNES_DECISIONS_CADUQUES)
+    # Le tuple rendu a quatre membres.
+    tables_nettoyees, journal, bilan, caduques = resultat
+    assert caduques is resultat.caduques
+
+
+def test_retrait_des_decisions_caduques_puis_nouveau_nettoyage(tmp_path, monkeypatch):
+    import yaml
+
+    import frigeo.dictionnaire as module_dictionnaire
+
+    monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: datetime(2026, 11, 4, 10))
+    fichier = tmp_path / "config" / "decisions.yaml"
+    fichier.parent.mkdir()
+    tables = {"t": _table(code=["a", "b"], nom=["x", "y"])}
+    decisions = _decisions(
+        c1=_decision(2, "nom", "corriger", _empreinte_cellule("x"), "v", "texte"),
+        c2=_decision(3, "nom", "corriger", _empreinte_cellule("ancien"), "v", "texte"),
+    )
+    fichier.write_text(yaml.safe_dump(decisions, allow_unicode=True, sort_keys=False),
+                       encoding="utf-8")
+    lues = module_decisions.charger_decisions(fichier)
+    premier = _nettoyer_avec(tables, lues)
+    assert list(premier.caduques["id_anomalie"]) == ["c2"]
+    _, entree = module_decisions.retirer_decisions(
+        premier.caduques["id_anomalie"], "2026-03", lues, fichier
+    )
+    assert entree == {"date": "2026-11-04 10:00:00", "periode_fin": "2026-03",
+                      "decisions": 1, "identifiants": ["c2"]}
+    relues = module_decisions.charger_decisions(fichier)
+    assert list(relues["decisions"]) == ["c1"]
+    second = _nettoyer_avec(tables, relues)
+    assert second.caduques.empty
+    assert _lignes(_du_regle(second.bilan), "visees", "corrigees", "raisons") == [(1, 1, None)]
+    assert second.tables["t"].equals(premier.tables["t"])
+    assert second.journal.equals(premier.journal)

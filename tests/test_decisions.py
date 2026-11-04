@@ -792,3 +792,141 @@ def test_mode_emploi_avec_separateur_des_milliers():
     texte = " ".join(_mode_emploi("2026-03", elements))
     assert f"Contenu : 1{milliers}204 lignes" in texte
     assert f"dont 1{milliers}200 cellules, 3 lignes et 1 écarts; 1{milliers}001 lignes" in texte
+
+
+# --- retrait des décisions caduques --------------------------------------------
+
+
+IMPORT = {"date": "2026-11-04 09:00:00", "classeur": "a.xlsx", "periode_fin": "2026-03",
+          "decisions": 3, "remplacees": 0, "corriger": 3, "garder": 0, "retirer": 0}
+
+
+def _decision_enregistree(ligne):
+    return {
+        "sorte": "cellule", "table": "t", "fichier_source": "t.csv", "feuille_source": None,
+        "num_ligne_source": ligne, "champ": "nom", "constat": "c", "empreinte": "e",
+        "decision": "corriger", "valeur_retenue": "v", "nature": "texte",
+        "commentaire": None, "decide_le": "2026-11-04 09:00:00", "classeur": "a.xlsx",
+    }
+
+
+def _fichier_de_decisions(tmp_path, retraits=None):
+    import yaml
+
+    meta = {"structure": 1, "imports": [IMPORT]}
+    if retraits is not None:
+        meta["retraits"] = retraits
+    contenu = {
+        "meta": meta,
+        "decisions": {i: _decision_enregistree(n) for n, i in enumerate("abc", start=2)},
+    }
+    fichier = tmp_path / "config" / "decisions.yaml"
+    fichier.parent.mkdir(parents=True, exist_ok=True)
+    fichier.write_text(yaml.safe_dump(contenu, allow_unicode=True, sort_keys=False),
+                       encoding="utf-8")
+    return fichier
+
+
+def test_retirer_decisions(tmp_path, monkeypatch):
+    from frigeo.decisions import retirer_decisions
+
+    instants = iter([datetime(2026, 11, 4, 10, 0, s) for s in range(0, 60, 5)])
+    monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: next(instants))
+    fichier = _fichier_de_decisions(tmp_path)
+    origine = fichier.read_bytes()
+    lues = charger_decisions(fichier)
+    sauvegardes = fichier.parent / "sauvegardes"
+
+    # Sans identifiant, rien n'est écrit.
+    assert retirer_decisions([], "2026-03", lues, fichier) == (fichier, None)
+    assert fichier.read_bytes() == origine and not sauvegardes.exists()
+    # Identifiant absent ou donné deux fois : refusé, rien n'est écrit.
+    with pytest.raises(ValueError) as erreur:
+        retirer_decisions(["a", "z", "a"], "2026-03", lues, fichier)
+    assert str(erreur.value).splitlines()[1:] == [
+        "  identifiants donnés plusieurs fois : a",
+        "  identifiants absents de decisions.yaml : z",
+    ]
+    assert fichier.read_bytes() == origine and not sauvegardes.exists()
+
+    ecrit, entree = retirer_decisions(pd.Series(["c", "a"]), "2026-03", lues, fichier)
+    assert ecrit == fichier
+    assert entree == {"date": "2026-11-04 10:00:00", "periode_fin": "2026-03",
+                      "decisions": 2, "identifiants": ["a", "c"]}
+    relues = charger_decisions(fichier)
+    assert relues["decisions"] == {"b": _decision_enregistree(3)}
+    # Le journal des imports n'est pas touché : un classeur exporté avant reste importable.
+    assert relues["meta"] == {"structure": 1, "imports": [IMPORT], "retraits": [entree]}
+    copies = list(sauvegardes.iterdir())
+    assert len(copies) == 1 and copies[0].read_bytes() == origine
+
+    # Décisions lues avant ce retrait : le fichier a changé, refusé.
+    avant = fichier.read_bytes()
+    with pytest.raises(ValueError, match="a changé depuis sa lecture par le nettoyage"):
+        retirer_decisions(["b"], "2026-03", lues, fichier)
+    assert fichier.read_bytes() == avant
+    # Second retrait, à la suite du premier dans le journal.
+    _, entree2 = retirer_decisions(["b"], "2026-04", relues, fichier)
+    assert charger_decisions(fichier) == {
+        "meta": {"structure": 1, "imports": [IMPORT], "retraits": [entree, entree2]},
+        "decisions": {},
+    }
+    # Même seconde que le retrait précédent : refusé.
+    fichier = _fichier_de_decisions(tmp_path / "autre", retraits=[entree2])
+    monkeypatch.setattr(
+        module_dictionnaire, "_maintenant", lambda: datetime(2026, 11, 4, 10, 0, 10)
+    )
+    avant = fichier.read_bytes()
+    with pytest.raises(ValueError, match="doit être postérieur"):
+        retirer_decisions(["a"], "2026-03", charger_decisions(fichier), fichier)
+    assert fichier.read_bytes() == avant
+
+
+def test_ecrire_decisions_garde_les_retraits(tmp_path, monkeypatch):
+    from frigeo.decisions import Arbitrage
+
+    monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: datetime(2026, 11, 4, 11))
+    retrait = {"date": "2026-11-04 10:00:00", "periode_fin": "2026-03", "decisions": 1,
+               "identifiants": ["z"]}
+    fichier = _fichier_de_decisions(tmp_path, retraits=[retrait])
+    lue = {
+        "id_anomalie": "d", **_decision_enregistree(5), "ligne_excel": 2,
+    }
+    decisions = pd.DataFrame([{c: lue[c] for c in COLONNES_DECISIONS_LUES}], dtype=object)
+    arbitrage = Arbitrage(decisions, [], tmp_path / "b.xlsx", 1)
+    _, entree = ecrire_decisions(arbitrage, "2026-03", fichier)
+    meta = charger_decisions(fichier)["meta"]
+    assert meta == {"structure": 1, "imports": [IMPORT, entree], "retraits": [retrait]}
+    assert list(meta) == ["structure", "imports", "retraits"]
+
+
+def test_problemes_des_retraits():
+    from frigeo.decisions import problemes_decisions
+
+    r1 = {"date": "2026-11-04 10:00:00", "periode_fin": "2026-03", "decisions": 1,
+          "identifiants": ["a"]}
+    retraits = [
+        r1,
+        {**r1},
+        {"date": "2026-11-04 11:00:00"},
+        {**r1, "date": "2026-11-04 12:00:00", "decisions": 2},
+        {**r1, "date": "x", "decisions": 0, "identifiants": []},
+        {**r1, "date": "2026-11-04 13:00:00", "identifiants": [1]},
+    ]
+    meta = {"structure": 1, "imports": [], "retraits": retraits, "autre": 1}
+    assert problemes_decisions({"meta": meta, "decisions": {}}) == [
+        "meta : clés inconnues autre",
+        "meta, retrait 2 : date antérieure ou égale à celle du retrait précédent",
+        "meta, retrait 3 : champs attendus date, periode_fin, decisions, identifiants",
+        "meta, retrait 4 : identifiants attendus, liste de textes de longueur decisions",
+        "meta, retrait 5 : identifiants attendus, liste de textes de longueur decisions",
+        "meta, retrait 5 : date 'AAAA-MM-JJ HH:MM:SS' attendue",
+        "meta, retrait 6 : identifiants attendus, liste de textes de longueur decisions",
+    ]
+    meta = {"structure": 1, "imports": [], "retraits": "x"}
+    assert problemes_decisions({"meta": meta, "decisions": {}}) == [
+        "meta : retraits doit être une liste"
+    ]
+    assert problemes_decisions(
+        {"meta": {"structure": 1, "imports": [], "retraits": [r1]}, "decisions": {}}
+    ) == []
