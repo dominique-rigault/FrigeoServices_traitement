@@ -538,6 +538,54 @@ def _dates_ordonnees(donnees, parametres, natures) -> Constats:
     return Constats(evaluables, _ecarts(constats, valeurs=affichees), hors_champ=hors_champ)
 
 
+CONSTAT_DATE_TROP_ANCIENNE = "date antérieure au minimum"
+CONSTAT_DATE_TROP_TARDIVE = "date postérieure à la limite après la coupure"
+
+
+def _date_plausible(donnees, parametres, natures) -> Constats:
+    """Date au plus tôt à `min`, au plus tard `apres_coupure` jours après la coupure.
+
+    La coupure est la fin de la période traitée (`CONTEXTE_DATE_COUPURE`) : la limite
+    haute avance d'elle-même avec la période. `apres_coupure` (0 par défaut) admet les
+    dates d'un référentiel extrait après la coupure, ou une date future légitime (une
+    sortie prévue). `min`, facultatif, est une date fixe. Une date vide ou illisible
+    rend la ligne non évaluable, une date vide la laisse hors champ avec
+    `vide_hors_champ`. La valeur affichée donne la date, la borne dépassée et l'écart
+    en jours.
+    """
+    colonne = parametres["colonne"]
+    lecture = lire(donnees[colonne], natures[colonne])
+    dates = lecture.valeurs.dt.normalize()
+    evaluables = dates.notna().astype(bool)
+    marge = parametres.get("apres_coupure", 0)
+    limite = pd.Timestamp(parametres[CONTEXTE_DATE_COUPURE]).normalize() + pd.Timedelta(
+        days=marge
+    )
+    mini = parametres.get("min")
+    mini = None if mini is None else pd.Timestamp(_jour_ferie(mini))
+    trop_anciennes = (evaluables & (dates < mini)) if mini is not None else evaluables & False
+    trop_tardives = evaluables & ~trop_anciennes & (dates > limite)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position in donnees.index[trop_anciennes.to_numpy()]:
+        date = dates.loc[position]
+        constats.loc[position] = CONSTAT_DATE_TROP_ANCIENNE
+        affichees.loc[position] = (
+            f"{_jour(date)}, minimum {_jour(mini)}, {_jours((mini - date).days)} avant"
+        )
+    for position in donnees.index[trop_tardives.to_numpy()]:
+        date = dates.loc[position]
+        constats.loc[position] = CONSTAT_DATE_TROP_TARDIVE
+        affichees.loc[position] = (
+            f"{_jour(date)}, limite {_jour(limite)} (coupure plus {_jours(marge)}), "
+            f"{_jours((date - limite).days)} après"
+        )
+    hors_champ = None
+    if parametres.get("vide_hors_champ"):
+        hors_champ = (lecture.etats == ETAT_VIDE).astype(bool)
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees), hors_champ=hors_champ)
+
+
 CONSTAT_INFERIEURE = "inférieure au minimum"
 CONSTAT_SUPERIEURE = "supérieure au maximum"
 CONSTAT_RAPPORT_INFERIEUR = "rapport inférieur au minimum"
@@ -2852,6 +2900,13 @@ def _verifier_dates_ordonnees(parametres: dict) -> list[str]:
     return problemes
 
 
+def _verifier_date_plausible(parametres: dict) -> list[str]:
+    marge = parametres.get("apres_coupure", 0)
+    if not float(marge).is_integer() or marge < 0:
+        return ["apres_coupure : un nombre entier de jours, positif ou nul, est attendu"]
+    return []
+
+
 def _verifier_rapport(parametres: dict) -> list[str]:
     problemes = _problemes_bornes(parametres)
     if parametres.get("facteur") == 0:
@@ -3579,6 +3634,26 @@ TYPES = {
         controler=_dates_ordonnees,
         facultatifs=("delai_min", "delai_max", "vide_hors_champ"),
         verifier=_verifier_dates_ordonnees,
+    ),
+    "date_plausible": TypeRegle(
+        description=(
+            "La date de chaque ligne n'est pas antérieure à min (date AAAA-MM-JJ, "
+            "facultative) ni postérieure à la date de coupure (fin de la période traitée) "
+            "de plus de apres_coupure jours (0 par défaut). Avec vide_hors_champ, une date "
+            "vide laisse la ligne hors champ au lieu de la rendre non évaluable."
+        ),
+        parametres={
+            "colonne": GENRE_COLONNE_DATE,
+            "min": GENRE_DATE,
+            "apres_coupure": GENRE_NOMBRE,
+            "vide_hors_champ": GENRE_BOOLEEN,
+        },
+        vue=VUE_TOUTES,
+        controler=_date_plausible,
+        issue=ISSUE_A_ARBITRER,
+        facultatifs=("min", "apres_coupure", "vide_hors_champ"),
+        verifier=_verifier_date_plausible,
+        contexte=(CONTEXTE_DATE_COUPURE,),
     ),
 }
 

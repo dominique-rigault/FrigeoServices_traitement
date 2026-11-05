@@ -26,6 +26,8 @@ from frigeo.gestion import (
     CONSTAT_DATE_DIFFERENTE,
     CONSTAT_DATE_POSTERIEURE,
     CONSTAT_DELAI_NON_ECHU,
+    CONSTAT_DATE_TROP_ANCIENNE,
+    CONSTAT_DATE_TROP_TARDIVE,
     CONSTAT_DELAI_INFERIEUR,
     CONSTAT_DELAI_SUPERIEUR,
     CONSTAT_DESEQUILIBRE,
@@ -253,7 +255,7 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
         "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle, "
         "sommes_liees_concordantes, totaux_par_periode, solde_jamais_negatif, "
-        "renseignee_selon_valeur, dates_ordonnees)",
+        "renseignee_selon_valeur, dates_ordonnees, date_plausible)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, commentaire, "
         "colonne, vide_hors_champ)",
@@ -4301,3 +4303,97 @@ def test_dates_ordonnees_parametres_refuses():
         "delai_max (nombre, facultatif), vide_hors_champ (true ou false, facultatif)"
     )
     assert catalogue.loc["dates_ordonnees", "issue"] == "anomalie"
+
+
+# --- date plausible (B4) ---------------------------------------------------------
+
+
+def _plausible(**autres):
+    return {"ref": "plausible", "libelle": "Date plausible", "type": "date_plausible",
+            "table": "t", "colonne": "d", **autres}
+
+
+NATURES_PLAUSIBLE = {"t": {"d": "date JJ/MM/AAAA"}}
+
+
+def _donnees_plausibles():
+    return {"t": _table(d=["15/06/2011", "31/05/2026", "01/06/2026", "15/02/2052", "", "x",
+                           "31/12/2009", "01/01/2010"])}
+
+
+def test_date_plausible_limite_relative_a_la_coupure_et_minimum():
+    ecarts, bilan = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE, [_plausible()])
+    # Sans marge ni minimum, la limite est la coupure (31/03/2026 dans ces tests).
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (3, CONSTAT_DATE_TROP_TARDIVE, "à arbitrer", "d",
+         "31/05/2026, limite 31/03/2026 (coupure plus 0 jour), 61 jours après"),
+        (4, CONSTAT_DATE_TROP_TARDIVE, "à arbitrer", "d",
+         "01/06/2026, limite 31/03/2026 (coupure plus 0 jour), 62 jours après"),
+        (5, CONSTAT_DATE_TROP_TARDIVE, "à arbitrer", "d",
+         "15/02/2052, limite 31/03/2026 (coupure plus 0 jour), 9452 jours après"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["non_evaluables"], resume["hors_champ"]) == (6, 2, 0)
+    # Bornes incluses (31/05/2026 et 01/01/2010); min lu par YAML comme une date.
+    regle = _plausible(min=dt.date(2010, 1, 1), apres_coupure=61)
+    ecarts, _ = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (4, CONSTAT_DATE_TROP_TARDIVE,
+         "01/06/2026, limite 31/05/2026 (coupure plus 61 jours), 1 jour après"),
+        (5, CONSTAT_DATE_TROP_TARDIVE,
+         "15/02/2052, limite 31/05/2026 (coupure plus 61 jours), 9391 jours après"),
+        (8, CONSTAT_DATE_TROP_ANCIENNE, "31/12/2009, minimum 01/01/2010, 1 jour avant"),
+    ]
+    # La limite avance avec la coupure, sans changer la règle.
+    ecarts, _ = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE,
+                                  [_plausible(apres_coupure=61)], date_coupure=dt.date(2026, 4, 30))
+    assert _lignes(ecarts, "num_ligne_source") == [(5,)]
+    # Un minimum écrit en texte AAAA-MM-JJ vaut la date.
+    ecarts, _ = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE,
+                                  [_plausible(min="2010-01-01", apres_coupure=10000)])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [(8, CONSTAT_DATE_TROP_ANCIENNE)]
+    # Heures ignorées : une date native du jour de la limite, en cours de journée, est admise.
+    natives = {"t": _table(d=[pd.Timestamp("2026-03-31 10:00")])}
+    ecarts, _ = _controler_tables(natives, {"t": {"d": "date native"}}, [_plausible()])
+    assert ecarts.empty
+    # Toutes les lignes : un doublon exact porte aussi l'écart.
+    doubles = {"t": _table(d=["15/02/2052"] * 2)}
+    ecarts, _ = _controler_tables(doubles, NATURES_PLAUSIBLE, [_plausible()])
+    assert _lignes(ecarts, "num_ligne_source") == [(2,), (3,)]
+
+
+def test_date_plausible_vide_hors_champ_et_coupure_attendue():
+    _, bilan = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE,
+                                 [_plausible(vide_hors_champ=True)])
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["non_evaluables"], resume["hors_champ"]) == (6, 1, 1)
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE, [_plausible()],
+                          date_coupure=None)
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (plausible) : la date de coupure des données est attendue (argument "
+        "date_coupure, perimetre.date_coupure dans le notebook)"
+    ]
+
+
+def test_date_plausible_parametres_refuses():
+    regles = [
+        _plausible(apres_coupure=-1),
+        _plausible(apres_coupure=2.5),
+        _plausible(min="2010-13-01"),
+        _plausible(min=5),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (plausible) : apres_coupure : un nombre entier de jours, positif ou nul, "
+        "est attendu",
+        "règle n° 2 (plausible) : apres_coupure : un nombre entier de jours, positif ou nul, "
+        "est attendu",
+        "règle n° 3 (plausible), min : une date AAAA-MM-JJ est attendue",
+        "règle n° 4 (plausible), min : une date AAAA-MM-JJ est attendue",
+    ]
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["date_plausible", "parametres"] == (
+        "colonne (colonne de date), min (date AAAA-MM-JJ, facultatif), apres_coupure "
+        "(nombre, facultatif), vide_hors_champ (true ou false, facultatif)"
+    )
+    assert catalogue.loc["date_plausible", "issue"] == "à arbitrer"
