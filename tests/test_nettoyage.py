@@ -11,6 +11,7 @@ from datetime import date, datetime
 import pandas as pd
 import pytest
 
+import frigeo.controles as module_controles
 import frigeo.decisions as module_decisions
 import frigeo.gestion as module_gestion
 import frigeo.nettoyage as module_nettoyage
@@ -58,6 +59,14 @@ def sans_regles_de_gestion(tmp_path_factory, monkeypatch):
     ces tests : sauf règles passées, aucune."""
     absent = tmp_path_factory.mktemp("gestion") / "gestion_absent.yaml"
     monkeypatch.setattr(module_gestion, "chemin_regles_gestion", lambda: absent)
+
+
+@pytest.fixture(autouse=True)
+def sans_regles_complementaires(tmp_path_factory, monkeypatch):
+    """Les règles complémentaires du poste (config/controles.yaml) ne sont jamais lues
+    par ces tests : sauf règles passées, aucune."""
+    absent = tmp_path_factory.mktemp("controles") / "controles_absent.yaml"
+    monkeypatch.setattr(module_controles, "chemin_regles_complementaires", lambda: absent)
 
 
 @pytest.fixture(autouse=True)
@@ -544,14 +553,16 @@ def test_remplacement_sur_colonne_sensible_masque():
 COUPURE = date(2026, 3, 31)
 
 
-def _nature(valeurs, nature, sensibles=AUCUNE_SENSIBLE, date_coupure=COUPURE):
+def _nature(valeurs, nature, sensibles=AUCUNE_SENSIBLE, date_coupure=COUPURE, duree=None):
     """Nettoie une colonne « v » de la nature donnée; rend (valeurs nettoyées,
     journal, bilan), réduits à la règle `nature`. La colonne « n » rend les lignes
     toutes différentes : sans elle, deux valeurs converties en la même deviendraient
     des doublons exacts."""
     tables = {"t": _table(v=list(valeurs), n=list(range(len(valeurs))))}
     dictionnaire = _dictionnaire(tables, **{"t.v": _colonne(nature)})
-    resultat = nettoyer(tables, dictionnaire, sensibles, AUCUNE_DECLARATION, date_coupure)
+    complementaires = {"t": {"v": {"duree": duree}}} if duree else {}
+    resultat = nettoyer(tables, dictionnaire, sensibles, AUCUNE_DECLARATION, date_coupure,
+                        complementaires=complementaires)
     journal = resultat.journal[resultat.journal["regle_nettoyage"] == "nature"]
     bilan = resultat.bilan[resultat.bilan["regle_nettoyage"] == "nature"]
     return list(resultat.tables["t"]["v"]), journal, bilan, (
@@ -684,6 +695,70 @@ def test_nature_nombres_en_texte():
     assert _lignes(bilan, "visees", "corrigees", "raisons") == [
         (7, 4, "valeur avec une unité 1; partie décimale non nulle 2"),
     ]
+
+
+DUREES = ["95", "1h10", "95 min", "1 h 30", "2h", "1,5 h", "45mn", "1h10min", "2 heures",
+          "1H05", "1h75", "1:10", "1,01 h", "x", "12 kg"]
+
+
+def test_nature_durees_dans_une_colonne_declaree():
+    valeurs, journal, bilan, _ = _nature(DUREES, "entier (texte)", duree="minutes")
+    assert valeurs == ["95", "70", "95", "90", "120", "90", "45", "70", "120", "65",
+                       "1h75", "1:10", "1,01 h", "x", "12 kg"]
+    assert _lignes(journal, "num_ligne_source", "detail") == [
+        (3, "forme lue 9a99, durée en minutes"),
+        (4, "forme lue 99 aaa, durée en minutes"),
+        (5, "forme lue 9 a 99, durée en minutes"),
+        (6, "forme lue 9a, durée en minutes"),
+        (7, "forme lue 9,9 a, durée en minutes"),
+        (8, "forme lue 99aa, durée en minutes"),
+        (9, "forme lue 9a99aaa, durée en minutes"),
+        (10, "forme lue 9 aaaaaa, durée en minutes"),
+        (11, "forme lue 9A99, durée en minutes"),
+    ]
+    # 1h75 : minutes au-delà de 59; 1:10 : forme d'heure, refusée; 1,01 h : 60,6 minutes
+    # vers un entier; 12 kg : autre unité.
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (14, 9, "valeur avec une unité 2; partie décimale non nulle 1; forme non reconnue 2"),
+    ]
+    # Sans déclaration, une durée avec ses unités n'est pas lue.
+    valeurs, journal, bilan, _ = _nature(DUREES[:3], "entier (texte)")
+    assert valeurs == DUREES[:3] and journal.empty
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (2, 0, "valeur avec une unité 2"),
+    ]
+
+
+def test_nature_durees_en_heures():
+    valeurs, journal, bilan, _ = _nature(["90 min", "1h30", "2 h", "70 min", "1.25 heure"],
+                                         "décimal virgule (texte)", duree="heures")
+    assert valeurs == ["1,5", "1,5", "2,0", "70 min", "1,25"]
+    assert list(journal["detail"]) == [
+        "forme lue 99 aaa, durée en heures", "forme lue 9a99, durée en heures",
+        "forme lue 9 a, durée en heures", "forme lue 9.99 aaaaa, durée en heures",
+    ]
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (5, 4, "durée non exacte dans l'unité 1"),
+    ]
+    # Colonne masquée : la forme n'est pas montrée, la mention de la durée l'est.
+    _, journal, _, _ = _nature(["1h10"], "entier (texte)", sensibles={"t": frozenset({"v"})},
+                               duree="minutes")
+    assert list(journal["detail"]) == ["forme masquée, durée en minutes"]
+
+
+def test_durees_declarees_et_refusees():
+    tables = {"t": _table(v=["1h10"], n=[1])}
+    dictionnaire = _dictionnaire(tables, **{"t.v": _colonne("entier (texte)")})
+    for complementaires, message in (
+        ({"t": {"v": {"duree": "secondes"}}}, "t.v, règle duree : minutes ou heures est attendu"),
+        ({"t": {"w": {"duree": "minutes"}}}, "colonne t.w absente des données chargées"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, AUCUNE_DECLARATION, COUPURE,
+                     complementaires=complementaires)
+    # Par défaut, les règles complémentaires de config/controles.yaml (ici absentes).
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, AUCUNE_DECLARATION, COUPURE)
+    assert list(resultat.tables["t"]["v"]) == ["1h10"]
 
 
 def test_nature_heure_et_colonne_texte():

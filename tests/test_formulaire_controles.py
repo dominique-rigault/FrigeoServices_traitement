@@ -11,10 +11,12 @@ from frigeo.formulaire_controles import (
     COLONNES_CHANGEMENTS,
     COLONNES_DECIMALES,
     COLONNES_DOUBLONS,
+    COLONNES_DUREES,
     COLONNES_LUHN,
     COLONNES_MOTIFS,
     COLONNES_TABLES,
     ENTETE_CONTROLES,
+    FEUILLE_DUREES,
     LIGNES_AJOUT,
     REPERE_EMPREINTE,
     appliquer_formulaire,
@@ -25,6 +27,7 @@ from frigeo.formulaire_controles import (
     lignes_bornes,
     lignes_decimales,
     lignes_doublons,
+    lignes_durees,
     lignes_luhn,
     lignes_motifs,
     lignes_tables,
@@ -260,12 +263,12 @@ def test_formulaire_exporte(tmp_path):
     classeur = load_workbook(_exporter(tmp_path))
     assert classeur.sheetnames == [
         "mode_emploi", "décimales", "bornes", "clé_luhn", "doublons", "tables", "motifs",
-        "listes",
+        "durées", "listes",
     ]
     for nom, colonnes in (
         ("décimales", COLONNES_DECIMALES), ("bornes", COLONNES_BORNES),
         ("clé_luhn", COLONNES_LUHN), ("doublons", COLONNES_DOUBLONS),
-        ("tables", COLONNES_TABLES), ("motifs", COLONNES_MOTIFS),
+        ("tables", COLONNES_TABLES), ("motifs", COLONNES_MOTIFS), ("durées", COLONNES_DUREES),
     ):
         assert tuple(c.value for c in classeur[nom][1]) == colonnes
         assert classeur[nom].protection.sheet
@@ -922,3 +925,32 @@ def test_bornes_incluses_par_defaut_ou_par_oui(tmp_path):
     assert (
         f"ligne {numero} (factures.montant) : min_inclus : oui, non ou vide est attendu"
     ) in str(erreur.value)
+
+
+def test_durees_en_lecture_seule_et_reprises(tmp_path):
+    tables, dictionnaire, contenu, sensibles = _jeu()
+    contenu["regles"]["factures"]["montant"]["duree"] = "minutes"
+    assert lignes_durees(contenu) == [
+        {"table": "factures", "colonne": "montant", "duree": "minutes"}
+    ]
+    chemin = exporter_formulaire(tables, dictionnaire, contenu, sensibles, "2026-03",
+                                 tmp_path / "f.xlsx", empreinte="abc123")
+    classeur = load_workbook(chemin)
+    feuille = classeur[FEUILLE_DUREES]
+    assert tuple(c.value for c in feuille[1]) == COLONNES_DUREES
+    assert _lire(feuille) == [{"table": "factures", "colonne": "montant", "duree": "minutes"}]
+    assert feuille.protection.sheet
+    assert all(cellule.protection.locked for cellule in feuille[2])
+    # Import sans modification : la durée est reprise telle quelle.
+    formulaire = importer_formulaire(chemin, dictionnaire, contenu, empreinte="abc123")
+    assert formulaire.contenu == contenu and formulaire.changements.empty
+    # Les décimales de la colonne retirées, la durée reste.
+    _modifier(chemin, "décimales", ("factures", "montant"), statut="invalide")
+    formulaire = importer_formulaire(chemin, dictionnaire, contenu, empreinte="abc123")
+    assert formulaire.contenu["regles"]["factures"]["montant"] == {"duree": "minutes"}
+    # Écriture du fichier : la durée suit les règles contrôlées de la colonne.
+    contenu["regles"]["factures"]["montant"] = {"decimales": 2, "duree": "minutes"}
+    texte = texte_controles(contenu)
+    assert "    montant: {decimales: 2, duree: minutes}\n" in texte
+    assert yaml.safe_load(texte) == contenu
+    assert "#   duree      unité d'une colonne de durée" in texte

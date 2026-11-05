@@ -86,10 +86,14 @@ from .controles import (
     _colonnes_de_donnees,
     _issue_element,
     _octets,
+    _problemes_de_complementaires,
     _problemes_de_correspondance,
     _valeur_constatee,
+    charger_regles_complementaires,
     constats_encodage,
     constats_espaces,
+    durees_declarees,
+    problemes_regles_complementaires,
 )
 from .dictionnaire import (
     LISTE_FERMEE,
@@ -166,6 +170,7 @@ RAISON_DATE_FUTURE = "année sur deux chiffres, date future"
 RAISON_SANS_COUPURE = "année sur deux chiffres, date de coupure non fournie"
 RAISON_HEURE = "date avec une heure"
 RAISON_UNITE = "valeur avec une unité"
+RAISON_DUREE_INEXACTE = "durée non exacte dans l'unité"
 RAISON_SEPARATEUR = "séparateur ambigu"
 RAISON_DECIMALES = "partie décimale non nulle"
 RAISON_AUTRE_FAMILLE = "autre famille de nature"
@@ -176,6 +181,7 @@ RAISONS_NATURE = (
     RAISON_SANS_COUPURE,
     RAISON_HEURE,
     RAISON_UNITE,
+    RAISON_DUREE_INEXACTE,
     RAISON_SEPARATEUR,
     RAISON_DECIMALES,
     RAISON_AUTRE_FAMILLE,
@@ -279,10 +285,13 @@ _CATALOGUE = {
         "nature : dates JJ/MM/AAAA, JJ.MM.AAAA, JJ-MM-AAAA, AAAA-MM-JJ, AAAAMMJJ, date "
         "native, et JJ/MM/AA (ou point, tiret) en 20AA si la date ne dépasse pas la "
         "date de coupure; nombres entiers, décimaux à virgule ou à point, espace "
-        "séparateur de milliers, symbole € en fin de valeur",
+        "séparateur de milliers, symbole € en fin de valeur; dans une colonne déclarée "
+        "durée (règle duree de config/controles.yaml), durées écrites avec leurs unités "
+        "(95 min, 2 h, 1h10), converties dans l'unité de la colonne",
         "une date impossible; une année sur deux chiffres qui donnerait une date "
         "postérieure à la date de coupure; une date avec une heure écrite dans une "
-        "colonne de dates en texte; une valeur avec une unité (1h30, 45 min); un point "
+        "colonne de dates en texte; une valeur avec une unité (1h30, 45 min) hors d'une "
+        "colonne déclarée durée, ou une durée non exacte dans son unité; un point "
         "suivi de trois chiffres (séparateur ambigu); une partie décimale non nulle "
         "vers un entier; une valeur d'une autre famille (nombre dans une colonne de "
         "dates); une heure hors de la forme HH:MM",
@@ -723,6 +732,15 @@ _ENTIER = re.compile(r"(-?)(\d+)")
 _VIRGULE = re.compile(r"(-?)(\d+),(\d+)")
 _POINT = re.compile(r"(-?)(\d+)\.(\d+)")
 _MILLIERS = re.compile(f"(-?)(\\d{{1,3}}(?:{_ESPACES}\\d{{3}})+)(?:,(\\d+))?")
+# Durées avec leurs unités, pour une colonne déclarée durée (règle duree de
+# config/controles.yaml) : minutes seules, heures seules, heures et minutes.
+_NOMBRE_DUREE = r"(\d+(?:[.,]\d+)?)"
+_UNITE_MINUTES = r"(?:min|mn|minutes?)"
+_DUREE_MINUTES = re.compile(f"{_NOMBRE_DUREE}{_ESPACES}?{_UNITE_MINUTES}", re.IGNORECASE)
+_DUREE_HEURES = re.compile(f"{_NOMBRE_DUREE}{_ESPACES}?(?:h|heures?)", re.IGNORECASE)
+_DUREE_HEURES_MINUTES = re.compile(
+    f"(\\d+){_ESPACES}?h{_ESPACES}?(\\d{{1,2}})(?:{_ESPACES}?{_UNITE_MINUTES})?", re.IGNORECASE
+)
 
 
 class _Refus(str):
@@ -789,6 +807,36 @@ def _lire_nombre(texte: str):
     return None
 
 
+def _lire_duree(texte: str, unite: str):
+    """(signe, chiffres entiers, chiffres décimaux) d'une durée écrite avec ses unités,
+    convertie dans `unite` (minutes ou heures); raison du refus si la conversion
+    n'est pas exacte, None si la forme n'est pas une durée.
+
+    Formes lues, la valeur entière devant correspondre : « 95 min » (mn, minutes),
+    « 2 h » (heures, décimale à virgule ou à point admise), « 1h10 » (avec ou sans
+    espaces, min en fin facultatif, minutes de 0 à 59). « 1:10 » n'en est pas une.
+    """
+    texte = texte.strip()
+    trouve = _DUREE_HEURES_MINUTES.fullmatch(texte)
+    if trouve:
+        heures, minutes = int(trouve.group(1)), int(trouve.group(2))
+        if minutes > 59:
+            return None
+        total = Decimal(heures * 60 + minutes)
+    elif _DUREE_MINUTES.fullmatch(texte):
+        total = Decimal(_DUREE_MINUTES.fullmatch(texte).group(1).replace(",", "."))
+    elif _DUREE_HEURES.fullmatch(texte):
+        total = Decimal(_DUREE_HEURES.fullmatch(texte).group(1).replace(",", ".")) * 60
+    else:
+        return None
+    resultat = total if unite == "minutes" else total / 60
+    if resultat * (1 if unite == "minutes" else 60) != total or resultat.as_tuple().exponent < -6:
+        return RAISON_DUREE_INEXACTE
+    texte_resultat = format(resultat.normalize(), "f")
+    entiers, _, decimales = texte_resultat.partition(".")
+    return "", entiers, decimales
+
+
 def _a_une_unite(texte: str) -> bool:
     return any(c.isdigit() for c in texte) and any(c.isalpha() for c in texte)
 
@@ -810,8 +858,16 @@ def _ecrire_nombre(signe: str, entiers: str, decimales: str, nature: str):
     return f"{signe}{entiers}{separateur}{decimales or '0'}"
 
 
-def _convertir(valeur, nature: str, date_coupure):
-    """(valeur convertie, forme lue, siècle ajouté) ou raison du refus."""
+_MENTION_SIECLE = "siècle 20 ajouté"
+
+
+def _convertir(valeur, nature: str, date_coupure, duree: str | None = None):
+    """(valeur convertie, mention pour le journal) ou raison du refus.
+
+    La mention est vide, « siècle 20 ajouté » ou « durée en minutes » (ou en heures),
+    une durée écrite avec ses unités n'étant lue que si `duree` donne l'unité de la
+    colonne (règle duree de config/controles.yaml).
+    """
     famille = _famille(nature)
     if isinstance(valeur, str):
         date = _lire_date(valeur, date_coupure)
@@ -824,11 +880,12 @@ def _convertir(valeur, nature: str, date_coupure):
             return date
         if date is not None:
             instant, siecle = date
+            mention = _MENTION_SIECLE if siecle else ""
             if nature == "date native":
-                return instant, siecle
+                return instant, mention
             if instant != instant.replace(hour=0, minute=0, second=0, microsecond=0):
                 return RAISON_HEURE
-            return ecrire_date(instant, nature), siecle
+            return ecrire_date(instant, nature), mention
         if nombre is not None or (isinstance(valeur, str) and _HEURE.fullmatch(valeur)):
             return RAISON_AUTRE_FAMILLE
         return RAISON_NON_RECONNUE
@@ -837,9 +894,16 @@ def _convertir(valeur, nature: str, date_coupure):
             return nombre
         if nombre is not None:
             ecrit = _ecrire_nombre(*nombre, nature)
-            return str(ecrit) if isinstance(ecrit, _Refus) else (ecrit, False)
+            return str(ecrit) if isinstance(ecrit, _Refus) else (ecrit, "")
         if date is not None:
             return RAISON_AUTRE_FAMILLE
+        if duree is not None and isinstance(valeur, str):
+            lue = _lire_duree(valeur, duree)
+            if isinstance(lue, str):
+                return lue
+            if lue is not None:
+                ecrit = _ecrire_nombre(*lue, nature)
+                return str(ecrit) if isinstance(ecrit, _Refus) else (ecrit, f"durée en {duree}")
         if isinstance(valeur, str) and _a_une_unite(valeur):
             return RAISON_UNITE
         return RAISON_NON_RECONNUE
@@ -877,13 +941,13 @@ def _nature(serie: pd.Series, regles: dict, contexte: dict):
         return None
     acceptees, raisons = {}, Counter()
     for position, valeur in visees.items():
-        resultat = _convertir(valeur, nature, contexte["date_coupure"])
+        resultat = _convertir(valeur, nature, contexte["date_coupure"], contexte.get("duree"))
         if isinstance(resultat, str):
             raisons[resultat] += 1
             continue
-        convertie, siecle = resultat
+        convertie, mention = resultat
         forme = "forme masquée" if contexte["masquee"] else f"forme lue {signature(valeur)}"
-        acceptees[position] = (convertie, forme + (", siècle 20 ajouté" if siecle else ""))
+        acceptees[position] = (convertie, forme + (f", {mention}" if mention else ""))
     return list(visees.index), acceptees, raisons
 
 
@@ -1101,6 +1165,7 @@ def nettoyer(
     decisions: dict | None = None,
     cle_empreinte: str | None = None,
     regles_gestion: list | None = None,
+    complementaires: dict | None = None,
 ) -> Nettoyage:
     """Applique les règles de nettoyage et rend les tables nettoyées, le journal des
     corrections et le bilan.
@@ -1120,7 +1185,9 @@ def nettoyer(
     empreintes des valeurs masquées; par défaut, celle de `charger_cle_empreintes`,
     qui la crée au premier nettoyage (un avertissement donne alors son emplacement).
     `regles_gestion` (règles de config/gestion.yaml par défaut) sert à la règle
-    `referentiel`.
+    `referentiel`. `complementaires` (règles complémentaires de config/controles.yaml
+    par défaut) donne l'unité des colonnes déclarées durée (règle duree), dans
+    laquelle la règle `nature` convertit une durée écrite avec ses unités.
 
     Tables nettoyées : copies des tables reçues, mêmes colonnes, mêmes types de
     colonnes, lignage compris; seules les cellules corrigées changent, et les lignes
@@ -1183,6 +1250,14 @@ def nettoyer(
     problemes = problemes_regles_gestion(regles_gestion)
     if problemes:
         raise ValueError("Règles de gestion invalides\n  " + "\n  ".join(problemes))
+    if complementaires is None:
+        complementaires = charger_regles_complementaires()
+    problemes = problemes_regles_complementaires(complementaires)
+    if not problemes:
+        problemes = _problemes_de_complementaires(tables, complementaires)
+    if problemes:
+        raise ValueError("Règles complémentaires invalides\n  " + "\n  ".join(problemes))
+    durees = durees_declarees(complementaires)
     regles_referentiel = _regles_referentiel(regles_gestion)
     problemes = _problemes_referentiel(regles_referentiel, tables)
     if problemes:
@@ -1417,7 +1492,8 @@ def nettoyer(
                 )
                 # La règle s'applique aux valeurs laissées par les règles précédentes.
                 courante = nettoyees[table][colonne].reset_index(drop=True)
-                contexte = {"date_coupure": date_coupure, "masquee": masquee}
+                contexte = {"date_coupure": date_coupure, "masquee": masquee,
+                            "duree": durees.get((table, colonne))}
                 resultat = appliquer_regle(courante, regles, contexte)
                 if resultat is None:
                     continue

@@ -25,7 +25,8 @@ Pour une liste ou un format, trois issues sont possibles :
 
 S'y ajoutent les règles complémentaires, que le dictionnaire ne peut pas déduire des
 données et que le métier donne dans `config/controles.yaml` (voir
-`charger_regles_complementaires`) : nombre de décimales, bornes, motif, clé de Luhn.
+`charger_regles_complementaires`) : nombre de décimales, bornes, motif, clé de Luhn,
+plus l'unité d'une colonne de durée, sans contrôle, qui sert au nettoyage.
 Une forme fixe (code postal, numéro à longueur fixe) n'en fait pas partie : elle
 relève de la règle `format` du dictionnaire.
 
@@ -128,6 +129,11 @@ REGLES_COMPLEMENTAIRES = {
     "cle_luhn": "clé invalide",
 }
 STATUT_COMPLEMENTAIRE = "documenté"
+# Unité d'une colonne de durée, déclarée au même endroit (règle duree) : sans contrôle à
+# l'étape 3, elle sert à la règle nature du nettoyage, qui convertit dans cette unité
+# une durée écrite avec ses unités (1h10, 95 min).
+REGLE_DUREE = "duree"
+UNITES_DUREE = ("minutes", "heures")
 CLE_REGLES_COMPLEMENTAIRES = "regles"
 # Le même fichier porte, sous une autre clé, les déclarations de doublons (voir le
 # module doublons).
@@ -304,10 +310,16 @@ def problemes_regles_complementaires(regles) -> list[str]:
                 problemes.append(f"{ou} : au moins une règle est attendue")
                 continue
             for type_regle, parametre in types.items():
+                if type_regle == REGLE_DUREE:
+                    if parametre not in UNITES_DUREE:
+                        problemes.append(
+                            f"{ou}, règle {REGLE_DUREE} : {' ou '.join(UNITES_DUREE)} est attendu"
+                        )
+                    continue
                 if type_regle not in REGLES_COMPLEMENTAIRES:
                     problemes.append(
                         f"{ou} : règle inconnue {type_regle!r} (règles possibles : "
-                        f"{', '.join(REGLES_COMPLEMENTAIRES)})"
+                        f"{', '.join((*REGLES_COMPLEMENTAIRES, REGLE_DUREE))})"
                     )
                     continue
                 probleme = _probleme_parametre(type_regle, parametre)
@@ -355,7 +367,9 @@ def charger_regles_complementaires(chemin: str | Path | None = None) -> dict:
       seule borne est possible); `min_exclu: true` ou `max_exclu: true` exclut une
       borne (`{min: 0, max: 1, min_exclu: true}` : plus de 0, au plus 1);
     - `motif: "..."` : la valeur entière correspond à l'expression régulière;
-    - `cle_luhn: true` : la clé de contrôle de Luhn est valide.
+    - `cle_luhn: true` : la clé de contrôle de Luhn est valide;
+    - `duree: minutes` (ou `heures`) : unité d'une colonne de durée, sans contrôle,
+      qui sert au nettoyage (voir `durees_declarees`).
 
     Un fichier absent, ou sans clé `regles`, ne donne aucune règle. Un fichier mal
     formé est refusé, tous les problèmes étant listés en une fois.
@@ -370,6 +384,17 @@ def charger_regles_complementaires(chemin: str | Path | None = None) -> dict:
             f"Règles complémentaires invalides ({chemin})\n  " + "\n  ".join(problemes)
         )
     return regles
+
+
+def durees_declarees(complementaires: dict) -> dict[tuple[str, str], str]:
+    """Unité de chaque colonne déclarée durée (règle duree des règles
+    complémentaires), par (table, colonne)."""
+    return {
+        (table, colonne): types[REGLE_DUREE]
+        for table, colonnes in (complementaires or {}).items()
+        for colonne, types in (colonnes or {}).items()
+        if isinstance(types, dict) and REGLE_DUREE in types
+    }
 
 
 def charger_dictionnaire_enregistre(chemin: str | Path | None = None) -> dict:

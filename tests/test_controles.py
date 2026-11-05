@@ -20,6 +20,7 @@ from frigeo.controles import (
     constats_encodage,
     constats_espaces,
     controler,
+    durees_declarees,
     problemes_regles_complementaires,
     regles_sans_controle,
 )
@@ -919,3 +920,25 @@ def test_espaces_apres_les_autres_regles_et_colonne_sensible_masquee():
         ("code", "encodage", 3, 0),
         ("code", "espaces", 3, 1),
     ]
+
+
+def test_duree_declaree_sans_controle():
+    # Une colonne déclarée durée : aucune ligne de bilan ni écart pour la règle duree,
+    # les autres règles de la colonne restent contrôlées.
+    donnees = _table(d=["95", "1h10"])
+    colonnes = {"d": _colonne(nature="entier (texte)")}
+    ecarts, bilan = _controler(donnees, colonnes, complementaires={
+        "d": {"bornes": {"max": 100}, "duree": "minutes"}})
+    assert "duree" not in set(bilan["regle"]) and "duree" not in set(ecarts["regle"])
+    assert list(bilan["regle"]) == ["nature", "bornes"]
+    regles = {"t": {"a": {"duree": "heures"}, "b": {"duree": "secondes"}, "c": {"dureé": 1}}}
+    assert problemes_regles_complementaires(regles) == [
+        "t.b, règle duree : minutes ou heures est attendu",
+        "t.c : règle inconnue 'dureé' (règles possibles : decimales, bornes, motif, cle_luhn, "
+        "duree)",
+    ]
+    assert durees_declarees({"t": {"a": {"duree": "heures"}, "b": {"decimales": 1}},
+                             "u": {"x": {"bornes": {"min": 0}, "duree": "minutes"}}}) == {
+        ("t", "a"): "heures", ("u", "x"): "minutes",
+    }
+    assert durees_declarees({}) == {}

@@ -53,6 +53,7 @@ from .controles import (
     CLE_REGLES_COMPLEMENTAIRES,
     CLES_FICHIER_CONTROLES,
     EXCLUSIONS,
+    REGLE_DUREE,
     REGLES_COMPLEMENTAIRES,
     _cle_luhn_valide,
     _nombre,
@@ -83,6 +84,7 @@ FEUILLE_LUHN = "clé_luhn"
 FEUILLE_DOUBLONS = "doublons"
 FEUILLE_TABLES = "tables"
 FEUILLE_MOTIFS = "motifs"
+FEUILLE_DUREES = "durées"
 # Feuille technique, masquée : la liste des tables, pour le menu des lignes d'ajout.
 FEUILLE_LISTES = "listes"
 
@@ -163,6 +165,7 @@ COLONNES_LUHN = (
 COLONNES_DOUBLONS = ("table", "type", "colonnes", "origine", "observé", "statut", "commentaire")
 COLONNES_TABLES = ("table", "lignes", "clé_en_vigueur", "identiques_hors_clé")
 COLONNES_MOTIFS = ("table", "colonne", "motif")
+COLONNES_DUREES = ("table", "colonne", "duree")
 COLONNES_TYPE = {
     "decimales": COLONNES_DECIMALES,
     "bornes": COLONNES_BORNES,
@@ -207,6 +210,7 @@ LARGEURS = {
     "clé_en_vigueur": 34,
     "identiques_hors_clé": 20,
     "motif": 50,
+    "duree": 12,
 }
 
 
@@ -572,6 +576,16 @@ def lignes_tables(tables: dict, dictionnaire: dict, contenu: dict) -> list[dict]
     ]
 
 
+def lignes_durees(contenu: dict) -> list[dict]:
+    """Colonnes déclarées durée et leur unité, affichées en lecture seule."""
+    return [
+        {"table": table, "colonne": colonne, "duree": regles[REGLE_DUREE]}
+        for table, colonnes in _section(contenu, CLE_REGLES_COMPLEMENTAIRES).items()
+        for colonne, regles in (colonnes or {}).items()
+        if isinstance(regles, dict) and REGLE_DUREE in regles
+    ]
+
+
 def lignes_motifs(contenu: dict) -> list[dict]:
     """Motifs en vigueur, affichés en lecture seule."""
     return [
@@ -670,6 +684,11 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         f"Feuille « {FEUILLE_MOTIFS} » : lecture seule",
         "Les motifs (expressions régulières) sont écrits par le consultant et repris "
         "tels quels.",
+        "",
+        f"Feuille « {FEUILLE_DUREES} » : lecture seule",
+        "Les colonnes de durée et leur unité (minutes ou heures) sont déclarées par le "
+        "consultant et reprises telles quelles. Au nettoyage, une durée écrite avec ses "
+        "unités (1h10, 95 min) y est convertie dans cette unité.",
         "",
         "Règles à respecter pour que le formulaire puisse être réimporté",
         f"Ne modifier que les cellules non verrouillées, {FOND_MODIFIABLE}. Ne pas "
@@ -817,6 +836,9 @@ def exporter_formulaire(
 
     feuille = classeur.create_sheet(FEUILLE_MOTIFS)
     _remplir(feuille, COLONNES_MOTIFS, lignes_motifs(contenu), ())
+
+    feuille = classeur.create_sheet(FEUILLE_DUREES)
+    _remplir(feuille, COLONNES_DUREES, lignes_durees(contenu), ())
 
     listes = classeur.create_sheet(FEUILLE_LISTES)
     for numero, table in enumerate(noms_tables, start=1):
@@ -1383,8 +1405,8 @@ ENTETE_CONTROLES = """\
 # pas déduire des fichiers. Une forme fixe (code postal, numéro à longueur fixe) ne
 # se déclare pas ici mais dans le classeur de revue du dictionnaire (règle format).
 # Ce fichier est réécrit en entier par le formulaire des règles de contrôle (notebook
-# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs s'écrivent à
-# la main, le formulaire les reprend tels quels.
+# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs et les durées
+# s'écrivent à la main, le formulaire les reprend tels quels.
 #
 # Règles possibles pour une colonne
 #   decimales  nombre maximal de décimales
@@ -1392,6 +1414,8 @@ ENTETE_CONTROLES = """\
 #              min_exclu: true ou max_exclu: true exclut la borne
 #   motif      expression régulière que la valeur entière doit respecter
 #   cle_luhn   clé de contrôle de Luhn valide (true)
+#   duree      unité d'une colonne de durée (minutes ou heures), sans contrôle : au
+#              nettoyage, une durée écrite avec ses unités (1h10, 95 min) y est convertie
 """
 COMMENTAIRE_DOUBLONS = """\
 # Doublons, déclarés d'après ce que dit le métier.
