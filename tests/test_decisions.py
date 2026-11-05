@@ -25,6 +25,7 @@ from frigeo.decisions import (
     _mode_emploi,
     ajouter_decisions,
     charger_decisions,
+    date_inversee_proposee,
     ecrire_decisions,
     elements_a_arbitrer,
     exporter_arbitrage,
@@ -1043,3 +1044,78 @@ def test_forme_du_referentiel_lue_dans_les_tables_recues():
     sans = {k: v for k, v in _regle_referentiel().items() if k != "cle_reference"}
     propositions = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION, [sans])
     assert list(propositions["proposition"]) == ["Dupont Jean", "masqué", "masqué"]
+
+
+# --- date dont le jour et le mois semblent inversés (D) -----------------------
+
+
+@pytest.mark.parametrize(
+    "valeur, nature, attendu",
+    [
+        ("03/25/2025", "date JJ/MM/AAAA", "25/03/2025"),
+        (" 3.25.2025 ", "date JJ/MM/AAAA", "25/03/2025"),
+        ("03-25-2025", "date JJ/MM/AAAA", "25/03/2025"),
+        ("03/25/2025", "date native", "25/03/2025"),
+        ("03/25/2025", "date AAAAMMJJ", "20250325"),
+        ("03/25/2025", "date AAAA-MM-JJ", "2025-03-25"),
+        ("02/29/2024", "date JJ/MM/AAAA", "29/02/2024"),
+        # Lisible jour puis mois, impossible dans les deux sens, autre forme.
+        ("03/04/2025", "date JJ/MM/AAAA", None),
+        ("31/02/2025", "date JJ/MM/AAAA", None),
+        ("02/30/2025", "date JJ/MM/AAAA", None),
+        ("02/29/2025", "date JJ/MM/AAAA", None),
+        ("03/25/25", "date JJ/MM/AAAA", None),
+        ("03/25-2025", "date JJ/MM/AAAA", None),
+        ("2025-25-03", "date JJ/MM/AAAA", None),
+        ("03/25/2025 10:00", "date JJ/MM/AAAA", None),
+        (None, "date JJ/MM/AAAA", None),
+        (3.25, "date JJ/MM/AAAA", None),
+        # Colonne qui n'est pas une colonne de date.
+        ("03/25/2025", "texte", None),
+        ("03/25/2025", "nombre natif", None),
+    ],
+)
+def test_date_inversee_proposee(valeur, nature, attendu):
+    assert date_inversee_proposee(valeur, nature) == attendu
+
+
+def test_date_inversee_proposee_dans_le_classeur(tmp_path):
+    tables = {
+        "t": _table(
+            id=["A1", "A2", "A3", "A4"],
+            d=["03/25/2025", "31/02/2025", "03/26/2025", "03/27/2025"],
+            m=[1.0, 2.0, 3.0, 4.0],
+            nom=["x", "y", "z", "w"],
+        )
+    }
+    nature = "nature = date JJ/MM/AAAA"
+    anomalies = _anomalies(
+        _anomalie("format", "anomalie", 2, "d", id_anomalie="f1", regle=nature),
+        _anomalie("format", "anomalie", 3, "d", id_anomalie="f2", regle=nature),
+        # Une autre règle de format, une proposition déjà faite, un écart de gestion.
+        _anomalie("format", "anomalie", 4, "d", id_anomalie="f3", regle="format = formes fermées"),
+        _anomalie("format", "anomalie", 5, "d", id_anomalie="f4", regle=nature,
+                  proposition="01/01/2025"),
+        _anomalie("gestion", "à arbitrer", 4, "d", id_anomalie="g1", regle=nature),
+    )
+    elements = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION)
+    propositions = {
+        e.id_anomalie: None if pd.isna(e.proposition) else e.proposition
+        for e in elements.itertuples(index=False)
+    }
+    assert propositions == {
+        "f1": "25/03/2025", "f2": None, "f3": None, "f4": "01/01/2025", "g1": None,
+    }
+    chemin = exporter_arbitrage(elements, "2026-03", tmp_path / "a.xlsx", nb_imports=0)
+    classeur = load_workbook(chemin)
+    lignes = list(classeur[FEUILLE_ARBITRAGE].iter_rows(values_only=True))
+    par_id = {ligne[COLONNES_ARBITRAGE.index("id_anomalie")]: dict(zip(COLONNES_ARBITRAGE, ligne))
+              for ligne in lignes[1:]}
+    assert (par_id["f1"]["valeur"], par_id["f1"]["valeur_retenue"]) == ("03/25/2025", "25/03/2025")
+    assert par_id["f2"]["valeur_retenue"] is None
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "le jour et le mois étant sans doute inversés" in notice
+    # La valeur préremplie, gardée avec la décision corriger, est lue à l'import.
+    _remplir(chemin, {"f1": ("corriger", ..., None)})
+    arbitrage = importer_arbitrage(chemin, DICTIONNAIRE, nb_imports=0)
+    assert list(arbitrage.decisions["valeur_retenue"]) == ["25/03/2025"]

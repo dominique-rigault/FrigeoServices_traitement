@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import unicodedata
 from collections import Counter
 from datetime import date, datetime
@@ -59,6 +60,7 @@ from .anomalies import (
     ETAPE_GESTION,
     _controle_gestion,
     _index_lignage,
+    _regle_format,
     _repere,
 )
 from .controles import ISSUE_A_ARBITRER, ISSUE_ANOMALIE, _colonnes_de_donnees, _valeur_constatee
@@ -79,7 +81,7 @@ from .gestion import (
 from .nettoyage import _convertir, _regles_referentiel
 from .profilage import _interpretations
 from .revue import _ecrire_texte, _est_vide, _menu
-from .typage import NATURES_LISIBLES, ecrire_date
+from .typage import NATURES_DATE, NATURES_LISIBLES, ecrire_date
 
 SORTE_CELLULE = "cellule"
 SORTE_LIGNE = "ligne"
@@ -106,6 +108,13 @@ ETATS_A_ARBITRER = (ETAT_SANS_DECISION, ETAT_CADUQUE)
 
 LONGUEUR_EMPREINTE = 16
 VALEUR_MASQUEE = "masqué"
+
+# Règle d'une anomalie de nature dans la table des anomalies (« nature = date
+# JJ/MM/AAAA »), et forme jour, mois, année d'une date en texte : une date
+# impossible lue jour puis mois mais valide lue mois puis jour est proposée lue
+# mois puis jour (voir `date_inversee_proposee`).
+PREFIXE_NATURE = _regle_format("nature", "")
+_JOUR_MOIS_ANNEE = re.compile(r"(\d{1,2})([/.-])(\d{1,2})\2(\d{4})")
 
 COLONNES_ELEMENTS = (
     "id_anomalie",
@@ -426,6 +435,40 @@ def _formes_proposees(tables: dict[str, pd.DataFrame], regles_gestion: list):
     return forme
 
 
+def _date_existe(annee: int, mois: int, jour: int) -> bool:
+    try:
+        date(annee, mois, jour)
+    except ValueError:
+        return False
+    return True
+
+
+def date_inversee_proposee(valeur, nature: str):
+    """Date lue mois puis jour, à proposer comme valeur retenue, ou None.
+
+    Pour une colonne de date (`nature` parmi `typage.NATURES_DATE`), une valeur en
+    texte de forme jour, mois, année (séparateur barre, point ou tiret, année sur
+    quatre chiffres), impossible lue jour puis mois mais valide lue mois puis jour,
+    donne cette date : le jour et le mois sont sans doute inversés. Elle est écrite
+    dans la représentation de la nature (JJ/MM/AAAA pour une date native, que
+    `lire_valeur_retenue` lit à l'import). Rien sinon, ni pour une année sur deux
+    chiffres : la proposition cumulerait deux hypothèses.
+    """
+    if nature not in NATURES_DATE or not isinstance(valeur, str):
+        return None
+    trouve = _JOUR_MOIS_ANNEE.fullmatch(valeur.strip())
+    if trouve is None:
+        return None
+    premier, second, annee = int(trouve.group(1)), int(trouve.group(3)), int(trouve.group(4))
+    if _date_existe(annee, second, premier) or not _date_existe(annee, premier, second):
+        return None
+    texte = f"{second:02d}/{premier:02d}/{annee:04d}"
+    retenue, raison = lire_valeur_retenue(texte, nature)
+    if raison is not None:
+        return None
+    return texte if isinstance(retenue, (date, datetime)) else retenue
+
+
 def elements_a_arbitrer(
     tables: dict[str, pd.DataFrame],
     anomalies: pd.DataFrame,
@@ -464,7 +507,10 @@ def elements_a_arbitrer(
     sensible) : elle vaut alors la forme du référentiel, en clair, lue dans les
     tables reçues comme le fait la règle de nettoyage `referentiel`, si cette forme
     est unique (sinon elle reste masquée). `regles_gestion` (règles de
-    config/gestion.yaml par défaut) donne le référentiel de chaque règle.
+    config/gestion.yaml par défaut) donne le référentiel de chaque règle. Une
+    anomalie de nature sur une colonne de date, sans proposition, reçoit la date lue
+    mois puis jour quand la valeur est impossible lue jour puis mois mais valide lue
+    mois puis jour (`date_inversee_proposee`).
     """
     manquantes = [c for c in COLONNES_ANOMALIES if c not in anomalies.columns]
     if manquantes:
@@ -503,6 +549,15 @@ def elements_a_arbitrer(
                 and proposition == VALEUR_MASQUEE
             ):
                 proposition = forme_proposee(ligne, source) or proposition
+            elif (
+                sorte == SORTE_CELLULE
+                and ligne.etape == ETAPE_FORMAT
+                and _texte(proposition) == ""
+                and _texte(ligne.regle).startswith(PREFIXE_NATURE)
+                and ligne.champ in donnees.columns
+            ):
+                nature = _texte(ligne.regle)[len(PREFIXE_NATURE):]
+                proposition = date_inversee_proposee(source[ligne.champ], nature) or proposition
             colonnes = _colonnes_locales(ligne.champ, donnees)
             if sorte == SORTE_LIGNE:
                 empreinte = _empreinte(
@@ -633,7 +688,9 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
         "l'outil quand il en propose une : la vérifier avant de choisir corriger. Elle "
         "n'est lue qu'avec la décision corriger. Pour une clé écrite autrement que dans "
         "son référentiel (constat « trouvée après normalisation seulement »), c'est la "
-        "forme du référentiel, y compris sur une colonne sensible.",
+        "forme du référentiel, y compris sur une colonne sensible. Pour une date "
+        "impossible lue jour puis mois mais valide lue mois puis jour, c'est cette date, "
+        "le jour et le mois étant sans doute inversés.",
         "Écrire la valeur retenue comme dans le fichier source. Une date peut s'écrire "
         "JJ/MM/AAAA, JJ.MM.AAAA, JJ-MM-AAAA, AAAA-MM-JJ ou AAAAMMJJ, un nombre avec une "
         "virgule ou un point décimal; une année sur deux chiffres est refusée. La "
