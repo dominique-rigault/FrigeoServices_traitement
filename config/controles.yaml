@@ -2,8 +2,8 @@
 # pas déduire des fichiers. Une forme fixe (code postal, numéro à longueur fixe) ne
 # se déclare pas ici mais dans le classeur de revue du dictionnaire (règle format).
 # Ce fichier est réécrit en entier par le formulaire des règles de contrôle (notebook
-# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs et les durées
-# s'écrivent à la main, le formulaire les reprend tels quels.
+# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs, les durées et
+# les tables des lignes s'écrivent à la main, le formulaire les reprend tels quels.
 #
 # Règles possibles pour une colonne
 #   decimales  nombre maximal de décimales
@@ -76,6 +76,8 @@ regles:
 # cle = identifiant d'une ligne; unique = colonnes qui ne doivent pas se répéter;
 # presume_unique = colonnes en principe uniques, une répétition est à arbitrer;
 # identique_hors_cle false = deux lignes pareilles hors clé sont normales dans cette table.
+# table_des_lignes = table des lignes d'une table d'en-têtes : deux en-têtes pareils hors
+# clé ne sont signalés que si leurs lignes sont pareilles aussi.
 doublons:
   interventions:
     cle: [id_intervention]
@@ -84,12 +86,14 @@ doublons:
     cle: [id_consommation]
   factures_entetes:
     cle: [num_facture]
+    table_des_lignes: factures_lignes
   factures_lignes:
     cle: [num_facture, num_ligne]
   achats_entetes:
     cle: [num_piece_achat]
     unique:
       - [code_fournisseur, ref_facture_fournisseur]
+    table_des_lignes: achats_lignes
   achats_lignes:
     cle: [num_piece_achat, num_ligne]
     identique_hors_cle: false
