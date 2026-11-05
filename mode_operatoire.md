@@ -108,7 +108,7 @@ Repères pour la phase 4 :
 | 5.2 | Revoir le formulaire (mode d'emploi dans la première feuille) : un statut par ligne (valide adopte la proposition, documenté prend les valeurs saisies, invalide écarte la règle et la proposition), un commentaire si besoin, un groupe de plusieurs colonnes ajouté en bas de la feuille `doublons`; une revue partielle suffit pour avancer | M avec C | Excel | opérationnel |
 | 5.3 | Enregistrer et fermer le formulaire, exécuter `# IMPORT FORMULAIRE` (rapport des règles changées et avertissements; un formulaire mal rempli arrête la cellule avec la liste des lignes à corriger), puis `# ECRITURE FORMULAIRE`, qui copie l'ancien fichier dans `data/config/sauvegardes/`, archive le formulaire dans `data/formulaires/appliques/` et réécrit `config/controles.yaml` | C | notebook 04 | opérationnel |
 | 5.4 | Commiter `config/controles.yaml` | C | Git | opérationnel |
-| 5.5 | Si le métier demande un motif (expression régulière), ou si une colonne de durée porte des valeurs écrites avec leurs unités (1h10, 95 min), écrire à la main le motif ou la règle `duree` (unité de la colonne, minutes ou heures) dans `config/controles.yaml`, quand aucun formulaire n'attend son import | A, puis C (dépôt dans `config/`) | `config/controles.yaml` | opérationnel |
+| 5.5 | Si le métier demande un motif (expression régulière), si une colonne de durée porte des valeurs écrites avec leurs unités (1h10, 95 min), ou si une table d'en-têtes de documents a sa table de lignes, écrire à la main le motif, la règle `duree` (unité de la colonne, minutes ou heures) ou la clé `table_des_lignes` de l'en-tête dans `config/controles.yaml`, quand aucun formulaire n'attend son import | A, puis C (dépôt dans `config/`) | `config/controles.yaml` | opérationnel |
 | 5.6 | Exécuter le notebook en entier, et vérifier les lignes « N règles complémentaires lues » et « N tables avec des doublons déclarés » (emplacement attendu) | C | notebook 04 | opérationnel |
 
 Repères pour la phase 5 :
@@ -119,6 +119,7 @@ Repères pour la phase 5 :
 - un formulaire exporté avant une modification de `config/controles.yaml` (un motif ajouté à la main, par exemple) est refusé à l'import : le supprimer, puis le réexporter;
 - `config/controles.yaml` est réécrit en entier, dans l'ordre du dictionnaire : un commentaire écrit à la main y est perdu, celui du métier se saisit dans le formulaire;
 - l'unité d'une colonne de durée (règle `duree`) ne donne aucun contrôle à cette phase : elle sert au nettoyage (phase 8), et le formulaire la montre dans la feuille `durées` sans la modifier;
+- pour une table d'en-têtes de documents (factures, pièces d'achat), la clé `table_des_lignes` nomme sa table des lignes, déclarée avec une clé qui contient celle de l'en-tête et au moins une autre colonne; deux en-têtes identiques hors clé ne sont alors à arbitrer que si leurs lignes le sont aussi, et le formulaire la montre dans la feuille `tables` sans la modifier;
 - une forme fixe (code postal, SIRET, téléphone) ne va pas dans ce formulaire : elle relève de la règle `format` du dictionnaire, décidée à la revue (phase 4).
 
 ### Phase 6, règles de gestion (notebook 05)
