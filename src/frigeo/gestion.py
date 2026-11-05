@@ -115,6 +115,9 @@ CLE_REGLES_GESTION = "regles"
 # chaque règle dont le type a un paramètre feries et qui n'en déclare pas.
 CLE_JOURS_FERIES = "jours_feries"
 PARAMETRE_FERIES = "feries"
+# Paramètres communs par type (type vers paramètre vers valeur), repris par chaque règle
+# du type qui ne déclare pas le paramètre; une valeur écrite dans la règle l'emporte.
+CLE_PARAMETRES_COMMUNS = "parametres_communs"
 # Clés tenues par le formulaire des règles de gestion (voir frigeo.formulaire_gestion),
 # sans effet sur les contrôles : propositions refusées par le métier, règles retirées
 # (gardées en entier pour pouvoir les rétablir) et règles demandées en texte libre.
@@ -122,7 +125,8 @@ CLE_ECARTEES = "ecartees"
 CLE_RETIREES = "retirees"
 CLE_DEMANDES = "demandes"
 CLES_FICHIER_GESTION = (
-    CLE_REGLES_GESTION, CLE_JOURS_FERIES, CLE_ECARTEES, CLE_RETIREES, CLE_DEMANDES
+    CLE_REGLES_GESTION, CLE_JOURS_FERIES, CLE_PARAMETRES_COMMUNS, CLE_ECARTEES, CLE_RETIREES,
+    CLE_DEMANDES,
 )
 # Clés communes à toutes les instances, en plus des paramètres de leur type.
 CLES_COMMUNES = ("ref", "libelle", "type", "table")
@@ -4379,6 +4383,70 @@ def completer_jours_feries(regles, jours_feries) -> list:
     return completes
 
 
+def problemes_parametres_communs(communs) -> list[str]:
+    """Problèmes de la clé `parametres_communs` : un dictionnaire de types connus, chacun
+    vers un dictionnaire non vide de paramètres de ce type, chaque valeur conforme au
+    genre du paramètre, plus un commentaire facultatif (texte, non transmis aux règles).
+    Les vérifications propres au type (bornes, cohérence entre paramètres) se font sur
+    les règles complétées."""
+    lieu = CLE_PARAMETRES_COMMUNS
+    if not isinstance(communs, dict) or not communs:
+        return [f"{lieu} : un dictionnaire non vide est attendu (type vers paramètres)"]
+    problemes = []
+    for nom_type, parametres in communs.items():
+        type_regle = TYPES.get(nom_type) if isinstance(nom_type, str) else None
+        if type_regle is None:
+            problemes.append(f"{lieu}, {nom_type} : type inconnu du catalogue")
+            continue
+        if not isinstance(parametres, dict) or not parametres:
+            problemes.append(
+                f"{lieu}, {nom_type} : un dictionnaire non vide est attendu "
+                "(paramètre vers valeur)"
+            )
+            continue
+        for parametre, valeur in parametres.items():
+            if parametre == CLE_COMMENTAIRE:
+                if not _texte_attendu(valeur):
+                    problemes.append(f"{lieu}, {nom_type}, {parametre} : un texte est attendu")
+                continue
+            genre = type_regle.parametres.get(parametre)
+            if genre is None:
+                problemes.append(
+                    f"{lieu}, {nom_type}, {parametre} : paramètre inconnu du type "
+                    f"(paramètres : {', '.join(type_regle.parametres)})"
+                )
+                continue
+            problemes.extend(
+                f"{lieu}, {nom_type}, {parametre} : {probleme}"
+                for probleme in _problemes_parametre(genre, valeur)
+            )
+    return problemes
+
+
+def completer_parametres_communs(regles, communs) -> list:
+    """Règles où chaque règle reçoit les paramètres communs de son type qu'elle ne
+    déclare pas; une règle qui déclare un paramètre garde sa valeur.
+
+    Sans paramètres communs (None), les règles sont rendues telles quelles. Les
+    arguments ne sont pas modifiés; une règle mal formée est rendue telle quelle (ses
+    problèmes sont listés par `problemes_regles_gestion`).
+    """
+    if not communs or not isinstance(regles, list):
+        return regles
+    completes = []
+    for instance in regles:
+        if isinstance(instance, dict) and isinstance(instance.get("type"), str):
+            manquants = {
+                parametre: deepcopy(valeur)
+                for parametre, valeur in (communs.get(instance["type"]) or {}).items()
+                if parametre not in instance and parametre != CLE_COMMENTAIRE
+            }
+            if manquants:
+                instance = {**instance, **manquants}
+        completes.append(instance)
+    return completes
+
+
 def charger_regles_gestion(chemin: str | Path | None = None) -> list:
     """Règles de gestion de config/gestion.yaml, dans l'ordre du fichier.
 
@@ -4403,6 +4471,11 @@ def charger_regles_gestion(chemin: str | Path | None = None) -> list:
     paramètre feries et qui n'en déclare pas les reçoit (voir
     `completer_jours_feries`).
 
+    La clé `parametres_communs`, facultative, déclare des paramètres une fois par type
+    (type vers paramètre vers valeur) : chaque règle du type qui ne déclare pas un de ces
+    paramètres le reçoit, une valeur écrite dans la règle l'emportant (voir
+    `completer_parametres_communs`). Ils sont repris avant les jours fériés du fichier.
+
     Un fichier absent, ou sans clé `regles`, ne donne aucune règle. Un fichier mal
     formé est refusé, tous les problèmes étant listés en une fois.
     """
@@ -4419,7 +4492,13 @@ def charger_regles_gestion(chemin: str | Path | None = None) -> list:
         ]
         if problemes:
             jours_feries = None
-    regles = completer_jours_feries(regles, jours_feries)
+    communs = contenu.get(CLE_PARAMETRES_COMMUNS)
+    if CLE_PARAMETRES_COMMUNS in contenu:
+        problemes_communs = problemes_parametres_communs(communs)
+        if problemes_communs:
+            problemes.extend(problemes_communs)
+            communs = None
+    regles = completer_jours_feries(completer_parametres_communs(regles, communs), jours_feries)
     problemes.extend(problemes_regles_gestion(regles))
     if problemes:
         raise ValueError(

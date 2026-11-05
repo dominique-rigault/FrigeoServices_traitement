@@ -70,6 +70,7 @@ from frigeo.gestion import (
     catalogue_types,
     charger_regles_gestion,
     completer_jours_feries,
+    completer_parametres_communs,
     controler_gestion,
     lire_fichier_gestion,
     problemes_regles_gestion,
@@ -416,8 +417,8 @@ def test_chargement_du_fichier(tmp_path):
     chemin.write_text("- ref: x\n", encoding="utf-8")
     with pytest.raises(
         ValueError,
-        match="clés attendues sont « regles », « jours_feries », « ecartees », « retirees » "
-        "et « demandes »",
+        match="clés attendues sont « regles », « jours_feries », « parametres_communs », "
+        "« ecartees », « retirees » et « demandes »",
     ):
         charger_regles_gestion(chemin)
     chemin.write_text(
@@ -4397,3 +4398,94 @@ def test_date_plausible_parametres_refuses():
         "(nombre, facultatif), vide_hors_champ (true ou false, facultatif)"
     )
     assert catalogue.loc["date_plausible", "issue"] == "à arbitrer"
+
+
+# --- paramètres communs par type (B4b) -------------------------------------------
+
+
+TEXTE_COMMUNS = (
+    "parametres_communs:\n"
+    "  date_plausible:\n"
+    "    min: 2010-01-01\n"
+    "    apres_coupure: 61\n"
+    "    commentaire: Création de l'entreprise et extraction des référentiels\n"
+    "regles:\n"
+    "  - ref: dates\n    libelle: Entrée\n    type: date_plausible\n    table: t\n"
+    "    colonne: d\n"
+    "  - ref: dates\n    libelle: Sortie\n    type: date_plausible\n    table: t\n"
+    "    colonne: d\n    apres_coupure: 0\n"
+    "  - ref: R02\n    libelle: Durée\n    type: plage\n    table: t\n    colonne: n\n"
+    "    min: 0\n"
+)
+
+
+def test_parametres_communs_repris_par_les_regles_du_type(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(TEXTE_COMMUNS, encoding="utf-8")
+    regles = charger_regles_gestion(chemin)
+    # Repris par chaque règle du type, sauf ce qu'elle déclare; le commentaire du type
+    # n'est pas transmis, et une règle d'un autre type n'est pas touchée.
+    assert {k: regles[0][k] for k in ("min", "apres_coupure")} == {
+        "min": dt.date(2010, 1, 1), "apres_coupure": 61,
+    }
+    assert "commentaire" not in regles[0]
+    assert regles[1]["apres_coupure"] == 0 and regles[1]["min"] == dt.date(2010, 1, 1)
+    assert regles[2] == {"ref": "R02", "libelle": "Durée", "type": "plage", "table": "t",
+                         "colonne": "n", "min": 0}
+    # Le contenu lu tel quel n'est pas complété.
+    contenu = lire_fichier_gestion(chemin)
+    assert "min" not in contenu["regles"][0]
+    # Les règles complétées s'appliquent (limite au 31/05/2026, minimum au 01/01/2010).
+    donnees = {"t": _table(d=["31/12/2009", "31/05/2026", "01/06/2026"])}
+    ecarts, _ = _controler_tables(donnees, NATURES_PLAUSIBLE, regles[:1])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (2, CONSTAT_DATE_TROP_ANCIENNE), (4, CONSTAT_DATE_TROP_TARDIVE),
+    ]
+
+
+def test_parametres_communs_refuses(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    regle = "regles:\n  - ref: dates\n    libelle: E\n    type: date_plausible\n    table: t\n" \
+            "    colonne: d\n"
+    cas = [
+        ("parametres_communs: [1]\n",
+         ["parametres_communs : un dictionnaire non vide est attendu (type vers paramètres)"]),
+        ("parametres_communs:\n  autre: {min: 1}\n  date_plausible: 3\n",
+         ["parametres_communs, autre : type inconnu du catalogue",
+          "parametres_communs, date_plausible : un dictionnaire non vide est attendu "
+          "(paramètre vers valeur)"]),
+        ("parametres_communs:\n  date_plausible:\n    maxi: 2\n    min: 5\n"
+         "    commentaire: [1]\n",
+         ["parametres_communs, date_plausible, maxi : paramètre inconnu du type (paramètres : "
+          "colonne, min, apres_coupure, vide_hors_champ)",
+          "parametres_communs, date_plausible, min : une date AAAA-MM-JJ est attendue",
+          "parametres_communs, date_plausible, commentaire : un texte est attendu"]),
+        # Les vérifications propres au type portent sur les règles complétées.
+        ("parametres_communs:\n  date_plausible:\n    apres_coupure: -1\n",
+         ["règle n° 1 (dates) : apres_coupure : un nombre entier de jours, positif ou nul, "
+          "est attendu"]),
+    ]
+    for communs, attendus in cas:
+        chemin.write_text(communs + regle, encoding="utf-8")
+        with pytest.raises(ValueError) as erreur:
+            charger_regles_gestion(chemin)
+        assert [ligne.strip() for ligne in str(erreur.value).splitlines()[1:]] == attendus
+
+
+def test_completer_parametres_communs_sans_modifier_les_arguments():
+    regles = [_plausible(), _plausible(min="2000-01-01"), "x", {"type": 3},
+              {"type": "renseignee_selon_valeur"}]
+    copie = deepcopy(regles)
+    communs = {"date_plausible": {"min": "2010-01-01", "apres_coupure": 61,
+                                  "commentaire": "texte"}, "plage": {"min": 0},
+               "renseignee_selon_valeur": {"valeurs": ["A"]}}
+    copie_communs = deepcopy(communs)
+    completes = completer_parametres_communs(regles, communs)
+    assert regles == copie and communs == copie_communs
+    assert completes[0] == {**_plausible(), "min": "2010-01-01", "apres_coupure": 61}
+    assert completes[1] == {**_plausible(min="2000-01-01"), "apres_coupure": 61}
+    assert completes[2:4] == ["x", {"type": 3}]
+    # Chaque règle reçoit sa propre copie d'une valeur modifiable.
+    assert completes[4]["valeurs"] == ["A"]
+    assert completes[4]["valeurs"] is not communs["renseignee_selon_valeur"]["valeurs"]
+    assert completer_parametres_communs(regles, None) is regles

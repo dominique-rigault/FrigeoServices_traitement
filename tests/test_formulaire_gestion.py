@@ -1707,3 +1707,51 @@ def test_vide_hors_champ_importe(tmp_path):
             vide_hors_champ="peut-être")
     with pytest.raises(ValueError, match="vide_hors_champ"):
         _importer_c(chemin, dictionnaire, contenu)
+
+
+def _contenu_communs():
+    contenu = _contenu()
+    contenu["parametres_communs"] = {
+        "date_plausible": {"min": dt.date(2010, 1, 1), "apres_coupure": 61,
+                           "commentaire": "Création de l'entreprise"},
+        "plage": {"max": 999},
+    }
+    contenu["regles"].append({"ref": "dates", "libelle": "Date plausible",
+                              "type": "date_plausible", "table": "t", "colonne": "d"})
+    return contenu
+
+
+def test_parametres_communs_dans_le_formulaire(tmp_path):
+    contenu = _contenu_communs()
+    assert problemes_contenu_formulaire(contenu) == []
+    # Valeurs effectives montrées avec la mention « (commun) »; une valeur de la règle
+    # l'emporte (R22 garde son maximum).
+    lignes = {ligne["ref"]: ligne["paramètres"] for ligne in lignes_autres(contenu)}
+    assert lignes["dates"] == "colonne = d; min = 2010-01-01 (commun); apres_coupure = 61 (commun)"
+    assert lignes["R22"] == "colonne = n; min = 2; max = 120"
+    # Formulaire rendu sans revue : contenu inchangé, clé comprise.
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu)
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert formulaire.contenu == contenu
+    assert formulaire.changements.empty
+    # Écriture du fichier : la clé après les jours fériés, relue à l'identique.
+    texte = texte_gestion(contenu)
+    assert yaml.safe_load(texte) == contenu
+    assert texte_gestion(yaml.safe_load(texte)) == texte
+    lignes = texte.splitlines()
+    debut = lignes.index("parametres_communs:")
+    assert lignes.index("jours_feries:") < debut < lignes.index("regles:")
+    assert lignes[debut - 3].startswith("# Paramètres communs par type de règle")
+    assert lignes[debut + 1:debut + 7] == [
+        "  date_plausible:",
+        "    min: 2010-01-01",
+        "    apres_coupure: 61",
+        "    commentaire: Création de l'entreprise",
+        "  plage:",
+        "    max: 999",
+    ]
+    # Paramètres communs mal formés : refusés, sans les reporter sur les règles.
+    contenu["parametres_communs"] = {"autre": {"min": 1}}
+    assert problemes_contenu_formulaire(contenu) == [
+        "parametres_communs, autre : type inconnu du catalogue"
+    ]

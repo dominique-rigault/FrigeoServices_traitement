@@ -71,6 +71,7 @@ from .gestion import (
     CLE_FILTRE,
     CLE_ISSUE,
     CLE_JOURS_FERIES,
+    CLE_PARAMETRES_COMMUNS,
     CLE_REGLES_GESTION,
     CLE_RETIREES,
     CLES_COMMUNES,
@@ -92,6 +93,8 @@ from .gestion import (
     _texte_lu,
     chemin_regles_gestion,
     completer_jours_feries,
+    completer_parametres_communs,
+    problemes_parametres_communs,
     problemes_regles_gestion,
 )
 from .revue import FEUILLE_LISTES, _ecrire_texte, _feuille_listes, _menu, _menus_d_ajout
@@ -385,8 +388,8 @@ def _jours_declares(feries) -> dict[int, list[date]]:
 
 def problemes_contenu_formulaire(contenu: dict) -> list[str]:
     """Problèmes des clés que tient le formulaire dans config/gestion.yaml (règles,
-    jours fériés, propositions écartées, règles retirées, règles demandées), tous
-    listés en une fois."""
+    jours fériés, paramètres communs, propositions écartées, règles retirées, règles
+    demandées), tous listés en une fois."""
     problemes = []
     jours_feries = contenu.get(CLE_JOURS_FERIES)
     if CLE_JOURS_FERIES in contenu:
@@ -395,9 +398,17 @@ def problemes_contenu_formulaire(contenu: dict) -> list[str]:
         )
         if problemes:
             jours_feries = None
+    communs = contenu.get(CLE_PARAMETRES_COMMUNS)
+    if CLE_PARAMETRES_COMMUNS in contenu:
+        problemes_communs = problemes_parametres_communs(communs)
+        if problemes_communs:
+            problemes.extend(problemes_communs)
+            communs = None
     for cle in (CLE_REGLES_GESTION, CLE_RETIREES):
         if cle in contenu:
-            regles = completer_jours_feries(contenu[cle], jours_feries)
+            regles = completer_jours_feries(
+                completer_parametres_communs(contenu[cle], communs), jours_feries
+            )
             problemes.extend(f"{cle}, {probleme}" for probleme in problemes_regles_gestion(regles))
     ecartees = contenu.get(CLE_ECARTEES)
     if CLE_ECARTEES in contenu:
@@ -489,9 +500,14 @@ def _texte_valeur(valeur) -> str:
     return str(valeur)
 
 
-def texte_parametres(instance: dict) -> str:
+def texte_parametres(instance: dict, communs: dict | None = None) -> str:
     """Paramètres d'une règle écrits en clair, dans l'ordre de son type
-    (« cle = id_intervention; delai_max = 30 »), hors filtre, issue et commentaire."""
+    (« cle = id_intervention; delai_max = 30 »), hors filtre, issue et commentaire.
+
+    Avec `communs` (la clé `parametres_communs` du fichier), un paramètre que la règle
+    ne déclare pas et qu'elle reçoit des paramètres communs de son type est écrit avec
+    la mention « (commun) », pour montrer la valeur qui s'applique.
+    """
     type_regle = TYPES.get(instance.get("type"))
     noms = list(type_regle.parametres) if type_regle is not None else []
     noms += [
@@ -499,9 +515,15 @@ def texte_parametres(instance: dict) -> str:
         if cle not in noms
         and cle not in (*CLES_COMMUNES, CLE_FILTRE, CLE_ISSUE, CLE_COMMENTAIRE)
     ]
-    return "; ".join(
-        f"{nom} = {_texte_valeur(instance[nom])}" for nom in noms if nom in instance
-    )
+    du_type = (communs or {}).get(instance.get("type")) if isinstance(communs, dict) else None
+    du_type = du_type if isinstance(du_type, dict) else {}
+    parties = []
+    for nom in noms:
+        if nom in instance:
+            parties.append(f"{nom} = {_texte_valeur(instance[nom])}")
+        elif nom in du_type:
+            parties.append(f"{nom} = {_texte_valeur(du_type[nom])} (commun)")
+    return "; ".join(parties)
 
 
 def _issue(instance: dict) -> str:
@@ -1317,7 +1339,7 @@ def lignes_autres(
                 "libellé": instance["libelle"],
                 "type": instance["type"],
                 "table": instance["table"],
-                "paramètres": texte_parametres(instance),
+                "paramètres": texte_parametres(instance, contenu.get(CLE_PARAMETRES_COMMUNS)),
                 "filtre": _texte_filtre(instance.get(CLE_FILTRE)),
                 "issue": _issue(instance),
                 "origine": origine,
@@ -2053,6 +2075,7 @@ class _Etat:
     def __init__(self, contenu: dict):
         self.regles = list(contenu.get(CLE_REGLES_GESTION) or [])
         self.retirees = list(contenu.get(CLE_RETIREES) or [])
+        self.communs = contenu.get(CLE_PARAMETRES_COMMUNS)
         # Sort des règles désignées par une ligne : rang vers (action, règle).
         self.sort_regles: dict[int, tuple[str, dict | None]] = {}
         self.sort_retirees: dict[int, tuple[str, dict | None]] = {}
@@ -2399,7 +2422,7 @@ def _importer_autres(lignes: list[tuple[int, dict]], etat: _Etat, problemes: lis
             or any(famille.en_famille(instance) for famille in FAMILLES)
             or identite != (
                 _texte(instance.get("type")), _texte(instance.get("table")),
-                _texte(texte_parametres(instance)),
+                _texte(texte_parametres(instance, etat.communs)),
                 _texte(_texte_filtre(instance.get(CLE_FILTRE))),
             )
         ):
@@ -2766,6 +2789,11 @@ ENTETE_GESTION = """\
 COMMENTAIRE_JOURS_FERIES = """\
 # Jours fériés, repris par chaque règle d'horaires qui n'en déclare pas (clé feries).
 """
+COMMENTAIRE_PARAMETRES_COMMUNS = """\
+# Paramètres communs par type de règle, repris par chaque règle du type qui ne les déclare
+# pas; une valeur écrite dans la règle l'emporte. La clé commentaire d'un type dit ce que
+# représentent ses valeurs.
+"""
 COMMENTAIRE_RETIREES = """\
 # Règles retirées par le métier, gardées en entier pour pouvoir les rétablir
 # (sans effet sur les contrôles).
@@ -2912,9 +2940,9 @@ def _lignes_jours(jours: dict, retrait: int) -> list[str]:
 def texte_gestion(contenu: dict) -> str:
     """Texte de config/gestion.yaml pour un contenu.
 
-    Un en-tête de commentaires standard, puis les jours fériés, les règles (une clé par
-    ligne, une ligne vide quand la référence change), les règles retirées, les
-    propositions écartées et les règles demandées. La relecture du texte redonne
+    Un en-tête de commentaires standard, puis les jours fériés, les paramètres communs,
+    les règles (une clé par ligne, une ligne vide quand la référence change), les règles
+    retirées, les propositions écartées et les règles demandées. La relecture du texte redonne
     exactement le contenu.
     """
     blocs = [ENTETE_GESTION]
@@ -2922,6 +2950,14 @@ def texte_gestion(contenu: dict) -> str:
     if jours_feries:
         blocs.append(COMMENTAIRE_JOURS_FERIES + f"{CLE_JOURS_FERIES}:\n"
                      + "\n".join(_lignes_jours(jours_feries, 2)) + "\n")
+    communs = contenu.get(CLE_PARAMETRES_COMMUNS)
+    if communs:
+        lignes = [f"{CLE_PARAMETRES_COMMUNS}:"]
+        for nom_type, parametres in communs.items():
+            lignes.append(f"  {_scalaire(nom_type)}:")
+            for nom, valeur in parametres.items():
+                lignes += _lignes_valeur(nom, valeur, 4)
+        blocs.append(COMMENTAIRE_PARAMETRES_COMMUNS + "\n".join(lignes) + "\n")
     for cle, commentaire in ((CLE_REGLES_GESTION, ""), (CLE_RETIREES, COMMENTAIRE_RETIREES)):
         regles = contenu.get(cle)
         if regles:
