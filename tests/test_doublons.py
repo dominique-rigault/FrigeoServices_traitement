@@ -10,6 +10,7 @@ from frigeo.doublons import (
     COLONNES_BILAN_DOUBLONS,
     COLONNES_DOUBLONS,
     COLONNES_NON_CHERCHES,
+    _signatures_des_lignes,
     charger_declarations_doublons,
     detecter_doublons,
     doublons_non_cherches,
@@ -458,3 +459,91 @@ def test_lecture_des_declarations(tmp_path):
     chemin.write_text("doublons:\n  clients:\n    cle: code_client\n", encoding="utf-8")
     with pytest.raises(ValueError, match="clients, cle : une liste de noms de colonnes"):
         charger_declarations_doublons(chemin)
+
+
+def test_identique_hors_cle_selon_les_lignes_des_documents():
+    entetes = _table(
+        "e.csv",
+        num=["F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10"],
+        client=["a", "a", "b", "b", "c", "c", "c", "d", "d", "e"],
+        total=["10"] * 10,
+    )
+    lignes = _table(
+        "l.csv",
+        num=["F1", "F1", "F2", "F3", "F3", "F4", "F5", "F5", "F6", "F7", "F7", ""],
+        n=["1", "2", "1", "1", "1", "1", "1", "2", "1", "1", "2", "1"],
+        article=["x", "x", "x", "x", "x", "x", "p", "q", "p", "Q", "p", "x"],
+    )
+    tables = {"e": entetes, "l": lignes}
+    declarations = {
+        "e": {"cle": ["num"], "table_des_lignes": "l"},
+        "l": {"cle": ["num", "n"], "identique_hors_cle": False},
+    }
+    doublons, bilan = detecter_doublons(tables, declarations, AUCUNE_SENSIBLE)
+    hors_cle = doublons[(doublons["table"] == "e") & (doublons["constat"] == "identique hors clé")]
+    # F1 et F2 diffèrent par le nombre de lignes, F6 par ses lignes; la ligne en
+    # surnombre de F3 (doublon exact) ne compte pas; F5 et F7 ont les mêmes lignes
+    # dans un autre ordre et à la casse près; F8 et F9 n'ont aucune ligne.
+    colonnes = "toutes sauf num, lignes de l comprises"
+    assert _lignes(hors_cle, "cle", "groupe", "taille_groupe", "comparaison", "colonnes") == [
+        ("F3", 1, 2, "telle quelle", colonnes),
+        ("F4", 1, 2, "telle quelle", colonnes),
+        ("F5", 2, 2, "après normalisation", colonnes),
+        ("F7", 2, 2, "après normalisation", colonnes),
+        ("F8", 3, 2, "telle quelle", colonnes),
+        ("F9", 3, 2, "telle quelle", colonnes),
+    ]
+    ligne = _bilan(bilan[bilan["table"] == "e"], "identique hors clé")
+    assert ligne["colonnes"] == colonnes
+    assert (
+        ligne["comparees"], ligne["groupes"], ligne["lignes"], ligne["en_surnombre"],
+        ligne["apres_normalisation"],
+    ) == (10, 3, 6, 3, 1)
+    # Signatures des lignes par document : une ligne sans numéro de document n'est
+    # rattachée à aucun, les textes bruts gardent la casse.
+    normees, brutes = _signatures_des_lignes(lignes, ["num", "n"], ["num"])
+    assert ("",) not in normees and set(normees) == set(brutes)
+    assert normees[("f5",)] == normees[("f7",)] and brutes[("f5",)] != brutes[("f7",)]
+    # Les autres contrôles ne changent pas, et la table des lignes garde les siens.
+    assert set(doublons["table"]) == {"e", "l"}
+    assert set(doublons.loc[doublons["table"] == "l", "constat"]) == {"doublon exact"}
+    # Sans table des lignes, les quatre groupes d'en-têtes sont signalés.
+    sans = {"e": {"cle": ["num"]}, "l": declarations["l"]}
+    doublons, bilan = detecter_doublons(tables, sans, AUCUNE_SENSIBLE)
+    ligne = _bilan(bilan[bilan["table"] == "e"], "identique hors clé")
+    assert (ligne["colonnes"], ligne["groupes"], ligne["lignes"]) == ("toutes sauf num", 4, 9)
+    # La table des lignes doit être chargée.
+    with pytest.raises(ValueError, match="table l absente des données chargées"):
+        detecter_doublons({"e": entetes}, declarations, AUCUNE_SENSIBLE)
+
+
+def test_problemes_de_la_table_des_lignes():
+    lignes = {"cle": ["num", "n"]}
+    declarations = {
+        "a": {"cle": ["num"], "table_des_lignes": ""},
+        "b": {"cle": ["num"], "table_des_lignes": "b"},
+        "c": {"cle": ["num"], "identique_hors_cle": False, "table_des_lignes": "l"},
+        "d": {"unique": [["num"]], "table_des_lignes": "l"},
+        "e": {"cle": ["num"], "table_des_lignes": "x"},
+        "f": {"cle": ["code"], "table_des_lignes": "l"},
+        "g": {"cle": ["n", "num"], "table_des_lignes": "l"},
+        "l": lignes,
+        "x": {"unique": [["num"]]},
+    }
+    problemes = problemes_declarations_doublons(declarations)
+    texte = "\n".join(problemes)
+    for attendu in (
+        "a, table_des_lignes\u00a0: un nom de table est attendu",
+        "b, table_des_lignes\u00a0: la table des lignes doit être une autre table",
+        "c, table_des_lignes\u00a0: sans objet avec identique_hors_cle false",
+        "d, table_des_lignes\u00a0: sans clé déclarée, il n'y a rien à comparer",
+        "e, table_des_lignes\u00a0: la table x doit être déclarée avec une clé",
+        "f, table_des_lignes\u00a0: la clé de l (num, n) doit contenir celle de f (code) et "
+        "au moins une autre colonne",
+        "g, table_des_lignes\u00a0: la clé de l (num, n) doit contenir celle de g (n, num)",
+    ):
+        assert attendu in texte
+    assert len(problemes) == 7
+    assert problemes_declarations_doublons(
+        {"e": {"cle": ["num"], "table_des_lignes": "l"}, "l": lignes}
+    ) == []

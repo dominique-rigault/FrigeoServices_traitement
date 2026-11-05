@@ -1,5 +1,9 @@
 """Tests des règles de nettoyage (frigeo.nettoyage)."""
 
+import hashlib
+import hmac
+import re
+import warnings
 from collections import Counter
 from copy import deepcopy
 from datetime import date, datetime
@@ -7,7 +11,10 @@ from datetime import date, datetime
 import pandas as pd
 import pytest
 
+import frigeo.controles as module_controles
 import frigeo.decisions as module_decisions
+import frigeo.gestion as module_gestion
+import frigeo.nettoyage as module_nettoyage
 
 from frigeo.controles import _REPERTOIRE, VALEUR_MASQUEE, constats_encodage, controler
 from frigeo.dictionnaire import MOTIF_SENSIBLE
@@ -22,15 +29,20 @@ from frigeo.nettoyage import (
     RAISON_REMPLACEMENT,
     Reparation,
     catalogue_nettoyage,
+    charger_cle_empreintes,
+    empreinte_valeur,
     nettoyer,
+    normaliser_espaces,
     reparer_encodage,
 )
+from frigeo.nettoyage import chemin_cle_empreintes as chemin_cle_du_poste
 
 AUCUNE_SENSIBLE = {}
 AUCUNE_DECLARATION = {}
 INSECABLE = chr(160)
 REMPLACEMENT = chr(0xFFFD)
 TOUS = ("cp1252", "iso8859_15", "latin_1")
+CLE = "0123456789abcdef" * 4
 
 
 @pytest.fixture(autouse=True)
@@ -39,6 +51,31 @@ def sans_fichier_de_decisions(tmp_path, monkeypatch):
     monkeypatch.setattr(
         module_decisions, "chemin_decisions", lambda: tmp_path / "decisions_absent.yaml"
     )
+
+
+@pytest.fixture(autouse=True)
+def sans_regles_de_gestion(tmp_path_factory, monkeypatch):
+    """Les règles de gestion du poste (config/gestion.yaml) ne sont jamais lues par
+    ces tests : sauf règles passées, aucune."""
+    absent = tmp_path_factory.mktemp("gestion") / "gestion_absent.yaml"
+    monkeypatch.setattr(module_gestion, "chemin_regles_gestion", lambda: absent)
+
+
+@pytest.fixture(autouse=True)
+def sans_regles_complementaires(tmp_path_factory, monkeypatch):
+    """Les règles complémentaires du poste (config/controles.yaml) ne sont jamais lues
+    par ces tests : sauf règles passées, aucune."""
+    absent = tmp_path_factory.mktemp("controles") / "controles_absent.yaml"
+    monkeypatch.setattr(module_controles, "chemin_regles_complementaires", lambda: absent)
+
+
+@pytest.fixture(autouse=True)
+def cle_des_empreintes(tmp_path_factory, monkeypatch):
+    """La clé des empreintes du poste n'est jamais lue ni créée par ces tests : ils
+    lisent la clé CLE, dans un dossier à part (tmp_path reste vide)."""
+    fichier = tmp_path_factory.mktemp("cle") / "cle_empreintes.txt"
+    fichier.write_text(CLE + "\n", encoding="utf-8")
+    monkeypatch.setattr(module_nettoyage, "chemin_cle_empreintes", lambda: fichier)
 
 
 def _mal(texte, encodage="cp1252", fois=1):
@@ -364,16 +401,20 @@ def test_catalogue_nettoyage():
     assert list(catalogue.columns) == list(COLONNES_CATALOGUE_NETTOYAGE)
     assert _lignes(catalogue, "rang", "regle_nettoyage", "source") == [
         (1, "encodage", "règle générique"),
-        (2, "remplacement", "dictionnaire"),
-        (3, "nature", "règle générique"),
-        (4, "doublons", "règle générique"),
-        (5, "decision", "décision du métier"),
+        (2, "espaces", "règle générique"),
+        (3, "referentiel", "règle de gestion"),
+        (4, "remplacement", "dictionnaire"),
+        (5, "nature", "règle générique"),
+        (6, "doublons", "règle générique"),
+        (7, "decision", "décision du métier"),
     ]
     assert "caractère de remplacement" in catalogue.at[0, "ne_corrige_jamais"]
-    assert "hors liste" in catalogue.at[1, "ne_corrige_jamais"]
-    assert "date impossible" in catalogue.at[2, "ne_corrige_jamais"]
-    assert "identiques hors clé" in catalogue.at[3, "ne_corrige_jamais"]
-    assert "décidé de garder" in catalogue.at[4, "ne_corrige_jamais"]
+    assert "saut de ligne" in catalogue.at[1, "ne_corrige_jamais"]
+    assert "forme du référentiel non unique" in catalogue.at[2, "ne_corrige_jamais"]
+    assert "hors liste" in catalogue.at[3, "ne_corrige_jamais"]
+    assert "date impossible" in catalogue.at[4, "ne_corrige_jamais"]
+    assert "identiques hors clé" in catalogue.at[5, "ne_corrige_jamais"]
+    assert "décidé de garder" in catalogue.at[6, "ne_corrige_jamais"]
 
 
 # --- remplacement -------------------------------------------------------------
@@ -512,14 +553,19 @@ def test_remplacement_sur_colonne_sensible_masque():
 COUPURE = date(2026, 3, 31)
 
 
-def _nature(valeurs, nature, sensibles=AUCUNE_SENSIBLE, date_coupure=COUPURE):
+def _nature(valeurs, nature, sensibles=AUCUNE_SENSIBLE, date_coupure=COUPURE, duree=None):
     """Nettoie une colonne « v » de la nature donnée; rend (valeurs nettoyées,
-    journal, bilan). La colonne « n » rend les lignes toutes différentes : sans
-    elle, deux valeurs converties en la même deviendraient des doublons exacts."""
+    journal, bilan), réduits à la règle `nature`. La colonne « n » rend les lignes
+    toutes différentes : sans elle, deux valeurs converties en la même deviendraient
+    des doublons exacts."""
     tables = {"t": _table(v=list(valeurs), n=list(range(len(valeurs))))}
     dictionnaire = _dictionnaire(tables, **{"t.v": _colonne(nature)})
-    resultat = nettoyer(tables, dictionnaire, sensibles, AUCUNE_DECLARATION, date_coupure)
-    return list(resultat.tables["t"]["v"]), resultat.journal, resultat.bilan, (
+    complementaires = {"t": {"v": {"duree": duree}}} if duree else {}
+    resultat = nettoyer(tables, dictionnaire, sensibles, AUCUNE_DECLARATION, date_coupure,
+                        complementaires=complementaires)
+    journal = resultat.journal[resultat.journal["regle_nettoyage"] == "nature"]
+    bilan = resultat.bilan[resultat.bilan["regle_nettoyage"] == "nature"]
+    return list(resultat.tables["t"]["v"]), journal, bilan, (
         tables, dictionnaire, resultat.tables
     )
 
@@ -620,8 +666,10 @@ def test_nature_nombre_natif():
         (3, "forme lue 999,99 €"),
         (4, "forme lue 999.99"),
         (5, "forme lue 9 999,99"),
-        (6, "forme lue 9" + INSECABLE + "999,99 €"),
-        (7, "forme lue 9" + chr(0x202F) + "999"),
+        # Insécable et espace fine, devenues des espaces ordinaires par la règle des
+        # espaces, appliquée avant.
+        (6, "forme lue 9 999,99 €"),
+        (7, "forme lue 9 999"),
         (8, "forme lue -99,9"),
         (9, "forme lue 99"),
         (15, "forme lue 99,9€"),
@@ -647,6 +695,70 @@ def test_nature_nombres_en_texte():
     assert _lignes(bilan, "visees", "corrigees", "raisons") == [
         (7, 4, "valeur avec une unité 1; partie décimale non nulle 2"),
     ]
+
+
+DUREES = ["95", "1h10", "95 min", "1 h 30", "2h", "1,5 h", "45mn", "1h10min", "2 heures",
+          "1H05", "1h75", "1:10", "1,01 h", "x", "12 kg"]
+
+
+def test_nature_durees_dans_une_colonne_declaree():
+    valeurs, journal, bilan, _ = _nature(DUREES, "entier (texte)", duree="minutes")
+    assert valeurs == ["95", "70", "95", "90", "120", "90", "45", "70", "120", "65",
+                       "1h75", "1:10", "1,01 h", "x", "12 kg"]
+    assert _lignes(journal, "num_ligne_source", "detail") == [
+        (3, "forme lue 9a99, durée en minutes"),
+        (4, "forme lue 99 aaa, durée en minutes"),
+        (5, "forme lue 9 a 99, durée en minutes"),
+        (6, "forme lue 9a, durée en minutes"),
+        (7, "forme lue 9,9 a, durée en minutes"),
+        (8, "forme lue 99aa, durée en minutes"),
+        (9, "forme lue 9a99aaa, durée en minutes"),
+        (10, "forme lue 9 aaaaaa, durée en minutes"),
+        (11, "forme lue 9A99, durée en minutes"),
+    ]
+    # 1h75 : minutes au-delà de 59; 1:10 : forme d'heure, refusée; 1,01 h : 60,6 minutes
+    # vers un entier; 12 kg : autre unité.
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (14, 9, "valeur avec une unité 2; partie décimale non nulle 1; forme non reconnue 2"),
+    ]
+    # Sans déclaration, une durée avec ses unités n'est pas lue.
+    valeurs, journal, bilan, _ = _nature(DUREES[:3], "entier (texte)")
+    assert valeurs == DUREES[:3] and journal.empty
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (2, 0, "valeur avec une unité 2"),
+    ]
+
+
+def test_nature_durees_en_heures():
+    valeurs, journal, bilan, _ = _nature(["90 min", "1h30", "2 h", "70 min", "1.25 heure"],
+                                         "décimal virgule (texte)", duree="heures")
+    assert valeurs == ["1,5", "1,5", "2,0", "70 min", "1,25"]
+    assert list(journal["detail"]) == [
+        "forme lue 99 aaa, durée en heures", "forme lue 9a99, durée en heures",
+        "forme lue 9 a, durée en heures", "forme lue 9.99 aaaaa, durée en heures",
+    ]
+    assert _lignes(bilan, "visees", "corrigees", "raisons") == [
+        (5, 4, "durée non exacte dans l'unité 1"),
+    ]
+    # Colonne masquée : la forme n'est pas montrée, la mention de la durée l'est.
+    _, journal, _, _ = _nature(["1h10"], "entier (texte)", sensibles={"t": frozenset({"v"})},
+                               duree="minutes")
+    assert list(journal["detail"]) == ["forme masquée, durée en minutes"]
+
+
+def test_durees_declarees_et_refusees():
+    tables = {"t": _table(v=["1h10"], n=[1])}
+    dictionnaire = _dictionnaire(tables, **{"t.v": _colonne("entier (texte)")})
+    for complementaires, message in (
+        ({"t": {"v": {"duree": "secondes"}}}, "t.v, règle duree : minutes ou heures est attendu"),
+        ({"t": {"w": {"duree": "minutes"}}}, "colonne t.w absente des données chargées"),
+    ):
+        with pytest.raises(ValueError, match=message):
+            nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, AUCUNE_DECLARATION, COUPURE,
+                     complementaires=complementaires)
+    # Par défaut, les règles complémentaires de config/controles.yaml (ici absentes).
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, AUCUNE_DECLARATION, COUPURE)
+    assert list(resultat.tables["t"]["v"]) == ["1h10"]
 
 
 def test_nature_heure_et_colonne_texte():
@@ -694,7 +806,7 @@ def test_doublons_exacts_retires_premiere_occurrence_gardee():
     clients = _table(
         "clients.csv",
         code=["C1", "C2", "C1", "C3", "C3", "C4", "C5", "C1"],
-        nom=["Café", "Bar", "Café", "Épicerie", "Epicerie ", "Bar", "Bar", "Café"],
+        nom=["Café", "Bar", "Café", "Épicerie", "Epicerie", "Bar", "Bar", "Café"],
         ville=["Rouen", "Évreux", "Rouen", "Vernon", "vernon", "Évreux", "Évreux", "Rouen"],
     )
     clients.index = range(10, 18)
@@ -710,7 +822,7 @@ def test_doublons_exacts_retires_premiere_occurrence_gardee():
     declarations = {"clients": {"cle": ["code"]}, "factures": {"cle": ["num"]}}
     resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, declarations)
     # Lignes 4 et 9 : copies de la ligne 2; ligne 6 : copie de la ligne 5 après
-    # normalisation (casse, accents, espaces). C4 et C5 sont identiques à C2 hors clé :
+    # normalisation (casse, accents). C4 et C5 sont identiques à C2 hors clé :
     # à arbitrer, gardées. La facture F2 est en double entre deux exports.
     assert list(resultat.tables["clients"].index) == [10, 11, 13, 15, 16]
     assert list(resultat.tables["clients"]["num_ligne_source"]) == [2, 3, 5, 7, 8]
@@ -1222,6 +1334,13 @@ def test_ecrire_nettoyage(tmp_path):
         ["doublons", "4", "", "", ""],
         ["decision", "2", "j", "2025-01-01 00:00:00", "2025-02-01 00:00:00"],
     ]
+    # Empreintes sur la seule valeur masquée.
+    assert journal[["empreinte_avant", "empreinte_apres"]].values.tolist() == [
+        ["", ""],
+        [empreinte_valeur(_mal("Rue Été"), CLE), empreinte_valeur("Rue Été", CLE)],
+        ["", ""],
+        ["", ""],
+    ]
     # Un numéro de ligne lu 2.0 (classeur Excel) s'écrit 2.
     flottants = resultat.journal.copy()
     flottants["num_ligne_source"] = [float(n) for n in flottants["num_ligne_source"]]
@@ -1277,3 +1396,481 @@ def test_ecrire_nettoyage_refusee(tmp_path, monkeypatch):
         ecrire_nettoyage(resultat.journal.iloc[:1], resultat.bilan, "2026-03", tmp_path,
                          sensibles, declarations)
     assert {f.name: f.read_bytes() for f in tmp_path.iterdir()} == avant
+
+
+# --- empreintes des valeurs masquées -------------------------------------------
+
+
+def _hmac(texte, cle=CLE):
+    """Calcul indépendant du module, tel que la note d'évaluation le décrit."""
+    return hmac.new(bytes.fromhex(cle), texte.encode("utf-8"), hashlib.sha256).hexdigest()[:16]
+
+
+def test_empreinte_valeur():
+    assert empreinte_valeur("Café", CLE) == _hmac("texte:Café")
+    assert empreinte_valeur(2500, CLE) == _hmac("nombre:2500.0")
+    assert empreinte_valeur(2500.0, CLE) == empreinte_valeur(2500, CLE)
+    # Un texte et un nombre de même écriture n'ont pas la même empreinte.
+    assert empreinte_valeur("2500", CLE) == _hmac("texte:2500")
+    assert empreinte_valeur("2500", CLE) != empreinte_valeur(2500, CLE)
+    assert empreinte_valeur(pd.Timestamp(2025, 3, 12), CLE) == _hmac("date:2025-03-12T00:00:00")
+    assert empreinte_valeur(datetime(2025, 3, 12), CLE) == _hmac("date:2025-03-12T00:00:00")
+    assert empreinte_valeur(True, CLE) == _hmac("booléen:True")
+    assert empreinte_valeur(None, CLE) == _hmac("vide")
+    assert empreinte_valeur(float("nan"), CLE) == _hmac("vide")
+    assert empreinte_valeur("", CLE) == _hmac("texte:")
+    assert re.fullmatch("[0-9a-f]{16}", empreinte_valeur("x", CLE))
+    # L'empreinte dépend de la clé, et n'est pas le hachage sans clé des décisions.
+    assert empreinte_valeur("Café", "f" * 64) == _hmac("texte:Café", "f" * 64)
+    assert empreinte_valeur("Café", "f" * 64) != empreinte_valeur("Café", CLE)
+    assert empreinte_valeur("Café", CLE) != _empreinte_cellule("Café")
+    for invalide in ("abc", CLE + "0", "g" * 64, CLE.upper(), None, 12):
+        with pytest.raises(ValueError, match="64 chiffres hexadécimaux"):
+            empreinte_valeur("x", invalide)
+
+
+def test_empreintes_des_valeurs_masquees():
+    tables = {
+        "t": _table(
+            code=["a", "b"],
+            nom=[_mal("Café"), "x"],
+            adresse=[_mal("rue Élise"), "y"],
+            ville=[_mal("Évreux"), "z"],
+            salaire=["2 500", 3000],
+            entree=[datetime(2025, 3, 12), "01/01/2025"],
+        )
+    }
+    dictionnaire = _dictionnaire(
+        tables,
+        **{"t.adresse": _colonne(motif_valeurs=MOTIF_SENSIBLE),
+           "t.salaire": _colonne("nombre natif"),
+           "t.entree": _colonne("date JJ/MM/AAAA")},
+    )
+    sensibles = {"t": frozenset({"nom", "salaire", "entree"})}
+    resultat = nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}})
+    assert resultat.tables["t"].at[0, "salaire"] == 2500
+    assert resultat.tables["t"].at[0, "entree"] == "12/03/2025"
+    # Classification ou dictionnaire : la valeur est masquée et remplacée par son
+    # empreinte, calculée sur la valeur telle que dans la table (texte avant, nombre
+    # après la mise en conformité, date native avant et texte après); une valeur
+    # visible n'a pas d'empreinte.
+    assert _lignes(resultat.journal, "regle_nettoyage", "colonne", "valeur_avant",
+                   "valeur_apres", "empreinte_avant", "empreinte_apres") == [
+        ("encodage", "nom", VALEUR_MASQUEE, VALEUR_MASQUEE, _hmac("texte:" + _mal("Café")),
+         _hmac("texte:Café")),
+        ("encodage", "adresse", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         _hmac("texte:" + _mal("rue Élise")), _hmac("texte:rue Élise")),
+        ("encodage", "ville", _mal("Évreux"), "Évreux", None, None),
+        ("nature", "salaire", VALEUR_MASQUEE, VALEUR_MASQUEE, _hmac("texte:2 500"),
+         _hmac("nombre:2500.0")),
+        ("nature", "entree", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         _hmac("date:2025-03-12T00:00:00"), _hmac("texte:12/03/2025")),
+    ]
+    # Une autre clé donne d'autres empreintes, sans rien changer d'autre.
+    autre = nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}},
+                     cle_empreinte="f" * 64)
+    assert autre.journal.at[0, "empreinte_apres"] == _hmac("texte:Café", "f" * 64)
+    assert autre.journal.at[0, "empreinte_apres"] != resultat.journal.at[0, "empreinte_apres"]
+    sans = ["empreinte_avant", "empreinte_apres"]
+    assert autre.journal.drop(columns=sans).equals(resultat.journal.drop(columns=sans))
+
+
+def test_empreintes_des_decisions_et_lignes_retirees():
+    tables = {"t": _table(code=["a", "b", "b", "d"], salaire=[2500, 3000, 3000, 4000])}
+    dictionnaire = _dictionnaire(tables, **{"t.salaire": _colonne("nombre natif")})
+    decisions = _decisions(
+        a1=_decision(2, "salaire", "corriger", _empreinte_cellule(2500), 2600, "nombre natif"),
+        a2=_decision(5, None, "retirer", _empreinte_ligne(code="d", salaire=4000)),
+    )
+    resultat = _nettoyer_avec(tables, decisions, dictionnaire, {"t": frozenset({"salaire"})})
+    # Une ligne retirée, comme doublon ou par décision, n'a ni valeur ni empreinte.
+    assert _lignes(resultat.journal, "regle_nettoyage", "num_ligne_source", "colonne",
+                   "valeur_avant", "valeur_apres", "empreinte_avant", "empreinte_apres") == [
+        ("doublons", 4, None, None, None, None, None),
+        ("decision", 2, "salaire", VALEUR_MASQUEE, VALEUR_MASQUEE, _hmac("nombre:2500.0"),
+         _hmac("nombre:2600.0")),
+        ("decision", 5, None, None, None, None, None),
+    ]
+
+
+def test_charger_cle_empreintes(tmp_path):
+    from frigeo.nettoyage import ENTETE_CLE_EMPREINTES
+
+    assert chemin_cle_du_poste().parts[-3:] == ("data", "config", "cle_empreintes.txt")
+    fichier = tmp_path / "config" / "cle_empreintes.txt"
+    creee = charger_cle_empreintes(fichier)
+    assert creee.creee and creee.chemin == fichier
+    assert re.fullmatch("[0-9a-f]{64}", creee.cle)
+    assert fichier.read_text(encoding="utf-8") == ENTETE_CLE_EMPREINTES + creee.cle + "\n"
+    # Relue sans être remplacée.
+    assert charger_cle_empreintes(fichier) == (creee.cle, fichier, False)
+    assert fichier.read_text(encoding="utf-8") == ENTETE_CLE_EMPREINTES + creee.cle + "\n"
+    # Tirée au hasard : deux créations donnent deux clés.
+    assert charger_cle_empreintes(tmp_path / "autre.txt").cle != creee.cle
+    # Marque d'ordre des octets, lignes vides, majuscules et fins de ligne CRLF admises.
+    fichier.write_bytes((chr(0xFEFF) + "# commentaire\r\n\r\n  " + CLE.upper() + "  \r\n")
+                        .encode("utf-8"))
+    assert charger_cle_empreintes(fichier) == (CLE, fichier, False)
+    for contenu in ("", "# seul commentaire\n", CLE + "\n" + CLE + "\n", CLE[:-1] + "\n",
+                    CLE + "z\n", "g" * 64 + "\n"):
+        fichier.write_text(contenu, encoding="utf-8")
+        with pytest.raises(ValueError, match="Fichier de la clé des empreintes invalide"):
+            charger_cle_empreintes(fichier)
+        assert fichier.read_text(encoding="utf-8") == contenu
+
+
+def test_nettoyer_cle_par_defaut(tmp_path, monkeypatch):
+    tables = {"t": _table(code=["a"], nom=[_mal("Café")])}
+    dictionnaire = _dictionnaire(tables)
+    sensibles = {"t": frozenset({"nom"})}
+    # Clé lue dans le fichier par défaut (ici celui de la fixture, qui porte CLE).
+    defaut = nettoyer(tables, dictionnaire, sensibles, {})
+    assert defaut.journal.equals(nettoyer(tables, dictionnaire, sensibles, {},
+                                          cle_empreinte=CLE).journal)
+    # Fichier absent : la clé est créée, un avertissement donne son emplacement.
+    fichier = tmp_path / "data" / "config" / "cle_empreintes.txt"
+    monkeypatch.setattr(module_nettoyage, "chemin_cle_empreintes", lambda: fichier)
+    with pytest.warns(UserWarning, match="Clé des empreintes créée dans .*cle_empreintes"):
+        premier = nettoyer(tables, dictionnaire, sensibles, {})
+    cle = charger_cle_empreintes(fichier).cle
+    assert premier.journal.at[0, "empreinte_apres"] == empreinte_valeur("Café", cle)
+    # Second nettoyage : la même clé, sans avertissement.
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        second = nettoyer(tables, dictionnaire, sensibles, {})
+    assert second.journal.equals(premier.journal)
+    for invalide in ("abc", CLE.upper()):
+        with pytest.raises(ValueError, match="64 chiffres hexadécimaux"):
+            nettoyer(tables, dictionnaire, sensibles, {}, cle_empreinte=invalide)
+
+
+def test_ecrire_nettoyage_refuse_des_empreintes_incoherentes(tmp_path):
+    from frigeo.nettoyage import ecrire_nettoyage, empreintes_incoherentes
+
+    resultat = _journal_exemple()
+    sensibles = {"t": frozenset({"adresse"})}
+    declarations = {"t": {"cle": ["code"]}}
+    journal = resultat.journal
+    # Lignes : 0 valeur visible, 1 valeur masquée, 2 ligne retirée, 3 valeur visible.
+    assert list(journal["action"]) == ["valeur modifiée", "valeur modifiée", "ligne retirée",
+                                       "valeur modifiée"]
+    assert empreintes_incoherentes(journal).empty
+    fautifs = []
+    for ligne, colonne, valeur in (
+        (1, "empreinte_apres", None),          # valeur masquée sans son empreinte
+        (1, "empreinte_avant", ""),
+        (1, "empreinte_avant", "0" * 15),      # empreinte mal formée
+        (1, "empreinte_apres", "x" * 16),
+        (0, "empreinte_avant", "0" * 16),      # empreinte d'une valeur visible
+        (3, "empreinte_apres", "0" * 16),
+        (2, "empreinte_avant", "0" * 16),      # empreinte d'une ligne retirée
+    ):
+        fautif = journal.copy()
+        fautif.loc[ligne, colonne] = valeur
+        fautifs.append(fautif)
+    # Une valeur visible au lieu de « masqué » rend aussi ses empreintes incohérentes.
+    visible = journal.copy()
+    visible.loc[1, "valeur_avant"] = _mal("Rue Été")
+    fautifs.append(visible)
+    for fautif in fautifs:
+        assert len(empreintes_incoherentes(fautif)) == 1
+        with pytest.raises(ValueError, match="1 lignes du journal dont les empreintes ne "
+                                             "suivent pas le masquage"):
+            ecrire_nettoyage(fautif, resultat.bilan, "2026-03", tmp_path, sensibles,
+                             declarations)
+    assert not any(tmp_path.iterdir())
+
+
+# --- espaces --------------------------------------------------------------------
+
+
+def test_normaliser_espaces():
+    import random
+
+    from frigeo.controles import ESPACES_HORIZONTALES, SAUTS_DE_LIGNE, constats_espaces
+
+    fine = chr(0x202F)
+    assert normaliser_espaces(" Rouen ") == "Rouen"
+    assert normaliser_espaces("Rue  de" + INSECABLE + "la" + chr(9) + chr(9) + "Paix") == (
+        "Rue de la Paix"
+    )
+    assert normaliser_espaces("1" + fine + "234,50") == "1 234,50"
+    assert normaliser_espaces("ligne 1  \n  ligne 2 ") == "ligne 1 \n ligne 2"
+    assert normaliser_espaces("\nRouen\n") == "\nRouen\n"
+    assert normaliser_espaces("Rouen") == "Rouen"
+    # Sur des textes tirés au hasard : plus aucun constat, rien d'autre que les
+    # espaces horizontales ne change, et une seconde passe ne change rien.
+    alphabet = sorted(ESPACES_HORIZONTALES) + sorted(SAUTS_DE_LIGNE) + list("ab")
+    tirage = random.Random(6)
+    for _ in range(3000):
+        texte = "".join(tirage.choice(alphabet) for _ in range(tirage.randint(1, 8)))
+        normalise = normaliser_espaces(texte)
+        assert constats_espaces(normalise) == (), repr(texte)
+        assert normaliser_espaces(normalise) == normalise
+        sans = [c for c in texte if c not in ESPACES_HORIZONTALES]
+        assert [c for c in normalise if c not in ESPACES_HORIZONTALES] == sans
+        assert set(normalise) - set(sans) <= {" "}
+
+
+def test_espaces_corriges_apres_l_encodage():
+    tables = {
+        "t": _table(
+            code=["a", "b", "c", "d", "e", "f"],
+            nom=[" Rouen", _mal("Café") + "  ", _mal("voilà"), "Rue  de" + INSECABLE + "Paix",
+                 "  ", 12],
+            adresse=["x", "y ", "z", "w", "v", "u"],
+        )
+    }
+    dictionnaire = _dictionnaire(tables)
+    sensibles = {"t": frozenset({"adresse"})}
+    resultat = nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}})
+    # « voilà » mal décodé finit par une insécable : réparé par l'encodage, qui passe
+    # avant, il n'a plus d'espace à retirer. Une cellule d'espaces et un nombre ne sont
+    # pas visés.
+    assert list(resultat.tables["t"]["nom"]) == [
+        "Rouen", "Café", "voilà", "Rue de Paix", "  ", 12
+    ]
+    assert list(resultat.tables["t"]["adresse"]) == ["x", "y", "z", "w", "v", "u"]
+    assert _lignes(resultat.journal, "regle_nettoyage", "num_ligne_source", "colonne",
+                   "source", "valeur_avant", "valeur_apres", "detail") == [
+        ("encodage", 3, "nom", "règle générique", _mal("Café") + "  ", "Café  ",
+         "repéré en cp1252, iso8859_15, latin_1; 1 passe"),
+        ("encodage", 4, "nom", "règle générique", _mal("voilà"), "voilà",
+         "repéré en cp1252, iso8859_15, latin_1; 1 passe"),
+        ("espaces", 2, "nom", "règle générique", " Rouen", "Rouen",
+         "espace en début ou en fin"),
+        ("espaces", 3, "nom", "règle générique", "Café  ", "Café",
+         "espace en début ou en fin; espaces répétées"),
+        ("espaces", 3, "adresse", "règle générique", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         "espace en début ou en fin"),
+        ("espaces", 5, "nom", "règle générique", "Rue  de" + INSECABLE + "Paix", "Rue de Paix",
+         "espaces répétées; espace spéciale"),
+    ]
+    # Valeur masquée : ses empreintes, avant et après.
+    masquee = resultat.journal[resultat.journal["colonne"] == "adresse"].iloc[0]
+    assert (masquee["empreinte_avant"], masquee["empreinte_apres"]) == (
+        empreinte_valeur("y ", CLE), empreinte_valeur("y", CLE)
+    )
+    assert _lignes(_du_regle(resultat.bilan, "espaces"), "table", "colonne", "visees",
+                   "corrigees", "non_corrigees", "raisons") == [
+        ("t", "nom", 3, 3, 0, None),
+        ("t", "adresse", 1, 1, 0, None),
+    ]
+    # Après nettoyage, la règle des espaces de l'étape 3 ne signale plus rien.
+    ecarts, _ = controler(resultat.tables, dictionnaire, sensibles, {})
+    assert not (ecarts["regle"] == "espaces").any()
+    # Avant, 8 constats, dont 2 sur « voilà » mal décodé, signalé aussi par l'encodage.
+    ecarts, _ = controler(tables, dictionnaire, sensibles, {})
+    assert (ecarts["regle"] == "espaces").sum() == 8
+
+
+# --- referentiel ----------------------------------------------------------------
+
+
+def _regle_referentiel(**autres):
+    return {
+        "ref": "R10", "libelle": "Intervenant connu", "type": "existence_dans_reference",
+        "table": "t", "cle": ["nom"], "table_reference": "r", "cle_reference": ["n", "p"],
+        "comparaison": "mots dans le désordre", **autres,
+    }
+
+
+def _intervenants():
+    """60 lignes « Jean Dupont », 1 « Dupont Jean » (ordre toléré), 2 variantes; Curie
+    trop rare pour une correction sans arbitrage; Martin écrit de deux façons au
+    référentiel; Inconnu absent du référentiel."""
+    noms = (["Jean Dupont"] * 60 + ["Dupont Jean", "jean dupont", "JEAN  DUPONT"]
+            + ["Marie Curie"] * 3 + ["marie curie", "paul martin", "Inconnu"])
+    tables = {
+        "t": _table(code=[f"I{i}" for i in range(len(noms))], nom=noms),
+        "r": _table("r.csv", n=["Dupont", "Curie", "Martin", "MARTIN"],
+                    p=["Jean", "Marie", "Paul", "Paul"], m=["1", "2", "3", "4"]),
+    }
+    return tables, _dictionnaire(tables)
+
+
+def test_referentiel_corrige_les_variantes():
+    tables, dictionnaire = _intervenants()
+    sensibles = {"t": frozenset({"nom"})}
+    resultat = nettoyer(tables, dictionnaire, sensibles, {"t": {"cle": ["code"]}},
+                        regles_gestion=[_regle_referentiel()])
+    noms = list(resultat.tables["t"]["nom"])
+    # Les deux variantes de Jean Dupont (la seconde après la règle des espaces) sont
+    # corrigées, « Dupont Jean » garde son ordre; les autres restent.
+    assert noms[60:] == ["Dupont Jean", "Jean Dupont", "Jean Dupont", "Marie Curie",
+                         "Marie Curie", "Marie Curie", "marie curie", "paul martin", "Inconnu"]
+    referentiel = _du_regle(resultat.journal, "referentiel")
+    assert _lignes(referentiel, "num_ligne_source", "colonne", "source", "valeur_avant",
+                   "valeur_apres", "detail") == [
+        (63, "nom", "règle de gestion", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         "forme de r (R10), 61 lignes sur 63 déjà écrites ainsi"),
+        (64, "nom", "règle de gestion", VALEUR_MASQUEE, VALEUR_MASQUEE,
+         "forme de r (R10), 61 lignes sur 63 déjà écrites ainsi"),
+    ]
+    # Empreintes de la valeur laissée par la règle des espaces, puis de la forme.
+    assert list(referentiel["empreinte_avant"]) == [
+        empreinte_valeur("jean dupont", CLE), empreinte_valeur("JEAN DUPONT", CLE)
+    ]
+    assert set(referentiel["empreinte_apres"]) == {empreinte_valeur("Jean Dupont", CLE)}
+    assert _lignes(_du_regle(resultat.bilan, "referentiel"), "table", "colonne", "visees",
+                   "corrigees", "non_corrigees", "raisons") == [
+        ("t", "nom", 4, 2, 2,
+         "forme du référentiel non unique 1; forme du référentiel minoritaire dans la table 1"),
+    ]
+    # Ordre des règles : espaces, puis référentiel.
+    assert list(resultat.journal["regle_nettoyage"]) == ["espaces", "referentiel", "referentiel"]
+    # Cohérent avec le contrôle des règles de gestion : avant nettoyage, quatre clés
+    # trouvées après normalisation seulement; après, les deux qui restent à arbitrer.
+    from frigeo.gestion import CONSTAT_APRES_NORMALISATION, controler_gestion
+
+    def variantes(donnees):
+        ecarts, _ = controler_gestion(donnees, dictionnaire, [_regle_referentiel()], {}, None,
+                                      sensibles)
+        return list(ecarts.loc[ecarts["constat"] == CONSTAT_APRES_NORMALISATION,
+                               "num_ligne_source"])
+
+    assert variantes(tables) == [63, 64, 68, 69]
+    assert variantes(resultat.tables) == [68, 69]
+
+
+def test_referentiel_seuil_robuste():
+    from frigeo.nettoyage import SEUIL_REFERENTIEL
+
+    assert SEUIL_REFERENTIEL == 0.95
+    for exactes, corrigee in ((37, False), (38, True)):
+        noms = ["Jean Dupont"] * exactes + ["jean dupont"]
+        tables = {
+            "t": _table(code=[f"I{i}" for i in range(len(noms))], nom=noms),
+            "r": _table("r.csv", n=["Dupont"], p=["Jean"]),
+        }
+        resultat = nettoyer(tables, _dictionnaire(tables), AUCUNE_SENSIBLE, {},
+                            regles_gestion=[_regle_referentiel()])
+        # 38 / 40 = 0,95 atteint le seuil, 37 / 39 non.
+        assert (resultat.tables["t"]["nom"].iloc[-1] == "Jean Dupont") is corrigee, exactes
+
+
+def test_referentiel_regles_concernees():
+    tables, dictionnaire = _intervenants()
+    regles = [
+        _regle_referentiel(comparaison="telle quelle"),
+        _regle_referentiel(ref="R99", cle=["nom", "code"], cle_reference=["n", "p"]),
+        {"ref": "R22", "libelle": "x", "type": "plage", "table": "t", "colonne": "code",
+         "min": 0, "max": 1},
+    ]
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {}, regles_gestion=regles)
+    # Comparaison telle quelle, clé de deux colonnes, autre type : rien n'est visé.
+    assert _du_regle(resultat.bilan, "referentiel").empty
+    # Après normalisation, sans remise en ordre : « Dupont Jean » est la forme exacte,
+    # et les autres écritures de Jean Dupont sont absentes du référentiel : rien à corriger.
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {},
+                        regles_gestion=[_regle_referentiel(comparaison="après normalisation")])
+    assert _du_regle(resultat.bilan, "referentiel").empty
+    # Par défaut, les règles de config/gestion.yaml (ici absent : aucune).
+    assert _du_regle(nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {}).bilan,
+                     "referentiel").empty
+    with pytest.raises(ValueError, match="R10 : table x absente des données"):
+        nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {},
+                 regles_gestion=[_regle_referentiel(table_reference="x")])
+    with pytest.raises(ValueError, match="Règles de gestion invalides"):
+        nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {}, regles_gestion={"R10": 1})
+
+
+def test_referentiel_rend_caduque_une_decision_sur_la_variante():
+    tables, dictionnaire = _intervenants()
+    # Le métier avait corrigé la variante autrement que le référentiel.
+    decisions = _decisions(
+        a1=_decision(63, "nom", "corriger", _empreinte_cellule("jean dupont"), "Jean DUPONT",
+                     "texte"),
+    )
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {}, None, decisions,
+                        regles_gestion=[_regle_referentiel()])
+    assert resultat.tables["t"].at[61, "nom"] == "Jean Dupont"
+    assert _lignes(_du_regle(resultat.bilan), "colonne", "visees", "corrigees", "raisons") == [
+        ("nom", 1, 0, "source modifiée depuis la décision 1"),
+    ]
+
+
+def test_referentiel_regles_lues_par_defaut(tmp_path, monkeypatch):
+    import yaml
+
+    tables, dictionnaire = _intervenants()
+    fichier = tmp_path / "gestion.yaml"
+    fichier.write_text(yaml.safe_dump({"regles": [_regle_referentiel()]}, allow_unicode=True),
+                       encoding="utf-8")
+    monkeypatch.setattr(module_gestion, "chemin_regles_gestion", lambda: fichier)
+    resultat = nettoyer(tables, dictionnaire, AUCUNE_SENSIBLE, {})
+    assert _lignes(_du_regle(resultat.bilan, "referentiel"), "visees", "corrigees") == [(4, 2)]
+
+
+# --- décisions caduques -----------------------------------------------------------
+
+
+def test_decisions_caduques():
+    # Seules les décisions « corriger » et « retirer » dont la donnée a changé depuis
+    # la décision sont caduques; une décision appliquée, « garder » ou introuvable ne
+    # l'est pas.
+    from frigeo.nettoyage import COLONNES_DECISIONS_CADUQUES
+
+    tables = {"t": _table(code=["a", "b", "c", "d"], nom=["x", "y", "z", "w"])}
+    decisions = _decisions(
+        c1=_decision(2, "nom", "corriger", _empreinte_cellule("x"), "v", "texte"),
+        c2=_decision(3, "nom", "corriger", _empreinte_cellule("ancien"), "v", "texte",
+                     decide_le="2026-10-21 10:00:00"),
+        c3=_decision(9, "nom", "corriger", _empreinte_cellule("x"), "v", "texte"),
+        g1=_decision(4, "nom", "garder", _empreinte_cellule("ancien")),
+        r1=_decision(5, "code", "retirer", _empreinte_ligne(code="d", nom="autre")),
+        r2=_decision(4, "code", "retirer", _empreinte_ligne(code="c", nom="z")),
+    )
+    resultat = _nettoyer_avec(tables, decisions)
+    caduques = resultat.caduques
+    assert list(caduques.columns) == list(COLONNES_DECISIONS_CADUQUES)
+    # Dans l'ordre d'examen : corrections (de la plus ancienne), puis retraits.
+    assert _lignes(caduques, *COLONNES_DECISIONS_CADUQUES) == [
+        ("c2", "cellule", "t", "nom", "corriger", "2026-10-21 10:00:00",
+         "arbitrage_2026-03.xlsx"),
+        ("r1", "ligne", "t", "code", "retirer", "2026-10-20 10:00:00",
+         "arbitrage_2026-03.xlsx"),
+    ]
+    assert _lignes(_du_regle(resultat.bilan), "colonne", "visees", "corrigees", "raisons") == [
+        ("nom", 3, 1, "source modifiée depuis la décision 1; ligne source introuvable 1"),
+        (None, 2, 1, "source modifiée depuis la décision 1"),
+    ]
+    assert list(resultat.tables["t"]["num_ligne_source"]) == [2, 3, 5]
+    # Sans décision : aucune ligne, mêmes colonnes.
+    vide = _nettoyer_avec(tables, AUCUNE_DECISION).caduques
+    assert vide.empty and list(vide.columns) == list(COLONNES_DECISIONS_CADUQUES)
+    # Le tuple rendu a quatre membres.
+    tables_nettoyees, journal, bilan, caduques = resultat
+    assert caduques is resultat.caduques
+
+
+def test_retrait_des_decisions_caduques_puis_nouveau_nettoyage(tmp_path, monkeypatch):
+    import yaml
+
+    import frigeo.dictionnaire as module_dictionnaire
+
+    monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: datetime(2026, 11, 4, 10))
+    fichier = tmp_path / "config" / "decisions.yaml"
+    fichier.parent.mkdir()
+    tables = {"t": _table(code=["a", "b"], nom=["x", "y"])}
+    decisions = _decisions(
+        c1=_decision(2, "nom", "corriger", _empreinte_cellule("x"), "v", "texte"),
+        c2=_decision(3, "nom", "corriger", _empreinte_cellule("ancien"), "v", "texte"),
+    )
+    fichier.write_text(yaml.safe_dump(decisions, allow_unicode=True, sort_keys=False),
+                       encoding="utf-8")
+    lues = module_decisions.charger_decisions(fichier)
+    premier = _nettoyer_avec(tables, lues)
+    assert list(premier.caduques["id_anomalie"]) == ["c2"]
+    _, entree = module_decisions.retirer_decisions(
+        premier.caduques["id_anomalie"], "2026-03", lues, fichier
+    )
+    assert entree == {"date": "2026-11-04 10:00:00", "periode_fin": "2026-03",
+                      "decisions": 1, "identifiants": ["c2"]}
+    relues = module_decisions.charger_decisions(fichier)
+    assert list(relues["decisions"]) == ["c1"]
+    second = _nettoyer_avec(tables, relues)
+    assert second.caduques.empty
+    assert _lignes(_du_regle(second.bilan), "visees", "corrigees", "raisons") == [(1, 1, None)]
+    assert second.tables["t"].equals(premier.tables["t"])
+    assert second.journal.equals(premier.journal)

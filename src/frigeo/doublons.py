@@ -17,7 +17,9 @@ Trois constats, à la maille de la ligne :
   avec des clés différentes (un enregistrement ressaisi sous un autre
   identifiant, ou deux enregistrements réellement pareils). L'outil ne sait pas
   les distinguer : c'est toujours un écart à arbitrer, et le métier peut écarter
-  ce constat pour une table.
+  ce constat pour une table. Pour une table d'en-têtes de documents (factures,
+  pièces d'achat) qui déclare sa table des lignes, deux en-têtes ne sont signalés
+  que si leurs lignes sont identiques elles aussi.
 
 Les valeurs sont comparées après normalisation des textes (casse, accents, espaces
 en bord et répétées). Un groupe dont les valeurs ne sont pas strictement égales
@@ -63,8 +65,17 @@ COMPARAISON_NORMALISEE = "après normalisation"
 TOUTES_COLONNES = "toutes"
 SEPARATEUR = " | "
 
+# Clé qui nomme la table des lignes d'une table d'en-têtes de documents.
+CLE_TABLE_DES_LIGNES = "table_des_lignes"
+
 # Clés admises dans la déclaration d'une table.
-CLES_DECLARATION = ("cle", "unique", "presume_unique", "identique_hors_cle")
+CLES_DECLARATION = (
+    "cle", "unique", "presume_unique", "identique_hors_cle", CLE_TABLE_DES_LIGNES
+)
+
+# Colonne ajoutée aux textes d'une table d'en-têtes pour comparer leurs lignes (un
+# nom de colonne lue dans un fichier ne commence jamais par un caractère nul).
+_SIGNATURE_LIGNES = "\0lignes"
 
 COLONNES_DOUBLONS = (
     "table",
@@ -168,6 +179,39 @@ def problemes_declarations_doublons(declarations) -> list[str]:
                 problemes.append(
                     f"{table}, identique_hors_cle : sans clé déclarée, il n'y a rien à écarter"
                 )
+        if CLE_TABLE_DES_LIGNES in declaration:
+            problemes += _problemes_table_des_lignes(table, declaration, declarations)
+    return problemes
+
+
+def _problemes_table_des_lignes(table, declaration: dict, declarations: dict) -> list[str]:
+    """Problèmes de la clé table_des_lignes d'une table d'en-têtes."""
+    ou = f"{table}, {CLE_TABLE_DES_LIGNES}"
+    lignes = declaration[CLE_TABLE_DES_LIGNES]
+    if not isinstance(lignes, str) or not lignes:
+        return [f"{ou} : un nom de table est attendu, par exemple factures_lignes"]
+    if lignes == table:
+        return [f"{ou} : la table des lignes doit être une autre table"]
+    problemes = []
+    if declaration.get("identique_hors_cle") is False:
+        problemes.append(
+            f"{ou} : sans objet avec identique_hors_cle false (les lignes identiques "
+            "hors clé ne sont pas cherchées)"
+        )
+    if "cle" not in declaration:
+        problemes.append(f"{ou} : sans clé déclarée, il n'y a rien à comparer")
+    cle = declaration.get("cle")
+    if _probleme_groupe(cle) is not None:
+        return problemes
+    autre = declarations.get(lignes)
+    cle_lignes = autre.get("cle") if isinstance(autre, dict) else None
+    if cle_lignes is None:
+        problemes.append(f"{ou} : la table {lignes} doit être déclarée avec une clé")
+    elif _probleme_groupe(cle_lignes) is None and not set(cle) < set(cle_lignes):
+        problemes.append(
+            f"{ou} : la clé de {lignes} ({', '.join(cle_lignes)}) doit contenir celle "
+            f"de {table} ({', '.join(cle)}) et au moins une autre colonne"
+        )
     return problemes
 
 
@@ -183,7 +227,12 @@ def charger_declarations_doublons(chemin: str | Path | None = None) -> dict:
     - `presume_unique: [[colonne, ...], ...]` : des colonnes en principe uniques,
       dont une répétition est à arbitrer par le métier;
     - `identique_hors_cle: false` : pour ne pas chercher dans cette table les
-      lignes identiques hors clé (deux enregistrements peuvent y être pareils).
+      lignes identiques hors clé (deux enregistrements peuvent y être pareils);
+    - `table_des_lignes: <table>` : pour une table d'en-têtes de documents, la table
+      de leurs lignes, déclarée avec une clé qui contient celle de l'en-tête et au
+      moins une autre colonne (`[num_facture, num_ligne]` pour `[num_facture]`). Deux
+      en-têtes identiques hors clé ne sont alors signalés que si leurs lignes sont
+      identiques aussi (voir `detecter_doublons`).
 
     Un fichier absent, ou sans clé `doublons`, ne donne aucune déclaration : seuls
     les doublons exacts sont alors cherchés. Un fichier mal formé est refusé, tous
@@ -292,6 +341,42 @@ def _groupes(reperes, retenues, differents, bruts, fichiers) -> pd.DataFrame:
     )
 
 
+def _signatures_des_lignes(
+    lignes: pd.DataFrame, cle_lignes: list[str], lien: list[str]
+) -> tuple[dict, dict]:
+    """Lignes de chaque document, par clé du document (textes normalisés).
+
+    `lien` est la clé de l'en-tête, contenue dans `cle_lignes`. Chaque ligne est
+    réduite à ses colonnes hors de sa clé. Les doublons exacts en surnombre (mêmes
+    textes normalisés sur toutes les colonnes) et les lignes sans clé de document
+    sont écartés. Rend deux dictionnaires de la clé du document vers une signature
+    en texte, l'une des textes normalisés, l'autre des textes bruts : deux documents
+    ont la même signature quand ils ont les mêmes lignes, dans n'importe quel ordre
+    et en même nombre.
+    """
+    donnees = lignes.reset_index(drop=True)
+    metier = _colonnes_de_donnees(donnees)
+    hors_cle = [c for c in metier if c not in cle_lignes]
+    bruts = {c: [_texte(v) for v in donnees[c]] for c in metier}
+    normes = {}
+    for c in metier:
+        correspondance = {t: normaliser(t) for t in set(bruts[c])}
+        normes[c] = [correspondance[t] for t in bruts[c]]
+    contenus_normes, contenus_bruts, vues = {}, {}, set()
+    for i in range(len(donnees)):
+        toutes = tuple(normes[c][i] for c in metier)
+        cle = tuple(normes[c][i] for c in lien)
+        if toutes in vues or not any(cle):
+            continue
+        vues.add(toutes)
+        contenus_normes.setdefault(cle, []).append(tuple(normes[c][i] for c in hors_cle))
+        contenus_bruts.setdefault(cle, []).append(tuple(bruts[c][i] for c in hors_cle))
+    return (
+        {cle: repr(sorted(contenu)) for cle, contenu in contenus_normes.items()},
+        {cle: repr(sorted(contenu)) for cle, contenu in contenus_bruts.items()},
+    )
+
+
 def detecter_doublons(
     tables: dict[str, pd.DataFrame],
     declarations: dict | None = None,
@@ -325,6 +410,15 @@ def detecter_doublons(
     Ne sont pas comparées : pour un doublon exact, une ligne entièrement vide; pour
     une valeur en double, une ligne dont l'une des colonnes du groupe est vide;
     pour les lignes identiques hors clé, une ligne vide hors de sa clé.
+
+    Pour une table d'en-têtes qui déclare sa table des lignes (`table_des_lignes`),
+    deux en-têtes identiques hors clé ne forment un groupe que si leurs lignes sont
+    identiques aussi : mêmes lignes, comparées sur les colonnes de la table des
+    lignes hors de sa clé et après la même normalisation, dans n'importe quel ordre
+    mais en même nombre. Les doublons exacts en surnombre de la table des lignes ne
+    comptent pas, et deux en-têtes sans aucune ligne ont les mêmes lignes. La colonne
+    `colonnes` le dit (« toutes sauf num_facture, lignes de factures_lignes
+    comprises »), et seules les lignes d'en-tête figurent dans la table des doublons.
 
     La classification de sensibilité (config/sensibilite.yaml par défaut) est
     vérifiée avant le calcul. Les arguments ne sont pas modifiés.
@@ -402,12 +496,23 @@ def detecter_doublons(
                 )
             )
         if cle and hors_cle and declaration.get("identique_hors_cle") is not False:
+            comparees, affichees = hors_cle, "toutes sauf " + ", ".join(cle)
+            table_lignes = declaration.get(CLE_TABLE_DES_LIGNES)
+            if table_lignes is not None:
+                normees, brutes = _signatures_des_lignes(
+                    tables[table_lignes], declarations[table_lignes]["cle"], cle
+                )
+                cles_normees = list(zip(*(normes[c] for c in cle)))
+                normes[_SIGNATURE_LIGNES] = [normees.get(k, "") for k in cles_normees]
+                bruts[_SIGNATURE_LIGNES] = [brutes.get(k, "") for k in cles_normees]
+                comparees = [*hors_cle, _SIGNATURE_LIGNES]
+                affichees += f", lignes de {table_lignes} comprises"
             a_faire.append(
                 (
                     CONSTAT_HORS_CLE,
-                    "toutes sauf " + ", ".join(cle),
+                    affichees,
                     ISSUE_A_ARBITRER,
-                    hors_cle,
+                    comparees,
                     renseignees[hors_cle].any(axis=1),
                     _reperes(normes, cle),
                     None,

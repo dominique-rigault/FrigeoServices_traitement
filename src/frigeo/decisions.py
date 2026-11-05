@@ -27,8 +27,9 @@ Fichiers, tous hors du dépôt :
 - data/formulaires/arbitrage_AAAA-MM.xlsx : le classeur d'arbitrage
   (`exporter_arbitrage`, `importer_arbitrage`); il porte des valeurs du client, y
   compris celles des colonnes sensibles;
-- data/config/decisions.yaml : les décisions enregistrées et le journal des
-  imports (`charger_decisions`, `ecrire_decisions`), avec une copie datée dans
+- data/config/decisions.yaml : les décisions enregistrées, le journal des
+  imports et celui des retraits de décisions caduques (`charger_decisions`,
+  `ecrire_decisions`, `retirer_decisions`), avec une copie datée dans
   data/config/sauvegardes/ avant chaque écriture.
 
 L'application des décisions aux tables nettoyées relève du morceau 6e2.
@@ -38,6 +39,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import unicodedata
 from collections import Counter
 from datetime import date, datetime
@@ -56,7 +58,9 @@ from .anomalies import (
     ETAPE_DOUBLONS,
     ETAPE_FORMAT,
     ETAPE_GESTION,
+    _controle_gestion,
     _index_lignage,
+    _regle_format,
     _repere,
 )
 from .controles import ISSUE_A_ARBITRER, ISSUE_ANOMALIE, _colonnes_de_donnees, _valeur_constatee
@@ -68,10 +72,16 @@ from .dictionnaire import (
 )
 from .doublons import SEPARATEUR, _texte
 from .formulaires import FOND_MODIFIABLE, dossier_formulaires, rendre_modifiable, texte_entier
-from .nettoyage import _convertir
+from .gestion import (
+    CONSTAT_APRES_NORMALISATION,
+    charger_regles_gestion,
+    formes_de_la_cle,
+    formes_du_referentiel,
+)
+from .nettoyage import _convertir, _regles_referentiel
 from .profilage import _interpretations
 from .revue import _ecrire_texte, _est_vide, _menu
-from .typage import NATURES_LISIBLES, ecrire_date
+from .typage import NATURES_DATE, NATURES_LISIBLES, ecrire_date
 
 SORTE_CELLULE = "cellule"
 SORTE_LIGNE = "ligne"
@@ -98,6 +108,13 @@ ETATS_A_ARBITRER = (ETAT_SANS_DECISION, ETAT_CADUQUE)
 
 LONGUEUR_EMPREINTE = 16
 VALEUR_MASQUEE = "masqué"
+
+# Règle d'une anomalie de nature dans la table des anomalies (« nature = date
+# JJ/MM/AAAA »), et forme jour, mois, année d'une date en texte : une date
+# impossible lue jour puis mois mais valide lue mois puis jour est proposée lue
+# mois puis jour (voir `date_inversee_proposee`).
+PREFIXE_NATURE = _regle_format("nature", "")
+_JOUR_MOIS_ANNEE = re.compile(r"(\d{1,2})([/.-])(\d{1,2})\2(\d{4})")
 
 COLONNES_ELEMENTS = (
     "id_anomalie",
@@ -183,6 +200,8 @@ CHAMPS_DECISION = (
     "classeur",
 )
 CHAMPS_IMPORT = ("date", "classeur", "periode_fin", "decisions", "remplacees", *DECISIONS)
+CHAMPS_RETRAIT = ("date", "periode_fin", "decisions", "identifiants")
+CLES_META = ("structure", "imports", "retraits")
 COLONNES_DECISIONS_LUES = (
     "id_anomalie",
     "sorte",
@@ -239,6 +258,9 @@ def problemes_decisions(contenu) -> list[str]:
     if not isinstance(meta, dict) or meta.get("structure") != STRUCTURE_DECISIONS:
         problemes.append(f"meta : structure {STRUCTURE_DECISIONS} attendue")
         meta = {}
+    inconnues = [str(cle) for cle in meta if cle not in CLES_META]
+    if inconnues:
+        problemes.append(f"meta : clés inconnues {', '.join(inconnues)}")
     imports = meta.get("imports", [])
     if not isinstance(imports, list):
         problemes.append("meta : imports doit être une liste")
@@ -254,6 +276,32 @@ def problemes_decisions(contenu) -> list[str]:
             problemes.append(f"{ou} : date 'AAAA-MM-JJ HH:MM:SS' attendue")
         elif precedent is not None and instant <= precedent:
             problemes.append(f"{ou} : date antérieure ou égale à celle de l'import précédent")
+        precedent = instant or precedent
+    retraits = meta.get("retraits", [])
+    if not isinstance(retraits, list):
+        problemes.append("meta : retraits doit être une liste")
+        retraits = []
+    precedent = None
+    for rang, entree in enumerate(retraits, start=1):
+        ou = f"meta, retrait {rang}"
+        if not isinstance(entree, dict) or set(entree) != set(CHAMPS_RETRAIT):
+            problemes.append(f"{ou} : champs attendus {', '.join(CHAMPS_RETRAIT)}")
+            continue
+        identifiants = entree["identifiants"]
+        if (
+            not isinstance(identifiants, list)
+            or not identifiants
+            or not all(isinstance(i, str) for i in identifiants)
+            or entree["decisions"] != len(identifiants)
+        ):
+            problemes.append(
+                f"{ou} : identifiants attendus, liste de textes de longueur decisions"
+            )
+        instant = lire_instant(entree["date"])
+        if instant is None:
+            problemes.append(f"{ou} : date 'AAAA-MM-JJ HH:MM:SS' attendue")
+        elif precedent is not None and instant <= precedent:
+            problemes.append(f"{ou} : date antérieure ou égale à celle du retrait précédent")
         precedent = instant or precedent
     decisions = contenu["decisions"]
     if not isinstance(decisions, dict):
@@ -352,10 +400,80 @@ def _sorte(ligne, donnees: pd.DataFrame | None) -> str | None:
     return None
 
 
+def _formes_proposees(tables: dict[str, pd.DataFrame], regles_gestion: list):
+    """Fonction qui rend la forme du référentiel d'une clé « trouvée après
+    normalisation seulement », lue dans une ligne de sa table, ou None si la règle
+    n'est pas une de celles que corrige la règle de nettoyage `referentiel`, si la
+    clé n'est plus trouvée ou si le référentiel en a plusieurs formes."""
+    regles = {
+        _controle_gestion(regle["ref"], regle["libelle"]): regle
+        for regle in _regles_referentiel(regles_gestion)
+    }
+    formes_par_controle = {}
+
+    def forme(ligne, source) -> str | None:
+        regle = regles.get(ligne.controle)
+        if regle is None or regle["table"] != ligne.table or regle["cle"] != [ligne.champ]:
+            return None
+        cle_reference = regle.get("cle_reference", regle["cle"])
+        reference = tables.get(regle["table_reference"])
+        if reference is None or any(c not in reference.columns for c in cle_reference):
+            return None
+        comparaison = regle["comparaison"]
+        if ligne.controle not in formes_par_controle:
+            formes_par_controle[ligne.controle] = formes_du_referentiel(
+                reference.reset_index(drop=True), cle_reference, comparaison
+            )
+        texte = _valeur_constatee(source[ligne.champ])
+        if texte is None or not texte.strip():
+            return None
+        candidates = formes_de_la_cle(texte, formes_par_controle[ligne.controle], comparaison)
+        if not candidates or len(candidates) != 1 or None in candidates or texte in candidates:
+            return None
+        return next(iter(candidates))
+
+    return forme
+
+
+def _date_existe(annee: int, mois: int, jour: int) -> bool:
+    try:
+        date(annee, mois, jour)
+    except ValueError:
+        return False
+    return True
+
+
+def date_inversee_proposee(valeur, nature: str):
+    """Date lue mois puis jour, à proposer comme valeur retenue, ou None.
+
+    Pour une colonne de date (`nature` parmi `typage.NATURES_DATE`), une valeur en
+    texte de forme jour, mois, année (séparateur barre, point ou tiret, année sur
+    quatre chiffres), impossible lue jour puis mois mais valide lue mois puis jour,
+    donne cette date : le jour et le mois sont sans doute inversés. Elle est écrite
+    dans la représentation de la nature (JJ/MM/AAAA pour une date native, que
+    `lire_valeur_retenue` lit à l'import). Rien sinon, ni pour une année sur deux
+    chiffres : la proposition cumulerait deux hypothèses.
+    """
+    if nature not in NATURES_DATE or not isinstance(valeur, str):
+        return None
+    trouve = _JOUR_MOIS_ANNEE.fullmatch(valeur.strip())
+    if trouve is None:
+        return None
+    premier, second, annee = int(trouve.group(1)), int(trouve.group(3)), int(trouve.group(4))
+    if _date_existe(annee, second, premier) or not _date_existe(annee, premier, second):
+        return None
+    texte = f"{second:02d}/{premier:02d}/{annee:04d}"
+    retenue, raison = lire_valeur_retenue(texte, nature)
+    if raison is not None:
+        return None
+    return texte if isinstance(retenue, (date, datetime)) else retenue
+
+
 def elements_a_arbitrer(
     tables: dict[str, pd.DataFrame],
     anomalies: pd.DataFrame,
     decisions: dict | None = None,
+    regles_gestion: list | None = None,
 ) -> pd.DataFrame:
     """Éléments soumis au métier, avec l'état de leur décision.
 
@@ -383,6 +501,16 @@ def elements_a_arbitrer(
     valable », ou « ligne source introuvable » (lignage absent ou en double dans la
     table : l'élément ne peut pas être arbitré). Seuls les deux premiers états sont
     exportés dans le classeur.
+
+    `proposition` est celle de la table des anomalies, sauf pour une clé « trouvée
+    après normalisation seulement » dont la proposition y est masquée (colonne
+    sensible) : elle vaut alors la forme du référentiel, en clair, lue dans les
+    tables reçues comme le fait la règle de nettoyage `referentiel`, si cette forme
+    est unique (sinon elle reste masquée). `regles_gestion` (règles de
+    config/gestion.yaml par défaut) donne le référentiel de chaque règle. Une
+    anomalie de nature sur une colonne de date, sans proposition, reçoit la date lue
+    mois puis jour quand la valeur est impossible lue jour puis mois mais valide lue
+    mois puis jour (`date_inversee_proposee`).
     """
     manquantes = [c for c in COLONNES_ANOMALIES if c not in anomalies.columns]
     if manquantes:
@@ -392,6 +520,9 @@ def elements_a_arbitrer(
     if decisions is None:
         decisions = charger_decisions()
     enregistrees = decisions["decisions"]
+    if regles_gestion is None:
+        regles_gestion = charger_regles_gestion()
+    forme_proposee = _formes_proposees(tables, regles_gestion)
     index = {}
     for table, donnees in tables.items():
         donnees = donnees.reset_index(drop=True)
@@ -408,9 +539,25 @@ def elements_a_arbitrer(
             position = reperes.get(
                 _repere(ligne.fichier_source, ligne.feuille_source, ligne.num_ligne_source)
             )
-        valeur, empreinte = ligne.valeur, None
+        valeur, empreinte, proposition = ligne.valeur, None, ligne.proposition
         if position is not None:
             source = donnees.iloc[position]
+            if (
+                sorte == SORTE_CELLULE
+                and ligne.etape == ETAPE_GESTION
+                and ligne.constat == CONSTAT_APRES_NORMALISATION
+                and proposition == VALEUR_MASQUEE
+            ):
+                proposition = forme_proposee(ligne, source) or proposition
+            elif (
+                sorte == SORTE_CELLULE
+                and ligne.etape == ETAPE_FORMAT
+                and _texte(proposition) == ""
+                and _texte(ligne.regle).startswith(PREFIXE_NATURE)
+                and ligne.champ in donnees.columns
+            ):
+                nature = _texte(ligne.regle)[len(PREFIXE_NATURE):]
+                proposition = date_inversee_proposee(source[ligne.champ], nature) or proposition
             colonnes = _colonnes_locales(ligne.champ, donnees)
             if sorte == SORTE_LIGNE:
                 empreinte = _empreinte(
@@ -465,7 +612,7 @@ def elements_a_arbitrer(
                 "regle": ligne.regle,
                 "constat": ligne.constat,
                 "detail": ligne.detail,
-                "proposition": ligne.proposition,
+                "proposition": proposition,
                 "empreinte": empreinte,
             }
         )
@@ -539,7 +686,11 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
         "valeurs ne changent pas).",
         "La colonne valeur_retenue est préremplie avec la correction proposée par "
         "l'outil quand il en propose une : la vérifier avant de choisir corriger. Elle "
-        "n'est lue qu'avec la décision corriger.",
+        "n'est lue qu'avec la décision corriger. Pour une clé écrite autrement que dans "
+        "son référentiel (constat « trouvée après normalisation seulement »), c'est la "
+        "forme du référentiel, y compris sur une colonne sensible. Pour une date "
+        "impossible lue jour puis mois mais valide lue mois puis jour, c'est cette date, "
+        "le jour et le mois étant sans doute inversés.",
         "Écrire la valeur retenue comme dans le fichier source. Une date peut s'écrire "
         "JJ/MM/AAAA, JJ.MM.AAAA, JJ-MM-AAAA, AAAA-MM-JJ ou AAAAMMJJ, un nombre avec une "
         "virgule ou un point décimal; une année sur deux chiffres est refusée. La "
@@ -921,7 +1072,8 @@ def ecrire_decisions(
 
     Une décision remplace celle du même identifiant (décision caduque). Le
     journal des imports reçoit une entrée (date, classeur, période, nombre de
-    décisions, de décisions remplacées, et par décision). Rien n'est écrit si le
+    décisions, de décisions remplacées, et par décision); celui des retraits est
+    gardé tel quel. Rien n'est écrit si le
     classeur ne porte aucune décision (entrée None) : le classeur reste alors
     importable.
 
@@ -967,13 +1119,84 @@ def ecrire_decisions(
         **{choix: int(nombres[choix]) for choix in DECISIONS},
     }
     nouveau = {
-        "meta": {"structure": STRUCTURE_DECISIONS, "imports": [*imports, entree]},
+        "meta": {**contenu["meta"], "imports": [*imports, entree]},
         "decisions": decisions,
     }
+    _ecrire_contenu(chemin, nouveau, periode_fin)
+    return chemin, entree
+
+
+def retirer_decisions(
+    identifiants,
+    periode_fin: str,
+    lues: dict,
+    chemin: str | Path | None = None,
+) -> tuple[Path, dict | None]:
+    """Retire des décisions caduques du fichier des décisions et rend le chemin et
+    l'entrée du journal des retraits.
+
+    `identifiants` : identifiants des décisions à retirer, en pratique la colonne
+    id_anomalie des décisions caduques rendues par `nettoyage.nettoyer`; `lues` : le
+    contenu du fichier tel que passé à `nettoyer` (`charger_decisions`). Rien n'est
+    écrit sans identifiant (entrée None).
+
+    Refusé, sans rien écrire, si le fichier a changé depuis la lecture de `lues` (un
+    import ou un retrait entre-temps : relancer le nettoyage), si un identifiant n'y
+    figure pas ou est donné deux fois, ou si la date du retrait n'est pas
+    postérieure à celle du précédent. Le journal des retraits (meta, retraits) reçoit
+    une entrée : date, période, nombre de décisions et identifiants retirés. Le
+    journal des imports n'est pas touché, si bien qu'un classeur d'arbitrage exporté
+    avant le retrait reste importable. Le fichier en place est d'abord copié dans
+    data/config/sauvegardes/, comme pour `ecrire_decisions`.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_decisions()
+    identifiants = list(identifiants)
+    contenu = charger_decisions(chemin)
+    if contenu != lues:
+        raise ValueError(
+            f"{chemin} a changé depuis sa lecture par le nettoyage : relancer le "
+            "nettoyage. Rien n'est retiré."
+        )
+    if not identifiants:
+        return chemin, None
+    doubles = sorted(str(i) for i, n in Counter(identifiants).items() if n > 1)
+    absents = sorted({str(i) for i in identifiants if i not in contenu["decisions"]})
+    problemes = []
+    if doubles:
+        problemes.append(f"identifiants donnés plusieurs fois : {', '.join(doubles)}")
+    if absents:
+        problemes.append(f"identifiants absents de {chemin.name} : {', '.join(absents)}")
+    if problemes:
+        raise ValueError("Rien n'est retiré\n  " + "\n  ".join(problemes))
+    retraits = contenu["meta"].get("retraits", [])
+    instant = horodater()
+    if retraits and lire_instant(instant) <= lire_instant(retraits[-1]["date"]):
+        raise ValueError(
+            f"{chemin} : le retrait ({instant}) doit être postérieur au précédent "
+            f"({retraits[-1]['date']}); relancer le retrait"
+        )
+    entree = {
+        "date": instant,
+        "periode_fin": periode_fin,
+        "decisions": len(identifiants),
+        "identifiants": sorted(identifiants),
+    }
+    retirees = set(identifiants)
+    nouveau = {
+        "meta": {**contenu["meta"], "retraits": [*retraits, entree]},
+        "decisions": {i: d for i, d in contenu["decisions"].items() if i not in retirees},
+    }
+    _ecrire_contenu(chemin, nouveau, periode_fin)
+    return chemin, entree
+
+
+def _ecrire_contenu(chemin: Path, nouveau: dict, periode_fin: str) -> None:
+    """Écrit le fichier des décisions : contrôle du contenu, copie datée du fichier en
+    place, écriture dans un fichier provisoire, relu et comparé, qui remplace enfin
+    le fichier en place."""
     problemes = problemes_decisions(nouveau)
     if problemes:
         raise ValueError("Décisions invalides, rien n'est écrit\n  " + "\n  ".join(problemes))
-
     chemin.parent.mkdir(parents=True, exist_ok=True)
     if chemin.exists():
         _sauvegarder(chemin, periode_fin)
@@ -989,5 +1212,4 @@ def ecrire_decisions(
         os.replace(provisoire, chemin)
     finally:
         provisoire.unlink(missing_ok=True)
-    return chemin, entree
 

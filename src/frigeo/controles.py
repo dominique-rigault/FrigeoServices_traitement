@@ -25,7 +25,8 @@ Pour une liste ou un format, trois issues sont possibles :
 
 S'y ajoutent les règles complémentaires, que le dictionnaire ne peut pas déduire des
 données et que le métier donne dans `config/controles.yaml` (voir
-`charger_regles_complementaires`) : nombre de décimales, bornes, motif, clé de Luhn.
+`charger_regles_complementaires`) : nombre de décimales, bornes, motif, clé de Luhn,
+plus l'unité d'une colonne de durée, sans contrôle, qui sert au nettoyage.
 Une forme fixe (code postal, numéro à longueur fixe) n'en fait pas partie : elle
 relève de la règle `format` du dictionnaire.
 
@@ -34,6 +35,11 @@ texte, dans toutes les colonnes, sans déclaration (voir `constats_encodage`) :
 repère un texte UTF-8 relu avec un encodage d'un octet (Windows-1252, ISO-8859-15
 ou Latin-1), et le caractère de remplacement laissé par un décodage qui a perdu
 l'information. Elle ne propose aucune correction (étape 6).
+
+La règle `espaces` s'applique de même à toute cellule de texte (voir
+`constats_espaces`) : elle repère une espace en début ou en fin de texte, des espaces
+répétées et une espace autre que l'espace ordinaire (insécable, fine, tabulation).
+Les sauts de ligne n'en relèvent pas. Sa correction relève de l'étape 6.
 
 Rien n'est corrigé ni écrit : `controler` rend la table des écarts et un bilan.
 """
@@ -123,6 +129,11 @@ REGLES_COMPLEMENTAIRES = {
     "cle_luhn": "clé invalide",
 }
 STATUT_COMPLEMENTAIRE = "documenté"
+# Unité d'une colonne de durée, déclarée au même endroit (règle duree) : sans contrôle à
+# l'étape 3, elle sert à la règle nature du nettoyage, qui convertit dans cette unité
+# une durée écrite avec ses unités (1h10, 95 min).
+REGLE_DUREE = "duree"
+UNITES_DUREE = ("minutes", "heures")
 CLE_REGLES_COMPLEMENTAIRES = "regles"
 # Le même fichier porte, sous une autre clé, les déclarations de doublons (voir le
 # module doublons).
@@ -155,6 +166,28 @@ CONSTAT_REMPLACEMENT = "caractère de remplacement"
 # demanderait d'étendre cette liste.
 ENCODAGES_SUSPECTS = ("cp1252", "iso8859_15", "latin_1")
 CARACTERE_REMPLACEMENT = chr(0xFFFD)
+
+# Règle des espaces, appliquée sans déclaration à toutes les cellules de texte, après
+# la règle d'encodage. Son statut est vide, comme celui de la règle d'encodage.
+REGLE_ESPACES = "espaces"
+ESPACES_EN_VIGUEUR = "sans espace superflue"
+CONSTAT_ESPACE_BORD = "espace en début ou en fin"
+CONSTAT_ESPACES_REPETEES = "espaces répétées"
+CONSTAT_ESPACE_SPECIALE = "espace spéciale"
+CONSTATS_ESPACES = (CONSTAT_ESPACE_BORD, CONSTAT_ESPACES_REPETEES, CONSTAT_ESPACE_SPECIALE)
+# Sauts de ligne (ceux que reconnaît `str.splitlines`) : ils peuvent être voulus dans
+# un texte libre, la règle ne les signale ni ne les corrige.
+SAUTS_DE_LIGNE = frozenset(chr(c) for c in (10, 11, 12, 13, 28, 29, 30, 0x85, 0x2028, 0x2029))
+# Espaces horizontales : tout caractère d'espacement Unicode hors saut de ligne.
+ESPACES_HORIZONTALES = frozenset(
+    chr(c) for c in range(0x110000) if chr(c).isspace()
+) - SAUTS_DE_LIGNE
+ESPACE_ORDINAIRE = " "
+_CLASSE_ESPACES = "".join(re.escape(c) for c in sorted(ESPACES_HORIZONTALES))
+_MOTIF_ESPACES_REPETEES = re.compile(f"[{_CLASSE_ESPACES}]{{2}}")
+_MOTIF_ESPACE_SPECIALE = re.compile(
+    "[" + "".join(re.escape(c) for c in sorted(ESPACES_HORIZONTALES - {ESPACE_ORDINAIRE})) + "]"
+)
 
 
 def _repertoire(encodages) -> frozenset[str]:
@@ -277,10 +310,16 @@ def problemes_regles_complementaires(regles) -> list[str]:
                 problemes.append(f"{ou} : au moins une règle est attendue")
                 continue
             for type_regle, parametre in types.items():
+                if type_regle == REGLE_DUREE:
+                    if parametre not in UNITES_DUREE:
+                        problemes.append(
+                            f"{ou}, règle {REGLE_DUREE} : {' ou '.join(UNITES_DUREE)} est attendu"
+                        )
+                    continue
                 if type_regle not in REGLES_COMPLEMENTAIRES:
                     problemes.append(
                         f"{ou} : règle inconnue {type_regle!r} (règles possibles : "
-                        f"{', '.join(REGLES_COMPLEMENTAIRES)})"
+                        f"{', '.join((*REGLES_COMPLEMENTAIRES, REGLE_DUREE))})"
                     )
                     continue
                 probleme = _probleme_parametre(type_regle, parametre)
@@ -328,7 +367,9 @@ def charger_regles_complementaires(chemin: str | Path | None = None) -> dict:
       seule borne est possible); `min_exclu: true` ou `max_exclu: true` exclut une
       borne (`{min: 0, max: 1, min_exclu: true}` : plus de 0, au plus 1);
     - `motif: "..."` : la valeur entière correspond à l'expression régulière;
-    - `cle_luhn: true` : la clé de contrôle de Luhn est valide.
+    - `cle_luhn: true` : la clé de contrôle de Luhn est valide;
+    - `duree: minutes` (ou `heures`) : unité d'une colonne de durée, sans contrôle,
+      qui sert au nettoyage (voir `durees_declarees`).
 
     Un fichier absent, ou sans clé `regles`, ne donne aucune règle. Un fichier mal
     formé est refusé, tous les problèmes étant listés en une fois.
@@ -343,6 +384,17 @@ def charger_regles_complementaires(chemin: str | Path | None = None) -> dict:
             f"Règles complémentaires invalides ({chemin})\n  " + "\n  ".join(problemes)
         )
     return regles
+
+
+def durees_declarees(complementaires: dict) -> dict[tuple[str, str], str]:
+    """Unité de chaque colonne déclarée durée (règle duree des règles
+    complémentaires), par (table, colonne)."""
+    return {
+        (table, colonne): types[REGLE_DUREE]
+        for table, colonnes in (complementaires or {}).items()
+        for colonne, types in (colonnes or {}).items()
+        if isinstance(types, dict) and REGLE_DUREE in types
+    }
 
 
 def charger_dictionnaire_enregistre(chemin: str | Path | None = None) -> dict:
@@ -582,6 +634,28 @@ def constats_encodage(texte: str) -> tuple[str, ...]:
     return tuple(constats)
 
 
+def constats_espaces(texte: str) -> tuple[str, ...]:
+    """Constats de la règle `espaces` pour un texte, vide s'il n'en a aucun.
+
+    « espace en début ou en fin » : le premier ou le dernier caractère est une
+    espace horizontale (`ESPACES_HORIZONTALES`). « espaces répétées » : deux espaces
+    horizontales se suivent. « espace spéciale » : le texte contient une espace
+    horizontale autre que l'espace ordinaire (insécable, fine, tabulation). Un texte
+    peut porter les trois, dans cet ordre. Un saut de ligne n'est jamais signalé, et
+    ne compte pas comme une espace.
+    """
+    if not texte:
+        return ()
+    constats = []
+    if texte[0] in ESPACES_HORIZONTALES or texte[-1] in ESPACES_HORIZONTALES:
+        constats.append(CONSTAT_ESPACE_BORD)
+    if _MOTIF_ESPACES_REPETEES.search(texte):
+        constats.append(CONSTAT_ESPACES_REPETEES)
+    if _MOTIF_ESPACE_SPECIALE.search(texte):
+        constats.append(CONSTAT_ESPACE_SPECIALE)
+    return tuple(constats)
+
+
 def _controler_encodage(presentes: pd.Series):
     """Contrôle de la règle `encodage` sur les textes d'une colonne, rendu comme
     `_controler_regle` : None si la colonne n'a aucune cellule de texte."""
@@ -593,6 +667,21 @@ def _controler_encodage(presentes: pd.Series):
     ecarts = [
         (constats.index[[constat in c for c in constats]], constat, ISSUE_ANOMALIE)
         for constat in (CONSTAT_DECODAGE, CONSTAT_REMPLACEMENT)
+    ]
+    return len(textes), 0, ecarts
+
+
+def _controler_espaces(presentes: pd.Series):
+    """Contrôle de la règle `espaces` sur les textes d'une colonne, rendu comme
+    `_controler_regle` : None si la colonne n'a aucune cellule de texte."""
+    textes = presentes[[isinstance(valeur, str) for valeur in presentes]]
+    if textes.empty:
+        return None
+    verdicts = {texte: constats_espaces(texte) for texte in textes.unique()}
+    constats = textes.map(verdicts)
+    ecarts = [
+        (constats.index[[constat in c for c in constats]], constat, ISSUE_ANOMALIE)
+        for constat in CONSTATS_ESPACES
     ]
     return len(textes), 0, ecarts
 
@@ -683,6 +772,11 @@ def controler(
     ceux de `constats_encodage`, tous deux des anomalies. Une colonne sensible est
     contrôlée comme les autres, sa valeur constatée étant « masqué ».
 
+    Règle des espaces : elle suit la règle d'encodage, sur les mêmes cellules, avec
+    `regle` « espaces », `regle_en_vigueur` « sans espace superflue » et
+    `statut_regle` vide. Les constats sont ceux de `constats_espaces`, tous des
+    anomalies.
+
     La classification de sensibilité (config/sensibilite.yaml par défaut) est
     vérifiée avant le calcul. Une colonne est aussi tenue pour sensible quand le
     dictionnaire la marque comme telle. Les arguments ne sont pas modifiés.
@@ -716,7 +810,9 @@ def controler(
 
     rang_regles = {
         nom: rang
-        for rang, nom in enumerate((*REGLES, *REGLES_COMPLEMENTAIRES, REGLE_ENCODAGE))
+        for rang, nom in enumerate(
+            (*REGLES, *REGLES_COMPLEMENTAIRES, REGLE_ENCODAGE, REGLE_ESPACES)
+        )
     }
     bilan, morceaux = [], []
     for rang_table, (table, colonnes) in enumerate(dictionnaire.items()):
@@ -754,6 +850,9 @@ def controler(
             encodage = _controler_encodage(presentes)
             if encodage is not None:
                 a_faire.append((REGLE_ENCODAGE, ENCODAGE_EN_VIGUEUR, None, encodage))
+            espaces = _controler_espaces(presentes)
+            if espaces is not None:
+                a_faire.append((REGLE_ESPACES, ESPACES_EN_VIGUEUR, None, espaces))
             for nom, en_vigueur, statut, (controlees, non_revues, ecarts) in a_faire:
                 commun = {
                     "table": table,

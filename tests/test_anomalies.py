@@ -12,6 +12,7 @@ from frigeo.anomalies import (
     COLONNES_ANOMALIES,
     COLONNES_BILAN_ANOMALIES,
     COLONNES_NON_DECLAREES,
+    COLONNES_NON_EVALUABLES,
     COLONNES_NON_QUALIFIES,
     REGLE_CLE_UNIQUE,
     REGLE_HORS_CLE,
@@ -22,17 +23,24 @@ from frigeo.anomalies import (
     avertissements_qualification,
     bilan_controles,
     charger_qualification,
+    chemin_non_evaluables,
     chemins_anomalies,
     colonnes_non_declarees,
     dossier_anomalies,
     ecrire_anomalies,
+    lignes_non_evaluables,
     problemes_qualification,
     qualifier,
     reunir_anomalies,
 )
 from frigeo.controles import COLONNES_BILAN, COLONNES_ECARTS, VALEUR_MASQUEE
 from frigeo.doublons import COLONNES_BILAN_DOUBLONS, COLONNES_DOUBLONS, detecter_doublons
-from frigeo.gestion import COLONNES_BILAN_GESTION, COLONNES_ECARTS_GESTION, controler_gestion
+from frigeo.gestion import (
+    COLONNES_BILAN_GESTION,
+    COLONNES_ECARTS_GESTION,
+    COLONNES_NON_EVALUABLES_GESTION,
+    controler_gestion,
+)
 
 AUCUNE_SENSIBLE = {}
 DECLARATIONS = {"t": {"cle": ["id"], "unique": [["siret"]], "presume_unique": [["nom"]]}}
@@ -1034,3 +1042,148 @@ def test_ecriture_des_anomalies_nettoyees(tmp_path):
     with pytest.raises(ValueError, match="colonnes attendues"):
         _ecrire(marquees, bilan, tmp_path)
     assert sorted(f.name for f in tmp_path.iterdir()) == [c.name for c in chemins]
+
+
+# Lignes non évaluables des règles de gestion (correction de l'évaluation, C2a).
+
+
+def _non_evaluables_gestion(*lignes):
+    """Table de controler_gestion(..., avec_non_evaluables=True), une ligne par
+    (table, fichier, numéro de ligne, référence, libellé, clé)."""
+    return _frame(
+        [(table, fichier, None, numero, ref, "plage", libelle, cle)
+         for table, fichier, numero, ref, libelle, cle in lignes],
+        COLONNES_NON_EVALUABLES_GESTION,
+    )
+
+
+def test_lignes_non_evaluables_mises_en_forme():
+    tables = _tables()
+    regle = {"ref": "R01", "libelle": "Règle un", "type": "date_dans_periode_export",
+             "table": "t", "colonne": "d"}
+    _, bilan, brutes = controler_gestion(
+        tables, {"t": {"d": {"nature": {"regle": "date JJ/MM/AAAA"}}}}, [regle],
+        DECLARATIONS, None, AUCUNE_SENSIBLE, avec_non_evaluables=True,
+    )
+    assert bilan["non_evaluables"].tolist() == [2]
+    copie = brutes.copy()
+    lignes = lignes_non_evaluables(tables, brutes)
+    pd.testing.assert_frame_equal(brutes, copie)
+    assert list(lignes.columns) == list(COLONNES_NON_EVALUABLES)
+    assert _lignes(lignes, *COLONNES_NON_EVALUABLES) == [
+        ("gestion", "R01 Règle un", "R01", "t", "t_2025.csv", None, 3, "2025", "A2"),
+        ("gestion", "R01 Règle un", "R01", "t", "t_2026-01.csv", None, 3, "2026-01", "B2"),
+    ]
+    assert str(lignes["num_ligne_source"].dtype) == "Int64"
+    # Ligne introuvable (table absente, numéro lu en flottant, référentiel sans
+    # période) : période vide.
+    autres = lignes_non_evaluables(tables, _non_evaluables_gestion(
+        ("x", "x.csv", 2, "R02", "Sans écart", None),
+        ("t", "t_2025.csv", 4.0, "R02", "Sans écart", "A3"),
+        ("r", "r.csv", 2, "R02", "Sans écart", None),
+    ))
+    assert _lignes(autres, "table", "num_ligne_source", "periode_export") == [
+        ("x", 2, None), ("t", 4, "2025"), ("r", 2, None),
+    ]
+    vide = lignes_non_evaluables(tables, _non_evaluables_gestion())
+    assert vide.empty and list(vide.columns) == list(COLONNES_NON_EVALUABLES)
+    with pytest.raises(ValueError, match="colonnes absentes cle"):
+        lignes_non_evaluables(tables, brutes.drop(columns="cle"))
+
+
+def _non_evaluables_ecrites():
+    return lignes_non_evaluables(_tables(), _non_evaluables_gestion(
+        ("t", "t_2025.csv", 3, "R01", "Règle un", "A2"),
+        ("t", "t_2026-01.csv", 3, "R02", "Sans écart", "B2"),
+    ))
+
+
+def test_ecriture_des_lignes_non_evaluables(tmp_path):
+    anomalies, bilan = _qualifiees()
+    non_evaluables = _non_evaluables_ecrites()
+    chemins = ecrire_anomalies(anomalies, bilan, "2026-03", tmp_path, AUCUNE_SENSIBLE,
+                               DECLARATIONS, non_evaluables=non_evaluables)
+    assert chemins == chemins_anomalies("2026-03", tmp_path)
+    chemin = chemin_non_evaluables("2026-03", tmp_path)
+    assert chemin.name == "non_evaluables_2026-03.csv"
+    assert sorted(f.name for f in tmp_path.iterdir()) == sorted(
+        [c.name for c in chemins] + [chemin.name]
+    )
+    octets = chemin.read_bytes()
+    assert octets.startswith(
+        b"\xef\xbb\xbf" + ";".join(COLONNES_NON_EVALUABLES).encode("utf-8") + b"\r\n"
+    )
+    relue = _relire(chemin)
+    assert relue.values.tolist() == _textes(non_evaluables)
+    assert relue["num_ligne_source"].tolist() == ["3", "3"]
+    # Tables nettoyées : fichier à part, à côté de celui des données brutes.
+    from frigeo.anomalies import COLONNE_DECISION_METIER
+
+    marquees = anomalies.assign(**{COLONNE_DECISION_METIER: None})
+    ecrire_anomalies(marquees, bilan, "2026-03", tmp_path, AUCUNE_SENSIBLE, DECLARATIONS,
+                     nettoyees=True, non_evaluables=non_evaluables.iloc[:1])
+    nettoyees = chemin_non_evaluables("2026-03", tmp_path, nettoyees=True)
+    assert nettoyees.name == "non_evaluables_nettoyees_2026-03.csv"
+    assert len(_relire(nettoyees)) == 1 and len(_relire(chemin)) == 2
+    assert chemin_non_evaluables("2026-03") == dossier_anomalies() / chemin.name
+    # Sans table des lignes non évaluables : deux fichiers seulement, comme avant.
+    seuls = tmp_path / "seuls"
+    _ecrire(anomalies, bilan, seuls)
+    assert sorted(f.name for f in seuls.iterdir()) == [c.name for c in chemins]
+
+
+def test_ecriture_des_lignes_non_evaluables_refusee(tmp_path, monkeypatch):
+    anomalies, bilan = _qualifiees()
+    non_evaluables = _non_evaluables_ecrites()
+    dossier = tmp_path / "sortie"
+
+    def refus(*morceaux, table=non_evaluables, sensibles=AUCUNE_SENSIBLE, anomalies_=anomalies,
+              bilan_=bilan):
+        with pytest.raises(ValueError) as erreur:
+            ecrire_anomalies(anomalies_, bilan_, "2026-03", dossier, sensibles, DECLARATIONS,
+                             non_evaluables=table)
+        for morceau in morceaux:
+            assert morceau in str(erreur.value)
+        assert not dossier.exists()
+
+    refus("colonnes attendues", "lignes_non_evaluables", table=non_evaluables.drop(columns="ref"))
+    refus("colonnes attendues", table=_non_evaluables_gestion())
+    refus("colonnes attendues", table=non_evaluables[list(COLONNES_NON_EVALUABLES)[::-1]])
+    inconnue = non_evaluables.copy()
+    inconnue.loc[1, "controle"] = "R09 Inconnue"
+    refus("absents du bilan", "gestion : R09 Inconnue", table=inconnue)
+    # Clé sensible visible : refusée; masquée, acceptée. La table des anomalies est
+    # vide ici, pour que seul le contrôle des lignes non évaluables parle.
+    sources = _sources(bilan_gestion=[_ligne_bilan_gestion(), _ligne_bilan_gestion(
+        ref="R02", libelle="Sans écart")])
+    vides = _reunir(sources)
+    bilan_vide = _bilan(sources, vides)
+    sensibles = {"t": frozenset({"id"})}
+    refus("clé d'une colonne sensible", "tables : t", sensibles=sensibles, anomalies_=vides,
+          bilan_=bilan_vide)
+    masquees = non_evaluables.assign(cle=VALEUR_MASQUEE)
+    ecrire_anomalies(vides, bilan_vide, "2026-03", dossier, sensibles, DECLARATIONS,
+                     non_evaluables=masquees)
+    assert _relire(chemin_non_evaluables("2026-03", dossier))["cle"].tolist() == [
+        VALEUR_MASQUEE, VALEUR_MASQUEE
+    ]
+    # Fichier des lignes non évaluables ouvert dans Excel : aucun des trois fichiers
+    # n'est modifié.
+    dossier = tmp_path / "ouvert"
+    ecrire_anomalies(anomalies, bilan, "2026-03", dossier, AUCUNE_SENSIBLE, DECLARATIONS,
+                     non_evaluables=non_evaluables)
+    avant = _etat(dossier)
+    ouvert = builtins.open
+    cible = chemin_non_evaluables("2026-03", dossier)
+
+    def ouvrir(fichier, mode="r", *args, **kwargs):
+        if mode == "r+b" and Path(fichier) == cible:
+            raise PermissionError(13, "Permission denied")
+        return ouvert(fichier, mode, *args, **kwargs)
+
+    monkeypatch.setattr(module_anomalies, "open", ouvrir, raising=False)
+    with pytest.raises(PermissionError) as erreur:
+        ecrire_anomalies(anomalies.iloc[:2], bilan, "2026-03", dossier, AUCUNE_SENSIBLE,
+                         DECLARATIONS, non_evaluables=non_evaluables.iloc[:1])
+    assert str(cible) in str(erreur.value) and "Rien n'a été modifié" in str(erreur.value)
+    assert _etat(dossier) == avant

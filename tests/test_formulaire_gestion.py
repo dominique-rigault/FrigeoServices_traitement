@@ -148,9 +148,9 @@ def test_lignes_periodes():
         ("d", "date JJ/MM/AAAA", 6, "6 sur 6 dans la période de l'export (100 %)", "aucune"),
         ("f", "date JJ/MM/AAAA", 6, "5 sur 6 dans la période de l'export (83,3 %)",
          "aucune"),
-        # Cellules vides ou illisibles non comptées.
-        ("h", "date JJ/MM/AAAA", 3, "3 sur 3 dans la période de l'export (100 %)",
-         "aucune"),
+        # Cellules vides ou illisibles non comptées, les vides indiquées à part.
+        ("h", "date JJ/MM/AAAA", 3,
+         "3 sur 3 dans la période de l'export (100 %), 2 dates vides", "aucune"),
         ("g", "date JJ/MM/AAAA", 6, "5 sur 6 dans la période de l'export (83,3 %)",
          "aucune"),
     ]
@@ -380,13 +380,17 @@ def test_export_du_classeur(tmp_path):
         for texte in textes
     )
     assert any(texte and "moins de 19 lignes" in texte for texte in textes)
+    assert any(texte and "vide_hors_champ à « oui »" in texte for texte in textes)
     assert any(texte and "non verrouillées, sur fond jaune clair" in texte for texte in textes)
     assert _cellules_jaunes(classeur) > 0
 
     feuille = classeur[FEUILLE_PERIODES]
     assert [c.value for c in feuille[1]] == list(COLONNES_PERIODES)
-    assert feuille.column_dimensions["O"].hidden
-    assert feuille.cell(row=2, column=15).value == 0
+    lettre = {nom: chr(ord("A") + rang) for rang, nom in enumerate(COLONNES_PERIODES)}
+    assert feuille.column_dimensions[lettre["rang"]].hidden
+    assert feuille.column_dimensions[lettre["proposition_vide_hors_champ"]].hidden
+    assert not feuille.column_dimensions[lettre["vide_hors_champ"]].hidden
+    assert feuille.cell(row=2, column=COLONNES_PERIODES.index("rang") + 1).value == 0
     # Nombre de dates affiché avec le séparateur des milliers.
     assert feuille.cell(row=2, column=COLONNES_PERIODES.index("dates") + 1).number_format == (
         "#,##0"
@@ -402,6 +406,9 @@ def test_export_du_classeur(tmp_path):
     plages = {str(menu.sqref): menu.formula1 for menu in feuille.data_validations.dataValidation}
     assert plages["H2:H56"] == '"observé,valide,invalide,documenté"'
     assert plages["K2:K56"] == '"anomalie,à arbitrer,information"'
+    assert plages[f"{lettre['vide_hors_champ']}2:{lettre['vide_hors_champ']}56"] == '"oui,non"'
+    assert not _verrouillee(feuille, 2, "vide_hors_champ", COLONNES_PERIODES)
+    assert not _verrouillee(feuille, 8, "vide_hors_champ", COLONNES_PERIODES)
     assert "A7:A56" in plages and "B7:B56" in plages
 
     feuille = classeur[FEUILLE_FERIES]
@@ -1622,3 +1629,129 @@ def test_appliquer_formulaire_gestion(tmp_path, monkeypatch):
     assert resultat == (True, tmp_path / "sauv" / "gestion_2026-10-30_090507.yaml", archive)
     assert archive.exists() and not chemin.exists()
     assert lire_fichier_gestion(fichier)["retirees"][-1]["ref"] == "R22"
+
+
+# Date facultative hors champ quand elle est vide (correction de l'évaluation).
+
+
+def _periodes_facultatives():
+    dates = ["01/02/2025"] * 20
+    tables = {"t": _export(["2025"] * 24, d=dates + [""] * 4, e=dates + ["01/03/2025"] * 4,
+                           f=dates + [None] * 4)}
+    date = {"nature": {"regle": "date JJ/MM/AAAA"}}
+    dictionnaire = {"t": {
+        "d": {**date, "obligatoire": {"regle": "facultatif"}},
+        "e": {**date, "obligatoire": {"regle": "obligatoire"}},
+        "f": date,
+    }}
+    return tables, dictionnaire, {"regles": [_periode("f", issue="anomalie")]}
+
+
+def test_vide_hors_champ_propose_pour_une_date_facultative():
+    tables, dictionnaire, contenu = _periodes_facultatives()
+    lignes = lignes_periodes(tables, dictionnaire, contenu)
+    assert _reduites(lignes, "colonne", "origine", "observé", "vide_hors_champ",
+                     "proposition_vide_hors_champ") == [
+        ("f", "en vigueur", "20 sur 20 dans la période de l'export (100 %), 4 dates vides",
+         "non", "non"),
+        ("d", "proposée", "20 sur 20 dans la période de l'export (100 %), 4 dates vides",
+         "oui", "oui"),
+        ("e", "proposée", "24 sur 24 dans la période de l'export (100 %)", "non", "non"),
+    ]
+    contenu = {"regles": [_periode("f", vide_hors_champ=True)],
+               "ecartees": {"periodes_export": [{"table": "t", "colonne": "d"}]}}
+    lignes = lignes_periodes(tables, dictionnaire, contenu)
+    assert _reduites(lignes, "colonne", "origine", "vide_hors_champ") == [
+        ("f", "en vigueur", "oui"), ("e", "proposée", "non"), ("d", "écartée", "oui"),
+    ]
+
+
+def test_vide_hors_champ_importe(tmp_path):
+    tables, dictionnaire, contenu = _periodes_facultatives()
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu)
+    feuille = FEUILLE_PERIODES
+    _saisir(chemin, feuille, {"colonne": "f", "origine": "en vigueur"}, vide_hors_champ="oui")
+    _saisir(chemin, feuille, {"colonne": "d"}, statut="valide")
+    _saisir(chemin, feuille, {"colonne": "e"}, statut="documenté", vide_hors_champ="oui")
+    _saisir(chemin, feuille, None, table="t", colonne="d", statut="documenté",
+            ref="decoupage_d", vide_hors_champ="oui", filtre_colonne="e",
+            filtre_valeurs="01/03/2025")
+    formulaire = _importer_c(chemin, dictionnaire, contenu)
+    assert formulaire.avertissements == []
+    regles = formulaire.contenu["regles"]
+    assert regles[0] == {**_periode("f", issue="anomalie"), "vide_hors_champ": True}
+    # Le paramètre suit la colonne.
+    assert list(regles[0])[-3:] == ["colonne", "vide_hors_champ", "issue"]
+    assert regles[1:] == [
+        {"ref": "decoupage", "libelle": "d dans la période de l'export",
+         "type": "date_dans_periode_export", "table": "t", "colonne": "d",
+         "vide_hors_champ": True},
+        {"ref": "decoupage", "libelle": "e dans la période de l'export",
+         "type": "date_dans_periode_export", "table": "t", "colonne": "e",
+         "vide_hors_champ": True},
+        {"ref": "decoupage_d", "libelle": "d dans la période de l'export",
+         "type": "date_dans_periode_export", "table": "t", "colonne": "d",
+         "vide_hors_champ": True, "filtre": [{"colonne": "e", "valeurs": ["01/03/2025"]}]},
+    ]
+    assert formulaire.changements.iloc[0]["avant"] == "vide_hors_champ absent"
+    assert formulaire.changements.iloc[0]["apres"] == "vide_hors_champ = true"
+    # Remis à « non » : la clé disparaît.
+    contenu = formulaire.contenu
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, nom="second.xlsx")
+    _saisir(chemin, feuille, {"colonne": "f", "origine": "en vigueur"}, vide_hors_champ="non")
+    regles = _importer_c(chemin, dictionnaire, contenu).contenu["regles"]
+    assert regles[0] == _periode("f", issue="anomalie")
+    # Une autre saisie est refusée.
+    chemin = _exporter_c(tmp_path, tables, dictionnaire, contenu, nom="troisieme.xlsx")
+    _saisir(chemin, feuille, {"colonne": "f", "origine": "en vigueur"},
+            vide_hors_champ="peut-être")
+    with pytest.raises(ValueError, match="vide_hors_champ"):
+        _importer_c(chemin, dictionnaire, contenu)
+
+
+def _contenu_communs():
+    contenu = _contenu()
+    contenu["parametres_communs"] = {
+        "date_plausible": {"min": dt.date(2010, 1, 1), "apres_coupure": 61,
+                           "commentaire": "Création de l'entreprise"},
+        "plage": {"max": 999},
+    }
+    contenu["regles"].append({"ref": "dates", "libelle": "Date plausible",
+                              "type": "date_plausible", "table": "t", "colonne": "d"})
+    return contenu
+
+
+def test_parametres_communs_dans_le_formulaire(tmp_path):
+    contenu = _contenu_communs()
+    assert problemes_contenu_formulaire(contenu) == []
+    # Valeurs effectives montrées avec la mention « (commun) »; une valeur de la règle
+    # l'emporte (R22 garde son maximum).
+    lignes = {ligne["ref"]: ligne["paramètres"] for ligne in lignes_autres(contenu)}
+    assert lignes["dates"] == "colonne = d; min = 2010-01-01 (commun); apres_coupure = 61 (commun)"
+    assert lignes["R22"] == "colonne = n; min = 2; max = 120"
+    # Formulaire rendu sans revue : contenu inchangé, clé comprise.
+    chemin = _exporter_c(tmp_path, _tables(), _dictionnaire(), contenu)
+    formulaire = _importer_c(chemin, _dictionnaire(), contenu)
+    assert formulaire.contenu == contenu
+    assert formulaire.changements.empty
+    # Écriture du fichier : la clé après les jours fériés, relue à l'identique.
+    texte = texte_gestion(contenu)
+    assert yaml.safe_load(texte) == contenu
+    assert texte_gestion(yaml.safe_load(texte)) == texte
+    lignes = texte.splitlines()
+    debut = lignes.index("parametres_communs:")
+    assert lignes.index("jours_feries:") < debut < lignes.index("regles:")
+    assert lignes[debut - 3].startswith("# Paramètres communs par type de règle")
+    assert lignes[debut + 1:debut + 7] == [
+        "  date_plausible:",
+        "    min: 2010-01-01",
+        "    apres_coupure: 61",
+        "    commentaire: Création de l'entreprise",
+        "  plage:",
+        "    max: 999",
+    ]
+    # Paramètres communs mal formés : refusés, sans les reporter sur les règles.
+    contenu["parametres_communs"] = {"autre": {"min": 1}}
+    assert problemes_contenu_formulaire(contenu) == [
+        "parametres_communs, autre : type inconnu du catalogue"
+    ]

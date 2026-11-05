@@ -12,7 +12,9 @@ from frigeo.gestion import (
     COLONNES_BILAN_GESTION,
     COLONNES_CATALOGUE,
     COLONNES_ECARTS_GESTION,
+    COLONNES_NON_EVALUABLES_GESTION,
     CONSTAT_ABSENTE,
+    CONSTAT_APRES_NORMALISATION,
     CONSTAT_ANNEE_ABSENTE,
     CONSTAT_AUCUNE_LIGNE_CONFORME,
     CONSTAT_ANNEE_DU_NUMERO,
@@ -24,8 +26,13 @@ from frigeo.gestion import (
     CONSTAT_DATE_DIFFERENTE,
     CONSTAT_DATE_POSTERIEURE,
     CONSTAT_DELAI_NON_ECHU,
+    CONSTAT_DATE_TROP_ANCIENNE,
+    CONSTAT_DATE_TROP_TARDIVE,
+    CONSTAT_DELAI_INFERIEUR,
+    CONSTAT_DELAI_SUPERIEUR,
     CONSTAT_DESEQUILIBRE,
     CONSTAT_ECART_CALCUL,
+    CONSTAT_FIN_AVANT_DEBUT,
     CONSTAT_HORS_DELAI,
     CONSTAT_HORS_HORAIRES,
     CONSTAT_HORS_PERIODES,
@@ -47,6 +54,7 @@ from frigeo.gestion import (
     CONSTAT_SANS_LIGNE,
     CONSTAT_SOMME_DIFFERENTE,
     CONSTAT_SOLDE_NEGATIF,
+    CONSTAT_SOLDE_TOUJOURS_NEGATIF,
     CONSTAT_SOMMES_DIFFERENTES,
     CONSTAT_SUPERIEURE,
     CONSTAT_TOTAL_DIFFERENT,
@@ -62,6 +70,7 @@ from frigeo.gestion import (
     catalogue_types,
     charger_regles_gestion,
     completer_jours_feries,
+    completer_parametres_communs,
     controler_gestion,
     lire_fichier_gestion,
     problemes_regles_gestion,
@@ -247,10 +256,10 @@ def test_structure_des_regles_tous_les_problemes_listes():
         "sans_ligne_liee, ligne_liee_attendue, conforme_selon_horaires, "
         "quantites_concordantes, produit_calcule, somme_liee_arrondie, au_plus_une_non_nulle, "
         "sommes_liees_concordantes, totaux_par_periode, solde_jamais_negatif, "
-        "renseignee_selon_valeur)",
+        "renseignee_selon_valeur, dates_ordonnees, date_plausible)",
         "règle n° 4 (decoupage) : clé inconnue colonnes (clés possibles pour le type "
         "date_dans_periode_export : ref, libelle, type, table, filtre, issue, commentaire, "
-        "colonne)",
+        "colonne, vide_hors_champ)",
         "règle n° 5 (decoupage) : paramètre manquant (colonne)",
         "règle n° 6 (decoupage), libelle : un texte non vide est attendu",
         "règle n° 7 (decoupage), table : un texte non vide est attendu",
@@ -408,8 +417,8 @@ def test_chargement_du_fichier(tmp_path):
     chemin.write_text("- ref: x\n", encoding="utf-8")
     with pytest.raises(
         ValueError,
-        match="clés attendues sont « regles », « jours_feries », « ecartees », « retirees » "
-        "et « demandes »",
+        match="clés attendues sont « regles », « jours_feries », « parametres_communs », "
+        "« ecartees », « retirees » et « demandes »",
     ):
         charger_regles_gestion(chemin)
     chemin.write_text(
@@ -443,7 +452,9 @@ def test_catalogue_des_types():
     assert list(catalogue.columns) == list(COLONNES_CATALOGUE)
     assert list(catalogue["type"]) == list(gestion.TYPES)
     ligne = catalogue.iloc[0].to_dict()
-    assert ligne["parametres"] == "colonne (colonne de date)"
+    assert ligne["parametres"] == (
+        "colonne (colonne de date), vide_hors_champ (true ou false, facultatif)"
+    )
     assert ligne["vue"] == VUE_TOUTES
     assert ligne["issue"] == "à arbitrer"
     plage = catalogue.set_index("type").loc["plage"].to_dict()
@@ -1523,12 +1534,20 @@ def test_existence_dans_reference():
     resume = _bilan(bilan)
     assert (resume["vue"], resume["hors_champ"], resume["non_evaluables"],
             resume["controlees"], resume["anomalies"]) == (VUE_TOUTES, 0, 2, 5, 3)
-    # Après normalisation, « a1 » rejoint « A1 ».
-    ecarts, _ = _controler_reference(
+    # Après normalisation, « a1 » rejoint « A1 » : la ligne n'est plus absente, mais
+    # sa clé est à arbitrer, portée par sa seule colonne, avec la forme du référentiel.
+    ecarts, bilan = _controler_reference(
         donnees, reference, natures, {"c": "texte"},
         [_existence(comparaison="après normalisation")],
     )
-    assert _lignes(ecarts, "num_ligne_source") == [(5,), (8,)]
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur",
+                   "proposition") == [
+        (5, CONSTAT_ABSENTE, "anomalie", "c, r.c", "Z9", None),
+        (6, CONSTAT_APRES_NORMALISATION, "à arbitrer", "c", "a1 ", "A1"),
+        (8, CONSTAT_ABSENTE, "anomalie", "c, r.c", "Z9", None),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["anomalies"], resume["a_arbitrer"]) == (5, 2, 1)
     # Clé facultative : les clés vides sont hors champ, comptées avec celles du filtre.
     ecarts, bilan = _controler_reference(
         donnees, reference, natures, {"c": "texte"},
@@ -1551,12 +1570,21 @@ def test_existence_cle_de_plusieurs_colonnes_et_mots_dans_le_desordre():
         ecarts, _ = _controler_reference(
             donnees, reference, natures, natures_reference, [regle]
         )
-        return [ligne for (ligne,) in _lignes(ecarts, "num_ligne_source")]
+        constats = _lignes(ecarts, "num_ligne_source", "constat", "proposition")
+        return (
+            [ligne for ligne, constat, _ in constats if constat == CONSTAT_ABSENTE],
+            [(ligne, proposition) for ligne, constat, proposition in constats
+             if constat == CONSTAT_APRES_NORMALISATION],
+        )
 
     # Le prénom vide de DUPONT rend sa clé vide : elle n'est rattachée à rien.
-    assert absentes("telle quelle") == [3, 4, 5, 6]
-    assert absentes("après normalisation") == [3, 5, 6]
-    assert absentes("mots dans le désordre") == [5, 6]
+    assert absentes("telle quelle") == ([3, 4, 5, 6], [])
+    assert absentes("après normalisation") == ([3, 5, 6], [(4, "LEROUX Mathieu")])
+    # En mots dans le désordre, la forme du référentiel suit l'ordre des mots de la
+    # ligne : « Mathieu Leroux » ne diffère que par la casse de « Mathieu LEROUX ».
+    assert absentes("mots dans le désordre") == (
+        [5, 6], [(3, "Mathieu LEROUX"), (4, "LEROUX Mathieu")]
+    )
     regle = _reference("existence_dans_reference", cle=["nom"], cle_reference=["n", "p"])
     ecarts, _ = _controler_reference(
         donnees, reference, natures, natures_reference, [regle], sensibles={"r": {"n"}}
@@ -3528,22 +3556,29 @@ def _stock_et_mouvements():
 
 def test_solde_cumule_jamais_negatif_porte_par_la_sortie_qui_le_rend_negatif():
     ecarts, bilan = _controler_tables(_stock_et_mouvements(), NATURES_SOLDE, [_solde()])
-    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
-        (3, CONSTAT_SOLDE_NEGATIF,
+    # Les sorties qui suivent, tant que le solde reste négatif, sont en information,
+    # avec le lignage de la sortie qui porte l'écart.
+    assert _lignes(ecarts, "num_ligne_source", "issue", "constat", "valeur") == [
+        (3, "anomalie", CONSTAT_SOLDE_NEGATIF,
          "solde -1 au 11/01/2025 (solde initial 2 au 01/01/2025, entrées 0, sorties 3), "
          "puis 1 sortie en solde négatif avant le retour à un solde positif ou nul"),
+        (4, "information", CONSTAT_SOLDE_TOUJOURS_NEGATIF,
+         "solde -2 au 12/01/2025 (négatif depuis t.csv, ligne 3)"),
         # L'entrée négative (avoir) rend le solde négatif : la sortie suivante porte l'écart.
-        (6, CONSTAT_SOLDE_NEGATIF,
+        (6, "anomalie", CONSTAT_SOLDE_NEGATIF,
          "solde -5 au 05/03/2025 (solde initial 2 au 01/01/2025, entrées -1, sorties 6), "
          "aucune autre sortie jusqu'à la fin des données"),
-        (7, CONSTAT_SOLDE_NEGATIF,
+        (7, "anomalie", CONSTAT_SOLDE_NEGATIF,
          "solde -0,5 au 05/02/2025 (solde initial 0 au 01/01/2025, entrées 0, sorties 0,5), "
          "puis 1 sortie en solde négatif jusqu'à la fin des données"),
+        (11, "information", CONSTAT_SOLDE_TOUJOURS_NEGATIF,
+         "solde -1,5 au 06/02/2025 (négatif depuis t.csv, ligne 7)"),
     ]
     resume = _bilan(bilan)
     assert (resume["lignes"], resume["ecartees_doublons"], resume["hors_champ"],
             resume["non_evaluables"], resume["controlees"], resume["anomalies"],
             resume["avertissements"]) == (10, 0, 0, 0, 10, 3, None)
+    assert resume["informations"] == 2
     assert resume["colonnes"] == "r, d, q, c.r, c.s, l.r, l.q, l.n, e.n, e.f"
     # Colonne sensible dans une table liée : valeur masquée.
     ecarts, _ = _controler_tables(_stock_et_mouvements(), NATURES_SOLDE, [_solde()],
@@ -3917,3 +3952,540 @@ def test_table_qui_se_prend_pour_reference():
     ecarts, _ = _controler(_factures_et_avoirs(), NATURES_FACTURES, regles=regles[:1],
                            sensibles={"t": frozenset({"o"})})
     assert _lignes(ecarts, "valeur") == [(VALEUR_MASQUEE,)]
+
+
+# Lignes non évaluables rendues à part (correction de l'évaluation, morceau C2a).
+
+
+def test_non_evaluables_rendues_sur_demande_comme_au_bilan():
+    donnees, reference = _personnes_et_periodes()
+    donnees["n"] = [f"N{rang}" for rang in range(len(donnees))]
+    natures, natures_reference = NATURES_PERIODES
+    natures = {**natures, "n": "texte"}
+    tables = {"t": donnees, "r": reference}
+    dictionnaire = {**_dictionnaire("t", **natures), **_dictionnaire("r", **natures_reference)}
+    regles = [
+        _periodes(fin="s"),
+        {**_periodes(fin="s"), "ref": "R10b", "filtre": [{"colonne": "i", "valeurs": ["A"]}]},
+        {**_periodes(fin="s"), "ref": "R10c", "cle_facultative": True},
+    ]
+    declarations = {"t": {"cle": ["n"]}}
+    sans = controler_gestion(tables, dictionnaire, regles, declarations, None, AUCUNE_SENSIBLE)
+    assert len(sans) == 2
+    ecarts, bilan, non_evaluables = controler_gestion(
+        tables, dictionnaire, regles, declarations, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    # Les écarts et le bilan ne changent pas.
+    pd.testing.assert_frame_equal(ecarts, sans[0])
+    pd.testing.assert_frame_equal(bilan, sans[1])
+    assert list(non_evaluables.columns) == list(COLONNES_NON_EVALUABLES_GESTION)
+    # Ligne 7 : hors de la période utilisable de B, dont l'autre période est illisible;
+    # ligne 8 : C n'a qu'une période inutilisable; ligne 13 : fin illisible de F; puis
+    # date vide, clé vide, date illisible. La ligne 6 tombe dans la période utilisable
+    # de B et reste évaluable. Avec le filtre sur A, restent la date vide et la date
+    # illisible. Avec une clé facultative, la clé vide est hors champ.
+    assert _lignes(non_evaluables, "ref", "num_ligne_source", "cle") == [
+        ("R10", 7, "N5"), ("R10", 8, "N6"), ("R10", 10, "N8"), ("R10", 11, "N9"),
+        ("R10", 12, "N10"), ("R10", 13, "N11"),
+        ("R10b", 10, "N8"), ("R10b", 12, "N10"),
+        ("R10c", 7, "N5"), ("R10c", 8, "N6"), ("R10c", 10, "N8"), ("R10c", 12, "N10"),
+        ("R10c", 13, "N11"),
+    ]
+    assert bilan["hors_champ"].tolist() == [0, 6, 1]
+    assert non_evaluables.groupby("ref", sort=False).size().tolist() == (
+        bilan["non_evaluables"].tolist()
+    )
+    assert set(zip(non_evaluables["table"], non_evaluables["fichier_source"],
+                   non_evaluables["type"])) == {("t", "t.csv", "date_dans_periode_reference")}
+    assert set(non_evaluables["feuille_source"].isna()) == {True}
+    assert non_evaluables["libelle"].tolist() == [regles[0]["libelle"]] * 13
+    # Clé d'une colonne sensible : masquée; sans clé déclarée : vide.
+    _, _, masquees = controler_gestion(
+        tables, dictionnaire, regles, declarations, None, {"t": frozenset({"n"})},
+        avec_non_evaluables=True,
+    )
+    assert set(masquees["cle"]) == {VALEUR_MASQUEE}
+    _, _, sans_cle = controler_gestion(
+        tables, dictionnaire, regles, {}, None, AUCUNE_SENSIBLE, avec_non_evaluables=True
+    )
+    assert set(sans_cle["cle"].isna()) == {True}
+    assert len(sans_cle) == 13
+
+
+def test_non_evaluables_sans_les_doublons_en_surnombre_ni_les_lignes_hors_champ():
+    donnees = _table(
+        g=["A", "A", "A", "B", "A"],
+        d=["14/03/2025"] * 5,
+        h=["08:00", "25:00", "25:00", "09:00", "11:00"],
+        m=["60", "30", "30", "30", ""],
+    )
+    regle = _intervalles(filtre=[{"colonne": "g", "valeurs": ["A"]}])
+    dictionnaire = _dictionnaire(**NATURES_INTERVALLES)
+    _, bilan, non_evaluables = controler_gestion(
+        {"t": donnees}, dictionnaire, [regle], {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    # Ligne 4 : copie exacte de la ligne 3, écartée; ligne 5 : hors du filtre.
+    resume = _bilan(bilan)
+    assert (resume["ecartees_doublons"], resume["hors_champ"], resume["non_evaluables"]) == (
+        1, 1, 2,
+    )
+    assert _lignes(non_evaluables, "num_ligne_source") == [(3,), (6,)]
+    # Aucune ligne non évaluable : table vide, avec ses colonnes.
+    _, bilan, vide = controler_gestion(
+        {"t": donnees.iloc[[0, 3]]}, dictionnaire, [regle], {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    assert _bilan(bilan)["non_evaluables"] == 0
+    assert vide.empty and list(vide.columns) == list(COLONNES_NON_EVALUABLES_GESTION)
+
+
+def test_non_evaluables_dans_l_ordre_des_regles_puis_des_lignes():
+    donnees = pd.concat(
+        [
+            _table("t_2026-01.csv", "2026-01", km=["", "5,0"]),
+            _table("t_2025.csv", "2025", km=["x", "abc"]),
+        ],
+        ignore_index=True,
+    )
+    regles = [
+        _instance(colonne="km", min=2, ref="R30"), _instance(colonne="km", max=100, ref="R29")
+    ]
+    _, bilan, non_evaluables = controler_gestion(
+        {"t": donnees}, _dictionnaire(km=DECIMAL), regles, {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    assert _lignes(non_evaluables, "ref", "fichier_source", "num_ligne_source") == [
+        ("R30", "t_2025.csv", 2), ("R30", "t_2025.csv", 3), ("R30", "t_2026-01.csv", 2),
+        ("R29", "t_2025.csv", 2), ("R29", "t_2025.csv", 3), ("R29", "t_2026-01.csv", 2),
+    ]
+    assert bilan["non_evaluables"].tolist() == [3, 3]
+
+
+# Date facultative hors champ quand elle est vide (correction de l'évaluation).
+
+
+def test_date_vide_hors_champ_si_declaree_facultative():
+    donnees = _table(
+        "a.csv", "2025", d=["14/03/2025", "", "  ", "2025-03-14", "14/03/2052", None]
+    )
+    natures = {"d": "date JJ/MM/AAAA"}
+    ecarts, bilan, non_evaluables = controler_gestion(
+        {"t": donnees}, _dictionnaire(**natures), [_regle()], {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    resume = _bilan(bilan)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (0, 4, 2)
+    facultative = _regle(vide_hors_champ=True)
+    ecarts_f, bilan_f, non_evaluables_f = controler_gestion(
+        {"t": donnees}, _dictionnaire(**natures), [facultative], {}, None, AUCUNE_SENSIBLE,
+        avec_non_evaluables=True,
+    )
+    # Les trois dates vides sortent du champ; la date illisible reste non évaluable,
+    # et les écarts ne changent pas.
+    resume = _bilan(bilan_f)
+    assert (resume["hors_champ"], resume["non_evaluables"], resume["controlees"]) == (3, 1, 2)
+    assert _lignes(non_evaluables_f, "num_ligne_source") == [(5,)]
+    assert _lignes(non_evaluables, "num_ligne_source") == [(3,), (4,), (5,), (7,)]
+    pd.testing.assert_frame_equal(ecarts_f, ecarts)
+    assert _lignes(ecarts_f, "num_ligne_source", "constat") == [(6, CONSTAT_DATE_POSTERIEURE)]
+    # false vaut l'absence du paramètre; une autre valeur est refusée.
+    _, bilan_faux = _controler(donnees, natures, regles=[_regle(vide_hors_champ=False)])
+    assert _bilan(bilan_faux)["non_evaluables"] == 4
+    with pytest.raises(ValueError, match="vide_hors_champ"):
+        _controler(donnees, natures, regles=[_regle(vide_hors_champ="oui")])
+
+
+
+# --- clés trouvées après normalisation seulement (B2) ----------------------------
+
+
+def _variantes():
+    jour = dt.datetime
+    reference = _table(
+        "r.xlsx",
+        n=["Dupont", "Martin", "Curie", "CURIE"],
+        p=["Jean", "Jérôme", "Marie", "Marie"],
+        e=[jour(2020, 1, 1), jour(2020, 1, 1), jour(2020, 1, 1), jour(2024, 1, 1)],
+    )
+    donnees = _table(
+        i=["Jean Dupont", "jean dupont", "Jérome Martin", "Marie Curie", "marie curie",
+           "Paul Inconnu", "Dupont Jean"],
+        d=["15/03/2025", "15/03/2025", "15/03/2019", "15/03/2025", "15/03/2025", "15/03/2025",
+           "15/03/2025"],
+    )
+    natures = ({"i": "texte", "d": DATE}, {"n": "texte", "p": "texte", "e": NATIVE})
+    return donnees, reference, natures
+
+
+def test_trouvee_apres_normalisation_seulement():
+    donnees, reference, natures = _variantes()
+    regle = _periodes(cle_reference=["n", "p"], comparaison="mots dans le désordre")
+    ecarts, bilan = _controler_reference(donnees, reference, *natures, [regle])
+    # Ligne 3 : casse; ligne 4 : accent, et date hors période (deux écarts, le contrôle
+    # principal d'abord); ligne 6 : deux formes du référentiel (Curie et CURIE), pas de
+    # proposition; ligne 5 : égale à l'une des deux formes; ligne 8 : ordre des mots,
+    # toléré par la comparaison.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur",
+                   "proposition") == [
+        (3, CONSTAT_APRES_NORMALISATION, "à arbitrer", "i", "jean dupont", "Jean Dupont"),
+        (4, CONSTAT_HORS_PERIODES, "anomalie", "i, d, r.n, r.p, r.e",
+         "15/03/2019 (période depuis le 01/01/2020)", None),
+        (4, CONSTAT_APRES_NORMALISATION, "à arbitrer", "i", "Jérome Martin", "Jérôme Martin"),
+        (6, CONSTAT_APRES_NORMALISATION, "à arbitrer", "i", "marie curie", None),
+        (7, CONSTAT_ABSENTE, "anomalie", "i, d, r.n, r.p, r.e", "Paul Inconnu | 15/03/2025",
+         None),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["anomalies"], resume["a_arbitrer"]) == (7, 2, 3)
+    # La variante affiche sa propre règle; le bilan garde le type de la règle.
+    assert _lignes(ecarts, "constat", "type") == [
+        (CONSTAT_APRES_NORMALISATION, "forme du référentiel, mots dans le désordre"),
+        (CONSTAT_HORS_PERIODES, "date_dans_periode_reference"),
+        (CONSTAT_APRES_NORMALISATION, "forme du référentiel, mots dans le désordre"),
+        (CONSTAT_APRES_NORMALISATION, "forme du référentiel, mots dans le désordre"),
+        (CONSTAT_ABSENTE, "date_dans_periode_reference"),
+    ]
+    assert resume["type"] == "date_dans_periode_reference"
+    # Après normalisation, sans remise en ordre : « Dupont Jean » est la forme exacte,
+    # et « Jean Dupont » n'est plus trouvée.
+    regle = _periodes(cle_reference=["n", "p"], comparaison="après normalisation")
+    ecarts, _ = _controler_reference(donnees, reference, *natures, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "proposition") == [
+        (2, CONSTAT_ABSENTE, None),
+        (3, CONSTAT_ABSENTE, None),
+        (4, CONSTAT_ABSENTE, None),
+        (5, CONSTAT_ABSENTE, None),
+        (6, CONSTAT_ABSENTE, None),
+        (7, CONSTAT_ABSENTE, None),
+    ]
+    # Telle quelle (par défaut) : aucune variante n'est cherchée.
+    regle = _periodes(cle_reference=["n", "p"])
+    ecarts, _ = _controler_reference(donnees, reference, *natures, [regle])
+    assert CONSTAT_APRES_NORMALISATION not in set(ecarts["constat"])
+
+
+def test_apres_normalisation_cle_de_plusieurs_colonnes_et_colonne_sensible():
+    donnees = _table(a=["Jean", "JEAN", "Marie"], b=["Dupont", "Dupont", "Curie"])
+    reference = _table("r.csv", n=["Dupont", "Curie"], p=["Jean", "Marie"])
+    natures, natures_reference = {"a": "texte", "b": "texte"}, {"n": "texte", "p": "texte"}
+    regle = _reference("existence_dans_reference", cle=["a", "b"], cle_reference=["p", "n"],
+                       comparaison="après normalisation")
+    ecarts, _ = _controler_reference(donnees, reference, natures, natures_reference, [regle])
+    # Clé de deux colonnes : écart porté par les deux, sans proposition.
+    assert _lignes(ecarts, "num_ligne_source", "constat", "colonnes", "valeur",
+                   "proposition") == [
+        (3, CONSTAT_APRES_NORMALISATION, "a, b", "JEAN Dupont", None),
+    ]
+    regle = _reference("existence_dans_reference", cle=["a"], cle_reference=["p"],
+                       comparaison="après normalisation")
+    ecarts, _ = _controler_reference(donnees, reference, natures, natures_reference, [regle],
+                                     sensibles={"t": {"a"}})
+    assert _lignes(ecarts, "num_ligne_source", "constat", "colonnes", "valeur",
+                   "proposition") == [
+        (3, CONSTAT_APRES_NORMALISATION, "a", VALEUR_MASQUEE, VALEUR_MASQUEE),
+    ]
+
+
+# --- dates ordonnées (B3) --------------------------------------------------------
+
+
+def _ordre(ref="ordre", **autres):
+    return {"ref": ref, "libelle": "Fin au plus tôt le jour du début",
+            "type": "dates_ordonnees", "table": "t", "debut": "d", "fin": "f", **autres}
+
+
+NATURES_ORDRE = {"d": "date native", "f": "date JJ/MM/AAAA"}
+
+
+def _donnees_ordre():
+    jour = pd.Timestamp("2025-01-01")
+    return _table(
+        d=[jour, jour, jour, pd.Timestamp("2025-03-12"), pd.Timestamp("2025-01-01 23:30"),
+           None, jour, jour, jour, "x"],
+        f=["31/01/2025", "30/01/2025", "01/02/2025", "01/02/2025", "31/01/2025",
+           "31/01/2025", "", "1/2/2025", "02/01/2025", ""],
+    )
+
+
+def test_dates_ordonnees_ordre_delai_et_valeur_affichee():
+    donnees = _donnees_ordre()
+    ecarts, bilan = _controler(donnees, NATURES_ORDRE, regles=[_ordre()])
+    # Sans délai déclaré, seule la fin antérieure au début est un écart; les heures
+    # sont ignorées (ligne 6, 30 jours et non 29).
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (5, CONSTAT_FIN_AVANT_DEBUT, "anomalie", "d, f",
+         "début 12/03/2025, fin 01/02/2025, délai de -39 jours"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["non_evaluables"], resume["hors_champ"]) == (6, 4, 0)
+    ecarts, bilan = _controler(donnees, NATURES_ORDRE,
+                               regles=[_ordre(delai_min=30, delai_max=30)])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (3, CONSTAT_DELAI_INFERIEUR, "début 01/01/2025, fin 30/01/2025, délai de 29 jours"),
+        (4, CONSTAT_DELAI_SUPERIEUR, "début 01/01/2025, fin 01/02/2025, délai de 31 jours"),
+        (5, CONSTAT_FIN_AVANT_DEBUT, "début 12/03/2025, fin 01/02/2025, délai de -39 jours"),
+        (10, CONSTAT_DELAI_INFERIEUR, "début 01/01/2025, fin 02/01/2025, délai de 1 jour"),
+    ]
+    # Bornes incluses : un délai de 0 est admis par défaut, un maximum seul est possible.
+    ecarts, _ = _controler(donnees, NATURES_ORDRE, regles=[_ordre(delai_max=30)])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (4, CONSTAT_DELAI_SUPERIEUR), (5, CONSTAT_FIN_AVANT_DEBUT),
+    ]
+    egales = _table(d=[pd.Timestamp("2025-01-01")], f=["01/01/2025"])
+    ecarts, bilan = _controler(egales, NATURES_ORDRE, regles=[_ordre()])
+    assert ecarts.empty and _bilan(bilan)["controlees"] == 1
+    # Même jour, fin à une heure plus matinale que le début : pas d'écart.
+    heures = _table(d=[pd.Timestamp("2025-01-01 10:00")], f=[pd.Timestamp("2025-01-01 08:00")])
+    ecarts, _ = _controler(heures, {"d": "date native", "f": "date native"}, regles=[_ordre()])
+    assert ecarts.empty
+    # Toutes les lignes, comme pour une plage : un doublon exact porte aussi l'écart.
+    doubles = _table(d=[pd.Timestamp("2025-03-12")] * 2, f=["01/02/2025"] * 2)
+    ecarts, _ = _controler(doubles, NATURES_ORDRE, regles=[_ordre()])
+    assert _lignes(ecarts, "num_ligne_source") == [(2,), (3,)]
+
+
+def test_dates_ordonnees_fin_vide_hors_champ_si_declaree():
+    donnees = _donnees_ordre()
+    ecarts, bilan, non_evaluables = controler_gestion(
+        {"t": donnees}, _dictionnaire(**NATURES_ORDRE), [_ordre()], {}, None,
+        AUCUNE_SENSIBLE, avec_non_evaluables=True,
+    )
+    assert _lignes(non_evaluables, "num_ligne_source") == [(7,), (8,), (9,), (11,)]
+    ecarts_f, bilan_f, non_evaluables_f = controler_gestion(
+        {"t": donnees}, _dictionnaire(**NATURES_ORDRE), [_ordre(vide_hors_champ=True)], {},
+        None, AUCUNE_SENSIBLE, avec_non_evaluables=True,
+    )
+    # La fin vide sort du champ, même avec un début illisible (ligne 11); un début
+    # vide et une fin illisible restent non évaluables, et les écarts ne changent pas.
+    resume = _bilan(bilan_f)
+    assert (resume["controlees"], resume["non_evaluables"], resume["hors_champ"]) == (6, 2, 2)
+    assert _lignes(non_evaluables_f, "num_ligne_source") == [(7,), (9,)]
+    pd.testing.assert_frame_equal(ecarts_f, ecarts)
+    _, bilan_faux = _controler(donnees, NATURES_ORDRE, regles=[_ordre(vide_hors_champ=False)])
+    assert _bilan(bilan_faux)["non_evaluables"] == 4
+
+
+def test_dates_ordonnees_issue_declaree_et_colonne_sensible():
+    donnees = _donnees_ordre()
+    ecarts, _ = _controler(donnees, NATURES_ORDRE, regles=[_ordre(issue="information")])
+    assert _lignes(ecarts, "num_ligne_source", "issue") == [(5, "information")]
+    ecarts, _ = _controler(donnees, NATURES_ORDRE, regles=[_ordre()],
+                           sensibles={"t": {"f"}})
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (5, CONSTAT_FIN_AVANT_DEBUT, VALEUR_MASQUEE),
+    ]
+
+
+def test_dates_ordonnees_parametres_refuses():
+    regles = [
+        _ordre(fin="d"),
+        _ordre(delai_min=-1),
+        _ordre(delai_max=2.5),
+        _ordre(delai_min=31, delai_max=30),
+        _ordre(delai_min=5),
+        _ordre(vide_hors_champ="oui"),
+        _ordre(debut=None),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (ordre) : debut et fin : deux colonnes différentes sont attendues",
+        "règle n° 2 (ordre) : delai_min : un nombre entier de jours, positif ou nul, est "
+        "attendu",
+        "règle n° 3 (ordre) : delai_max : un nombre entier de jours, positif ou nul, est "
+        "attendu",
+        "règle n° 4 (ordre) : delai_min (31) supérieur à delai_max (30)",
+        "règle n° 6 (ordre), vide_hors_champ : true ou false est attendu",
+        "règle n° 7 (ordre), debut : un nom de colonne est attendu (colonne de date)",
+    ]
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["dates_ordonnees", "parametres"] == (
+        "debut (colonne de date), fin (colonne de date), delai_min (nombre, facultatif), "
+        "delai_max (nombre, facultatif), vide_hors_champ (true ou false, facultatif)"
+    )
+    assert catalogue.loc["dates_ordonnees", "issue"] == "anomalie"
+
+
+# --- date plausible (B4) ---------------------------------------------------------
+
+
+def _plausible(**autres):
+    return {"ref": "plausible", "libelle": "Date plausible", "type": "date_plausible",
+            "table": "t", "colonne": "d", **autres}
+
+
+NATURES_PLAUSIBLE = {"t": {"d": "date JJ/MM/AAAA"}}
+
+
+def _donnees_plausibles():
+    return {"t": _table(d=["15/06/2011", "31/05/2026", "01/06/2026", "15/02/2052", "", "x",
+                           "31/12/2009", "01/01/2010"])}
+
+
+def test_date_plausible_limite_relative_a_la_coupure_et_minimum():
+    ecarts, bilan = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE, [_plausible()])
+    # Sans marge ni minimum, la limite est la coupure (31/03/2026 dans ces tests).
+    assert _lignes(ecarts, "num_ligne_source", "constat", "issue", "colonnes", "valeur") == [
+        (3, CONSTAT_DATE_TROP_TARDIVE, "à arbitrer", "d",
+         "31/05/2026, limite 31/03/2026 (coupure plus 0 jour), 61 jours après"),
+        (4, CONSTAT_DATE_TROP_TARDIVE, "à arbitrer", "d",
+         "01/06/2026, limite 31/03/2026 (coupure plus 0 jour), 62 jours après"),
+        (5, CONSTAT_DATE_TROP_TARDIVE, "à arbitrer", "d",
+         "15/02/2052, limite 31/03/2026 (coupure plus 0 jour), 9452 jours après"),
+    ]
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["non_evaluables"], resume["hors_champ"]) == (6, 2, 0)
+    # Bornes incluses (31/05/2026 et 01/01/2010); min lu par YAML comme une date.
+    regle = _plausible(min=dt.date(2010, 1, 1), apres_coupure=61)
+    ecarts, _ = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE, [regle])
+    assert _lignes(ecarts, "num_ligne_source", "constat", "valeur") == [
+        (4, CONSTAT_DATE_TROP_TARDIVE,
+         "01/06/2026, limite 31/05/2026 (coupure plus 61 jours), 1 jour après"),
+        (5, CONSTAT_DATE_TROP_TARDIVE,
+         "15/02/2052, limite 31/05/2026 (coupure plus 61 jours), 9391 jours après"),
+        (8, CONSTAT_DATE_TROP_ANCIENNE, "31/12/2009, minimum 01/01/2010, 1 jour avant"),
+    ]
+    # La limite avance avec la coupure, sans changer la règle.
+    ecarts, _ = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE,
+                                  [_plausible(apres_coupure=61)], date_coupure=dt.date(2026, 4, 30))
+    assert _lignes(ecarts, "num_ligne_source") == [(5,)]
+    # Un minimum écrit en texte AAAA-MM-JJ vaut la date.
+    ecarts, _ = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE,
+                                  [_plausible(min="2010-01-01", apres_coupure=10000)])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [(8, CONSTAT_DATE_TROP_ANCIENNE)]
+    # Heures ignorées : une date native du jour de la limite, en cours de journée, est admise.
+    natives = {"t": _table(d=[pd.Timestamp("2026-03-31 10:00")])}
+    ecarts, _ = _controler_tables(natives, {"t": {"d": "date native"}}, [_plausible()])
+    assert ecarts.empty
+    # Toutes les lignes : un doublon exact porte aussi l'écart.
+    doubles = {"t": _table(d=["15/02/2052"] * 2)}
+    ecarts, _ = _controler_tables(doubles, NATURES_PLAUSIBLE, [_plausible()])
+    assert _lignes(ecarts, "num_ligne_source") == [(2,), (3,)]
+
+
+def test_date_plausible_vide_hors_champ_et_coupure_attendue():
+    _, bilan = _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE,
+                                 [_plausible(vide_hors_champ=True)])
+    resume = _bilan(bilan)
+    assert (resume["controlees"], resume["non_evaluables"], resume["hors_champ"]) == (6, 1, 1)
+    with pytest.raises(ValueError) as erreur:
+        _controler_tables(_donnees_plausibles(), NATURES_PLAUSIBLE, [_plausible()],
+                          date_coupure=None)
+    assert str(erreur.value).split("\n  ")[1:] == [
+        "règle n° 1 (plausible) : la date de coupure des données est attendue (argument "
+        "date_coupure, perimetre.date_coupure dans le notebook)"
+    ]
+
+
+def test_date_plausible_parametres_refuses():
+    regles = [
+        _plausible(apres_coupure=-1),
+        _plausible(apres_coupure=2.5),
+        _plausible(min="2010-13-01"),
+        _plausible(min=5),
+    ]
+    assert problemes_regles_gestion(regles) == [
+        "règle n° 1 (plausible) : apres_coupure : un nombre entier de jours, positif ou nul, "
+        "est attendu",
+        "règle n° 2 (plausible) : apres_coupure : un nombre entier de jours, positif ou nul, "
+        "est attendu",
+        "règle n° 3 (plausible), min : une date AAAA-MM-JJ est attendue",
+        "règle n° 4 (plausible), min : une date AAAA-MM-JJ est attendue",
+    ]
+    catalogue = catalogue_types().set_index("type")
+    assert catalogue.loc["date_plausible", "parametres"] == (
+        "colonne (colonne de date), min (date AAAA-MM-JJ, facultatif), apres_coupure "
+        "(nombre, facultatif), vide_hors_champ (true ou false, facultatif)"
+    )
+    assert catalogue.loc["date_plausible", "issue"] == "à arbitrer"
+
+
+# --- paramètres communs par type (B4b) -------------------------------------------
+
+
+TEXTE_COMMUNS = (
+    "parametres_communs:\n"
+    "  date_plausible:\n"
+    "    min: 2010-01-01\n"
+    "    apres_coupure: 61\n"
+    "    commentaire: Création de l'entreprise et extraction des référentiels\n"
+    "regles:\n"
+    "  - ref: dates\n    libelle: Entrée\n    type: date_plausible\n    table: t\n"
+    "    colonne: d\n"
+    "  - ref: dates\n    libelle: Sortie\n    type: date_plausible\n    table: t\n"
+    "    colonne: d\n    apres_coupure: 0\n"
+    "  - ref: R02\n    libelle: Durée\n    type: plage\n    table: t\n    colonne: n\n"
+    "    min: 0\n"
+)
+
+
+def test_parametres_communs_repris_par_les_regles_du_type(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(TEXTE_COMMUNS, encoding="utf-8")
+    regles = charger_regles_gestion(chemin)
+    # Repris par chaque règle du type, sauf ce qu'elle déclare; le commentaire du type
+    # n'est pas transmis, et une règle d'un autre type n'est pas touchée.
+    assert {k: regles[0][k] for k in ("min", "apres_coupure")} == {
+        "min": dt.date(2010, 1, 1), "apres_coupure": 61,
+    }
+    assert "commentaire" not in regles[0]
+    assert regles[1]["apres_coupure"] == 0 and regles[1]["min"] == dt.date(2010, 1, 1)
+    assert regles[2] == {"ref": "R02", "libelle": "Durée", "type": "plage", "table": "t",
+                         "colonne": "n", "min": 0}
+    # Le contenu lu tel quel n'est pas complété.
+    contenu = lire_fichier_gestion(chemin)
+    assert "min" not in contenu["regles"][0]
+    # Les règles complétées s'appliquent (limite au 31/05/2026, minimum au 01/01/2010).
+    donnees = {"t": _table(d=["31/12/2009", "31/05/2026", "01/06/2026"])}
+    ecarts, _ = _controler_tables(donnees, NATURES_PLAUSIBLE, regles[:1])
+    assert _lignes(ecarts, "num_ligne_source", "constat") == [
+        (2, CONSTAT_DATE_TROP_ANCIENNE), (4, CONSTAT_DATE_TROP_TARDIVE),
+    ]
+
+
+def test_parametres_communs_refuses(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    regle = "regles:\n  - ref: dates\n    libelle: E\n    type: date_plausible\n    table: t\n" \
+            "    colonne: d\n"
+    cas = [
+        ("parametres_communs: [1]\n",
+         ["parametres_communs : un dictionnaire non vide est attendu (type vers paramètres)"]),
+        ("parametres_communs:\n  autre: {min: 1}\n  date_plausible: 3\n",
+         ["parametres_communs, autre : type inconnu du catalogue",
+          "parametres_communs, date_plausible : un dictionnaire non vide est attendu "
+          "(paramètre vers valeur)"]),
+        ("parametres_communs:\n  date_plausible:\n    maxi: 2\n    min: 5\n"
+         "    commentaire: [1]\n",
+         ["parametres_communs, date_plausible, maxi : paramètre inconnu du type (paramètres : "
+          "colonne, min, apres_coupure, vide_hors_champ)",
+          "parametres_communs, date_plausible, min : une date AAAA-MM-JJ est attendue",
+          "parametres_communs, date_plausible, commentaire : un texte est attendu"]),
+        # Les vérifications propres au type portent sur les règles complétées.
+        ("parametres_communs:\n  date_plausible:\n    apres_coupure: -1\n",
+         ["règle n° 1 (dates) : apres_coupure : un nombre entier de jours, positif ou nul, "
+          "est attendu"]),
+    ]
+    for communs, attendus in cas:
+        chemin.write_text(communs + regle, encoding="utf-8")
+        with pytest.raises(ValueError) as erreur:
+            charger_regles_gestion(chemin)
+        assert [ligne.strip() for ligne in str(erreur.value).splitlines()[1:]] == attendus
+
+
+def test_completer_parametres_communs_sans_modifier_les_arguments():
+    regles = [_plausible(), _plausible(min="2000-01-01"), "x", {"type": 3},
+              {"type": "renseignee_selon_valeur"}]
+    copie = deepcopy(regles)
+    communs = {"date_plausible": {"min": "2010-01-01", "apres_coupure": 61,
+                                  "commentaire": "texte"}, "plage": {"min": 0},
+               "renseignee_selon_valeur": {"valeurs": ["A"]}}
+    copie_communs = deepcopy(communs)
+    completes = completer_parametres_communs(regles, communs)
+    assert regles == copie and communs == copie_communs
+    assert completes[0] == {**_plausible(), "min": "2010-01-01", "apres_coupure": 61}
+    assert completes[1] == {**_plausible(min="2000-01-01"), "apres_coupure": 61}
+    assert completes[2:4] == ["x", {"type": 3}]
+    # Chaque règle reçoit sa propre copie d'une valeur modifiable.
+    assert completes[4]["valeurs"] == ["A"]
+    assert completes[4]["valeurs"] is not communs["renseignee_selon_valeur"]["valeurs"]
+    assert completer_parametres_communs(regles, None) is regles

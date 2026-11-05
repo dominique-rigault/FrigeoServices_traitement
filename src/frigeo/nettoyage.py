@@ -21,6 +21,13 @@ Règles, dans l'ordre (voir `catalogue_nettoyage`) :
 - `encodage` : réparation des textes UTF-8 relus dans un encodage d'un octet
   (Windows-1252, ISO-8859-15 ou Latin-1), repérés comme à l'étape 3 par
   `controles.constats_encodage` (voir `reparer_encodage`);
+- `espaces` : les espaces en début et en fin de texte sont retirées, et toute suite
+  d'espaces (insécable, fine, tabulation comprises) devient une espace ordinaire,
+  les sauts de ligne restant en place (voir `normaliser_espaces`);
+- `referentiel` : une clé qu'une règle de gestion rapproche d'un référentiel après
+  normalisation ou mots dans le désordre, écrite autrement que le référentiel, reçoit
+  la forme du référentiel, si elle est unique et déjà celle de presque toutes les
+  lignes de la même clé (voir `SEUIL_REFERENTIEL`);
 - `remplacement` : une valeur invalidée par le métier dans la liste fermée de sa
   colonne et qui porte un remplacement au dictionnaire reçoit ce remplacement;
 - `nature` : une valeur hors de la nature de date, d'heure ou de nombre de sa
@@ -38,17 +45,24 @@ Chaque règle s'applique aux valeurs laissées par les règles précédentes.
 
 `nettoyer` rend les tables nettoyées, le journal des corrections (une ligne par
 cellule modifiée, avec sa valeur avant et après) et un bilan par règle et par
-colonne. `comparer_anomalies` compare, contrôle par contrôle, la table des
-anomalies des tables brutes et celle des tables nettoyées. `ecrire_nettoyage`
-écrit le journal et le bilan en CSV dans data/nettoyage/; c'est la seule fonction
-du module qui écrit sur disque.
+colonne. Une valeur d'une colonne sensible est masquée au journal et remplacée par
+son empreinte (`empreinte_valeur`), hachage à clé secrète qui permet de vérifier une
+correction sans révéler la valeur. `comparer_anomalies` compare, contrôle par
+contrôle, la table des anomalies des tables brutes et celle des tables nettoyées.
+`ecrire_nettoyage` écrit le journal et le bilan en CSV dans data/nettoyage/.
+Seules deux fonctions du module écrivent sur disque : `ecrire_nettoyage`, et
+`charger_cle_empreintes`, qui crée la clé des empreintes à son premier appel.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
+import hmac
 import numbers
 import re
+import secrets
+import warnings
 from collections import Counter, namedtuple
 from decimal import Decimal
 
@@ -61,18 +75,25 @@ from .confidentialite import charger_sensibilite, est_sensible, verifier_sensibi
 from .controles import (
     CARACTERE_REMPLACEMENT,
     COLONNES_LIGNAGE_ECART,
+    ESPACE_ORDINAIRE,
     ENCODAGES_SUSPECTS,
     ISSUE_A_ARBITRER,
     ISSUE_ANOMALIE,
     VALEUR_MASQUEE,
+    _CLASSE_ESPACES,
     _REPERTOIRE,
     _SEQUENCE_UTF8,
     _colonnes_de_donnees,
     _issue_element,
     _octets,
+    _problemes_de_complementaires,
     _problemes_de_correspondance,
     _valeur_constatee,
+    charger_regles_complementaires,
     constats_encodage,
+    constats_espaces,
+    durees_declarees,
+    problemes_regles_complementaires,
 )
 from .dictionnaire import (
     LISTE_FERMEE,
@@ -86,10 +107,20 @@ from .anomalies import (
     _index_lignage,
 )
 from .anomalies import _numero as _numero_entier
-from .gestion import ISSUE_INFORMATION
+from .gestion import (
+    ISSUE_INFORMATION,
+    TYPES_AVEC_REFERENTIEL,
+    _comparable,
+    _textes_des_cles,
+    charger_regles_gestion,
+    formes_de_la_cle,
+    formes_du_referentiel,
+    problemes_regles_gestion,
+)
 from .anomalies import _repere as _repere_anomalie
 from .doublons import (
     COMPARAISON_NORMALISEE,
+    COMPARAISON_TELLE_QUELLE,
     CONSTAT_EXACT,
     SEPARATEUR,
     _texte,
@@ -100,12 +131,20 @@ from .profilage import _interpretations, signature
 from .typage import NATURES_DATE, NATURES_HEURE, NATURES_LISIBLES, ecrire_date
 
 REGLE_ENCODAGE = "encodage"
+REGLE_ESPACES = "espaces"
+REGLE_REFERENTIEL = "referentiel"
 REGLE_REMPLACEMENT = "remplacement"
 REGLE_NATURE = "nature"
 REGLE_DOUBLONS = "doublons"
 REGLE_DECISION = "decision"
 REGLES_NETTOYAGE = (
-    REGLE_ENCODAGE, REGLE_REMPLACEMENT, REGLE_NATURE, REGLE_DOUBLONS, REGLE_DECISION
+    REGLE_ENCODAGE,
+    REGLE_ESPACES,
+    REGLE_REFERENTIEL,
+    REGLE_REMPLACEMENT,
+    REGLE_NATURE,
+    REGLE_DOUBLONS,
+    REGLE_DECISION,
 )
 
 ACTION_MODIFIEE = "valeur modifiée"
@@ -113,6 +152,7 @@ ACTION_RETIREE = "ligne retirée"
 SOURCE_GENERIQUE = "règle générique"
 SOURCE_DICTIONNAIRE = "dictionnaire"
 SOURCE_DECISION = "décision du métier"
+SOURCE_GESTION = "règle de gestion"
 
 RAISON_REMPLACEMENT = "caractère de remplacement"
 RAISON_DESACCORD = "encodages en désaccord"
@@ -130,6 +170,7 @@ RAISON_DATE_FUTURE = "année sur deux chiffres, date future"
 RAISON_SANS_COUPURE = "année sur deux chiffres, date de coupure non fournie"
 RAISON_HEURE = "date avec une heure"
 RAISON_UNITE = "valeur avec une unité"
+RAISON_DUREE_INEXACTE = "durée non exacte dans l'unité"
 RAISON_SEPARATEUR = "séparateur ambigu"
 RAISON_DECIMALES = "partie décimale non nulle"
 RAISON_AUTRE_FAMILLE = "autre famille de nature"
@@ -140,6 +181,7 @@ RAISONS_NATURE = (
     RAISON_SANS_COUPURE,
     RAISON_HEURE,
     RAISON_UNITE,
+    RAISON_DUREE_INEXACTE,
     RAISON_SEPARATEUR,
     RAISON_DECIMALES,
     RAISON_AUTRE_FAMILLE,
@@ -154,6 +196,15 @@ RAISON_INTROUVABLE = "ligne source introuvable"
 RAISON_ILLISIBLE = "valeur retenue illisible dans la nature en vigueur"
 RAISONS_DECISION = (RAISON_SOURCE_MODIFIEE, RAISON_INTROUVABLE, RAISON_ILLISIBLE)
 
+RAISON_FORME_NON_UNIQUE = "forme du référentiel non unique"
+RAISON_FORME_MINORITAIRE = "forme du référentiel minoritaire dans la table"
+RAISONS_REFERENTIEL = (RAISON_FORME_NON_UNIQUE, RAISON_FORME_MINORITAIRE, RAISON_NON_TEXTUELLE)
+# Part des lignes d'une clé déjà écrites dans la forme du référentiel au-delà de
+# laquelle une variante est corrigée sans arbitrage, comptée au seuil robuste
+# (favorables / (lignes + 1)) : une variante isolée demande ainsi 38 lignes au moins
+# déjà écrites dans la forme. En deçà, le référentiel est peut-être à corriger.
+SEUIL_REFERENTIEL = 0.95
+
 COLONNE_PERIODE = "periode_export"
 COLONNES_JOURNAL = (
     "regle_nettoyage",
@@ -166,6 +217,8 @@ COLONNES_JOURNAL = (
     "source",
     "valeur_avant",
     "valeur_apres",
+    "empreinte_avant",
+    "empreinte_apres",
     "detail",
 )
 COLONNES_BILAN_NETTOYAGE = (
@@ -176,6 +229,15 @@ COLONNES_BILAN_NETTOYAGE = (
     "corrigees",
     "non_corrigees",
     "raisons",
+)
+COLONNES_DECISIONS_CADUQUES = (
+    "id_anomalie",
+    "sorte",
+    "table",
+    "champ",
+    "decision",
+    "decide_le",
+    "classeur",
 )
 COLONNES_CATALOGUE_NETTOYAGE = ("rang", "regle_nettoyage", "source", "corrige", "ne_corrige_jamais")
 
@@ -188,6 +250,25 @@ _CATALOGUE = {
         "une cellule qui contient le caractère de remplacement (information perdue); "
         "une portion de texte que deux encodages réparent en deux caractères "
         f"différents; une séquence encore présente après {MAX_PASSES} passes",
+    ),
+    REGLE_ESPACES: (
+        SOURCE_GENERIQUE,
+        "toute cellule de texte signalée par la règle espaces de l'étape 3 : les espaces "
+        "en début et en fin sont retirées, et toute suite d'espaces (insécable, fine, "
+        "tabulation comprises) devient une seule espace ordinaire",
+        "un saut de ligne, laissé en place; une cellule faite seulement d'espaces "
+        "(cellule vide)",
+    ),
+    REGLE_REFERENTIEL: (
+        SOURCE_GESTION,
+        "toute clé d'une colonne qu'une règle de gestion de config/gestion.yaml rapproche "
+        "d'un référentiel après normalisation ou mots dans le désordre, trouvée mais "
+        "écrite autrement que le référentiel : elle reçoit la forme du référentiel (mots "
+        "dans l'ordre de la cellule), quand cette forme est unique et que 95 % au moins "
+        "des lignes de la même clé l'emploient déjà (seuil robuste)",
+        "une clé de plusieurs colonnes; une forme du référentiel non unique; une forme "
+        "employée par moins de 95 % des lignes de la même clé (le référentiel est peut-"
+        "être à corriger); une cellule qui n'est pas un texte",
     ),
     REGLE_REMPLACEMENT: (
         SOURCE_DICTIONNAIRE,
@@ -204,10 +285,13 @@ _CATALOGUE = {
         "nature : dates JJ/MM/AAAA, JJ.MM.AAAA, JJ-MM-AAAA, AAAA-MM-JJ, AAAAMMJJ, date "
         "native, et JJ/MM/AA (ou point, tiret) en 20AA si la date ne dépasse pas la "
         "date de coupure; nombres entiers, décimaux à virgule ou à point, espace "
-        "séparateur de milliers, symbole € en fin de valeur",
+        "séparateur de milliers, symbole € en fin de valeur; dans une colonne déclarée "
+        "durée (règle duree de config/controles.yaml), durées écrites avec leurs unités "
+        "(95 min, 2 h, 1h10), converties dans l'unité de la colonne",
         "une date impossible; une année sur deux chiffres qui donnerait une date "
         "postérieure à la date de coupure; une date avec une heure écrite dans une "
-        "colonne de dates en texte; une valeur avec une unité (1h30, 45 min); un point "
+        "colonne de dates en texte; une valeur avec une unité (1h30, 45 min) hors d'une "
+        "colonne déclarée durée, ou une durée non exacte dans son unité; un point "
         "suivi de trois chiffres (séparateur ambigu); une partie décimale non nulle "
         "vers un entier; une valeur d'une autre famille (nombre dans une colonne de "
         "dates); une heure hors de la forme HH:MM",
@@ -234,8 +318,9 @@ _CATALOGUE = {
     ),
 }
 
-Nettoyage = namedtuple("Nettoyage", ["tables", "journal", "bilan"])
-Nettoyage.__doc__ = """Résultat de `nettoyer` : tables nettoyées, journal et bilan."""
+Nettoyage = namedtuple("Nettoyage", ["tables", "journal", "bilan", "caduques"])
+Nettoyage.__doc__ = """Résultat de `nettoyer` : tables nettoyées, journal, bilan et décisions
+caduques."""
 
 Reparation = namedtuple("Reparation", ["texte", "raison", "passes", "encodages"])
 Reparation.__doc__ = """Résultat de `reparer_encodage`.
@@ -245,6 +330,103 @@ la réparation est refusée; `raison` dit pourquoi elle l'est (None sinon);
 `passes` est le nombre de passes qui ont modifié le texte; `encodages` les encodages
 qui ont repéré au moins une séquence, dans l'ordre de `ENCODAGES_SUSPECTS`.
 """
+
+
+# --------------------------------------------------------------------------------
+# Empreintes des valeurs masquées au journal
+
+LONGUEUR_EMPREINTE_JOURNAL = 16
+NOM_FICHIER_CLE_EMPREINTES = "cle_empreintes.txt"
+_MOTIF_CLE_EMPREINTES = re.compile(r"[0-9a-f]{64}")
+_MOTIF_EMPREINTE_JOURNAL = re.compile(r"[0-9a-f]{16}")
+ENTETE_CLE_EMPREINTES = (
+    "# Clé secrète des empreintes du journal du nettoyage (frigeo.nettoyage).\n"
+    "# À garder avec les données du client, hors du dépôt. Ne la transmettre qu'à une\n"
+    "# personne qui a déjà accès aux données (un évaluateur par exemple) : elle permet\n"
+    "# de vérifier les valeurs masquées. La remplacer rend les empreintes des journaux\n"
+    "# suivants incomparables aux anciennes.\n"
+)
+
+CleEmpreintes = namedtuple("CleEmpreintes", ["cle", "chemin", "creee"])
+CleEmpreintes.__doc__ = """Résultat de `charger_cle_empreintes`.
+
+`cle` est la clé (64 chiffres hexadécimaux), `chemin` le fichier qui la porte,
+`creee` vaut vrai si le fichier vient d'être créé par cet appel.
+"""
+
+
+def chemin_cle_empreintes() -> Path:
+    """Emplacement par défaut de la clé des empreintes : data/config/cle_empreintes.txt,
+    hors du dépôt, à côté du dictionnaire et des décisions du métier."""
+    return racine_projet() / "data" / "config" / NOM_FICHIER_CLE_EMPREINTES
+
+
+def probleme_cle_empreintes(cle) -> str | None:
+    """Problème d'une clé des empreintes, None si elle est valable."""
+    if not isinstance(cle, str) or not _MOTIF_CLE_EMPREINTES.fullmatch(cle):
+        return "clé des empreintes : 64 chiffres hexadécimaux (0 à 9, a à f) attendus"
+    return None
+
+
+def charger_cle_empreintes(chemin: str | Path | None = None) -> CleEmpreintes:
+    """Lit la clé des empreintes, et la crée si le fichier n'existe pas.
+
+    `chemin` vaut `chemin_cle_empreintes()` par défaut. Le fichier porte la clé sur une
+    seule ligne, après des lignes de commentaire (« # »). À la création, la clé est
+    tirée au hasard (`secrets`), écrite avec un commentaire qui dit son usage, et
+    `creee` vaut vrai : c'est le seul cas où la fonction écrit sur disque, et un fichier
+    existant n'est jamais remplacé. Un fichier mal formé lève `ValueError` sans être
+    modifié.
+    """
+    chemin = chemin_cle_empreintes() if chemin is None else Path(chemin)
+    creee = False
+    if not chemin.exists():
+        chemin.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            with open(chemin, "x", encoding="utf-8") as fichier:
+                fichier.write(ENTETE_CLE_EMPREINTES + secrets.token_hex(32) + "\n")
+            creee = True
+        except FileExistsError:
+            pass
+    lignes = [ligne.strip() for ligne in chemin.read_text(encoding="utf-8-sig").splitlines()]
+    cles = [ligne.lower() for ligne in lignes if ligne and not ligne.startswith("#")]
+    cle = cles[0] if len(cles) == 1 else None
+    if probleme_cle_empreintes(cle) is not None:
+        raise ValueError(
+            f"Fichier de la clé des empreintes invalide ({chemin}) : une seule ligne de 64 "
+            "chiffres hexadécimaux attendue, hors commentaires. Le restaurer depuis une "
+            "sauvegarde; le supprimer fait créer une clé nouvelle au prochain nettoyage, "
+            "dont les empreintes ne se comparent pas aux anciennes."
+        )
+    return CleEmpreintes(cle, chemin, creee)
+
+
+def _empreinte_journal(valeur, octets_cle: bytes) -> str:
+    # Import local : decisions.py importe ce module.
+    from .decisions import _forme
+
+    code = hmac.new(octets_cle, _forme(valeur).encode("utf-8"), hashlib.sha256)
+    return code.hexdigest()[:LONGUEUR_EMPREINTE_JOURNAL]
+
+
+def empreinte_valeur(valeur, cle: str) -> str:
+    """Empreinte d'une valeur, telle qu'au journal du nettoyage pour une valeur masquée.
+
+    HMAC-SHA256, de clé `cle` (64 chiffres hexadécimaux, lus comme 32 octets), du
+    texte UTF-8 de la valeur sous la forme qu'emploient les décisions du métier
+    (`decisions._forme`) : « vide » pour une cellule sans valeur, « texte: » suivi du
+    texte, « nombre: » suivi du nombre écrit en flottant par `repr` (2500 donne
+    « nombre:2500.0 »), « date: » suivi de la date au format ISO
+    (« date:2025-03-12T00:00:00 »), « booléen: » suivi de True ou False. L'empreinte
+    est faite des 16 premiers chiffres hexadécimaux. Un texte et un nombre de même
+    écriture n'ont donc pas la même empreinte. Sans la clé, l'empreinte ne permet pas
+    de retrouver une valeur, même peu variée; avec elle, on vérifie qu'une valeur
+    connue est celle du journal.
+    """
+    probleme = probleme_cle_empreintes(cle)
+    if probleme is not None:
+        raise ValueError(probleme)
+    return _empreinte_journal(valeur, bytes.fromhex(cle))
 
 
 def catalogue_nettoyage() -> pd.DataFrame:
@@ -381,6 +563,119 @@ def _encodage(serie: pd.Series, regles: dict, contexte: dict):
     return list(visees.index), acceptees, raisons
 
 
+_MOTIF_SUITE_ESPACES = re.compile(f"[{_CLASSE_ESPACES}]+")
+
+
+def normaliser_espaces(texte: str) -> str:
+    """Texte sans espace en début ni en fin, chaque suite d'espaces horizontales
+    (`controles.ESPACES_HORIZONTALES`) remplacée par une espace ordinaire. Les sauts
+    de ligne restent en place. Le texte rendu n'a plus aucun constat de la règle
+    `espaces` (`controles.constats_espaces`)."""
+    return _MOTIF_SUITE_ESPACES.sub(ESPACE_ORDINAIRE, texte).strip(ESPACE_ORDINAIRE)
+
+
+def _espaces(serie: pd.Series, regles: dict, contexte: dict):
+    """Règle `espaces` sur une colonne indexée par la position des lignes.
+
+    Rendu comme `_encodage`. Les cellules visées sont les cellules de texte que la
+    règle `espaces` de l'étape 3 signale; toutes sont corrigées par
+    `normaliser_espaces`, le détail donnant les constats corrigés. `regles` et
+    `contexte` ne servent pas à cette règle.
+    """
+    presentes = _valeurs_renseignees(serie)
+    textes = presentes[[isinstance(v, str) for v in presentes]]
+    verdicts = {v: constats_espaces(v) for v in textes.unique()}
+    suspects = {v for v, constats in verdicts.items() if constats}
+    if not suspects:
+        return None
+    visees = textes[textes.isin(suspects)]
+    acceptees = {
+        position: (normaliser_espaces(valeur), "; ".join(verdicts[valeur]))
+        for position, valeur in visees.items()
+    }
+    return list(visees.index), acceptees, Counter()
+
+
+def _regles_referentiel(regles_gestion: list) -> list[dict]:
+    """Règles de gestion que corrige la règle `referentiel`, dans l'ordre du fichier."""
+    return [
+        regle
+        for regle in regles_gestion
+        if regle.get("type") in TYPES_AVEC_REFERENTIEL
+        and regle.get("comparaison", COMPARAISON_TELLE_QUELLE)
+        != COMPARAISON_TELLE_QUELLE
+        and len(regle.get("cle", [])) == 1
+    ]
+
+
+def _problemes_referentiel(regles: list[dict], tables: dict) -> list[str]:
+    """Tables et colonnes de ces règles absentes des données chargées."""
+    problemes = []
+    for regle in regles:
+        table, reference = regle.get("table"), regle.get("table_reference")
+        attendues = [(table, regle["cle"]),
+                     (reference, regle.get("cle_reference", regle["cle"]))]
+        for nom, colonnes in attendues:
+            if nom not in tables:
+                problemes.append(f"{regle['ref']} : table {nom} absente des données")
+                continue
+            for colonne in colonnes:
+                if colonne not in _colonnes_de_donnees(tables[nom]):
+                    problemes.append(f"{regle['ref']} : colonne {nom}.{colonne} absente")
+    return problemes
+
+
+def _referentiel(nettoyees: dict, regle: dict):
+    """Règle `referentiel` pour une règle de gestion, sur sa table telle que les règles
+    précédentes l'ont laissée.
+
+    Rendu comme `_encodage` (positions des lignes dans la table). Les cellules visées
+    sont celles dont la clé est trouvée dans le référentiel selon la comparaison de la
+    règle, mais égale à aucune de ses formes (`gestion.formes_de_la_cle`), comme pour
+    le constat « trouvée après normalisation seulement ». Une cellule est corrigée si la
+    forme est unique et si les lignes de la même clé comparée déjà écrites dans une
+    forme du référentiel atteignent `SEUIL_REFERENTIEL` au seuil robuste.
+    """
+    comparaison = regle["comparaison"]
+    colonne = regle["cle"][0]
+    donnees = nettoyees[regle["table"]].reset_index(drop=True)
+    reference = nettoyees[regle["table_reference"]].reset_index(drop=True)
+    formes = formes_du_referentiel(
+        reference, regle.get("cle_reference", regle["cle"]), comparaison
+    )
+    textes = _textes_des_cles(donnees, [colonne])
+    par_cle: dict[str, list[int]] = {}
+    variantes = []
+    for position, texte in textes.items():
+        candidates = formes_de_la_cle(texte, formes, comparaison)
+        if candidates is None:
+            continue
+        compte = par_cle.setdefault(_comparable(texte, comparaison), [0, 0])
+        compte[0] += 1
+        if texte in candidates:
+            compte[1] += 1
+        else:
+            variantes.append((position, texte, candidates))
+    if not variantes:
+        return None
+    acceptees, raisons = {}, Counter()
+    for position, texte, candidates in variantes:
+        lignes, favorables = par_cle[_comparable(texte, comparaison)]
+        if len(candidates) != 1 or None in candidates:
+            raisons[RAISON_FORME_NON_UNIQUE] += 1
+        elif favorables / (lignes + 1) < SEUIL_REFERENTIEL:
+            raisons[RAISON_FORME_MINORITAIRE] += 1
+        elif not isinstance(donnees.at[position, colonne], str):
+            raisons[RAISON_NON_TEXTUELLE] += 1
+        else:
+            acceptees[position] = (
+                next(iter(candidates)),
+                f"forme de {regle['table_reference']} ({regle['ref']}), {favorables} lignes "
+                f"sur {lignes} déjà écrites ainsi",
+            )
+    return [position for position, _, _ in variantes], acceptees, raisons
+
+
 def _remplacement(serie: pd.Series, regles: dict, contexte: dict):
     """Règle `remplacement` sur une colonne indexée par la position des lignes.
 
@@ -437,6 +732,15 @@ _ENTIER = re.compile(r"(-?)(\d+)")
 _VIRGULE = re.compile(r"(-?)(\d+),(\d+)")
 _POINT = re.compile(r"(-?)(\d+)\.(\d+)")
 _MILLIERS = re.compile(f"(-?)(\\d{{1,3}}(?:{_ESPACES}\\d{{3}})+)(?:,(\\d+))?")
+# Durées avec leurs unités, pour une colonne déclarée durée (règle duree de
+# config/controles.yaml) : minutes seules, heures seules, heures et minutes.
+_NOMBRE_DUREE = r"(\d+(?:[.,]\d+)?)"
+_UNITE_MINUTES = r"(?:min|mn|minutes?)"
+_DUREE_MINUTES = re.compile(f"{_NOMBRE_DUREE}{_ESPACES}?{_UNITE_MINUTES}", re.IGNORECASE)
+_DUREE_HEURES = re.compile(f"{_NOMBRE_DUREE}{_ESPACES}?(?:h|heures?)", re.IGNORECASE)
+_DUREE_HEURES_MINUTES = re.compile(
+    f"(\\d+){_ESPACES}?h{_ESPACES}?(\\d{{1,2}})(?:{_ESPACES}?{_UNITE_MINUTES})?", re.IGNORECASE
+)
 
 
 class _Refus(str):
@@ -503,6 +807,36 @@ def _lire_nombre(texte: str):
     return None
 
 
+def _lire_duree(texte: str, unite: str):
+    """(signe, chiffres entiers, chiffres décimaux) d'une durée écrite avec ses unités,
+    convertie dans `unite` (minutes ou heures); raison du refus si la conversion
+    n'est pas exacte, None si la forme n'est pas une durée.
+
+    Formes lues, la valeur entière devant correspondre : « 95 min » (mn, minutes),
+    « 2 h » (heures, décimale à virgule ou à point admise), « 1h10 » (avec ou sans
+    espaces, min en fin facultatif, minutes de 0 à 59). « 1:10 » n'en est pas une.
+    """
+    texte = texte.strip()
+    trouve = _DUREE_HEURES_MINUTES.fullmatch(texte)
+    if trouve:
+        heures, minutes = int(trouve.group(1)), int(trouve.group(2))
+        if minutes > 59:
+            return None
+        total = Decimal(heures * 60 + minutes)
+    elif _DUREE_MINUTES.fullmatch(texte):
+        total = Decimal(_DUREE_MINUTES.fullmatch(texte).group(1).replace(",", "."))
+    elif _DUREE_HEURES.fullmatch(texte):
+        total = Decimal(_DUREE_HEURES.fullmatch(texte).group(1).replace(",", ".")) * 60
+    else:
+        return None
+    resultat = total if unite == "minutes" else total / 60
+    if resultat * (1 if unite == "minutes" else 60) != total or resultat.as_tuple().exponent < -6:
+        return RAISON_DUREE_INEXACTE
+    texte_resultat = format(resultat.normalize(), "f")
+    entiers, _, decimales = texte_resultat.partition(".")
+    return "", entiers, decimales
+
+
 def _a_une_unite(texte: str) -> bool:
     return any(c.isdigit() for c in texte) and any(c.isalpha() for c in texte)
 
@@ -524,8 +858,16 @@ def _ecrire_nombre(signe: str, entiers: str, decimales: str, nature: str):
     return f"{signe}{entiers}{separateur}{decimales or '0'}"
 
 
-def _convertir(valeur, nature: str, date_coupure):
-    """(valeur convertie, forme lue, siècle ajouté) ou raison du refus."""
+_MENTION_SIECLE = "siècle 20 ajouté"
+
+
+def _convertir(valeur, nature: str, date_coupure, duree: str | None = None):
+    """(valeur convertie, mention pour le journal) ou raison du refus.
+
+    La mention est vide, « siècle 20 ajouté » ou « durée en minutes » (ou en heures),
+    une durée écrite avec ses unités n'étant lue que si `duree` donne l'unité de la
+    colonne (règle duree de config/controles.yaml).
+    """
     famille = _famille(nature)
     if isinstance(valeur, str):
         date = _lire_date(valeur, date_coupure)
@@ -538,11 +880,12 @@ def _convertir(valeur, nature: str, date_coupure):
             return date
         if date is not None:
             instant, siecle = date
+            mention = _MENTION_SIECLE if siecle else ""
             if nature == "date native":
-                return instant, siecle
+                return instant, mention
             if instant != instant.replace(hour=0, minute=0, second=0, microsecond=0):
                 return RAISON_HEURE
-            return ecrire_date(instant, nature), siecle
+            return ecrire_date(instant, nature), mention
         if nombre is not None or (isinstance(valeur, str) and _HEURE.fullmatch(valeur)):
             return RAISON_AUTRE_FAMILLE
         return RAISON_NON_RECONNUE
@@ -551,9 +894,16 @@ def _convertir(valeur, nature: str, date_coupure):
             return nombre
         if nombre is not None:
             ecrit = _ecrire_nombre(*nombre, nature)
-            return str(ecrit) if isinstance(ecrit, _Refus) else (ecrit, False)
+            return str(ecrit) if isinstance(ecrit, _Refus) else (ecrit, "")
         if date is not None:
             return RAISON_AUTRE_FAMILLE
+        if duree is not None and isinstance(valeur, str):
+            lue = _lire_duree(valeur, duree)
+            if isinstance(lue, str):
+                return lue
+            if lue is not None:
+                ecrit = _ecrire_nombre(*lue, nature)
+                return str(ecrit) if isinstance(ecrit, _Refus) else (ecrit, f"durée en {duree}")
         if isinstance(valeur, str) and _a_une_unite(valeur):
             return RAISON_UNITE
         return RAISON_NON_RECONNUE
@@ -591,18 +941,19 @@ def _nature(serie: pd.Series, regles: dict, contexte: dict):
         return None
     acceptees, raisons = {}, Counter()
     for position, valeur in visees.items():
-        resultat = _convertir(valeur, nature, contexte["date_coupure"])
+        resultat = _convertir(valeur, nature, contexte["date_coupure"], contexte.get("duree"))
         if isinstance(resultat, str):
             raisons[resultat] += 1
             continue
-        convertie, siecle = resultat
+        convertie, mention = resultat
         forme = "forme masquée" if contexte["masquee"] else f"forme lue {signature(valeur)}"
-        acceptees[position] = (convertie, forme + (", siècle 20 ajouté" if siecle else ""))
+        acceptees[position] = (convertie, forme + (f", {mention}" if mention else ""))
     return list(visees.index), acceptees, raisons
 
 
 _REGLES = {
     REGLE_ENCODAGE: (_encodage, SOURCE_GENERIQUE, RAISONS_ENCODAGE),
+    REGLE_ESPACES: (_espaces, SOURCE_GENERIQUE, ()),
     REGLE_REMPLACEMENT: (_remplacement, SOURCE_DICTIONNAIRE, RAISONS_REMPLACEMENT),
     REGLE_NATURE: (_nature, SOURCE_GENERIQUE, RAISONS_NATURE),
 }
@@ -671,10 +1022,11 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
     """Règle `decision` : applique aux tables nettoyées (modifiées sur place) les
     décisions « corriger » puis « retirer » du métier.
 
-    Rend (corrections, retraits, lignes du bilan) : une correction est (table,
-    étiquette de la ligne, colonne, valeur avant, valeur après, détail), un retrait
-    (table, étiquette, détail). Les décisions sont prises de la plus ancienne à la
-    plus récente. Une décision ne s'applique que si sa ligne est retrouvée par son
+    Rend (corrections, retraits, lignes du bilan, caduques) : une correction est
+    (table, étiquette de la ligne, colonne, valeur avant, valeur après, détail), un
+    retrait (table, étiquette, détail), une décision caduque (identifiant, décision),
+    écartée parce que sa donnée a changé depuis la décision. Les décisions sont
+    prises de la plus ancienne à la plus récente. Une décision ne s'applique que si sa ligne est retrouvée par son
     lignage et si l'empreinte calculée comme à l'export (`decisions.elements_a_arbitrer`)
     est la sienne : valeur de la cellule pour une correction, ligne entière hors
     lignage, après les corrections, pour un retrait. Une valeur retenue est écrite
@@ -709,7 +1061,7 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
             )
         )
 
-    corrections = []
+    corrections, caduques = [], []
     for identifiant, decision in ordonnees:
         if decision["decision"] != DECISION_CORRIGER:
             continue
@@ -725,6 +1077,7 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
         avant = donnees.iat[position, rang]
         if _empreinte([_forme(avant)]) != decision["empreinte"]:
             compte[2][RAISON_SOURCE_MODIFIEE] += 1
+            caduques.append((identifiant, decision))
             continue
         valeur = decision["valeur_retenue"]
         nature = dictionnaire[table][colonne]["nature"]["regle"]
@@ -760,6 +1113,7 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
         )
         if empreinte != decision["empreinte"]:
             compte[2][RAISON_SOURCE_MODIFIEE] += 1
+            caduques.append((identifiant, decision))
             continue
         compte[1] += 1
         etiquette = donnees.index[position]
@@ -794,7 +1148,7 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
                 "raisons": _texte_raisons(raisons, RAISONS_DECISION),
             }
         )
-    return corrections, retraits, lignes
+    return corrections, retraits, lignes, caduques
 
 
 def _texte_raisons(raisons: Counter, ordre) -> str | None:
@@ -809,6 +1163,9 @@ def nettoyer(
     declarations: dict | None = None,
     date_coupure=None,
     decisions: dict | None = None,
+    cle_empreinte: str | None = None,
+    regles_gestion: list | None = None,
+    complementaires: dict | None = None,
 ) -> Nettoyage:
     """Applique les règles de nettoyage et rend les tables nettoyées, le journal des
     corrections et le bilan.
@@ -824,7 +1181,13 @@ def nettoyer(
     pas; sans elle, ces dates ne sont pas converties, et le bilan le dit.
     `decisions` (contenu rendu par `decisions.charger_decisions`, fichier
     data/config/decisions.yaml par défaut, aucune décision s'il est absent) sert à
-    la règle `decision`.
+    la règle `decision`. `cle_empreinte` (64 chiffres hexadécimaux) est la clé des
+    empreintes des valeurs masquées; par défaut, celle de `charger_cle_empreintes`,
+    qui la crée au premier nettoyage (un avertissement donne alors son emplacement).
+    `regles_gestion` (règles de config/gestion.yaml par défaut) sert à la règle
+    `referentiel`. `complementaires` (règles complémentaires de config/controles.yaml
+    par défaut) donne l'unité des colonnes déclarées durée (règle duree), dans
+    laquelle la règle `nature` convertit une durée écrite avec ses unités.
 
     Tables nettoyées : copies des tables reçues, mêmes colonnes, mêmes types de
     colonnes, lignage compris; seules les cellules corrigées changent, et les lignes
@@ -838,9 +1201,12 @@ def nettoyer(
     déclarée de la ligne, lue dans la table reçue (vide sans clé déclarée, « masqué »
     si une colonne de la clé est sensible); `valeur_avant` et `valeur_apres` valent
     « masqué » pour une colonne sensible, la valeur brute restant retrouvable par le
-    lignage; `valeur_avant` est la valeur laissée par les règles précédentes;
+    lignage; `empreinte_avant` et `empreinte_apres` portent alors l'empreinte de
+    chacune des deux valeurs (`empreinte_valeur`), et restent vides sur toute autre
+    ligne; `valeur_avant` est la valeur laissée par les règles précédentes;
     `detail` précise la correction (pour l'encodage, les encodages qui ont repéré
-    une séquence et le nombre de passes; pour un remplacement, la date de la revue
+    une séquence et le nombre de passes; pour les espaces, les constats corrigés;
+    pour un remplacement, la date de la revue
     qui a invalidé la valeur; pour la nature, la forme lue, « forme masquée » pour
     une colonne sensible, et l'ajout du siècle; pour une ligne retirée comme
     doublon, la ligne gardée du même groupe; pour une décision, sa date, son
@@ -852,6 +1218,14 @@ def nettoyer(
     retraits décidés par le métier), avec les
     cellules (ou lignes) visées, corrigées, non corrigées, et le décompte des raisons
     de non-correction (textes séparés par « ; »).
+
+    Décisions caduques (`COLONNES_DECISIONS_CADUQUES`) : une ligne par décision
+    « corriger » ou « retirer » écartée parce que sa donnée a changé depuis la
+    décision (raison « source modifiée depuis la décision » du bilan), dans l'ordre
+    où la règle `decision` les examine; elles ne peuvent plus s'appliquer, et
+    `decisions.retirer_decisions` les retire du fichier des décisions. Aucune valeur
+    n'y figure. Une décision « garder », une ligne source introuvable ou une valeur
+    retenue illisible n'y sont pas.
     """
     if sensibles is None:
         sensibles = charger_sensibilite()
@@ -871,6 +1245,25 @@ def nettoyer(
         )
     if declarations is None:
         declarations = charger_declarations_doublons()
+    if regles_gestion is None:
+        regles_gestion = charger_regles_gestion()
+    problemes = problemes_regles_gestion(regles_gestion)
+    if problemes:
+        raise ValueError("Règles de gestion invalides\n  " + "\n  ".join(problemes))
+    if complementaires is None:
+        complementaires = charger_regles_complementaires()
+    problemes = problemes_regles_complementaires(complementaires)
+    if not problemes:
+        problemes = _problemes_de_complementaires(tables, complementaires)
+    if problemes:
+        raise ValueError("Règles complémentaires invalides\n  " + "\n  ".join(problemes))
+    durees = durees_declarees(complementaires)
+    regles_referentiel = _regles_referentiel(regles_gestion)
+    problemes = _problemes_referentiel(regles_referentiel, tables)
+    if problemes:
+        raise ValueError(
+            "Règles de gestion inconnues des données chargées\n  " + "\n  ".join(problemes)
+        )
     # Import local : decisions.py importe ce module.
     from .decisions import charger_decisions, problemes_decisions
 
@@ -879,6 +1272,30 @@ def nettoyer(
     problemes = problemes_decisions(decisions)
     if problemes:
         raise ValueError("Décisions invalides\n  " + "\n  ".join(problemes))
+    if cle_empreinte is None:
+        lue = charger_cle_empreintes()
+        cle_empreinte = lue.cle
+        if lue.creee:
+            warnings.warn(
+                f"Clé des empreintes créée dans {lue.chemin} : la garder avec les données "
+                "du client, hors du dépôt.",
+                stacklevel=2,
+            )
+    probleme = probleme_cle_empreintes(cle_empreinte)
+    if probleme is not None:
+        raise ValueError(probleme)
+    octets_cle = bytes.fromhex(cle_empreinte)
+
+    def empreintes(masquee: bool, avant, apres) -> dict:
+        """Empreintes d'une valeur modifiée, vides si la valeur n'est pas masquée."""
+        if not masquee:
+            return {"empreinte_avant": None, "empreinte_apres": None}
+        return {
+            "empreinte_avant": _empreinte_journal(avant, octets_cle),
+            "empreinte_apres": _empreinte_journal(apres, octets_cle),
+        }
+
+    sans_empreinte = {"empreinte_avant": None, "empreinte_apres": None}
 
     nettoyees = {table: donnees.copy() for table, donnees in tables.items()}
     brutes = {table: donnees.reset_index(drop=True) for table, donnees in tables.items()}
@@ -886,7 +1303,7 @@ def nettoyer(
     for table, donnees in brutes.items():
         cle = [c for c in declarations.get(table, {}).get("cle", []) if c in donnees.columns]
         cles[table] = (cle, any(est_sensible(sensibles, table, c) for c in cle))
-    journal, bilan = [], []
+    journal, bilan, caduques = [], [], []
 
     def ligne_du_journal(rang_regle, rang_table, table, position, **champs) -> dict:
         """Ligne du journal pour la ligne source de la table reçue à cette position."""
@@ -914,7 +1331,7 @@ def nettoyer(
 
     for rang_regle, regle_nettoyage in enumerate(REGLES_NETTOYAGE):
         if regle_nettoyage == REGLE_DECISION:
-            corrections, retraits, lignes_bilan = _regle_decision(
+            corrections, retraits, lignes_bilan, caduques = _regle_decision(
                 nettoyees, decisions["decisions"], dictionnaire, list(tables)
             )
             bilan.extend(lignes_bilan)
@@ -930,6 +1347,8 @@ def nettoyer(
                     or est_masquee(regles["valeurs"])
                     or est_masquee(regles["format"])
                 )
+                # Empreintes des valeurs telles que dans les tables (type compris).
+                hachees = empreintes(masquee, avant, apres)
                 avant = _valeur_constatee(avant)
                 journal.append(
                     ligne_du_journal(
@@ -942,6 +1361,7 @@ def nettoyer(
                         source=SOURCE_DECISION,
                         valeur_avant=VALEUR_MASQUEE if masquee else avant,
                         valeur_apres=VALEUR_MASQUEE if masquee else apres,
+                        **hachees,
                         detail=detail,
                         _colonne=list(_colonnes_de_donnees(brutes[table])).index(colonne),
                     )
@@ -958,6 +1378,7 @@ def nettoyer(
                         source=SOURCE_DECISION,
                         valeur_avant=None,
                         valeur_apres=None,
+                        **sans_empreinte,
                         detail=detail,
                         _colonne=len(brutes[table].columns),
                     )
@@ -994,12 +1415,70 @@ def nettoyer(
                             source=SOURCE_GENERIQUE,
                             valeur_avant=None,
                             valeur_apres=None,
+                            **sans_empreinte,
                             detail=detail,
                             _colonne=-1,
                         )
                     )
                 donnees = nettoyees[table]
                 nettoyees[table] = donnees.drop(index=donnees.index[sorted(retirees)])
+            continue
+
+        if regle_nettoyage == REGLE_REFERENTIEL:
+            # Avant les doublons et les décisions : aucune ligne n'est encore retirée,
+            # la position dans la table nettoyée est celle de la table reçue.
+            for regle in regles_referentiel:
+                table, colonne = regle["table"], regle["cle"][0]
+                resultat = _referentiel(nettoyees, regle)
+                if resultat is None:
+                    continue
+                visees, acceptees, raisons = resultat
+                bilan.append(
+                    {
+                        "regle_nettoyage": regle_nettoyage,
+                        "table": table,
+                        "colonne": colonne,
+                        "visees": len(visees),
+                        "corrigees": len(acceptees),
+                        "non_corrigees": len(visees) - len(acceptees),
+                        "raisons": _texte_raisons(raisons, RAISONS_REFERENTIEL),
+                    }
+                )
+                if not acceptees:
+                    continue
+                regles = dictionnaire[table][colonne]
+                masquee = (
+                    est_sensible(sensibles, table, colonne)
+                    or est_masquee(regles["valeurs"])
+                    or est_masquee(regles["format"])
+                )
+                courante = nettoyees[table][colonne].reset_index(drop=True)
+                nouvelle = nettoyees[table][colonne].copy()
+                for position, (valeur_apres, _) in acceptees.items():
+                    nouvelle.iloc[position] = valeur_apres
+                nettoyees[table].isetitem(nettoyees[table].columns.get_loc(colonne), nouvelle)
+                rang_table = list(tables).index(table)
+                rang_colonne = list(_colonnes_de_donnees(brutes[table])).index(colonne)
+                for position in sorted(acceptees):
+                    valeur_apres, detail = acceptees[position]
+                    hachees = empreintes(masquee, courante.iloc[position], valeur_apres)
+                    avant = _valeur_constatee(courante.iloc[position])
+                    journal.append(
+                        ligne_du_journal(
+                            rang_regle,
+                            rang_table,
+                            table,
+                            position,
+                            colonne=colonne,
+                            action=ACTION_MODIFIEE,
+                            source=SOURCE_GESTION,
+                            valeur_avant=VALEUR_MASQUEE if masquee else avant,
+                            valeur_apres=VALEUR_MASQUEE if masquee else valeur_apres,
+                            **hachees,
+                            detail=detail,
+                            _colonne=rang_colonne,
+                        )
+                    )
             continue
 
         appliquer_regle, source, ordre_raisons = _REGLES[regle_nettoyage]
@@ -1013,7 +1492,8 @@ def nettoyer(
                 )
                 # La règle s'applique aux valeurs laissées par les règles précédentes.
                 courante = nettoyees[table][colonne].reset_index(drop=True)
-                contexte = {"date_coupure": date_coupure, "masquee": masquee}
+                contexte = {"date_coupure": date_coupure, "masquee": masquee,
+                            "duree": durees.get((table, colonne))}
                 resultat = appliquer_regle(courante, regles, contexte)
                 if resultat is None:
                     continue
@@ -1038,6 +1518,7 @@ def nettoyer(
                 nettoyees[table].isetitem(nettoyees[table].columns.get_loc(colonne), nouvelle)
                 for position in positions:
                     valeur_apres, detail = acceptees[position]
+                    hachees = empreintes(masquee, courante.iloc[position], valeur_apres)
                     avant = _valeur_constatee(courante.iloc[position])
                     journal.append(
                         ligne_du_journal(
@@ -1050,6 +1531,7 @@ def nettoyer(
                             source=source,
                             valeur_avant=VALEUR_MASQUEE if masquee else avant,
                             valeur_apres=VALEUR_MASQUEE if masquee else valeur_apres,
+                            **hachees,
                             detail=detail,
                             _colonne=rang_colonne,
                         )
@@ -1066,7 +1548,13 @@ def nettoyer(
         journal = pd.DataFrame(columns=list(COLONNES_JOURNAL), dtype=object)
     bilan = pd.DataFrame(bilan, columns=list(COLONNES_BILAN_NETTOYAGE), dtype=object)
     bilan = bilan.astype({"visees": int, "corrigees": int, "non_corrigees": int})
-    return Nettoyage(nettoyees, journal, bilan)
+    champs = COLONNES_DECISIONS_CADUQUES[1:]
+    caduques = pd.DataFrame(
+        [{"id_anomalie": i, **{c: d[c] for c in champs}} for i, d in caduques],
+        columns=list(COLONNES_DECISIONS_CADUQUES),
+        dtype=object,
+    )
+    return Nettoyage(nettoyees, journal, bilan, caduques)
 
 
 COLONNES_COMPARAISON = (
@@ -1207,6 +1695,30 @@ def journal_non_masque(
     return journal.iloc[fautives]
 
 
+def empreintes_incoherentes(journal: pd.DataFrame) -> pd.DataFrame:
+    """Lignes du journal dont les empreintes ne suivent pas le masquage.
+
+    Une valeur modifiée masquée (« masqué » avant et après) porte ses deux
+    empreintes, de 16 chiffres hexadécimaux chacune; toute autre ligne (valeur
+    visible, ligne retirée) n'en porte aucune. Une table vide est attendue.
+    """
+    fautives = []
+    for position, ligne in enumerate(journal.itertuples(index=False)):
+        masquee = (
+            ligne.action == ACTION_MODIFIEE
+            and _texte(ligne.valeur_avant) == VALEUR_MASQUEE
+            and _texte(ligne.valeur_apres) == VALEUR_MASQUEE
+        )
+        hachees = [_texte(ligne.empreinte_avant), _texte(ligne.empreinte_apres)]
+        if masquee:
+            coherente = all(_MOTIF_EMPREINTE_JOURNAL.fullmatch(e) for e in hachees)
+        else:
+            coherente = hachees == ["", ""]
+        if not coherente:
+            fautives.append(position)
+    return journal.iloc[fautives]
+
+
 def ecrire_nettoyage(
     journal: pd.DataFrame,
     bilan: pd.DataFrame,
@@ -1230,7 +1742,8 @@ def ecrire_nettoyage(
     Refuse (`ValueError`, tous les problèmes listés, sans rien écrire) : une période
     qui n'est pas de la forme AAAA-MM, des colonnes autres que `COLONNES_JOURNAL`
     et `COLONNES_BILAN_NETTOYAGE` (dans cet ordre), une valeur ou une clé d'une
-    colonne sensible non masquée (`journal_non_masque`). Écriture tout ou rien;
+    colonne sensible non masquée (`journal_non_masque`), des empreintes qui ne suivent
+    pas le masquage (`empreintes_incoherentes`). Écriture tout ou rien;
     un fichier ouvert dans Excel arrête l'écriture sans rien modifier.
     """
     problemes = []
@@ -1249,6 +1762,12 @@ def ecrire_nettoyage(
             problemes.append(
                 f"{len(fautives)} lignes du journal dont une valeur ou la clé d'une colonne "
                 f"sensible n'est pas masquée ({', '.join(colonnes)})"
+            )
+        incoherentes = empreintes_incoherentes(journal)
+        if not incoherentes.empty:
+            problemes.append(
+                f"{len(incoherentes)} lignes du journal dont les empreintes ne suivent pas "
+                "le masquage (deux empreintes pour une valeur masquée, aucune sinon)"
             )
     if problemes:
         raise ValueError("Écriture refusée\n  " + "\n  ".join(problemes))

@@ -115,6 +115,9 @@ CLE_REGLES_GESTION = "regles"
 # chaque règle dont le type a un paramètre feries et qui n'en déclare pas.
 CLE_JOURS_FERIES = "jours_feries"
 PARAMETRE_FERIES = "feries"
+# Paramètres communs par type (type vers paramètre vers valeur), repris par chaque règle
+# du type qui ne déclare pas le paramètre; une valeur écrite dans la règle l'emporte.
+CLE_PARAMETRES_COMMUNS = "parametres_communs"
 # Clés tenues par le formulaire des règles de gestion (voir frigeo.formulaire_gestion),
 # sans effet sur les contrôles : propositions refusées par le métier, règles retirées
 # (gardées en entier pour pouvoir les rétablir) et règles demandées en texte libre.
@@ -122,7 +125,8 @@ CLE_ECARTEES = "ecartees"
 CLE_RETIREES = "retirees"
 CLE_DEMANDES = "demandes"
 CLES_FICHIER_GESTION = (
-    CLE_REGLES_GESTION, CLE_JOURS_FERIES, CLE_ECARTEES, CLE_RETIREES, CLE_DEMANDES
+    CLE_REGLES_GESTION, CLE_JOURS_FERIES, CLE_PARAMETRES_COMMUNS, CLE_ECARTEES, CLE_RETIREES,
+    CLE_DEMANDES,
 )
 # Clés communes à toutes les instances, en plus des paramètres de leur type.
 CLES_COMMUNES = ("ref", "libelle", "type", "table")
@@ -281,6 +285,14 @@ COLONNES_BILAN_GESTION = (
     "informations",
     "avertissements",
 )
+COLONNES_NON_EVALUABLES_GESTION = (
+    "table",
+    *COLONNES_LIGNAGE_ECART,
+    "ref",
+    "type",
+    "libelle",
+    "cle",
+)
 COLONNES_CATALOGUE = ("type", "description", "parametres", "vue", "issue")
 
 
@@ -300,7 +312,10 @@ class Constats:
     son champ (par exemple une clé facultative vide); elle est comptée avec les
     lignes hors du filtre, et non parmi les lignes non évaluables. Une colonne
     `issue`, facultative, donne l'issue d'un écart quand elle n'est pas vide (par
-    exemple « information » pour une pratique normale déclarée en exception).
+    exemple « information » pour une pratique normale déclarée en exception). Une
+    colonne `colonnes`, facultative, remplace les colonnes de la règle pour un écart
+    quand elle n'est pas vide (colonnes de la table de la règle, séparées par « , »);
+    une colonne `type`, facultative, remplace de même le type affiché de l'écart.
     `ecarts_periodes`, facultatif : écarts qui n'appartiennent à aucune ligne source
     (par exemple un total de période), une ligne par écart, avec les colonnes
     `constat`, `cle` (par exemple la période) et `valeur`, et une colonne `issue`
@@ -441,11 +456,14 @@ def _date_dans_periode_export(donnees, parametres, natures) -> Constats:
     """Date de référence de chaque ligne dans la période de son export.
 
     La correction proposée remplace l'année par celle de l'export, quand la date
-    obtenue tombe dans la période.
+    obtenue tombe dans la période. Avec `vide_hors_champ`, une date vide laisse la
+    ligne hors champ (date facultative, par exemple une date de lettrage); sinon,
+    comme une date illisible, elle la rend non évaluable.
     """
     colonne = parametres["colonne"]
     nature = natures[colonne]
-    dates = lire(donnees[colonne], nature).valeurs
+    lecture = lire(donnees[colonne], nature)
+    dates = lecture.valeurs
     bornes = [_bornes_periode(valeur) for valeur in donnees[COLONNE_PERIODE]]
     evaluables = dates.notna() & pd.Series(
         [periode is not None for periode in bornes], index=donnees.index, dtype=bool
@@ -467,7 +485,109 @@ def _date_dans_periode_export(donnees, parametres, natures) -> Constats:
             corrigee = None
         if corrigee is not None and debut <= corrigee < fin:
             propositions.loc[position] = ecrire_date(corrigee, nature)
-    return Constats(evaluables, _ecarts(constats, propositions))
+    hors_champ = None
+    if parametres.get("vide_hors_champ"):
+        hors_champ = (lecture.etats == ETAT_VIDE).astype(bool)
+    return Constats(evaluables, _ecarts(constats, propositions), hors_champ=hors_champ)
+
+
+CONSTAT_FIN_AVANT_DEBUT = "date de fin antérieure à la date de début"
+CONSTAT_DELAI_INFERIEUR = "délai inférieur au minimum"
+CONSTAT_DELAI_SUPERIEUR = "délai supérieur au maximum"
+
+
+def _jours(nombre: int) -> str:
+    """Nombre de jours, au singulier de -1 à 1."""
+    return f"{nombre} {'jour' if abs(nombre) <= 1 else 'jours'}"
+
+
+def _dates_ordonnees(donnees, parametres, natures) -> Constats:
+    """Date de fin au plus tôt le jour de la date de début, dans un délai borné.
+
+    Le délai est le nombre de jours calendaires de la date de début à la date de fin,
+    heures ignorées. Une date de fin antérieure à la date de début est un écart, de
+    même qu'un délai inférieur à `delai_min` (0 par défaut) ou supérieur à
+    `delai_max` (sans maximum par défaut). Une date vide ou illisible rend la ligne
+    non évaluable; avec `vide_hors_champ`, une date de fin vide laisse la ligne hors
+    champ (date facultative, par exemple une date de sortie), quelle que soit la date
+    de début. La valeur affichée donne les deux dates et le délai.
+    """
+    debut, fin = parametres["debut"], parametres["fin"]
+    lecture_debut = lire(donnees[debut], natures[debut])
+    lecture_fin = lire(donnees[fin], natures[fin])
+    dates_debut = lecture_debut.valeurs.dt.normalize()
+    dates_fin = lecture_fin.valeurs.dt.normalize()
+    evaluables = (dates_debut.notna() & dates_fin.notna()).astype(bool)
+    mini, maxi = parametres.get("delai_min", 0), parametres.get("delai_max")
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position in donnees.index[evaluables.to_numpy()]:
+        date_debut, date_fin = dates_debut.loc[position], dates_fin.loc[position]
+        delai = (date_fin - date_debut).days
+        if delai < 0:
+            constat = CONSTAT_FIN_AVANT_DEBUT
+        elif delai < mini:
+            constat = CONSTAT_DELAI_INFERIEUR
+        elif maxi is not None and delai > maxi:
+            constat = CONSTAT_DELAI_SUPERIEUR
+        else:
+            continue
+        constats.loc[position] = constat
+        affichees.loc[position] = (
+            f"début {_jour(date_debut)}, fin {_jour(date_fin)}, délai de {_jours(delai)}"
+        )
+    hors_champ = None
+    if parametres.get("vide_hors_champ"):
+        hors_champ = (lecture_fin.etats == ETAT_VIDE).astype(bool)
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees), hors_champ=hors_champ)
+
+
+CONSTAT_DATE_TROP_ANCIENNE = "date antérieure au minimum"
+CONSTAT_DATE_TROP_TARDIVE = "date postérieure à la limite après la coupure"
+
+
+def _date_plausible(donnees, parametres, natures) -> Constats:
+    """Date au plus tôt à `min`, au plus tard `apres_coupure` jours après la coupure.
+
+    La coupure est la fin de la période traitée (`CONTEXTE_DATE_COUPURE`) : la limite
+    haute avance d'elle-même avec la période. `apres_coupure` (0 par défaut) admet les
+    dates d'un référentiel extrait après la coupure, ou une date future légitime (une
+    sortie prévue). `min`, facultatif, est une date fixe. Une date vide ou illisible
+    rend la ligne non évaluable, une date vide la laisse hors champ avec
+    `vide_hors_champ`. La valeur affichée donne la date, la borne dépassée et l'écart
+    en jours.
+    """
+    colonne = parametres["colonne"]
+    lecture = lire(donnees[colonne], natures[colonne])
+    dates = lecture.valeurs.dt.normalize()
+    evaluables = dates.notna().astype(bool)
+    marge = parametres.get("apres_coupure", 0)
+    limite = pd.Timestamp(parametres[CONTEXTE_DATE_COUPURE]).normalize() + pd.Timedelta(
+        days=marge
+    )
+    mini = parametres.get("min")
+    mini = None if mini is None else pd.Timestamp(_jour_ferie(mini))
+    trop_anciennes = (evaluables & (dates < mini)) if mini is not None else evaluables & False
+    trop_tardives = evaluables & ~trop_anciennes & (dates > limite)
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    affichees = pd.Series(None, index=donnees.index, dtype=object)
+    for position in donnees.index[trop_anciennes.to_numpy()]:
+        date = dates.loc[position]
+        constats.loc[position] = CONSTAT_DATE_TROP_ANCIENNE
+        affichees.loc[position] = (
+            f"{_jour(date)}, minimum {_jour(mini)}, {_jours((mini - date).days)} avant"
+        )
+    for position in donnees.index[trop_tardives.to_numpy()]:
+        date = dates.loc[position]
+        constats.loc[position] = CONSTAT_DATE_TROP_TARDIVE
+        affichees.loc[position] = (
+            f"{_jour(date)}, limite {_jour(limite)} (coupure plus {_jours(marge)}), "
+            f"{_jours((date - limite).days)} après"
+        )
+    hors_champ = None
+    if parametres.get("vide_hors_champ"):
+        hors_champ = (lecture.etats == ETAT_VIDE).astype(bool)
+    return Constats(evaluables, _ecarts(constats, valeurs=affichees), hors_champ=hors_champ)
 
 
 CONSTAT_INFERIEURE = "inférieure au minimum"
@@ -1087,6 +1207,13 @@ def _equilibre_par_groupe(donnees, parametres, natures) -> Constats:
 
 CONSTAT_ABSENTE = "absente de la table de référence"
 CONSTAT_HORS_PERIODES = "date hors des périodes de la table de référence"
+CONSTAT_APRES_NORMALISATION = "trouvée après normalisation seulement"
+# Règle affichée d'un écart « trouvée après normalisation seulement », suivie de la
+# comparaison de la règle.
+REGLE_FORME_REFERENTIEL = "forme du référentiel"
+# Types qui rapprochent une clé d'un référentiel, et cherchent les clés trouvées après
+# normalisation seulement (voir `_ecarts_apres_normalisation`).
+TYPES_AVEC_REFERENTIEL = ("existence_dans_reference", "date_dans_periode_reference")
 CONSTAT_PERIODE_NON_COUVERTE = "début de période non couvert par un palier"
 CONSTAT_ANNEE_ABSENTE = "année absente de la table de référence"
 # Raisons pour lesquelles une ligne d'un référentiel est inutilisable, dans l'ordre
@@ -1097,23 +1224,123 @@ RAISONS_PALIER = ("clé vide", "date vide", "date illisible")
 RAISONS_ANNEE = ("année vide", "année illisible")
 
 
-def _cles_comparees(
-    donnees: pd.DataFrame, colonnes: list[str], comparaison: str = COMPARAISON_TELLE_QUELLE
-) -> pd.Series:
-    """Clé de chaque ligne : textes de ses colonnes reliés par une espace, sous la forme
-    où ils sont comparés; None si l'une des colonnes est vide ou faite d'espaces."""
+def _textes_des_cles(donnees: pd.DataFrame, colonnes: list[str]) -> pd.Series:
+    """Clé de chaque ligne telle qu'écrite : textes de ses colonnes reliés par une
+    espace; None si l'une des colonnes est vide ou faite d'espaces."""
 
     def cle(ligne):
         textes = [_valeur_constatee(valeur) for valeur in ligne]
         if any(texte is None or not texte.strip() for texte in textes):
             return None
-        return _comparable(" ".join(textes), comparaison)
+        return " ".join(textes)
 
     return pd.Series(
         [cle(ligne) for ligne in donnees[colonnes].itertuples(index=False)],
         index=donnees.index,
         dtype=object,
     )
+
+
+def _cles_comparees(
+    donnees: pd.DataFrame, colonnes: list[str], comparaison: str = COMPARAISON_TELLE_QUELLE
+) -> pd.Series:
+    """Clé de chaque ligne : textes de ses colonnes reliés par une espace, sous la forme
+    où ils sont comparés; None si l'une des colonnes est vide ou faite d'espaces."""
+    textes = _textes_des_cles(donnees, colonnes)
+    return pd.Series(
+        [None if texte is None else _comparable(texte, comparaison) for texte in textes],
+        index=donnees.index,
+        dtype=object,
+    )
+
+
+def _remise_en_ordre(forme: str, texte: str) -> str | None:
+    """Mots de `forme` (texte d'une clé du référentiel) remis dans l'ordre des mots de
+    `texte`, chaque mot de `texte` prenant le mot de `forme` qui lui est égal après
+    normalisation; None si les mots ne se correspondent pas un à un."""
+    restants = forme.split()
+    mots = []
+    for mot in texte.split():
+        cible = normaliser(mot)
+        trouve = next((m for m in restants if normaliser(m) == cible), None)
+        if trouve is None:
+            return None
+        restants.remove(trouve)
+        mots.append(trouve)
+    return " ".join(mots) if not restants else None
+
+
+def _ecarts_apres_normalisation(
+    donnees: pd.DataFrame, parametres: dict, liee: Liee
+) -> pd.DataFrame | None:
+    """Écarts « trouvée après normalisation seulement » d'une règle de rapprochement
+    avec un référentiel, None si sa comparaison est « telle quelle ».
+
+    Une forme du référentiel est le texte d'une de ses clés (colonnes de
+    `cle_reference` reliées par une espace); en « mots dans le désordre », ses mots
+    sont remis dans l'ordre de ceux de la clé de la ligne (l'ordre des mots est la
+    tolérance déclarée par la règle, la casse, les accents et les espaces ne le sont
+    pas). Une clé trouvée selon la comparaison de la règle mais égale à aucune forme
+    est un écart à arbitrer, porté par les seules colonnes de `cle`, avec pour valeur
+    la clé et pour proposition la forme du référentiel, si elle est unique et si la
+    clé tient en une colonne.
+    """
+    comparaison = parametres.get("comparaison", COMPARAISON_TELLE_QUELLE)
+    if comparaison == COMPARAISON_TELLE_QUELLE:
+        return None
+    formes = formes_du_referentiel(liee.donnees, parametres["cle_reference"], comparaison)
+    textes = _textes_des_cles(donnees, parametres["cle"])
+    constats = pd.Series(None, index=donnees.index, dtype=object)
+    propositions = pd.Series(None, index=donnees.index, dtype=object)
+    for position, texte in textes.items():
+        candidates = formes_de_la_cle(texte, formes, comparaison)
+        if candidates is None or texte in candidates:
+            continue
+        constats.loc[position] = CONSTAT_APRES_NORMALISATION
+        if len(candidates) == 1 and None not in candidates and len(parametres["cle"]) == 1:
+            propositions.loc[position] = next(iter(candidates))
+    issues = pd.Series(ISSUE_A_ARBITRER, index=donnees.index, dtype=object)
+    ecarts = _ecarts(constats, propositions, valeurs=textes, issues=issues)
+    ecarts["colonnes"] = ", ".join(parametres["cle"])
+    ecarts["type"] = f"{REGLE_FORME_REFERENTIEL}, {comparaison}"
+    return ecarts
+
+
+def formes_du_referentiel(
+    reference: pd.DataFrame, cle_reference: list[str], comparaison: str
+) -> dict[str, set[str]]:
+    """Formes du référentiel par clé comparée : textes des clés de `reference` (colonnes
+    de `cle_reference` reliées par une espace), regroupés selon `comparaison`."""
+    formes = {}
+    for brut in _textes_des_cles(reference, cle_reference):
+        if brut is not None:
+            formes.setdefault(_comparable(brut, comparaison), set()).add(brut)
+    return formes
+
+
+def formes_de_la_cle(texte, formes: dict[str, set[str]], comparaison: str) -> set | None:
+    """Formes du référentiel d'une clé écrite `texte` (None si la clé est vide ou
+    absente du référentiel) : en « mots dans le désordre », chaque forme a ses mots
+    remis dans l'ordre de ceux de `texte` (None pour une forme dont les mots ne se
+    correspondent pas un à un). La clé est écrite dans la forme du référentiel si
+    `texte` est l'une d'elles."""
+    if texte is None:
+        return None
+    compare = _comparable(texte, comparaison)
+    if compare not in formes:
+        return None
+    if comparaison == COMPARAISON_MOTS:
+        return {_remise_en_ordre(forme, texte) for forme in formes[compare]}
+    return set(formes[compare])
+
+
+def _avec_ecarts(ecarts: pd.DataFrame, autres: pd.DataFrame | None) -> pd.DataFrame:
+    """Écarts d'un type suivis d'autres écarts (une ligne peut en porter plusieurs)."""
+    if autres is None or autres.empty:
+        return ecarts
+    if ecarts.empty:
+        return autres
+    return pd.concat([ecarts, autres])
 
 
 def _hors_champ_cle(cles: pd.Series, parametres: dict) -> pd.Series:
@@ -1167,7 +1394,10 @@ def _existence_dans_reference(donnees, parametres, natures, liee: Liee) -> Const
     constats = cles.map(lambda cle: None if cle is None or cle in connues else CONSTAT_ABSENTE)
     return Constats(
         cles.notna().astype(bool),
-        _ecarts(constats.astype(object)),
+        _avec_ecarts(
+            _ecarts(constats.astype(object)),
+            _ecarts_apres_normalisation(donnees, parametres, liee),
+        ),
         hors_champ=_hors_champ_cle(cles, parametres),
     )
 
@@ -1243,7 +1473,10 @@ def _date_dans_periode_reference(donnees, parametres, natures, liee: Liee) -> Co
         affichees.loc[position] = f"{_jour(date)} ({_ecrire_periodes(liste)})"
     return Constats(
         evaluables,
-        _ecarts(constats, valeurs=affichees),
+        _avec_ecarts(
+            _ecarts(constats, valeurs=affichees),
+            _ecarts_apres_normalisation(donnees, parametres, liee),
+        ),
         tuple(_inutilisables(liee.table, raisons)),
         hors_champ=_hors_champ_cle(cles, parametres),
     )
@@ -2311,6 +2544,7 @@ def _totaux_par_periode(donnees, parametres, natures, liee: Liee) -> Constats:
 
 
 CONSTAT_SOLDE_NEGATIF = "solde cumulé devenu négatif après cette sortie"
+CONSTAT_SOLDE_TOUJOURS_NEGATIF = "solde toujours négatif après cette sortie"
 # Raisons d'inutilisabilité d'une ligne de la table du solde initial et d'une entrée.
 RAISONS_INITIAL = ("clé vide", "clé répétée", "solde vide", "solde illisible",
                    "solde négatif", "date vide", "date illisible")
@@ -2337,7 +2571,10 @@ def _solde_jamais_negatif(donnees, parametres, natures, liees) -> Constats:
     ou nul après le mouvement précédent ou depuis le dernier écart (un solde rendu
     négatif par une entrée négative est porté par la sortie suivante). La valeur donne
     le solde, ce qui l'a formé et le nombre de sorties qui suivent avant le retour à
-    un solde positif ou nul.
+    un solde positif ou nul. Chacune de ces sorties suivantes est signalée en
+    information (constat « solde toujours négatif »), avec son solde et le lignage de
+    la sortie qui porte l'écart : elle n'est pas comptée parmi les anomalies, mais une
+    revue ligne à ligne la retrouve.
 
     Hors champ : sortie datée avant la date du solde initial de sa clé (aucun contrôle
     avant cette date, avec un avertissement). Non évaluable : sortie à clé vide ou
@@ -2490,6 +2727,7 @@ def _solde_jamais_negatif(donnees, parametres, natures, liees) -> Constats:
     )
     constats = pd.Series(None, index=donnees.index, dtype=object)
     affichees = pd.Series(None, index=donnees.index, dtype=object)
+    issues = pd.Series(None, index=donnees.index, dtype=object)
     for cle, liste in mouvements.items():
         if cle not in depart or cle in bloquees:
             continue
@@ -2517,11 +2755,17 @@ def _solde_jamais_negatif(donnees, parametres, natures, liees) -> Constats:
                 )
             else:
                 suivantes += 1
+                constats.loc[position] = CONSTAT_SOLDE_TOUJOURS_NEGATIF
+                issues.loc[position] = ISSUE_INFORMATION
+                affichees.loc[position] = (
+                    f"solde {_ecrire_nombre(solde)} au {_jour(date)} (négatif depuis "
+                    f"{_reperer_ligne(donnees, ecart)})"
+                )
         if ecart is not None:
             affichees.loc[ecart] += _suite_negative(suivantes, fin=True)
     return Constats(
         evaluables,
-        _ecarts(constats, valeurs=affichees),
+        _ecarts(constats, valeurs=affichees, issues=issues),
         tuple(avertissements),
         hors_champ=hors_champ,
     )
@@ -2643,6 +2887,30 @@ def _verifier_renseignee(parametres: dict) -> list[str]:
     return problemes
 
 
+def _verifier_dates_ordonnees(parametres: dict) -> list[str]:
+    problemes = []
+    if parametres["debut"] == parametres["fin"]:
+        problemes.append("debut et fin : deux colonnes différentes sont attendues")
+    for nom in ("delai_min", "delai_max"):
+        if nom in parametres and (
+            not float(parametres[nom]).is_integer() or parametres[nom] < 0
+        ):
+            problemes.append(f"{nom} : un nombre entier de jours, positif ou nul, est attendu")
+    mini = parametres.get("delai_min", 0)
+    if not problemes and "delai_max" in parametres and mini > parametres["delai_max"]:
+        problemes.append(
+            f"delai_min ({mini}) supérieur à delai_max ({parametres['delai_max']})"
+        )
+    return problemes
+
+
+def _verifier_date_plausible(parametres: dict) -> list[str]:
+    marge = parametres.get("apres_coupure", 0)
+    if not float(marge).is_integer() or marge < 0:
+        return ["apres_coupure : un nombre entier de jours, positif ou nul, est attendu"]
+    return []
+
+
 def _verifier_rapport(parametres: dict) -> list[str]:
     problemes = _problemes_bornes(parametres)
     if parametres.get("facteur") == 0:
@@ -2654,11 +2922,14 @@ TYPES = {
     "date_dans_periode_export": TypeRegle(
         description=(
             "La date de référence de chaque ligne tombe dans la période de son "
-            "export (année ou mois, lue dans periode_export)."
+            "export (année ou mois, lue dans periode_export). Avec vide_hors_champ, une "
+            "date vide laisse la ligne hors champ (date facultative) au lieu de la "
+            "rendre non évaluable."
         ),
-        parametres={"colonne": GENRE_COLONNE_DATE},
+        parametres={"colonne": GENRE_COLONNE_DATE, "vide_hors_champ": GENRE_BOOLEEN},
         vue=VUE_TOUTES,
         controler=_date_dans_periode_export,
+        facultatifs=("vide_hors_champ",),
         prerequis=_prerequis_export,
         issue=ISSUE_A_ARBITRER,
     ),
@@ -2843,8 +3114,10 @@ TYPES = {
             "La clé de chaque ligne (cle, une ou plusieurs colonnes, textes reliés par "
             "une espace) existe dans table_reference, sous les colonnes de "
             "cle_reference (par défaut celles de cle). comparaison vaut telle quelle "
-            "(par défaut), après normalisation ou mots dans le désordre. Une clé vide "
-            "rend la ligne non évaluable, ou hors champ si cle_facultative vaut true."
+            "(par défaut), après normalisation ou mots dans le désordre; une clé trouvée "
+            "seulement grâce à cette comparaison est à arbitrer, avec la forme du "
+            "référentiel en correction proposée. Une clé vide rend la ligne non "
+            "évaluable, ou hors champ si cle_facultative vaut true."
         ),
         parametres={
             "cle": GENRE_COLONNES,
@@ -2863,9 +3136,10 @@ TYPES = {
         description=(
             "La date de chaque ligne tombe dans l'une des périodes (debut à fin, "
             "incluses; fin vide ou absente : période ouverte) que table_reference donne "
-            "pour sa clé (voir existence_dans_reference). Une clé absente du référentiel "
-            "est un écart; une ligne du référentiel inutilisable (début vide ou "
-            "illisible, fin illisible, début après fin) est signalée au bilan et rend "
+            "pour sa clé (voir existence_dans_reference, comparaison comprise). Une clé "
+            "absente du référentiel est un écart; une ligne du référentiel inutilisable "
+            "(début vide ou illisible, fin illisible, début après fin) est signalée au "
+            "bilan et rend "
             "non évaluables les dates hors des autres périodes de sa clé."
         ),
         parametres={
@@ -3281,8 +3555,9 @@ TYPES = {
             "ou date_en_tetes de l'en-tête de table_en_tetes que désigne lien_entrees "
             "(cle_en_tetes, par défaut les colonnes de lien_entrees); elle est avancée de "
             "avance_entrees jours (0 par défaut). L'écart est porté par la sortie après "
-            "laquelle le solde devient négatif. Rien n'est contrôlé avant la date du solde "
-            "initial."
+            "laquelle le solde devient négatif; les sorties suivantes, tant que le solde "
+            "reste négatif, sont signalées en information. Rien n'est contrôlé avant la "
+            "date du solde initial."
         ),
         parametres={
             "cle": GENRE_COLONNES,
@@ -3343,6 +3618,46 @@ TYPES = {
         controler=_renseignee_selon_valeur,
         facultatifs=("vide_sinon",),
         verifier=_verifier_renseignee,
+    ),
+    "dates_ordonnees": TypeRegle(
+        description=(
+            "La date de fin (fin) de chaque ligne n'est pas antérieure à sa date de "
+            "début (debut), et le délai qui les sépare, en jours calendaires, est compris "
+            "entre delai_min (0 par défaut) et delai_max (inclus, sans maximum par "
+            "défaut). Avec vide_hors_champ, une date de fin vide laisse la ligne hors "
+            "champ (date facultative) au lieu de la rendre non évaluable."
+        ),
+        parametres={
+            "debut": GENRE_COLONNE_DATE,
+            "fin": GENRE_COLONNE_DATE,
+            "delai_min": GENRE_NOMBRE,
+            "delai_max": GENRE_NOMBRE,
+            "vide_hors_champ": GENRE_BOOLEEN,
+        },
+        vue=VUE_TOUTES,
+        controler=_dates_ordonnees,
+        facultatifs=("delai_min", "delai_max", "vide_hors_champ"),
+        verifier=_verifier_dates_ordonnees,
+    ),
+    "date_plausible": TypeRegle(
+        description=(
+            "La date de chaque ligne n'est pas antérieure à min (date AAAA-MM-JJ, "
+            "facultative) ni postérieure à la date de coupure (fin de la période traitée) "
+            "de plus de apres_coupure jours (0 par défaut). Avec vide_hors_champ, une date "
+            "vide laisse la ligne hors champ au lieu de la rendre non évaluable."
+        ),
+        parametres={
+            "colonne": GENRE_COLONNE_DATE,
+            "min": GENRE_DATE,
+            "apres_coupure": GENRE_NOMBRE,
+            "vide_hors_champ": GENRE_BOOLEEN,
+        },
+        vue=VUE_TOUTES,
+        controler=_date_plausible,
+        issue=ISSUE_A_ARBITRER,
+        facultatifs=("min", "apres_coupure", "vide_hors_champ"),
+        verifier=_verifier_date_plausible,
+        contexte=(CONTEXTE_DATE_COUPURE,),
     ),
 }
 
@@ -4068,6 +4383,70 @@ def completer_jours_feries(regles, jours_feries) -> list:
     return completes
 
 
+def problemes_parametres_communs(communs) -> list[str]:
+    """Problèmes de la clé `parametres_communs` : un dictionnaire de types connus, chacun
+    vers un dictionnaire non vide de paramètres de ce type, chaque valeur conforme au
+    genre du paramètre, plus un commentaire facultatif (texte, non transmis aux règles).
+    Les vérifications propres au type (bornes, cohérence entre paramètres) se font sur
+    les règles complétées."""
+    lieu = CLE_PARAMETRES_COMMUNS
+    if not isinstance(communs, dict) or not communs:
+        return [f"{lieu} : un dictionnaire non vide est attendu (type vers paramètres)"]
+    problemes = []
+    for nom_type, parametres in communs.items():
+        type_regle = TYPES.get(nom_type) if isinstance(nom_type, str) else None
+        if type_regle is None:
+            problemes.append(f"{lieu}, {nom_type} : type inconnu du catalogue")
+            continue
+        if not isinstance(parametres, dict) or not parametres:
+            problemes.append(
+                f"{lieu}, {nom_type} : un dictionnaire non vide est attendu "
+                "(paramètre vers valeur)"
+            )
+            continue
+        for parametre, valeur in parametres.items():
+            if parametre == CLE_COMMENTAIRE:
+                if not _texte_attendu(valeur):
+                    problemes.append(f"{lieu}, {nom_type}, {parametre} : un texte est attendu")
+                continue
+            genre = type_regle.parametres.get(parametre)
+            if genre is None:
+                problemes.append(
+                    f"{lieu}, {nom_type}, {parametre} : paramètre inconnu du type "
+                    f"(paramètres : {', '.join(type_regle.parametres)})"
+                )
+                continue
+            problemes.extend(
+                f"{lieu}, {nom_type}, {parametre} : {probleme}"
+                for probleme in _problemes_parametre(genre, valeur)
+            )
+    return problemes
+
+
+def completer_parametres_communs(regles, communs) -> list:
+    """Règles où chaque règle reçoit les paramètres communs de son type qu'elle ne
+    déclare pas; une règle qui déclare un paramètre garde sa valeur.
+
+    Sans paramètres communs (None), les règles sont rendues telles quelles. Les
+    arguments ne sont pas modifiés; une règle mal formée est rendue telle quelle (ses
+    problèmes sont listés par `problemes_regles_gestion`).
+    """
+    if not communs or not isinstance(regles, list):
+        return regles
+    completes = []
+    for instance in regles:
+        if isinstance(instance, dict) and isinstance(instance.get("type"), str):
+            manquants = {
+                parametre: deepcopy(valeur)
+                for parametre, valeur in (communs.get(instance["type"]) or {}).items()
+                if parametre not in instance and parametre != CLE_COMMENTAIRE
+            }
+            if manquants:
+                instance = {**instance, **manquants}
+        completes.append(instance)
+    return completes
+
+
 def charger_regles_gestion(chemin: str | Path | None = None) -> list:
     """Règles de gestion de config/gestion.yaml, dans l'ordre du fichier.
 
@@ -4092,6 +4471,11 @@ def charger_regles_gestion(chemin: str | Path | None = None) -> list:
     paramètre feries et qui n'en déclare pas les reçoit (voir
     `completer_jours_feries`).
 
+    La clé `parametres_communs`, facultative, déclare des paramètres une fois par type
+    (type vers paramètre vers valeur) : chaque règle du type qui ne déclare pas un de ces
+    paramètres le reçoit, une valeur écrite dans la règle l'emportant (voir
+    `completer_parametres_communs`). Ils sont repris avant les jours fériés du fichier.
+
     Un fichier absent, ou sans clé `regles`, ne donne aucune règle. Un fichier mal
     formé est refusé, tous les problèmes étant listés en une fois.
     """
@@ -4108,7 +4492,13 @@ def charger_regles_gestion(chemin: str | Path | None = None) -> list:
         ]
         if problemes:
             jours_feries = None
-    regles = completer_jours_feries(regles, jours_feries)
+    communs = contenu.get(CLE_PARAMETRES_COMMUNS)
+    if CLE_PARAMETRES_COMMUNS in contenu:
+        problemes_communs = problemes_parametres_communs(communs)
+        if problemes_communs:
+            problemes.extend(problemes_communs)
+            communs = None
+    regles = completer_jours_feries(completer_parametres_communs(regles, communs), jours_feries)
     problemes.extend(problemes_regles_gestion(regles))
     if problemes:
         raise ValueError(
@@ -4273,7 +4663,9 @@ def controler_gestion(
     doublons: pd.DataFrame | None = None,
     sensibles: dict[str, frozenset[str]] | None = None,
     date_coupure: dt.date | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+    *,
+    avec_non_evaluables: bool = False,
+) -> tuple[pd.DataFrame, pd.DataFrame] | tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Applique les règles de gestion et rend les écarts et le bilan.
 
     `dictionnaire` est le dictionnaire enregistré : la nature en vigueur de chaque
@@ -4316,7 +4708,16 @@ def controler_gestion(
     quatre nombres font le total), d'anomalies, d'écarts à arbitrer et
     d'informations, et les avertissements de la règle (par exemple une année des
     données sans jours fériés déclarés), séparés par « ; », None s'il n'y en a pas.
-    Les arguments ne sont pas modifiés.
+
+    Avec `avec_non_evaluables=True`, la fonction rend en plus la table des lignes
+    non évaluables (`COLONNES_NON_EVALUABLES_GESTION`) : une ligne par règle et par
+    ligne source que le type n'a pas pu juger (valeur vide ou illisible, ligne liée
+    absente ou inutilisable...), avec le lignage, la référence, le type, le libellé
+    de la règle et la clé de la ligne (« masqué » si une colonne de la clé est
+    sensible), sans aucune valeur. Ce sont exactement les lignes comptées dans
+    `non_evaluables` au bilan : ni les doublons en surnombre, ni les lignes hors
+    champ n'y figurent. Elles suivent l'ordre des règles, puis celui des lignes
+    sources. Les arguments ne sont pas modifiés.
     """
     if sensibles is None:
         sensibles = charger_sensibilite()
@@ -4344,7 +4745,7 @@ def controler_gestion(
     if doublons is None and any(TYPES[r["type"]].vue == VUE_SANS_SURNOMBRE for r in regles):
         doublons, _ = detecter_doublons(tables, declarations, sensibles)
 
-    bilan, morceaux = [], []
+    bilan, morceaux, morceaux_non_evaluables = [], [], []
     for rang, instance in enumerate(regles):
         table = instance["table"]
         type_regle = TYPES[instance["type"]]
@@ -4420,6 +4821,7 @@ def controler_gestion(
         hors_type = constats.hors_champ
         if hors_type is None:
             hors_type = pd.Series(False, index=constats.evaluables.index, dtype=bool)
+        non_evaluables = ~constats.evaluables & ~hors_type
         commun = {
             "ref": instance["ref"],
             "type": instance["type"],
@@ -4435,7 +4837,7 @@ def controler_gestion(
                 "lignes": len(donnees),
                 "ecartees_doublons": len(ecartees),
                 "hors_champ": hors_champ + int(hors_type.sum()),
-                "non_evaluables": int((~constats.evaluables & ~hors_type).sum()),
+                "non_evaluables": int(non_evaluables.sum()),
                 "controlees": int(constats.evaluables.sum()),
                 "anomalies": int((toutes_issues == ISSUE_ANOMALIE).sum()),
                 "a_arbitrer": int((toutes_issues == ISSUE_A_ARBITRER).sum()),
@@ -4470,20 +4872,35 @@ def controler_gestion(
             morceau_periodes["_regle"] = rang
             morceau_periodes["_sans_ligne"] = 1
             morceaux.append(morceau_periodes)
+        cle = declarations.get(table, {}).get("cle", [])
+        if avec_non_evaluables and non_evaluables.any():
+            positions_non_evaluables = non_evaluables.index[non_evaluables.to_numpy()]
+            morceau_non_evaluables = pd.DataFrame(
+                {
+                    "_position": positions_non_evaluables,
+                    **commun,
+                    "cle": pd.Series(
+                        _cles_des_lignes(
+                            donnees, positions_non_evaluables, cle, sensibles, table,
+                            regles_colonnes,
+                        ),
+                        dtype=object,
+                    ).to_numpy(),
+                }
+            )
+            for lignage in COLONNES_LIGNAGE_ECART:
+                morceau_non_evaluables[lignage] = (
+                    donnees[lignage].loc[positions_non_evaluables].to_numpy()
+                    if lignage in donnees.columns
+                    else None
+                )
+            morceau_non_evaluables["_regle"] = rang
+            morceaux_non_evaluables.append(morceau_non_evaluables)
         if ecarts.empty:
             continue
 
         positions = ecarts.index
-        cle = declarations.get(table, {}).get("cle", [])
-        if not cle:
-            cles = [None] * len(positions)
-        elif _sensible(sensibles, table, regles_colonnes, cle):
-            cles = [VALEUR_MASQUEE] * len(positions)
-        else:
-            cles = [
-                SEPARATEUR.join(_texte(v) for v in ligne)
-                for ligne in donnees.loc[positions, cle].itertuples(index=False)
-            ]
+        cles = _cles_des_lignes(donnees, positions, cle, sensibles, table, regles_colonnes)
         if sensible:
             valeurs = [VALEUR_MASQUEE] * len(positions)
             propositions = [
@@ -4503,13 +4920,18 @@ def controler_gestion(
                     for valeur, donnee in zip(valeurs, ecarts["valeur"])
                 ]
             propositions = list(ecarts["proposition"])
+        colonnes_ecarts = [texte_colonnes] * len(positions)
+        if "colonnes" in ecarts.columns:
+            colonnes_ecarts = [
+                texte if _renseignee(texte) else texte_colonnes for texte in ecarts["colonnes"]
+            ]
         morceau = pd.DataFrame(
             {
                 "_position": positions,
                 **commun,
                 "issue": issues.to_numpy(),
                 "constat": ecarts["constat"].to_numpy(),
-                "colonnes": texte_colonnes,
+                "colonnes": pd.Series(colonnes_ecarts, dtype=object).to_numpy(),
                 "cle": pd.Series(cles, dtype=object).to_numpy(),
                 "valeur": pd.Series(valeurs, dtype=object).to_numpy(),
                 "proposition": pd.Series(propositions, dtype=object).to_numpy(),
@@ -4521,6 +4943,10 @@ def controler_gestion(
                 if lignage in donnees.columns
                 else None
             )
+        if "type" in ecarts.columns:
+            morceau["type"] = [
+                texte if _renseignee(texte) else instance["type"] for texte in ecarts["type"]
+            ]
         morceau["_regle"] = rang
         morceau["_sans_ligne"] = 0
         morceaux.append(morceau)
@@ -4534,4 +4960,31 @@ def controler_gestion(
         ecarts = ecarts[list(COLONNES_ECARTS_GESTION)].reset_index(drop=True)
     else:
         ecarts = pd.DataFrame(columns=list(COLONNES_ECARTS_GESTION))
-    return ecarts, pd.DataFrame(bilan, columns=list(COLONNES_BILAN_GESTION))
+    bilan = pd.DataFrame(bilan, columns=list(COLONNES_BILAN_GESTION))
+    if not avec_non_evaluables:
+        return ecarts, bilan
+    if morceaux_non_evaluables:
+        non_evaluables = pd.concat(morceaux_non_evaluables, ignore_index=True).sort_values(
+            ["_regle", *COLONNES_LIGNAGE_ECART, "_position"],
+            kind="stable",
+            na_position="first",
+        )
+        non_evaluables = non_evaluables[list(COLONNES_NON_EVALUABLES_GESTION)].reset_index(
+            drop=True
+        )
+    else:
+        non_evaluables = pd.DataFrame(columns=list(COLONNES_NON_EVALUABLES_GESTION))
+    return ecarts, bilan, non_evaluables
+
+
+def _cles_des_lignes(donnees, positions, cle, sensibles, table, regles_colonnes) -> list:
+    """Clé déclarée de chaque ligne : vide sans clé déclarée, « masqué » si une de ses
+    colonnes est sensible, sinon les textes de ses colonnes reliés par « | »."""
+    if not cle:
+        return [None] * len(positions)
+    if _sensible(sensibles, table, regles_colonnes, cle):
+        return [VALEUR_MASQUEE] * len(positions)
+    return [
+        SEPARATEUR.join(_texte(v) for v in ligne)
+        for ligne in donnees.loc[positions, cle].itertuples(index=False)
+    ]

@@ -25,6 +25,7 @@ from frigeo.decisions import (
     _mode_emploi,
     ajouter_decisions,
     charger_decisions,
+    date_inversee_proposee,
     ecrire_decisions,
     elements_a_arbitrer,
     exporter_arbitrage,
@@ -36,6 +37,16 @@ from frigeo.doublons import detecter_doublons
 from frigeo.gestion import controler_gestion
 
 AUCUNE_DECISION = {"meta": {"structure": 1, "imports": []}, "decisions": {}}
+
+
+@pytest.fixture(autouse=True)
+def sans_regles_de_gestion(tmp_path_factory, monkeypatch):
+    """Les règles de gestion du poste (config/gestion.yaml) ne sont jamais lues par
+    ces tests : sauf règles passées, aucune."""
+    import frigeo.gestion as module_gestion
+
+    absent = tmp_path_factory.mktemp("gestion") / "gestion_absent.yaml"
+    monkeypatch.setattr(module_gestion, "chemin_regles_gestion", lambda: absent)
 
 
 def _table(fichier="t.csv", premiere_ligne=2, **colonnes) -> pd.DataFrame:
@@ -283,6 +294,55 @@ def test_coherence_avec_les_controles():
     assert list(elements["sorte"]) == [SORTE_CELLULE, SORTE_LIGNE, SORTE_LIGNE]
     assert list(elements["id_anomalie"]) == list(anomalies["id_anomalie"])
     assert (elements["etat_decision"] == ETAT_SANS_DECISION).all()
+
+
+def test_cle_trouvee_apres_normalisation_arbitree_comme_une_cellule():
+    """Une clé trouvée dans le référentiel après normalisation seulement est soumise
+    au métier comme une cellule, avec la forme du référentiel en proposition."""
+    tables = {
+        "t": _table(id=["A1", "A2"], nom=["Jean Dupont", "jean DUPONT"], q=["1", "2"]),
+        "r": _table("r.csv", n=["Dupont"], p=["Jean"]),
+    }
+
+    def colonne():
+        return {
+            regle: {"regle": valeur, "proposition": valeur, "statut": "observé", "motif": "m",
+                    "a_arbitrer": {}, "commentaire": "", "revu_le": None,
+                    **({"liste": []} if regle in ("valeurs", "format") else {})}
+            for regle, valeur in (("obligatoire", "facultatif"), ("nature", "texte"),
+                                  ("valeurs", "aucune"), ("format", "aucune"))
+        }
+
+    dictionnaire = {
+        "t": {"id": colonne(), "nom": colonne(), "q": colonne()},
+        "r": {"n": colonne(), "p": colonne()},
+    }
+    regle = {"ref": "R10", "libelle": "Intervenant connu", "type": "existence_dans_reference",
+             "table": "t", "cle": ["nom"], "table_reference": "r", "cle_reference": ["n", "p"],
+             "comparaison": "mots dans le désordre"}
+    declarations = {"t": {"cle": ["id"]}}
+    ecarts, bilan = controler(tables, dictionnaire, {}, {})
+    doublons, bilan_doublons = detecter_doublons(tables, declarations, {})
+    ecarts_gestion, bilan_gestion = controler_gestion(
+        tables, dictionnaire, [regle], declarations, doublons, {}
+    )
+    anomalies = reunir_anomalies(
+        tables, ecarts, doublons, ecarts_gestion, bilan, bilan_doublons, bilan_gestion,
+        declarations, {},
+    )
+    elements = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION)
+    assert _lignes_elements(elements) == [
+        (SORTE_CELLULE, 3, "nom", "jean DUPONT", "trouvée après normalisation seulement",
+         "Jean Dupont"),
+    ]
+
+
+def _lignes_elements(elements):
+    return [
+        (ligne.sorte, ligne.num_ligne_source, ligne.champ, ligne.valeur, ligne.constat,
+         ligne.proposition)
+        for ligne in elements.itertuples(index=False)
+    ]
 
 
 # --- classeur d'arbitrage -----------------------------------------------------
@@ -743,3 +803,319 @@ def test_mode_emploi_avec_separateur_des_milliers():
     texte = " ".join(_mode_emploi("2026-03", elements))
     assert f"Contenu : 1{milliers}204 lignes" in texte
     assert f"dont 1{milliers}200 cellules, 3 lignes et 1 écarts; 1{milliers}001 lignes" in texte
+
+
+# --- retrait des décisions caduques --------------------------------------------
+
+
+IMPORT = {"date": "2026-11-04 09:00:00", "classeur": "a.xlsx", "periode_fin": "2026-03",
+          "decisions": 3, "remplacees": 0, "corriger": 3, "garder": 0, "retirer": 0}
+
+
+def _decision_enregistree(ligne):
+    return {
+        "sorte": "cellule", "table": "t", "fichier_source": "t.csv", "feuille_source": None,
+        "num_ligne_source": ligne, "champ": "nom", "constat": "c", "empreinte": "e",
+        "decision": "corriger", "valeur_retenue": "v", "nature": "texte",
+        "commentaire": None, "decide_le": "2026-11-04 09:00:00", "classeur": "a.xlsx",
+    }
+
+
+def _fichier_de_decisions(tmp_path, retraits=None):
+    import yaml
+
+    meta = {"structure": 1, "imports": [IMPORT]}
+    if retraits is not None:
+        meta["retraits"] = retraits
+    contenu = {
+        "meta": meta,
+        "decisions": {i: _decision_enregistree(n) for n, i in enumerate("abc", start=2)},
+    }
+    fichier = tmp_path / "config" / "decisions.yaml"
+    fichier.parent.mkdir(parents=True, exist_ok=True)
+    fichier.write_text(yaml.safe_dump(contenu, allow_unicode=True, sort_keys=False),
+                       encoding="utf-8")
+    return fichier
+
+
+def test_retirer_decisions(tmp_path, monkeypatch):
+    from frigeo.decisions import retirer_decisions
+
+    instants = iter([datetime(2026, 11, 4, 10, 0, s) for s in range(0, 60, 5)])
+    monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: next(instants))
+    fichier = _fichier_de_decisions(tmp_path)
+    origine = fichier.read_bytes()
+    lues = charger_decisions(fichier)
+    sauvegardes = fichier.parent / "sauvegardes"
+
+    # Sans identifiant, rien n'est écrit.
+    assert retirer_decisions([], "2026-03", lues, fichier) == (fichier, None)
+    assert fichier.read_bytes() == origine and not sauvegardes.exists()
+    # Identifiant absent ou donné deux fois : refusé, rien n'est écrit.
+    with pytest.raises(ValueError) as erreur:
+        retirer_decisions(["a", "z", "a"], "2026-03", lues, fichier)
+    assert str(erreur.value).splitlines()[1:] == [
+        "  identifiants donnés plusieurs fois : a",
+        "  identifiants absents de decisions.yaml : z",
+    ]
+    assert fichier.read_bytes() == origine and not sauvegardes.exists()
+
+    ecrit, entree = retirer_decisions(pd.Series(["c", "a"]), "2026-03", lues, fichier)
+    assert ecrit == fichier
+    assert entree == {"date": "2026-11-04 10:00:00", "periode_fin": "2026-03",
+                      "decisions": 2, "identifiants": ["a", "c"]}
+    relues = charger_decisions(fichier)
+    assert relues["decisions"] == {"b": _decision_enregistree(3)}
+    # Le journal des imports n'est pas touché : un classeur exporté avant reste importable.
+    assert relues["meta"] == {"structure": 1, "imports": [IMPORT], "retraits": [entree]}
+    copies = list(sauvegardes.iterdir())
+    assert len(copies) == 1 and copies[0].read_bytes() == origine
+
+    # Décisions lues avant ce retrait : le fichier a changé, refusé.
+    avant = fichier.read_bytes()
+    with pytest.raises(ValueError, match="a changé depuis sa lecture par le nettoyage"):
+        retirer_decisions(["b"], "2026-03", lues, fichier)
+    assert fichier.read_bytes() == avant
+    # Second retrait, à la suite du premier dans le journal.
+    _, entree2 = retirer_decisions(["b"], "2026-04", relues, fichier)
+    assert charger_decisions(fichier) == {
+        "meta": {"structure": 1, "imports": [IMPORT], "retraits": [entree, entree2]},
+        "decisions": {},
+    }
+    # Même seconde que le retrait précédent : refusé.
+    fichier = _fichier_de_decisions(tmp_path / "autre", retraits=[entree2])
+    monkeypatch.setattr(
+        module_dictionnaire, "_maintenant", lambda: datetime(2026, 11, 4, 10, 0, 10)
+    )
+    avant = fichier.read_bytes()
+    with pytest.raises(ValueError, match="doit être postérieur"):
+        retirer_decisions(["a"], "2026-03", charger_decisions(fichier), fichier)
+    assert fichier.read_bytes() == avant
+
+
+def test_ecrire_decisions_garde_les_retraits(tmp_path, monkeypatch):
+    from frigeo.decisions import Arbitrage
+
+    monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: datetime(2026, 11, 4, 11))
+    retrait = {"date": "2026-11-04 10:00:00", "periode_fin": "2026-03", "decisions": 1,
+               "identifiants": ["z"]}
+    fichier = _fichier_de_decisions(tmp_path, retraits=[retrait])
+    lue = {
+        "id_anomalie": "d", **_decision_enregistree(5), "ligne_excel": 2,
+    }
+    decisions = pd.DataFrame([{c: lue[c] for c in COLONNES_DECISIONS_LUES}], dtype=object)
+    arbitrage = Arbitrage(decisions, [], tmp_path / "b.xlsx", 1)
+    _, entree = ecrire_decisions(arbitrage, "2026-03", fichier)
+    meta = charger_decisions(fichier)["meta"]
+    assert meta == {"structure": 1, "imports": [IMPORT, entree], "retraits": [retrait]}
+    assert list(meta) == ["structure", "imports", "retraits"]
+
+
+def test_problemes_des_retraits():
+    from frigeo.decisions import problemes_decisions
+
+    r1 = {"date": "2026-11-04 10:00:00", "periode_fin": "2026-03", "decisions": 1,
+          "identifiants": ["a"]}
+    retraits = [
+        r1,
+        {**r1},
+        {"date": "2026-11-04 11:00:00"},
+        {**r1, "date": "2026-11-04 12:00:00", "decisions": 2},
+        {**r1, "date": "x", "decisions": 0, "identifiants": []},
+        {**r1, "date": "2026-11-04 13:00:00", "identifiants": [1]},
+    ]
+    meta = {"structure": 1, "imports": [], "retraits": retraits, "autre": 1}
+    assert problemes_decisions({"meta": meta, "decisions": {}}) == [
+        "meta : clés inconnues autre",
+        "meta, retrait 2 : date antérieure ou égale à celle du retrait précédent",
+        "meta, retrait 3 : champs attendus date, periode_fin, decisions, identifiants",
+        "meta, retrait 4 : identifiants attendus, liste de textes de longueur decisions",
+        "meta, retrait 5 : identifiants attendus, liste de textes de longueur decisions",
+        "meta, retrait 5 : date 'AAAA-MM-JJ HH:MM:SS' attendue",
+        "meta, retrait 6 : identifiants attendus, liste de textes de longueur decisions",
+    ]
+    meta = {"structure": 1, "imports": [], "retraits": "x"}
+    assert problemes_decisions({"meta": meta, "decisions": {}}) == [
+        "meta : retraits doit être une liste"
+    ]
+    assert problemes_decisions(
+        {"meta": {"structure": 1, "imports": [], "retraits": [r1]}, "decisions": {}}
+    ) == []
+
+
+# --- forme du référentiel proposée dans le classeur ----------------------------
+
+
+APRES_NORMALISATION = "trouvée après normalisation seulement"
+
+
+def _regle_referentiel(ref="R10", comparaison="mots dans le désordre", **autres):
+    return {
+        "ref": ref, "libelle": "Intervenant connu", "type": "existence_dans_reference",
+        "table": "t", "cle": ["nom"], "table_reference": "r", "cle_reference": ["nom"],
+        "comparaison": comparaison, **autres,
+    }
+
+
+def _variante(ligne, identifiant, ref="R10", proposition="masqué", constat=APRES_NORMALISATION):
+    from frigeo.anomalies import _controle_gestion
+
+    return _anomalie(
+        "gestion", "à arbitrer", ligne, "nom", controle=_controle_gestion(ref, "Intervenant connu"),
+        valeur="masqué", id_anomalie=identifiant, proposition=proposition, constat=constat,
+    )
+
+
+def test_forme_du_referentiel_proposee_quand_masquee(tmp_path):
+    tables = {
+        "t": _table(id=["A1", "A2", "A3", "A4", "A5", "A6", "A7"],
+                    nom=["dupont jean", "martin paul", "durand luc", "petit", "dupont jean",
+                         "petit", "dupont jean"]),
+        "r": _table("r.csv", id=["1", "2", "3", "4", "5"],
+                    nom=["Jean Dupont", "Paul Martin", "Luc Durand", "LUC DURAND", "Petit"]),
+    }
+    anomalies = _anomalies(
+        # Forme unique, remise dans l'ordre des mots de la clé.
+        _variante(2, "v1"),
+        # Proposition déjà en clair (colonne non sensible) : gardée telle quelle.
+        _variante(3, "v2", proposition="proposition en clair"),
+        # Deux formes au référentiel : pas de proposition.
+        _variante(4, "v3"),
+        # Règle inconnue, règle « telle quelle », autre constat : rien.
+        _variante(5, "v4", ref="R99"),
+        _variante(6, "v5", ref="R11"),
+        _variante(7, "v6", constat="absente de la table de référence"),
+        # Règle d'un type que la règle de nettoyage referentiel ne corrige pas : rien.
+        _variante(8, "v7", ref="R12"),
+    )
+    regles = [
+        _regle_referentiel(),
+        _regle_referentiel("R11", "telle quelle"),
+        _regle_referentiel("R12", type="concordance_entre_references"),
+    ]
+    elements = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION, regles)
+    assert dict(zip(elements["id_anomalie"], elements["proposition"])) == {
+        "v1": "Dupont Jean", "v2": "proposition en clair", "v3": "masqué", "v4": "masqué",
+        "v5": "masqué", "v6": "masqué", "v7": "masqué",
+    }
+    # La table des anomalies reçue n'est pas modifiée.
+    assert list(anomalies["proposition"]) == ["masqué", "proposition en clair"] + ["masqué"] * 5
+    chemin = exporter_arbitrage(elements, "2026-03", tmp_path / "a.xlsx", nb_imports=0)
+    classeur = load_workbook(chemin)
+    notice = [ligne[0] or "" for ligne in classeur["mode_emploi"].iter_rows(values_only=True)]
+    assert sum("forme du référentiel, y compris sur une colonne sensible" in texte
+               for texte in notice) == 1
+    lignes = list(classeur[FEUILLE_ARBITRAGE].iter_rows(values_only=True))
+    par_id = {
+        ligne[COLONNES_ARBITRAGE.index("id_anomalie")]: (
+            ligne[COLONNES_ARBITRAGE.index("valeur_retenue")],
+            ligne[COLONNES_ARBITRAGE.index("decision")],
+        )
+        for ligne in lignes[1:]
+    }
+    assert par_id == {
+        "v1": ("Dupont Jean", None), "v2": ("proposition en clair", None),
+        "v3": (None, None), "v4": (None, None), "v5": (None, None), "v6": (None, None),
+        "v7": (None, None),
+    }
+    # Sans règle passée, celles de config/gestion.yaml (absent ici) : rien.
+    defaut = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION)
+    assert list(defaut["proposition"]) == list(anomalies["proposition"])
+
+
+def test_forme_du_referentiel_lue_dans_les_tables_recues():
+    # Référentiel absent, colonne de référence absente, clé vide ou devenue la forme
+    # du référentiel (nettoyée) : pas de proposition.
+    tables = {
+        "t": _table(id=["A1", "A2", "A3"], nom=["dupont jean", " ", "Jean Dupont"]),
+        "r": _table("r.csv", id=["1"], nom=["Jean Dupont"]),
+    }
+    anomalies = _anomalies(_variante(2, "v1"), _variante(3, "v2"), _variante(4, "v3"))
+    propositions = elements_a_arbitrer(
+        tables, anomalies, AUCUNE_DECISION, [_regle_referentiel()]
+    )["proposition"]
+    assert list(propositions) == ["Dupont Jean", "masqué", "masqué"]
+    for regle in (_regle_referentiel(table_reference="absente"),
+                  _regle_referentiel(cle_reference=["absente"]),
+                  _regle_referentiel(table="autre")):
+        propositions = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION, [regle])
+        assert list(propositions["proposition"]) == ["masqué"] * 3
+    # Sans cle_reference, celle de la table (même nom de colonne).
+    sans = {k: v for k, v in _regle_referentiel().items() if k != "cle_reference"}
+    propositions = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION, [sans])
+    assert list(propositions["proposition"]) == ["Dupont Jean", "masqué", "masqué"]
+
+
+# --- date dont le jour et le mois semblent inversés (D) -----------------------
+
+
+@pytest.mark.parametrize(
+    "valeur, nature, attendu",
+    [
+        ("03/25/2025", "date JJ/MM/AAAA", "25/03/2025"),
+        (" 3.25.2025 ", "date JJ/MM/AAAA", "25/03/2025"),
+        ("03-25-2025", "date JJ/MM/AAAA", "25/03/2025"),
+        ("03/25/2025", "date native", "25/03/2025"),
+        ("03/25/2025", "date AAAAMMJJ", "20250325"),
+        ("03/25/2025", "date AAAA-MM-JJ", "2025-03-25"),
+        ("02/29/2024", "date JJ/MM/AAAA", "29/02/2024"),
+        # Lisible jour puis mois, impossible dans les deux sens, autre forme.
+        ("03/04/2025", "date JJ/MM/AAAA", None),
+        ("31/02/2025", "date JJ/MM/AAAA", None),
+        ("02/30/2025", "date JJ/MM/AAAA", None),
+        ("02/29/2025", "date JJ/MM/AAAA", None),
+        ("03/25/25", "date JJ/MM/AAAA", None),
+        ("03/25-2025", "date JJ/MM/AAAA", None),
+        ("2025-25-03", "date JJ/MM/AAAA", None),
+        ("03/25/2025 10:00", "date JJ/MM/AAAA", None),
+        (None, "date JJ/MM/AAAA", None),
+        (3.25, "date JJ/MM/AAAA", None),
+        # Colonne qui n'est pas une colonne de date.
+        ("03/25/2025", "texte", None),
+        ("03/25/2025", "nombre natif", None),
+    ],
+)
+def test_date_inversee_proposee(valeur, nature, attendu):
+    assert date_inversee_proposee(valeur, nature) == attendu
+
+
+def test_date_inversee_proposee_dans_le_classeur(tmp_path):
+    tables = {
+        "t": _table(
+            id=["A1", "A2", "A3", "A4"],
+            d=["03/25/2025", "31/02/2025", "03/26/2025", "03/27/2025"],
+            m=[1.0, 2.0, 3.0, 4.0],
+            nom=["x", "y", "z", "w"],
+        )
+    }
+    nature = "nature = date JJ/MM/AAAA"
+    anomalies = _anomalies(
+        _anomalie("format", "anomalie", 2, "d", id_anomalie="f1", regle=nature),
+        _anomalie("format", "anomalie", 3, "d", id_anomalie="f2", regle=nature),
+        # Une autre règle de format, une proposition déjà faite, un écart de gestion.
+        _anomalie("format", "anomalie", 4, "d", id_anomalie="f3", regle="format = formes fermées"),
+        _anomalie("format", "anomalie", 5, "d", id_anomalie="f4", regle=nature,
+                  proposition="01/01/2025"),
+        _anomalie("gestion", "à arbitrer", 4, "d", id_anomalie="g1", regle=nature),
+    )
+    elements = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION)
+    propositions = {
+        e.id_anomalie: None if pd.isna(e.proposition) else e.proposition
+        for e in elements.itertuples(index=False)
+    }
+    assert propositions == {
+        "f1": "25/03/2025", "f2": None, "f3": None, "f4": "01/01/2025", "g1": None,
+    }
+    chemin = exporter_arbitrage(elements, "2026-03", tmp_path / "a.xlsx", nb_imports=0)
+    classeur = load_workbook(chemin)
+    lignes = list(classeur[FEUILLE_ARBITRAGE].iter_rows(values_only=True))
+    par_id = {ligne[COLONNES_ARBITRAGE.index("id_anomalie")]: dict(zip(COLONNES_ARBITRAGE, ligne))
+              for ligne in lignes[1:]}
+    assert (par_id["f1"]["valeur"], par_id["f1"]["valeur_retenue"]) == ("03/25/2025", "25/03/2025")
+    assert par_id["f2"]["valeur_retenue"] is None
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "le jour et le mois étant sans doute inversés" in notice
+    # La valeur préremplie, gardée avec la décision corriger, est lue à l'import.
+    _remplir(chemin, {"f1": ("corriger", ..., None)})
+    arbitrage = importer_arbitrage(chemin, DICTIONNAIRE, nb_imports=0)
+    assert list(arbitrage.decisions["valeur_retenue"]) == ["25/03/2025"]
