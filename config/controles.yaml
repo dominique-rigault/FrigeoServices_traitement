@@ -2,8 +2,8 @@
 # pas déduire des fichiers. Une forme fixe (code postal, numéro à longueur fixe) ne
 # se déclare pas ici mais dans le classeur de revue du dictionnaire (règle format).
 # Ce fichier est réécrit en entier par le formulaire des règles de contrôle (notebook
-# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs s'écrivent à
-# la main, le formulaire les reprend tels quels.
+# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs et les durées
+# s'écrivent à la main, le formulaire les reprend tels quels.
 #
 # Règles possibles pour une colonne
 #   decimales  nombre maximal de décimales
@@ -11,11 +11,13 @@
 #              min_exclu: true ou max_exclu: true exclut la borne
 #   motif      expression régulière que la valeur entière doit respecter
 #   cle_luhn   clé de contrôle de Luhn valide (true)
+#   duree      unité d'une colonne de durée (minutes ou heures), sans contrôle : au
+#              nettoyage, une durée écrite avec ses unités (1h10, 95 min) y est convertie
 
 regles:
   interventions:
-    duree_min: {bornes: {min: 5, max: 720}}
-    duree_trajet_min: {bornes: {min: 0, max: 180}}
+    duree_min: {bornes: {min: 5, max: 720}, duree: minutes}
+    duree_trajet_min: {bornes: {min: 0, max: 180}, duree: minutes}
     distance_km: {decimales: 1, bornes: {min: 0, max: 200}}
     lieu_cp: {bornes: {min: 27000, max: 76999}}
   pieces_interventions:
