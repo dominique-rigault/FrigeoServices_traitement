@@ -98,6 +98,7 @@ Repères pour la phase 4 :
 - `# IMPORT` puis `# APPLICATION` sur un classeur non modifié est sans effet (aucune écriture);
 - `# FUSION` et `# ECRITURE APRES FUSION` ne servent qu'à une régénération (un mois de plus, ou une nouvelle version du code de génération); chaque exécution de `# ECRITURE APRES FUSION` sur un dictionnaire revu ajoute une copie de sauvegarde, même si rien n'a changé;
 - la revue n'est pas un préalable aux étapes 3 et 4 : une règle non revue est contrôlée et ses écarts portent le statut `observé`;
+- un remplacement ne sert qu'à une variante d'écriture d'une seule valeur valide (casse, accents, abréviation); une valeur qui peut correspondre à plusieurs valeurs valides (« Divers », « Autre », « SAV ») reste invalide sans remplacement, et le métier la tranche ligne par ligne dans le classeur d'arbitrage (phase 8);
 - la relecture du classeur se fait sans en coller d'extraits dans la conversation.
 
 ### Phase 5, règles de contrôle (notebook 04)
