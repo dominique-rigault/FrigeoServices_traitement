@@ -17,7 +17,7 @@
 regles:
   interventions:
     duree_min: {bornes: {min: 5, max: 720}, duree: minutes}
-    duree_trajet_min: {bornes: {min: 0, max: 180}, duree: minutes}
+    duree_trajet_min: {bornes: {min: 0}, duree: minutes}
     distance_km: {decimales: 1, bornes: {min: 0, max: 200}}
     lieu_cp: {bornes: {min: 27000, max: 76999}}
   pieces_interventions:
@@ -51,7 +51,7 @@ regles:
   intervenants:
     nom: {motif: '[A-ZÀ-ÖØ-ÞŒŸ]+(?:[ ''’-][A-ZÀ-ÖØ-ÞŒŸ]+)*'}
   remunerations:
-    salaire_brut_mensuel: {decimales: 2, bornes: {min: 1000}}
+    salaire_brut_mensuel: {decimales: 2, bornes: {min: 1000, max: 5000}}
     taux_activite: {decimales: 2, bornes: {min: 0, max: 1, min_exclu: true}}
   clients:
     siret: {cle_luhn: true}
