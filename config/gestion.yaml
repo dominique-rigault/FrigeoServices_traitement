@@ -16,6 +16,16 @@ jours_feries:
   2027: ['2027-01-01', '2027-03-29', '2027-05-01', '2027-05-06', '2027-05-08', '2027-05-17',
          '2027-07-14', '2027-08-15', '2027-11-01', '2027-11-11', '2027-12-25']
 
+# Paramètres communs par type de règle, repris par chaque règle du type qui ne les déclare
+# pas; une valeur écrite dans la règle l'emporte. La clé commentaire d'un type dit ce que
+# représentent ses valeurs.
+parametres_communs:
+  date_plausible:
+    min: 2010-01-01
+    apres_coupure: 61
+    commentaire: min, date de création de l'entreprise; apres_coupure, délai d'extraction
+      des référentiels après la fin de la période
+
 regles:
   - ref: decoupage
     libelle: Date de début dans la période de l'export
@@ -882,6 +892,7 @@ regles:
     debut: date_creation
     fin: date_fin_relation
     vide_hors_champ: true
+
   - ref: echeance
     libelle: Échéance client à 30 jours de la date de facture
     type: dates_ordonnees
@@ -892,14 +903,15 @@ regles:
     delai_max: 30
   - ref: echeance
     libelle: Échéance fournisseur de 30 à 75 jours après la facture (30 ou 45 jours fin de mois)
-    commentaire: Enveloppe des deux conditions de paiement; le contrôle exact selon le délai
-      du fournisseur reste à faire.
+    commentaire: Enveloppe des deux conditions de paiement; le contrôle exact selon le
+      délai du fournisseur reste à faire.
     type: dates_ordonnees
     table: achats_entetes
     debut: date_facture
     fin: date_echeance
     delai_min: 30
     delai_max: 75
+
   - ref: fec
     libelle: Date de pièce au plus tard le jour de l'écriture
     type: dates_ordonnees
@@ -918,6 +930,34 @@ regles:
     table: fec
     debut: EcritureDate
     fin: DateLet
+    vide_hors_champ: true
+
+  - ref: dates
+    libelle: Date d'entrée d'un intervenant plausible
+    type: date_plausible
+    table: intervenants
+    colonne: date_entree
+  - ref: dates
+    libelle: Date de sortie d'un intervenant plausible
+    type: date_plausible
+    table: intervenants
+    colonne: date_sortie
+    vide_hors_champ: true
+  - ref: dates
+    libelle: Date d'effet d'une rémunération plausible
+    type: date_plausible
+    table: remunerations
+    colonne: date_effet
+  - ref: dates
+    libelle: Date de création d'un client plausible
+    type: date_plausible
+    table: clients
+    colonne: date_creation
+  - ref: dates
+    libelle: Date de fin de relation d'un client plausible
+    type: date_plausible
+    table: clients
+    colonne: date_fin_relation
     vide_hors_champ: true
 
 # Règles retirées par le métier, gardées en entier pour pouvoir les rétablir
