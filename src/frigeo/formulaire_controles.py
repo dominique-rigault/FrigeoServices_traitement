@@ -64,7 +64,7 @@ from .controles import (
     problemes_regles_complementaires,
 )
 from .dictionnaire import STATUTS, _valeurs_renseignees, dossier_sauvegardes
-from .doublons import problemes_declarations_doublons
+from .doublons import CLE_TABLE_DES_LIGNES, problemes_declarations_doublons
 from .formulaires import (
     FOND_MODIFIABLE,
     FORMAT_EFFECTIF,
@@ -163,7 +163,9 @@ COLONNES_LUHN = (
     "commentaire",
 )
 COLONNES_DOUBLONS = ("table", "type", "colonnes", "origine", "observé", "statut", "commentaire")
-COLONNES_TABLES = ("table", "lignes", "clé_en_vigueur", "identiques_hors_clé")
+COLONNES_TABLES = (
+    "table", "lignes", "clé_en_vigueur", "identiques_hors_clé", CLE_TABLE_DES_LIGNES
+)
 COLONNES_MOTIFS = ("table", "colonne", "motif")
 COLONNES_DUREES = ("table", "colonne", "duree")
 COLONNES_TYPE = {
@@ -209,6 +211,7 @@ LARGEURS = {
     "lignes": 10,
     "clé_en_vigueur": 34,
     "identiques_hors_clé": 20,
+    CLE_TABLE_DES_LIGNES: 20,
     "motif": 50,
     "duree": 12,
 }
@@ -560,7 +563,8 @@ def lignes_doublons(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
 
 def lignes_tables(tables: dict, dictionnaire: dict, contenu: dict) -> list[dict]:
     """Lignes de la feuille des tables : faut-il chercher les lignes identiques hors
-    de la clé (« non » quand deux enregistrements peuvent y être pareils) ?"""
+    de la clé (« non » quand deux enregistrements peuvent y être pareils) ? La table
+    des lignes d'une table d'en-têtes est affichée en lecture seule."""
     declarations = _section(contenu, CLE_DOUBLONS)
     return [
         {
@@ -570,6 +574,7 @@ def lignes_tables(tables: dict, dictionnaire: dict, contenu: dict) -> list[dict]
             "identiques_hors_clé": (
                 NON if declarations.get(table, {}).get("identique_hors_cle") is False else OUI
             ),
+            CLE_TABLE_DES_LIGNES: declarations.get(table, {}).get(CLE_TABLE_DES_LIGNES),
         }
         for table, donnees in tables.items()
         if table in dictionnaire
@@ -679,7 +684,10 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         f"Feuille « {FEUILLE_TABLES} » : les lignes identiques hors de la clé",
         "oui : deux lignes pareilles en tout sauf la clé sont signalées. non : elles "
         "sont normales dans cette table (deux enregistrements peuvent être pareils). Ne "
-        "s'applique qu'à une table qui a une clé.",
+        "s'applique qu'à une table qui a une clé. La colonne table_des_lignes, en "
+        "lecture seule, nomme la table des lignes d'une table d'en-têtes (déclarée par "
+        "le consultant) : deux en-têtes pareils n'y sont signalés que si leurs lignes "
+        "sont pareilles aussi.",
         "",
         f"Feuille « {FEUILLE_MOTIFS} » : lecture seule",
         "Les motifs (expressions régulières) sont écrits par le consultant et repris "
@@ -1190,6 +1198,8 @@ def _importer_doublons(
                     f"(déclarer une clé, ou choisir {OUI})"
                 )
             declaration[REGLE_IDENTIQUES] = False
+        if CLE_TABLE_DES_LIGNES in ancienne:
+            declaration[CLE_TABLE_DES_LIGNES] = ancienne[CLE_TABLE_DES_LIGNES]
         if declaration:
             nouvelles[table] = declaration
     for table, declaration in declarations.items():
@@ -1405,8 +1415,8 @@ ENTETE_CONTROLES = """\
 # pas déduire des fichiers. Une forme fixe (code postal, numéro à longueur fixe) ne
 # se déclare pas ici mais dans le classeur de revue du dictionnaire (règle format).
 # Ce fichier est réécrit en entier par le formulaire des règles de contrôle (notebook
-# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs et les durées
-# s'écrivent à la main, le formulaire les reprend tels quels.
+# 04), qui ne garde pas les commentaires ajoutés à la main. Les motifs, les durées et
+# les tables des lignes s'écrivent à la main, le formulaire les reprend tels quels.
 #
 # Règles possibles pour une colonne
 #   decimales  nombre maximal de décimales
@@ -1422,6 +1432,8 @@ COMMENTAIRE_DOUBLONS = """\
 # cle = identifiant d'une ligne; unique = colonnes qui ne doivent pas se répéter;
 # presume_unique = colonnes en principe uniques, une répétition est à arbitrer;
 # identique_hors_cle false = deux lignes pareilles hors clé sont normales dans cette table.
+# table_des_lignes = table des lignes d'une table d'en-têtes : deux en-têtes pareils hors
+# clé ne sont signalés que si leurs lignes sont pareilles aussi.
 """
 COMMENTAIRE_ECARTEES = """\
 # Propositions du formulaire écartées par le métier, qui ne sont plus proposées
