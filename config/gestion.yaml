@@ -376,12 +376,13 @@ regles:
     valeurs: [unité, kg]
     vide_sinon: true
   - ref: renseignement
-    libelle: ref_piece renseignée si unite vaut kg
+    libelle: ref_piece renseignée si compte_charge vaut 601100 ou 601200, vide sinon
     type: renseignee_selon_valeur
     table: achats_lignes
     colonne: ref_piece
-    selon: unite
-    valeurs: [kg]
+    selon: compte_charge
+    valeurs: ['601100', '601200']
+    vide_sinon: true
   - ref: renseignement
     libelle: date_fin_relation renseignée si statut vaut Inactif, vide sinon
     type: renseignee_selon_valeur
