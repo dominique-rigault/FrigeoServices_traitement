@@ -47,7 +47,7 @@ import hashlib
 import math
 import re
 from dataclasses import dataclass, field
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, localcontext
 from pathlib import Path
 from typing import Callable
 
@@ -185,6 +185,7 @@ class Colonne:
     valeurs: list
     illisibles: int = 0
     problemes: dict[str, int] = field(default_factory=dict)
+    positions_illisibles: list[int] = field(default_factory=list)
 
     def compter(self, probleme: str) -> None:
         self.problemes[probleme] = self.problemes.get(probleme, 0) + 1
@@ -219,7 +220,8 @@ def valeurs_propre(serie: pd.Series, famille: str, nature: str) -> Colonne:
 
     lecture = lire(serie, nature)
     lues = lecture.etats == ETAT_LUE
-    colonne = Colonne([None] * len(serie), illisibles=int((lecture.etats == ETAT_ILLISIBLE).sum()))
+    positions = [int(p) for p in lecture.etats.index[lecture.etats == ETAT_ILLISIBLE]]
+    colonne = Colonne([None] * len(serie), illisibles=len(positions), positions_illisibles=positions)
     for position in lues[lues].index:
         if famille == FAMILLE_DATE:
             instant = pd.Timestamp(lecture.valeurs.iloc[position])
@@ -243,6 +245,7 @@ def valeurs_propre(serie: pd.Series, famille: str, nature: str) -> Colonne:
                 nombre = _decimal(serie.iloc[position])
             except InvalidOperation:
                 colonne.illisibles += 1
+                colonne.positions_illisibles.append(int(position))
                 continue
             probleme = _probleme_decimal(nombre)
             if probleme:
@@ -326,11 +329,18 @@ class TablePreparee:
     lignes: list[list]
 
 
+COLONNES_CELLULES_ILLISIBLES = (
+    "table", "colonne", "fichier_source", "feuille_source", "num_ligne_source",
+)
+
+
 @dataclass
 class Preparation:
     tables: list[TablePreparee]
     journal: list[dict]
-    illisibles: pd.DataFrame
+    illisibles: pd.DataFrame  # table, colonne, cellules
+    # Une ligne par cellule illisible de propre : table, colonne, lignage.
+    cellules_illisibles: pd.DataFrame
 
 
 def _lignage(donnees: pd.DataFrame, schema: str) -> tuple[list[tuple], list[list]]:
@@ -361,7 +371,7 @@ def preparer(
     Un garde-fou déclenché lève `ErreurEcriture`, qui liste tous les problèmes par
     table, colonne et nombre de cellules, sans aucune valeur.
     """
-    problemes, illisibles, preparees = [], [], []
+    problemes, illisibles, cellules, preparees = [], [], [], []
     manquantes = [
         f"{nom} ({etat})"
         for nom in structure
@@ -387,6 +397,12 @@ def preparer(
                         illisibles.append(
                             {"table": nom, "colonne": c.source, "cellules": resultat.illisibles}
                         )
+                        numeros = colonnes[3]
+                        cellules += [
+                            {"table": nom, "colonne": c.source, "fichier_source": lignage[p][0],
+                             "feuille_source": lignage[p][1], "num_ligne_source": numeros[p]}
+                            for p in resultat.positions_illisibles
+                        ]
                 for probleme, nombre in resultat.problemes.items():
                     problemes.append(
                         f"{schema}.{table.nom}.{c.nom} ({nom}.{c.source}) : {nombre} cellule(s), "
@@ -413,7 +429,10 @@ def preparer(
             "Lignes dont le fichier n'est pas dans le périmètre : " + ", ".join(hors_journal)
         )
     return Preparation(
-        preparees, journal, pd.DataFrame(illisibles, columns=["table", "colonne", "cellules"])
+        preparees,
+        journal,
+        pd.DataFrame(illisibles, columns=["table", "colonne", "cellules"]),
+        pd.DataFrame(cellules, columns=list(COLONNES_CELLULES_ILLISIBLES)),
     )
 
 
@@ -537,6 +556,7 @@ class Ecriture:
     lignes: pd.DataFrame  # table, chargement, propre
     illisibles: pd.DataFrame  # table, colonne, cellules
     fichiers: int
+    preparation: Preparation | None = None  # valeurs écrites, pour verifier_base
 
 
 def ecrire_base(
@@ -601,7 +621,9 @@ def ecrire_base(
         ],
         columns=["table", SCHEMA_CHARGEMENT, SCHEMA_PROPRE],
     )
-    return Ecriture(id_execution, lignes, preparation.illisibles, len(preparation.journal))
+    return Ecriture(
+        id_execution, lignes, preparation.illisibles, len(preparation.journal), preparation
+    )
 
 
 # --- Tables de qualite (7.2d) -------------------------------------------------------
@@ -919,3 +941,166 @@ class CompleterQualite:
             if valeurs:
                 _inserer_qualite(curseur, table, noms, valeurs, colonnes_base[table])
             self.comptes[table] = len(valeurs)
+
+
+# --- Vérification de bout en bout (7.2e) --------------------------------------------
+
+COLONNES_VERIFICATION = ["famille", "controle", "attendu", "obtenu", "conforme"]
+FAMILLE_EXECUTION = "exécution"
+FAMILLE_ILLISIBLES = "illisibles"
+FAMILLE_QUALITE = "qualite"
+VALEUR_MASQUEE = "masqué"
+TABLES_AVEC_ETAT = ("anomalie", "non_evaluable", "bilan_controle")
+TABLES_AVEC_LIGNAGE = ("anomalie", "non_evaluable", "journal_nettoyage")
+
+
+def attendus_table(preparee: TablePreparee) -> list[tuple[str, str, object, bool]]:
+    """Agrégats attendus d'une table préparée : (libellé, expression SQL, valeur
+    attendue, valeur à masquer).
+
+    Pour toute table : nombre de lignes, puis nombre de cellules renseignées de chaque
+    colonne de données. En propre, en plus : somme exacte d'une colonne entière ou
+    décimale, plus petite et plus grande valeur d'une date ou d'une heure (écriture ISO).
+    Les agrégats d'une colonne sensible, hors décomptes, sont à masquer à l'affichage.
+    """
+    nom = f"{preparee.schema}.{preparee.table.nom}"
+    attendus = [(f"{nom} : lignes", "COUNT(*)", len(preparee.lignes), False)]
+    debut = len(preparee.colonnes) - len(preparee.table.colonnes)
+    for rang, colonne in enumerate(preparee.table.colonnes):
+        valeurs = [l[debut + rang] for l in preparee.lignes if l[debut + rang] is not None]
+        libelle = f"{nom}.{colonne.nom}"
+        attendus.append((f"{libelle} : cellules renseignées", f"COUNT({colonne.nom})", len(valeurs), False))
+        if preparee.schema != SCHEMA_PROPRE:
+            continue
+        if colonne.famille in (FAMILLE_ENTIER, FAMILLE_DECIMAL):
+            with localcontext() as contexte:
+                contexte.prec = 60
+                somme = sum((Decimal(v) for v in valeurs), Decimal(0)) if valeurs else None
+            attendus.append((f"{libelle} : somme", f"SUM({colonne.nom})", somme, colonne.sensible))
+        elif colonne.famille in (FAMILLE_DATE, FAMILLE_HEURE):
+            attendus.append((f"{libelle} : minimum", f"MIN({colonne.nom})",
+                             min(valeurs) if valeurs else None, colonne.sensible))
+            attendus.append((f"{libelle} : maximum", f"MAX({colonne.nom})",
+                             max(valeurs) if valeurs else None, colonne.sensible))
+    return attendus
+
+
+def valeur_lue(valeur):
+    """Valeur rendue par le serveur, sous la forme des valeurs attendues : nombre en
+    Decimal, date ou heure en écriture ISO."""
+    if valeur is None or isinstance(valeur, bool):
+        return valeur
+    if isinstance(valeur, (dt.date, dt.time)):
+        return valeur.isoformat()
+    if isinstance(valeur, (int, float, Decimal)):
+        return Decimal(str(valeur))
+    return valeur
+
+
+def _affiche(valeur):
+    if isinstance(valeur, Decimal):
+        return _decimal_en_texte(valeur)
+    return valeur
+
+
+def conformite(attendu, obtenu) -> bool:
+    """Égalité d'un agrégat attendu et lu : un entier attendu est comparé en Decimal."""
+    if isinstance(attendu, int) and not isinstance(attendu, bool) and isinstance(obtenu, Decimal):
+        attendu = Decimal(attendu)
+    return attendu == obtenu
+
+
+def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
+                  sorties: SortiesQualite | None = None) -> pd.DataFrame:
+    """Relit la base après une écriture et compare avec ce que Python a préparé.
+
+    Une ligne par contrôle (`COLONNES_VERIFICATION`), en décomptes et agrégats
+    seulement, ceux d'une colonne sensible étant affichés « masqué » : exécution
+    unique de la période, au statut réussie; lignes et cellules renseignées de chaque
+    table de chargement et de propre, sommes, minimums et maximums de propre;
+    cellules illisibles de propre rattachées à une anomalie après nettoyage (même
+    ligne source, même champ); avec `sorties`, lignes de chaque table de qualite par
+    état, et id_chargement renseigné pour toute ligne qui a un fichier source.
+    """
+    from sqlalchemy import text
+
+    from .anomalies import _colonnes_du_champ
+
+    controles = []
+
+    def ajouter(famille, controle, attendu, obtenu, masque=False):
+        conforme = conformite(attendu, obtenu)
+        if masque:
+            attendu = obtenu = VALEUR_MASQUEE
+        controles.append(
+            {"famille": famille, "controle": controle, "attendu": _affiche(attendu),
+             "obtenu": _affiche(obtenu), "conforme": conforme}
+        )
+
+    preparation = ecriture.preparation
+    execution = {"e": ecriture.id_execution}
+    with moteur.connect() as conn:
+        executions = conn.execute(
+            text("SELECT id_execution, statut FROM qualite.execution WHERE periode_fin = :p"),
+            {"p": periode_fin},
+        ).all()
+        ajouter(FAMILLE_EXECUTION, f"exécutions de la période {periode_fin}", 1, len(executions))
+        ajouter(FAMILLE_EXECUTION, "exécution écrite, au statut réussie",
+                f"{ecriture.id_execution} {STATUT_REUSSIE}",
+                ", ".join(f"{i} {s}" for i, s in executions) or None)
+
+        for preparee in preparation.tables:
+            attendus = attendus_table(preparee)
+            ligne = conn.execute(
+                text(f"SELECT {', '.join(a[1] for a in attendus)} "
+                     f"FROM {preparee.schema}.{preparee.table.nom}")
+            ).one()
+            for (libelle, _, attendu, masque), obtenu in zip(attendus, ligne):
+                ajouter(preparee.schema, libelle, attendu, valeur_lue(obtenu), masque)
+
+        connues = set()
+        for table, champ, fichier, feuille, numero in conn.execute(
+            text("SELECT table_source, champ, fichier_source, feuille_source, num_ligne_source "
+                 "FROM qualite.anomalie WHERE id_execution = :e AND etat = N'nettoyé'"),
+            execution,
+        ).all():
+            for autre, colonne in _colonnes_du_champ(table, champ):
+                connues.add((autre, colonne, fichier, _feuille(feuille), numero))
+        cellules = preparation.cellules_illisibles
+        rattachees = sum(
+            1 for c in cellules.itertuples(index=False)
+            if (c.table, c.colonne, c.fichier_source, c.feuille_source, c.num_ligne_source) in connues
+        )
+        ajouter(FAMILLE_ILLISIBLES, "cellules illisibles de propre rattachées à une anomalie "
+                "après nettoyage", len(cellules), rattachees)
+
+        if sorties is not None:
+            attendus_qualite = {
+                ("anomalie", ETAT_BRUT): len(sorties.anomalies_brutes),
+                ("anomalie", ETAT_NETTOYE): len(sorties.anomalies_nettoyees),
+                ("non_evaluable", ETAT_BRUT): len(sorties.non_evaluables_brutes),
+                ("non_evaluable", ETAT_NETTOYE): len(sorties.non_evaluables_nettoyees),
+                ("bilan_controle", ETAT_BRUT): len(sorties.bilan_brut),
+                ("bilan_controle", ETAT_NETTOYE): len(sorties.bilan_nettoye),
+                ("journal_nettoyage", None): len(sorties.journal_nettoyage),
+                ("bilan_nettoyage", None): len(sorties.bilan_nettoyage),
+                ("decision", None): len(sorties.decisions.get("decisions") or {}),
+            }
+            for (table, etat), attendu in attendus_qualite.items():
+                filtre = " AND etat = :etat" if etat else ""
+                obtenu = conn.execute(
+                    text(f"SELECT COUNT(*) FROM qualite.{table} WHERE id_execution = :e{filtre}"),
+                    {**execution, **({"etat": etat} if etat else {})},
+                ).scalar()
+                libelle = f"qualite.{table}" + (f", état {etat}" if etat else "") + " : lignes"
+                ajouter(FAMILLE_QUALITE, libelle, attendu, obtenu)
+            for table in TABLES_AVEC_LIGNAGE:
+                obtenu = conn.execute(
+                    text(f"SELECT COUNT(*) FROM qualite.{table} WHERE id_execution = :e "
+                         "AND fichier_source IS NOT NULL AND fichier_source <> N'' "
+                         "AND id_chargement IS NULL"),
+                    execution,
+                ).scalar()
+                ajouter(FAMILLE_QUALITE, f"qualite.{table} : lignes avec un fichier source "
+                        "sans id_chargement", 0, obtenu)
+    return pd.DataFrame(controles, columns=COLONNES_VERIFICATION)

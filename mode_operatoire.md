@@ -173,7 +173,7 @@ Repères pour la phase 7 :
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
-| 8.1 | Mettre `PERIODE_FIN` à jour et exécuter le notebook en entier (environ trois minutes : nettoyage, puis contrôles avant et après nettoyage); vérifier le nombre de décisions du métier lues (emplacement attendu), la clé des empreintes créée au premier passage puis lue (`data/config/cle_empreintes.txt`), les corrections sur une colonne sensible toutes masquées et avec leurs deux empreintes, 0 ligne aux empreintes incohérentes, 0 ligne dont la valeur ou la clé sensible n'est pas masquée | C | notebook 07 | opérationnel |
+| 8.1 | Mettre `PERIODE_FIN` à jour et exécuter le notebook en entier (environ trois minutes : nettoyage, puis contrôles avant et après nettoyage, écriture en base et sa vérification, voir la phase 9); vérifier le nombre de décisions du métier lues (emplacement attendu), la clé des empreintes créée au premier passage puis lue (`data/config/cle_empreintes.txt`), les corrections sur une colonne sensible toutes masquées et avec leurs deux empreintes, 0 ligne aux empreintes incohérentes, 0 ligne dont la valeur ou la clé sensible n'est pas masquée | C | notebook 07 | opérationnel |
 | 8.2 | Lire le bilan du nettoyage (cellules corrigées, lignes retirées, raisons de non-correction) et la comparaison avant et après; regarder un par un les contrôles aux anomalies apparues (une valeur devenue lisible rend une règle évaluable) | C, A (décomptes seulement) | cellules `# NETTOYAGE` et `# COMPARAISON` | opérationnel |
 | 8.3 | Exporter le classeur d'arbitrage dans `data/formulaires/` (cellule `# EXPORT ARBITRAGE`) | C | notebook 07 | opérationnel |
 | 8.4 | Trancher les lignes du classeur dans la colonne `decision` (corriger avec la valeur retenue, garder ou retirer, selon la sorte), mode d'emploi dans la première feuille; une ligne sans décision sera proposée de nouveau; la valeur retenue est préremplie quand l'outil propose une correction (date hors période, forme du référentiel d'une clé mal écrite, date au jour et au mois inversés, y compris sur une colonne sensible), à vérifier avant de choisir corriger | M avec C | Excel | opérationnel |
@@ -195,7 +195,7 @@ Repères pour la phase 8 :
 
 ### Phase 9, base de données (étape 7, en cours)
 
-Cette phase met en place la base SQL Server qui recevra les données chargées et nettoyées. La structure de la base est construite (sous-étape 7.1); l'écriture des données depuis Python (sous-étape 7.2) est en cours, les calculs suivront.
+Cette phase met en place la base SQL Server qui recevra les données chargées et nettoyées. La structure de la base est construite (sous-étape 7.1), et le notebook 07 y écrit les données chargées et nettoyées et les sorties de la qualité, puis vérifie ce qu'il a écrit (sous-étape 7.2); le modèle en étoile et les calculs suivront.
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
@@ -205,7 +205,8 @@ Cette phase met en place la base SQL Server qui recevra les données chargées e
 | 9.4 | Créer la base par `python -m frigeo.base --recreer`, depuis la racine du dépôt : la commande supprime la base si elle existe, la recrée, puis applique les scripts de `sql/socle/` par ordre de nom et ceux de chaque pack | C | terminal | opérationnel |
 | 9.5 | Vérifier dans SSMS que `qualite.script_applique` liste chaque script appliqué, avec son empreinte et la version du code | C | SSMS | opérationnel |
 | 9.6 | Après l'ajout d'un script, l'appliquer par `python -m frigeo.base` (une base à jour affiche « aucun script à appliquer ») | C | terminal | opérationnel |
-| 9.7 | Après le notebook 07, exécuter sa cellule `# BASE` : elle écrit en base les tables chargées (schéma `chargement`, valeurs telles que livrées) et nettoyées (schéma `propre`, valeurs typées), les fichiers chargés (`qualite.journal_chargement`, avec leur empreinte) et la correspondance des colonnes (`qualite.correspondance_colonne`), puis, dans la même transaction, les anomalies avant nettoyage (état « brut », celles du fichier `anomalies_AAAA-MM.csv`) et après nettoyage (état « nettoyé »), leurs bilans et lignes non évaluables, le journal et le bilan du nettoyage et les décisions du métier appliquées | C | notebook 07 | en cours |
+| 9.7 | Après le notebook 07, exécuter sa cellule `# BASE` : elle écrit en base les tables chargées (schéma `chargement`, valeurs telles que livrées) et nettoyées (schéma `propre`, valeurs typées), les fichiers chargés (`qualite.journal_chargement`, avec leur empreinte) et la correspondance des colonnes (`qualite.correspondance_colonne`), puis, dans la même transaction, les anomalies avant nettoyage (état « brut », celles du fichier `anomalies_AAAA-MM.csv`) et après nettoyage (état « nettoyé »), leurs bilans et lignes non évaluables, le journal et le bilan du nettoyage et les décisions du métier appliquées; un refus ou une erreur n'écrit rien (voir les repères) | C | notebook 07 | opérationnel |
+| 9.8 | Exécuter ensuite la cellule `# VERIFICATION BASE` : elle relit la base et la compare à ce que Python a préparé (lignes et cellules renseignées de chaque table, sommes exactes, dates extrêmes, cellules illisibles rattachées à une anomalie, lignes de `qualite` par état, exécution unique de la période); 0 contrôle non conforme attendu, un écart se lit dans le tableau affiché | C | notebook 07 | opérationnel |
 
 Repères pour la phase 9 :
 
@@ -224,6 +225,7 @@ Repères pour la phase 9 :
 - une valeur restée illisible après nettoyage est écrite vide dans `propre`, sa valeur livrée restant dans `chargement`;
 - dans `qualite`, les valeurs sont celles des fichiers CSV de `data/anomalies` et `data/nettoyage` : une valeur d'une colonne sensible y reste « masqué » (et non vide), et les mêmes refus s'appliquent avant toute écriture (valeur sensible non masquée, table non qualifiée), ainsi qu'un texte plus long que sa colonne en base;
 - pour une décision du métier sur une colonne sensible, `qualite.decision.valeur_retenue` reste vide et seule son empreinte est écrite (`empreinte_valeur_retenue`, avec la clé de `data/config/cle_empreintes.txt`);
+- un notebook modifié hors de l'éditeur (par l'assistant, ou par `git pull`) se ferme sans l'enregistrer puis se rouvre avant de l'exécuter : sinon l'éditeur exécute l'ancienne version qu'il garde en mémoire, et peut la réenregistrer;
 - les tests sans base se lancent par `python -m pytest tests/test_base.py tests/test_structure_base.py tests/test_ecriture_base.py`.
 
 ## Cycle mensuel (un mois de plus)
@@ -239,7 +241,7 @@ Repères pour la phase 9 :
 | M.7 | Exécuter les notebooks 04 puis 05 en entier; si `# EXPORT FORMULAIRE` signale des lignes à « observé » nouvelles (une colonne, un groupe ou une proposition de plus), faire revoir le formulaire du mois (phase 5, actions 5.2 à 5.4, ou phase 6, actions 6.2 à 6.4) | C, M | notebooks 04, 05, Excel | opérationnel |
 | M.8 | Exécuter le notebook 06 en entier : il relance les contrôles et réécrit les trois CSV de la période dans `data/anomalies/` (table des anomalies, bilan, lignes non évaluables) | C | notebook 06 | opérationnel |
 | M.9 | Revoir `config/anomalies.yaml` quand une colonne ou un indicateur change (le notebook 06 liste les colonnes non déclarées et les contrôles non qualifiés) | A, puis C | `config/anomalies.yaml` | opérationnel |
-| M.10 | Exécuter le notebook 07 en entier, puis l'arbitrage si des éléments sont à trancher (phase 8, étapes 8.3 à 8.7) | C, M | notebook 07, Excel | opérationnel |
+| M.10 | Exécuter le notebook 07 en entier, puis l'arbitrage si des éléments sont à trancher (phase 8, étapes 8.3 à 8.7); l'exécution complète écrit aussi la période en base et la vérifie (phase 9, actions 9.7 et 9.8) | C, M | notebook 07, Excel | opérationnel |
 
 Une fois par an : valider dans le formulaire des règles de gestion les jours fériés de la nouvelle année, proposés dès que ses premiers exports sont chargés (le notebook 05 avertit quand une année manque) et vérifier que les paramètres annuels du client couvrent la nouvelle année.
 
@@ -250,4 +252,4 @@ Une fois par an : valider dans le formulaire des règles de gestion les jours f
 - **Rapport.** Le rapport au client (plan, destinataire, format) n'est pas encore défini; les parties 2.5 et 3.3 en sont les premières briques.
 - **Découverte des encodages et séparateurs.** Ils sont déclarés à la main dans `config/sources.yaml`; l'étape qui les proposerait n'est pas faite.
 - **Dates dont le siècle a été ajouté.** Elles ne sont pas soumises à la confirmation du métier; les faire confirmer dans le classeur d'arbitrage serait une amélioration possible.
-- **Base de données.** L'authentification Windows est la seule prévue; la connexion à Azure SQL Database (étape 10) reste à faire. Un script ajouté avec un numéro inférieur à celui d'un script déjà appliqué serait appliqué après lui sans alerte, alors qu'une reconstruction l'appliquerait avant : toujours numéroter à la suite.
+- **Base de données.** L'authentification Windows est la seule prévue; la connexion à Azure SQL Database (étape 10) reste à faire. Un script ajouté avec un numéro inférieur à celui d'un script déjà appliqué serait appliqué après lui sans alerte, alors qu'une reconstruction l'appliquerait avant : toujours numéroter à la suite. Le jalon du premier déploiement (tag Git à partir duquel les scripts sont figés) reste à poser.

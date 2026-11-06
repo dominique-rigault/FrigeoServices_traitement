@@ -1,6 +1,7 @@
 """Tests sans base de données du module frigeo.ecriture_base."""
 
 import datetime as dt
+from decimal import Decimal
 import hashlib
 from types import SimpleNamespace
 
@@ -8,9 +9,12 @@ import pandas as pd
 import pytest
 
 from frigeo.ecriture_base import (
+    COLONNES_CELLULES_ILLISIBLES,
     CLE_LIGNAGE,
     SortiesQualite,
+    attendus_table,
     champ_sensible,
+    conformite,
     convertir_lignes,
     PROBLEME_DECIMALES,
     PROBLEME_GRAND,
@@ -28,6 +32,7 @@ from frigeo.ecriture_base import (
     texte_livre,
     valeurs_chargement,
     valeurs_propre,
+    valeur_lue,
     valeur_sql,
 )
 from frigeo.dictionnaire import MOTIF_SENSIBLE, est_masquee
@@ -498,3 +503,71 @@ def test_problemes_sorties_colonnes():
     assert any(p.startswith("anomalies, état nettoyé : ") for p in problemes)
     assert any(p.startswith("journal du nettoyage : colonnes attendues") for p in problemes)
     assert any(p.startswith("bilan du nettoyage : colonnes attendues") for p in problemes)
+
+
+# --- Vérification de bout en bout (7.2e) --------------------------------------------
+
+
+def test_cellules_illisibles_avec_leur_lignage(jeu):
+    jeu.nettoyees["interventions"] = jeu.tables["interventions"].copy()
+    preparation = preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure)
+    assert list(preparation.cellules_illisibles.columns) == list(COLONNES_CELLULES_ILLISIBLES)
+    assert preparation.cellules_illisibles.to_dict("records") == [
+        {"table": "interventions", "colonne": "duree_min",
+         "fichier_source": "interventions_2025.csv", "feuille_source": None,
+         "num_ligne_source": 3}
+    ]
+
+
+def test_attendus_table(jeu):
+    jeu.nettoyees["interventions"] = jeu.tables["interventions"].copy()
+    jeu.structure = construire_structure(
+        {
+            "interventions": {"id_intervention": regles(), "duree_min": regles("entier (texte)")},
+            "factures_entetes": {"num_facture": regles(), "total_ht": regles("nombre natif")},
+            "factures_lignes": {"num_facture": regles()},
+        },
+        {"factures_entetes": frozenset({"total_ht"})},
+    )
+    preparation = preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure)
+    tables = {(p.schema, p.table.source): p for p in preparation.tables}
+    assert attendus_table(tables[("propre", "interventions")]) == [
+        ("propre.interventions : lignes", "COUNT(*)", 2, False),
+        ("propre.interventions.id_intervention : cellules renseignées", "COUNT(id_intervention)", 2, False),
+        ("propre.interventions.duree_min : cellules renseignées", "COUNT(duree_min)", 1, False),
+        ("propre.interventions.duree_min : somme", "SUM(duree_min)", Decimal(45), False),
+    ]
+    assert attendus_table(tables[("propre", "factures_entetes")])[-1] == (
+        "propre.factures_entetes.total_ht : somme", "SUM(total_ht)", Decimal("100.5"), True
+    )
+    assert [a[1] for a in attendus_table(tables[("chargement", "interventions")])] == [
+        "COUNT(*)", "COUNT(id_intervention)", "COUNT(duree_min)",
+    ]
+    assert attendus_table(tables[("propre", "factures_lignes")]) == [
+        ("propre.factures_lignes : lignes", "COUNT(*)", 0, False),
+        ("propre.factures_lignes.num_facture : cellules renseignées", "COUNT(num_facture)", 0, False),
+    ]
+
+
+@pytest.mark.parametrize(
+    "valeur, attendu",
+    [
+        (None, None),
+        (Decimal("12.50000000"), Decimal("12.5")),
+        (45, Decimal(45)),
+        (dt.date(2025, 3, 14), "2025-03-14"),
+        (dt.time(8, 30), "08:30:00"),
+        ("texte", "texte"),
+    ],
+)
+def test_valeur_lue(valeur, attendu):
+    assert valeur_lue(valeur) == attendu
+
+
+def test_conformite():
+    assert conformite(3, Decimal(3))
+    assert conformite(Decimal("12.5"), Decimal("12.50000000"))
+    assert conformite(None, None)
+    assert conformite("2025-03-14", "2025-03-14")
+    assert not conformite(Decimal("12.5"), Decimal("12.4"))
+    assert not conformite(2, Decimal(3))
