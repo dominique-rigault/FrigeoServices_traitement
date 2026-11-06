@@ -3,6 +3,7 @@
 import pytest
 
 from frigeo.structure_base import (
+    COLONNES_CORRESPONDANCE,
     COLONNES_RESUME,
     FAMILLE_DATE,
     FAMILLE_DECIMAL,
@@ -14,8 +15,12 @@ from frigeo.structure_base import (
     ErreurStructure,
     colonnes_techniques,
     construire_structure,
+    ddl_structure,
+    ddl_suppression,
+    ddl_table,
     est_code,
     famille_propre,
+    lignes_correspondance,
     nom_sql,
     probleme_nom,
     resumer_structure,
@@ -223,3 +228,102 @@ def test_resume():
     assert ligne["colonne_base"] == "journal_code"
     assert ligne["type_propre"] == "nvarchar(4000)"
     assert resume["sensible"].sum() == 1
+
+
+# --- SQL des tables de données ------------------------------------------------------
+
+
+def structure_exemple():
+    return construire_structure(
+        dictionnaire_exemple(),
+        {"interventions": frozenset({"client"})},
+        {"clients": {"siret": {"cle_luhn": True}}},
+    )
+
+
+def test_ddl_table_propre():
+    sql = ddl_table(structure_exemple()["interventions"], SCHEMA_PROPRE)
+    assert sql.startswith("CREATE TABLE propre.interventions (\n")
+    assert sql.endswith("\n);")
+    lignes = [ligne.strip().rstrip(",") for ligne in sql.splitlines()[1:-1]]
+    assert lignes[:6] == [
+        "id_ligne bigint IDENTITY(1, 1) NOT NULL",
+        "id_chargement int NOT NULL",
+        "periode_export nvarchar(20) NULL",
+        "fichier_source nvarchar(260) NOT NULL",
+        "feuille_source nvarchar(128) NULL",
+        "num_ligne_source int NOT NULL",
+    ]
+    assert lignes[6:13] == [
+        "id_intervention nvarchar(4000) NULL",
+        "date_debut date NULL",
+        "heure_debut time(0) NULL",
+        "duree_min bigint NULL",
+        "lieu_cp nvarchar(4000) NULL",
+        "distance_km decimal(28, 8) NULL",
+        "client nvarchar(4000) NULL",
+    ]
+    assert lignes[13:] == [
+        "CONSTRAINT pk_interventions PRIMARY KEY (id_ligne)",
+        "CONSTRAINT uq_interventions_lignage UNIQUE "
+        "(fichier_source, feuille_source, num_ligne_source)",
+        "CONSTRAINT fk_interventions_chargement FOREIGN KEY (id_chargement) "
+        "REFERENCES qualite.journal_chargement (id_chargement)",
+    ]
+
+
+def test_ddl_table_chargement_en_texte():
+    sql = ddl_table(structure_exemple()["fec"], SCHEMA_CHARGEMENT)
+    assert sql.startswith("CREATE TABLE chargement.fec (\n")
+    for attendu in (
+        "nb_champs_source int NULL",
+        "champs_excedentaires nvarchar(4000) NULL",
+        "journal_code nvarchar(4000) NULL",
+        "compte_num nvarchar(4000) NULL",
+        "debit nvarchar(4000) NULL",
+    ):
+        assert attendu in sql
+    assert "decimal" not in sql
+
+
+def test_ddl_structure_chargement_puis_propre():
+    instructions = ddl_structure(structure_exemple())
+    entetes = [i.splitlines()[0] for i in instructions]
+    assert entetes == [
+        "CREATE TABLE chargement.interventions (",
+        "CREATE TABLE chargement.fec (",
+        "CREATE TABLE chargement.clients (",
+        "CREATE TABLE propre.interventions (",
+        "CREATE TABLE propre.fec (",
+        "CREATE TABLE propre.clients (",
+    ]
+
+
+def test_ddl_suppression():
+    assert ddl_suppression([("chargement", "fec"), ("propre", "ancienne]table")]) == [
+        "DROP TABLE [chargement].[fec];",
+        "DROP TABLE [propre].[ancienne]]table];",
+    ]
+    assert ddl_suppression([]) == []
+    with pytest.raises(ValueError, match="qualite.execution"):
+        ddl_suppression([("propre", "fec"), ("qualite", "execution")])
+
+
+def test_lignes_correspondance():
+    lignes = lignes_correspondance(structure_exemple())
+    assert len(lignes) == 11
+    assert all(set(ligne) == set(COLONNES_CORRESPONDANCE) for ligne in lignes)
+    fec = [ligne for ligne in lignes if ligne["table_source"] == "fec"]
+    assert [ligne["ordre"] for ligne in fec] == [1, 2, 3]
+    assert fec[1] == {
+        "table_source": "fec",
+        "colonne_source": "CompteNum",
+        "table_base": "fec",
+        "colonne_base": "compte_num",
+        "ordre": 2,
+        "nature": "entier (texte)",
+        "famille": "texte",
+        "type_propre": "nvarchar(4000)",
+        "sensible": False,
+    }
+    assert sum(ligne["sensible"] for ligne in lignes) == 1

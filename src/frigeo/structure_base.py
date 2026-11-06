@@ -34,6 +34,16 @@ primaire), id_chargement (qualite.journal_chargement), periode_export (vide pour
 un référentiel), fichier_source, feuille_source et num_ligne_source (lignage, uniques
 ensemble). Le schéma chargement garde en plus nb_champs_source et
 champs_excedentaires, qui décrivent la ligne livrée.
+
+SQL. Les tables de données ne sont pas créées par un script numéroté : `ddl_structure`
+produit leurs instructions CREATE TABLE, exécutées par l'écriture (7.2c) après la
+suppression de toutes les tables des deux schémas (`ddl_suppression`). Les tables
+reflètent donc toujours la dernière exécution; les vues construites sur elles ne
+doivent pas être créées WITH SCHEMABINDING. `lignes_correspondance` donne les lignes
+de qualite.correspondance_colonne (sql/socle/003_qualite_structure.sql).
+
+Essai, depuis la racine du dépôt : python -m frigeo.structure_base --essai crée
+toutes les tables dans une transaction annulée, pour vérifier le SQL généré.
 """
 
 from __future__ import annotations
@@ -380,3 +390,198 @@ def resumer_structure(structure: dict[str, TableBase]) -> pd.DataFrame:
         for colonne in table.colonnes
     ]
     return pd.DataFrame(lignes, columns=COLONNES_RESUME)
+
+
+# --- SQL des tables de données ------------------------------------------------------
+
+# Tables présentes en base dans les deux schémas de données, à supprimer avant la
+# recréation (lues au moment de l'écriture).
+REQUETE_TABLES_EXISTANTES = (
+    "SELECT s.name, t.name FROM sys.tables AS t "
+    "JOIN sys.schemas AS s ON s.schema_id = t.schema_id "
+    f"WHERE s.name IN (N'{SCHEMA_CHARGEMENT}', N'{SCHEMA_PROPRE}') "
+    "ORDER BY s.name, t.name"
+)
+
+
+def _definition(nom: str, type_sql: str, obligatoire: bool, identite: bool = False) -> str:
+    return (
+        f"{nom} {type_sql}"
+        + (" IDENTITY(1, 1)" if identite else "")
+        + (" NOT NULL" if obligatoire else " NULL")
+    )
+
+
+def ddl_table(table: TableBase, schema: str) -> str:
+    """Instruction CREATE TABLE d'une table de données dans le schéma.
+
+    Colonnes techniques d'abord, puis colonnes de données dans l'ordre du
+    dictionnaire, toutes facultatives : en texte dans chargement, au type de leur
+    famille dans propre. Contraintes : clé primaire sur id_ligne, unicité du lignage,
+    clé étrangère vers qualite.journal_chargement. Les noms de contraintes sont les
+    mêmes dans les deux schémas, SQL Server les rattachant au schéma de la table.
+    """
+    definitions = [
+        _definition(c.nom, c.type_sql, c.obligatoire, c.identite)
+        for c in colonnes_techniques(schema)
+    ]
+    definitions += [
+        _definition(
+            c.nom, TYPE_CHARGEMENT if schema == SCHEMA_CHARGEMENT else c.type_propre, False
+        )
+        for c in table.colonnes
+    ]
+    definitions += [
+        f"CONSTRAINT pk_{table.nom} PRIMARY KEY (id_ligne)",
+        f"CONSTRAINT uq_{table.nom}_lignage UNIQUE ({', '.join(COLONNES_LIGNAGE)})",
+        f"CONSTRAINT fk_{table.nom}_chargement FOREIGN KEY (id_chargement) "
+        "REFERENCES qualite.journal_chargement (id_chargement)",
+    ]
+    return f"CREATE TABLE {schema}.{table.nom} (\n    " + ",\n    ".join(definitions) + "\n);"
+
+
+def ddl_structure(structure: dict[str, TableBase]) -> list[str]:
+    """Instructions de création de toutes les tables de données : celles de
+    chargement, puis celles de propre, dans l'ordre du dictionnaire."""
+    return [ddl_table(table, schema) for schema in SCHEMAS for table in structure.values()]
+
+
+def _entre_crochets(nom: str) -> str:
+    return "[" + nom.replace("]", "]]") + "]"
+
+
+def ddl_suppression(existantes) -> list[str]:
+    """Instructions DROP TABLE des tables (schéma, nom) présentes en base.
+
+    Toutes les tables des schémas chargement et propre sont supprimées, y compris
+    une table qui n'est plus dans le dictionnaire. Une table d'un autre schéma est
+    refusée, par sécurité. Les noms sont mis entre crochets, une table créée à la
+    main pouvant porter un nom quelconque.
+    """
+    instructions = []
+    for schema, nom in existantes:
+        if schema not in SCHEMAS:
+            raise ValueError(
+                f"Suppression refusée : la table {schema}.{nom} n'est pas dans "
+                f"{' ou '.join(SCHEMAS)}"
+            )
+        instructions.append(f"DROP TABLE {_entre_crochets(schema)}.{_entre_crochets(nom)};")
+    return instructions
+
+
+COLONNES_CORRESPONDANCE = (
+    "table_source",
+    "colonne_source",
+    "table_base",
+    "colonne_base",
+    "ordre",
+    "nature",
+    "famille",
+    "type_propre",
+    "sensible",
+)
+
+
+def lignes_correspondance(structure: dict[str, TableBase]) -> list[dict]:
+    """Lignes de qualite.correspondance_colonne, sans id_execution.
+
+    `ordre` est la position de la colonne dans sa table, à partir de 1.
+    """
+    return [
+        {
+            "table_source": table.source,
+            "colonne_source": colonne.source,
+            "table_base": table.nom,
+            "colonne_base": colonne.nom,
+            "ordre": ordre,
+            "nature": colonne.nature or None,
+            "famille": colonne.famille,
+            "type_propre": colonne.type_propre,
+            "sensible": colonne.sensible,
+        }
+        for table in structure.values()
+        for ordre, colonne in enumerate(table.colonnes, start=1)
+    ]
+
+
+# --- Essai contre la base -----------------------------------------------------------
+
+
+def essayer(moteur) -> dict[str, tuple[int, int]]:
+    """Crée toutes les tables de données dans une transaction, puis l'annule.
+
+    Vérifie que le SQL généré est accepté par le serveur, sans rien laisser en
+    base. Rend, par schéma, le nombre de tables et de colonnes créées.
+    """
+    from sqlalchemy import text
+
+    from .base import executer_lot
+
+    structure = charger_structure()
+    comptes = {}
+    with moteur.connect() as conn:
+        transaction = conn.begin()
+        try:
+            existantes = conn.execute(text(REQUETE_TABLES_EXISTANTES)).all()
+            curseur = conn.connection.cursor()
+            try:
+                for instruction in ddl_suppression(existantes) + ddl_structure(structure):
+                    executer_lot(curseur, instruction)
+            finally:
+                curseur.close()
+            for schema, tables, colonnes in conn.execute(
+                text(
+                    "SELECT s.name, COUNT(DISTINCT t.object_id), COUNT(*) "
+                    "FROM sys.tables AS t "
+                    "JOIN sys.schemas AS s ON s.schema_id = t.schema_id "
+                    "JOIN sys.columns AS c ON c.object_id = t.object_id "
+                    f"WHERE s.name IN (N'{SCHEMA_CHARGEMENT}', N'{SCHEMA_PROPRE}') "
+                    "GROUP BY s.name"
+                )
+            ).all():
+                comptes[schema] = (tables, colonnes)
+        finally:
+            transaction.rollback()
+    return comptes
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    import sys
+
+    from .base import ErreurBase, creer_moteur
+
+    parser = argparse.ArgumentParser(
+        prog="python -m frigeo.structure_base",
+        description="Structure des tables de données déduite du dictionnaire.",
+    )
+    parser.add_argument(
+        "--essai", action="store_true",
+        help="crée les tables dans une transaction annulée, pour vérifier le SQL généré",
+    )
+    args = parser.parse_args(argv)
+    try:
+        structure = charger_structure()
+        resume = resumer_structure(structure)
+        print(f"{len(structure)} tables, {len(resume)} colonnes de données.")
+        print(resume["type_propre"].value_counts().to_string())
+        if args.essai:
+            moteur = creer_moteur()
+            try:
+                comptes = essayer(moteur)
+            finally:
+                moteur.dispose()
+            for schema in SCHEMAS:
+                tables, colonnes = comptes.get(schema, (0, 0))
+                print(f"Essai {schema} : {tables} tables, {colonnes} colonnes (annulé).")
+    except (ErreurStructure, ErreurBase, ValueError, RuntimeError) as erreur:
+        print(f"Erreur : {erreur}", file=sys.stderr)
+        return 1
+    except Exception as erreur:  # erreur du serveur, rendue sans trace Python
+        print(f"Erreur : {erreur}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
