@@ -12,8 +12,10 @@ from frigeo.base import (
     decouper_lots,
     empreinte,
     est_serveur_local,
+    execution_a_reconstruire,
     lire_packs,
     lister_scripts,
+    reconstruire_dw,
     scripts_a_appliquer,
 )
 
@@ -118,3 +120,48 @@ def test_version_propre_ou_modifiee():
     assert composer_version("v1-3-gabc1234\n", "?? src/frigeo/base.py\n") == "v1-3-gabc1234-dirty"
     assert composer_version("v1-3-gabc1234\n", " M README.md\n") == "v1-3-gabc1234-dirty"
     assert composer_version("", "") is None
+
+
+def test_execution_a_reconstruire():
+    assert execution_a_reconstruire([(1, "réussie"), (3, "échouée"), (2, "réussie")]) == 2
+    with pytest.raises(ErreurBase, match="aucune exécution dans"):
+        execution_a_reconstruire([])
+    with pytest.raises(ErreurBase, match="aucune exécution réussie"):
+        execution_a_reconstruire([(1, "échouée")])
+    with pytest.raises(ErreurBase, match="l'exécution 4 est en cours"):
+        execution_a_reconstruire([(1, "réussie"), (4, "en cours")])
+    # Une exécution en cours plus ancienne (interrompue) ne bloque pas.
+    assert execution_a_reconstruire([(1, "en cours"), (2, "réussie")]) == 2
+
+
+class CurseurFactice:
+    """Curseur qui rend des résultats prévus et garde les instructions reçues."""
+
+    def __init__(self, objet, journal=()):
+        self.objet, self.journal, self.instructions = objet, list(journal), []
+
+    def execute(self, instruction, *parametres):
+        self.instructions.append((instruction, parametres))
+        return self
+
+    def fetchone(self):
+        return (self.objet,)
+
+    def fetchall(self):
+        return self.journal
+
+    def nextset(self):
+        return False
+
+
+def test_reconstruire_dw_sans_pack():
+    curseur = CurseurFactice(None)
+    assert reconstruire_dw(curseur, 5) is None
+    assert len(curseur.instructions) == 1
+
+
+def test_reconstruire_dw_avec_pack():
+    curseur = CurseurFactice(1234, [(1, "contrat d'entrée", 0)])
+    assert reconstruire_dw(curseur, 5) == [(1, "contrat d'entrée", 0)]
+    assert curseur.instructions[1] == ("EXEC dw.reconstruire @id_execution = ?", (5,))
+    assert "dw.journal_reconstruction" in curseur.instructions[2][0]

@@ -7,7 +7,9 @@ valeurs typées), avec leur lignage, et les inscrit dans le schéma qualite
 qualite (anomalies, bilans, journal du nettoyage, décisions) s'ajoutent dans la
 même transaction par le paramètre `completer`, avec `CompleterQualite` (7.2d), ainsi
 que les tables de référence issues de la configuration (7.3a) : jours fériés de
-config/gestion.yaml et valeurs admises des listes fermées du dictionnaire.
+config/gestion.yaml et valeurs admises des listes fermées du dictionnaire. Si un
+pack déclare la procédure dw.reconstruire, elle est appelée en dernier, dans la même
+transaction (7.3b) : propre et dw ne peuvent pas être désaccordés.
 
 Cycle d'une exécution :
 
@@ -19,7 +21,8 @@ Cycle d'une exécution :
 3. une seule transaction supprime les tables générées, supprime les exécutions
    précédentes de la même période de fin (y compris celles qui ont échoué), recrée
    les tables, inscrit les fichiers chargés et la correspondance des colonnes,
-   insère les données, puis passe l'exécution à « réussie »;
+   insère les données, écrit les autres tables de qualite, reconstruit dw si un
+   pack le prévoit, puis passe l'exécution à « réussie »;
 4. en cas d'erreur, la transaction est annulée (l'exécution précédente et ses
    tables restent intactes) et l'exécution passe à « échouée », avec le message.
 
@@ -561,6 +564,9 @@ class Ecriture:
     illisibles: pd.DataFrame  # table, colonne, cellules
     fichiers: int
     preparation: Preparation | None = None  # valeurs écrites, pour verifier_base
+    # Journal de la reconstruction de dw (ordre, étape, lignes), None sans pack qui
+    # déclare dw.reconstruire.
+    journal_dw: list[tuple[int, str, int]] | None = None
 
 
 def ecrire_base(
@@ -578,9 +584,11 @@ def ecrire_base(
     `completer(curseur, id_execution, ids_chargement)` écrit, dans la même
     transaction, les autres tables de qualite; `ids_chargement` associe
     (fichier_source, feuille_source) à son id_chargement. `version` vaut par défaut
-    la version du traitement lue dans Git.
+    la version du traitement lue dans Git. Après `completer`, la procédure
+    dw.reconstruire est appelée si un pack la déclare : une erreur de sa part (contrat
+    d'entrée non respecté) fait échouer toute l'exécution.
     """
-    from .base import version_traitement
+    from .base import reconstruire_dw, version_traitement
 
     structure = structure or charger_structure()
     version = version if version is not None else version_traitement()
@@ -588,6 +596,7 @@ def ecrire_base(
     try:
         preparation = preparer(perimetre, tables, tables_nettoyees, structure)
         comptes: dict[str, dict[str, int]] = {}
+        journal_dw = None
         with moteur.begin() as conn:
             curseur = conn.connection.cursor()
             curseur.fast_executemany = True
@@ -605,6 +614,7 @@ def ecrire_base(
                     comptes.setdefault(preparee.table.source, {})[preparee.schema] = nombre
                 if completer is not None:
                     completer(curseur, id_execution, ids)
+                journal_dw = reconstruire_dw(curseur, id_execution)
                 curseur.execute(
                     "UPDATE qualite.execution SET statut = ?, fin = SYSUTCDATETIME() "
                     "WHERE id_execution = ?",
@@ -626,7 +636,8 @@ def ecrire_base(
         columns=["table", SCHEMA_CHARGEMENT, SCHEMA_PROPRE],
     )
     return Ecriture(
-        id_execution, lignes, preparation.illisibles, len(preparation.journal), preparation
+        id_execution, lignes, preparation.illisibles, len(preparation.journal), preparation,
+        journal_dw,
     )
 
 
@@ -1007,6 +1018,9 @@ COLONNES_VERIFICATION = ["famille", "controle", "attendu", "obtenu", "conforme"]
 FAMILLE_EXECUTION = "exécution"
 FAMILLE_ILLISIBLES = "illisibles"
 FAMILLE_QUALITE = "qualite"
+FAMILLE_DW = "dw"
+CONTRAT_RESPECTE = "respecté"
+CONTRAT_NON_RESPECTE = "non respecté"
 VALEUR_MASQUEE = "masqué"
 TABLES_AVEC_ETAT = ("anomalie", "non_evaluable", "bilan_controle")
 TABLES_AVEC_LIGNAGE = ("anomalie", "non_evaluable", "journal_nettoyage")
@@ -1080,7 +1094,10 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     cellules illisibles de propre rattachées à une anomalie après nettoyage (même
     ligne source, même champ); avec `sorties`, lignes de chaque table de qualite par
     état (jours fériés et valeurs des listes fermées compris, `sensibles` étant celui
-    de l'écriture), et id_chargement renseigné pour toute ligne qui a un fichier source.
+    de l'écriture), et id_chargement renseigné pour toute ligne qui a un fichier source;
+    pour dw, procédure de reconstruction présente si et seulement si l'écriture l'a
+    appelée, et, si elle l'a été, journal de la reconstruction identique à celui de
+    l'écriture et contrat d'entrée respecté par propre.
     """
     from sqlalchemy import text
 
@@ -1167,4 +1184,44 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
                 ).scalar()
                 ajouter(FAMILLE_QUALITE, f"qualite.{table} : lignes avec un fichier source "
                         "sans id_chargement", 0, obtenu)
+        _verifier_dw(conn, ecriture, ajouter)
     return pd.DataFrame(controles, columns=COLONNES_VERIFICATION)
+
+
+def _journal_en_texte(journal) -> str | None:
+    return "; ".join(f"{ordre}. {etape} {lignes}" for ordre, etape, lignes in journal) or None
+
+
+def _verifier_dw(conn, ecriture: Ecriture, ajouter) -> None:
+    """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte."""
+    import pyodbc
+
+    from .base import procedure_reconstruction_presente
+
+    curseur = conn.connection.cursor()
+    try:
+        presente = procedure_reconstruction_presente(curseur)
+        appelee = ecriture.journal_dw is not None
+        ajouter(FAMILLE_DW, "procédure dw.reconstruire présente si l'écriture l'a appelée",
+                appelee, presente)
+        if not appelee or not presente:
+            return
+        curseur.execute(
+            "SELECT ordre, etape, lignes FROM dw.journal_reconstruction "
+            "WHERE id_execution = ? ORDER BY ordre",
+            ecriture.id_execution,
+        )
+        lu = [(int(o), e, int(l)) for o, e, l in curseur.fetchall()]
+        ajouter(FAMILLE_DW, f"dw.journal_reconstruction de l'exécution {ecriture.id_execution}",
+                _journal_en_texte(ecriture.journal_dw), _journal_en_texte(lu))
+        try:
+            curseur.execute("EXEC dw.verifier_contrat")
+            while curseur.nextset():
+                pass
+            contrat = CONTRAT_RESPECTE
+        except pyodbc.Error:
+            contrat = CONTRAT_NON_RESPECTE
+        ajouter(FAMILLE_DW, "contrat d'entrée du pack respecté par propre",
+                CONTRAT_RESPECTE, contrat)
+    finally:
+        curseur.close()

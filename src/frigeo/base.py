@@ -5,6 +5,10 @@ Usage, depuis la racine du dépôt :
     python -m frigeo.base              applique les scripts pas encore appliqués
     python -m frigeo.base --recreer    supprime et recrée la base (serveur local
                                        seulement), puis applique tous les scripts
+    python -m frigeo.base --reconstruire
+                                       relance seule la reconstruction de dw
+                                       (procédure dw.reconstruire d'un pack) sur
+                                       la dernière exécution réussie
 
 Ordre d'application : les scripts de sql/socle/ par ordre de nom, puis ceux de
 chaque pack listé dans config/base.yaml (sql/packs/<pack>/), dans l'ordre de la
@@ -19,8 +23,8 @@ Dans un script, les lots sont séparés par une ligne qui ne contient que GO
 (casse indifférente, espaces admis). « GO 5 » ou « GO -- commentaire » ne sont
 pas reconnus comme séparateurs.
 
-Le module fournit aussi la connexion à la base (creer_moteur), réutilisée par
-l'écriture depuis Python.
+Le module fournit aussi la connexion à la base (creer_moteur) et l'appel de la
+reconstruction de dw (reconstruire_dw), réutilisés par l'écriture depuis Python.
 """
 
 from __future__ import annotations
@@ -52,6 +56,12 @@ CLASSEMENT_DEFAUT = "French_100_CI_AS"
 NOM_SUR = re.compile(r"^[A-Za-z0-9_]+$")
 SEPARATEUR_GO = re.compile(r"^[ \t]*GO[ \t]*$", re.IGNORECASE | re.MULTILINE)
 BOM_UTF8 = b"\xef\xbb\xbf"
+
+# Reconstruction de dw : procédure déclarée par un pack, et son journal.
+PROCEDURE_RECONSTRUCTION = "dw.reconstruire"
+# Statuts d'une exécution (contrainte ck_execution_statut de qualite.execution).
+STATUT_EN_COURS = "en cours"
+STATUT_REUSSIE = "réussie"
 
 
 class ErreurBase(Exception):
@@ -139,6 +149,33 @@ def scripts_a_appliquer(scripts: list[Script], appliques: dict[str, str]) -> lis
     return [s for s in scripts if s.nom not in appliques]
 
 
+def execution_a_reconstruire(executions: list[tuple[int, str]]) -> int:
+    """Exécution dont les tables sont dans propre : la dernière réussie.
+
+    executions donne (id_execution, statut) de qualite.execution. Refusé s'il n'y a
+    aucune exécution réussie, ou si la dernière exécution inscrite est encore en
+    cours (son écriture n'est pas finie, ou a été interrompue).
+    """
+    if not executions:
+        raise ErreurBase(
+            "aucune exécution dans qualite.execution : exécuter d'abord la cellule # BASE "
+            "du notebook 07."
+        )
+    derniere, statut = max(executions)
+    if statut == STATUT_EN_COURS:
+        raise ErreurBase(
+            f"l'exécution {derniere} est en cours : attendre sa fin, ou relancer la "
+            "cellule # BASE si elle a été interrompue."
+        )
+    reussies = [identifiant for identifiant, statut in executions if statut == STATUT_REUSSIE]
+    if not reussies:
+        raise ErreurBase(
+            "aucune exécution réussie dans qualite.execution : exécuter d'abord la "
+            "cellule # BASE du notebook 07."
+        )
+    return max(reussies)
+
+
 def est_serveur_local(serveur: str) -> bool:
     """Vrai pour localhost, ., (local) ou 127.0.0.1, avec ou sans instance ni port."""
     hote = re.split(r"[\\,]", serveur.strip(), maxsplit=1)[0].strip().lower()
@@ -222,6 +259,70 @@ def executer_lot(curseur, lot: str, *parametres) -> None:
 
 
 # Opérations sur la base
+
+
+def procedure_reconstruction_presente(curseur) -> bool:
+    """Vrai si un pack appliqué déclare la procédure dw.reconstruire."""
+    curseur.execute(f"SELECT OBJECT_ID(N'{PROCEDURE_RECONSTRUCTION}', N'P')")
+    return curseur.fetchone()[0] is not None
+
+
+def reconstruire_dw(curseur, id_execution: int) -> list[tuple[int, str, int]] | None:
+    """Reconstruit dw pour une exécution, dans la transaction ouverte sur curseur.
+
+    Renvoie le journal de la reconstruction (ordre, étape, lignes), ou None si
+    aucun pack ne déclare la procédure dw.reconstruire. Une erreur de la
+    procédure (contrat d'entrée non respecté par exemple) remonte telle quelle :
+    à l'appelant d'annuler la transaction.
+    """
+    if not procedure_reconstruction_presente(curseur):
+        return None
+    executer_lot(curseur, f"EXEC {PROCEDURE_RECONSTRUCTION} @id_execution = ?", id_execution)
+    curseur.execute(
+        "SELECT ordre, etape, lignes FROM dw.journal_reconstruction ORDER BY ordre"
+    )
+    return [(int(ordre), etape, int(lignes)) for ordre, etape, lignes in curseur.fetchall()]
+
+
+def reconstruire() -> None:
+    """Relance seule la reconstruction de dw sur la dernière exécution réussie, dans
+    sa propre transaction : en cas d'erreur, dw reste tel qu'il était."""
+    moteur = creer_moteur()
+    try:
+        with moteur.begin() as conn:
+            curseur = conn.connection.cursor()
+            try:
+                try:
+                    curseur.execute("SELECT id_execution, statut FROM qualite.execution")
+                    executions = [(int(i), statut) for i, statut in curseur.fetchall()]
+                except pyodbc.Error as erreur:
+                    raise ErreurBase(
+                        f"Lecture de qualite.execution impossible (base à construire : "
+                        f"python -m frigeo.base) : {erreur}"
+                    ) from erreur
+                id_execution = execution_a_reconstruire(executions)
+                try:
+                    journal = reconstruire_dw(curseur, id_execution)
+                except pyodbc.Error as erreur:
+                    raise ErreurBase(
+                        f"reconstruction de dw échouée (exécution {id_execution}), dw est "
+                        f"inchangé : {erreur}"
+                    ) from erreur
+                if journal is None:
+                    raise ErreurBase(
+                        f"aucune procédure {PROCEDURE_RECONSTRUCTION} : aucun pack de "
+                        "config/base.yaml ne construit dw, ou ses scripts ne sont pas "
+                        "appliqués (python -m frigeo.base)."
+                    )
+            finally:
+                curseur.close()
+    except DBAPIError as erreur:
+        raise ErreurBase(f"Reconstruction de dw impossible : {erreur}") from erreur
+    finally:
+        moteur.dispose()
+    print(f"dw reconstruit pour l'exécution {id_execution} :")
+    for ordre, etape, lignes in journal:
+        print(f"  {ordre}. {etape} : {lignes} ligne(s)")
 
 
 def recreer_base(p: dict[str, str | None]) -> None:
@@ -341,13 +442,21 @@ def main(argv: list[str] | None = None) -> int:
         prog="python -m frigeo.base",
         description="Applique les scripts SQL du socle et des packs à la base du fichier .env.",
     )
-    parser.add_argument(
+    action = parser.add_mutually_exclusive_group()
+    action.add_argument(
         "--recreer", action="store_true",
         help="supprime et recrée la base avant d'appliquer les scripts (serveur local seulement)",
     )
+    action.add_argument(
+        "--reconstruire", action="store_true",
+        help="relance seule la reconstruction de dw sur la dernière exécution réussie",
+    )
     args = parser.parse_args(argv)
     try:
-        construire(args.recreer)
+        if args.reconstruire:
+            reconstruire()
+        else:
+            construire(args.recreer)
     except ErreurBase as erreur:
         print(f"Erreur : {erreur}", file=sys.stderr)
         return 1
