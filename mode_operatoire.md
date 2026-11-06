@@ -1,6 +1,6 @@
 # Mode opératoire d'un cycle de traitement
 
-Document à l'usage du consultant. Il décrit, dans l'ordre chronologique, ce que font le consultant, le métier du client et l'assistant LLM pour traiter les exports d'un client avec cet outil, jusqu'à l'étape 6 comprise. Il sera complété avec les étapes 7 et suivantes. Les notebooks sont numérotés dans l'ordre d'exécution (01 à 07), qui ne suit pas la numérotation des étapes du README.
+Document à l'usage du consultant. Il décrit, dans l'ordre chronologique, ce que font le consultant, le métier du client et l'assistant LLM pour traiter les exports d'un client avec cet outil, jusqu'à l'étape 6 comprise, puis la mise en place de la base de données (étape 7, en cours). Il sera complété au fil de l'étape 7 et des suivantes. Les notebooks sont numérotés dans l'ordre d'exécution (01 à 07), qui ne suit pas la numérotation des étapes du README.
 
 ## Rôles et règles communes
 
@@ -13,7 +13,7 @@ Document à l'usage du consultant. Il décrit, dans l'ordre chronologique, ce qu
 Règles valables à chaque étape :
 
 - l'assistant ne reçoit jamais de valeurs des données du client, seulement des décomptes, des noms de tables et de colonnes et des formes (`AA-9999`); ce que le consultant lui transmet passe par une cellule d'export qui le garantit;
-- l'accès de l'assistant au poste est limité aux dossiers `src` et `tests`; les fichiers de `config/` et les cellules de notebook sont donnés dans la conversation et déposés par le consultant;
+- l'accès de l'assistant au poste est limité aux dossiers `src` et `tests`; les fichiers de `config/` et de `sql/` et les cellules de notebook sont donnés dans la conversation et déposés par le consultant;
 - aucune donnée n'est corrigée à la main : un fichier mal formé est réexporté par le client, ou décrit autrement dans `config/sources.yaml`;
 - le métier valide ou corrige des valeurs proposées, il ne les ressaisit pas.
 
@@ -193,6 +193,30 @@ Repères pour la phase 8 :
 - le jeu nettoyé n'est pas écrit : il se recalcule à chaque exécution à partir des fichiers bruts, des règles et des décisions.
 - la table à présenter au métier est celle après nettoyage (`anomalies_nettoyees_AAAA-MM.csv`), lue avec les conventions de la section « Lire les résultats » du README; le fichier des lignes non évaluables (`non_evaluables_nettoyees_AAAA-MM.csv`) dit ce qui n'a pas pu être contrôlé, et le tableau « avant, après » de la cellule `# COMPARAISON` ce que le nettoyage a rendu contrôlable.
 
+### Phase 9, base de données (étape 7, en cours)
+
+Cette phase met en place la base SQL Server qui recevra les données chargées et nettoyées. Seule la construction de la structure (sous-étape 7.1) est faite; l'écriture des données et les calculs suivront.
+
+| N° | Action | Qui | Outil | État |
+| --- | --- | --- | --- | --- |
+| 9.1 | Installer SQL Server 2025 Developer (instance par défaut, authentification Windows, classement French_100_CI_AS), le pilote ODBC Driver 18 for SQL Server et SSMS | C | installateurs Microsoft | opérationnel sur le poste du consultant (hébergement chez le client : étape 10) |
+| 9.2 | Copier `.env.exemple` en `.env` à la racine du dépôt et y renseigner `BASE_SERVEUR`, `BASE_NOM`, `BASE_PILOTE`, `BASE_CONFIANCE_CERTIFICAT` et, au besoin, `BASE_CLASSEMENT` (French_100_CI_AS par défaut) | C | éditeur | opérationnel |
+| 9.3 | Lister dans `config/base.yaml` les packs métier appliqués après le socle (Frigéo : `services_intervention`) | A, puis C | `config/base.yaml` | opérationnel |
+| 9.4 | Créer la base par `python -m frigeo.base --recreer`, depuis la racine du dépôt : la commande supprime la base si elle existe, la recrée, puis applique les scripts de `sql/socle/` par ordre de nom et ceux de chaque pack | C | terminal | opérationnel |
+| 9.5 | Vérifier dans SSMS que `qualite.script_applique` liste chaque script appliqué, avec son empreinte et la version du code | C | SSMS | opérationnel |
+| 9.6 | Après l'ajout d'un script, l'appliquer par `python -m frigeo.base` (une base à jour affiche « aucun script à appliquer ») | C | terminal | opérationnel |
+| 9.7 | Écrire dans la base les données chargées et nettoyées et la table des anomalies (sous-étape 7.2) | A, puis C | `src`, `tests` | à créer |
+
+Repères pour la phase 9 :
+
+- un script appliqué ne se modifie plus : toute évolution de la base passe par un nouveau script numéroté; un script appliqué puis modifié ou supprimé arrête la commande avant toute application, avec la liste des scripts en cause (une modification involontaire s'annule par `git restore` du script);
+- chaque script est appliqué dans sa propre transaction : en cas d'échec, la commande s'arrête en nommant le script et le lot fautifs, les scripts précédents restent appliqués, et il suffit de corriger le script fautif, pas encore inscrit, puis de relancer;
+- dans un script, les lots sont séparés par une ligne qui ne contient que `GO`;
+- `--recreer` efface toute la base, données comprises, et coupe les connexions ouvertes, SSMS compris; il est refusé hors d'un serveur local (localhost, ., (local), 127.0.0.1);
+- la version du code inscrite à chaque application est celle de `git describe`, suivie de « -dirty » si un fichier suivi est modifié ou si un fichier nouveau n'est pas encore commité : commiter avant une application à tracer;
+- `.env` n'est pas versionné; `.env.exemple` donne la liste des variables;
+- les tests sans base se lancent par `python -m pytest tests/test_base.py`.
+
 ## Cycle mensuel (un mois de plus)
 
 | N° | Action | Qui | Outil | État |
@@ -217,3 +241,4 @@ Une fois par an : valider dans le formulaire des règles de gestion les jours f
 - **Rapport.** Le rapport au client (plan, destinataire, format) n'est pas encore défini; les parties 2.5 et 3.3 en sont les premières briques.
 - **Découverte des encodages et séparateurs.** Ils sont déclarés à la main dans `config/sources.yaml`; l'étape qui les proposerait n'est pas faite.
 - **Dates dont le siècle a été ajouté.** Elles ne sont pas soumises à la confirmation du métier; les faire confirmer dans le classeur d'arbitrage serait une amélioration possible.
+- **Base de données.** L'authentification Windows est la seule prévue; la connexion à Azure SQL Database (étape 10) reste à faire. Un script ajouté avec un numéro inférieur à celui d'un script déjà appliqué serait appliqué après lui sans alerte, alors qu'une reconstruction l'appliquerait avant : toujours numéroter à la suite.

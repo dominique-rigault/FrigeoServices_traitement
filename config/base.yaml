@@ -1,0 +1,4 @@
+# Configuration de la construction de la base (python -m frigeo.base).
+# Packs métier appliqués après le socle (sql/packs/<pack>/), dans l'ordre de la liste.
+packs:
+  - services_intervention
