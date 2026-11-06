@@ -5,7 +5,7 @@ valeurs telles que livrées, en texte) et les tables nettoyées (schéma propre,
 valeurs typées), avec leur lignage, et les inscrit dans le schéma qualite
 (execution, journal_chargement, correspondance_colonne). Les autres tables de
 qualite (anomalies, bilans, journal du nettoyage, décisions) s'ajoutent dans la
-même transaction par le paramètre `completer` (7.2d).
+même transaction par le paramètre `completer`, avec `CompleterQualite` (7.2d).
 
 Cycle d'une exécution :
 
@@ -265,7 +265,7 @@ def empreinte_fichier(chemin: str | Path) -> str:
 
 
 def _feuille(valeur) -> str | None:
-    return None if _absente(valeur) else str(valeur)
+    return None if _vide(valeur) else str(valeur)
 
 
 COLONNES_JOURNAL_CHARGEMENT = (
@@ -602,3 +602,320 @@ def ecrire_base(
         columns=["table", SCHEMA_CHARGEMENT, SCHEMA_PROPRE],
     )
     return Ecriture(id_execution, lignes, preparation.illisibles, len(preparation.journal))
+
+
+# --- Tables de qualite (7.2d) -------------------------------------------------------
+
+ETAT_BRUT = "brut"
+ETAT_NETTOYE = "nettoyé"
+
+# Colonnes des fichiers du traitement renommées en base (« table » est réservé en T-SQL).
+RENOMMAGES = {"table": "table_source"}
+# Clé provisoire d'une ligne : (fichier_source, feuille_source) de sa ligne source,
+# remplacée à l'insertion par id_chargement.
+CLE_LIGNAGE = "__lignage"
+
+REQUETE_COLONNES_QUALITE = (
+    "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_SCALE "
+    "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = N'qualite'"
+)
+TYPES_ENTIERS = ("int", "bigint", "smallint", "tinyint")
+
+
+@dataclass
+class SortiesQualite:
+    """Sorties du traitement à écrire dans qualite, telles que les produit le
+    notebook 07 (mêmes tables que les fichiers CSV de data/anomalies et
+    data/nettoyage)."""
+
+    anomalies_brutes: pd.DataFrame
+    bilan_brut: pd.DataFrame
+    non_evaluables_brutes: pd.DataFrame
+    anomalies_nettoyees: pd.DataFrame
+    bilan_nettoye: pd.DataFrame
+    non_evaluables_nettoyees: pd.DataFrame
+    journal_nettoyage: pd.DataFrame
+    bilan_nettoyage: pd.DataFrame
+    decisions: dict
+    dictionnaire: dict
+    cle_empreinte: str
+
+
+def _cle_lignage(enregistrement: dict) -> tuple | None:
+    fichier = enregistrement.get("fichier_source")
+    if _vide(fichier):
+        return None
+    return (str(fichier), _feuille(enregistrement.get("feuille_source")))
+
+
+def _lignes(donnees: pd.DataFrame, communs: dict, lignage: bool = True) -> list[dict]:
+    lignes = []
+    for enregistrement in donnees.to_dict("records"):
+        ligne = dict(communs)
+        for colonne, valeur in enregistrement.items():
+            ligne[RENOMMAGES.get(colonne, colonne)] = valeur
+        if lignage:
+            ligne[CLE_LIGNAGE] = _cle_lignage(enregistrement)
+        lignes.append(ligne)
+    return lignes
+
+
+def champ_sensible(sensibles: dict, dictionnaire: dict, table, champ) -> bool:
+    """Vrai pour une colonne classée sensible ou masquée par le dictionnaire, comme
+    dans la cellule # COLONNES SENSIBLES du notebook 07."""
+    from .confidentialite import est_sensible
+    from .dictionnaire import est_masquee
+
+    if _vide(table) or _vide(champ):
+        return False
+    if est_sensible(sensibles, table, champ):
+        return True
+    regles = dictionnaire.get(table, {}).get(champ)
+    return bool(regles) and (est_masquee(regles["valeurs"]) or est_masquee(regles["format"]))
+
+
+def lignes_decisions(decisions: dict, dictionnaire: dict, sensibles: dict, cle: str) -> list[dict]:
+    """Lignes de qualite.decision, sans id_execution, telles qu'enregistrées.
+
+    Sur un champ sensible, valeur_retenue reste vide et son empreinte (clé du
+    journal du nettoyage) est écrite dans empreinte_valeur_retenue.
+    """
+    from .decisions import CHAMPS_DECISION
+    from .nettoyage import empreinte_valeur
+
+    lignes = []
+    for identifiant, decision in (decisions.get("decisions") or {}).items():
+        ligne = {"id_decision": identifiant}
+        for champ in CHAMPS_DECISION:
+            ligne[RENOMMAGES.get(champ, champ)] = decision.get(champ)
+        retenue = ligne["valeur_retenue"]
+        ligne["empreinte_valeur_retenue"] = None
+        if champ_sensible(sensibles, dictionnaire, decision.get("table"), decision.get("champ")):
+            ligne["valeur_retenue"] = None
+            if not _absente(retenue):
+                ligne["empreinte_valeur_retenue"] = empreinte_valeur(retenue, cle)
+        lignes.append(ligne)
+    return lignes
+
+
+def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> dict[str, list[dict]]:
+    """Lignes de chaque table de qualite, sans id_execution, valeurs telles que dans
+    les fichiers du traitement (une valeur masquée reste « masqué »).
+
+    Chaque ligne au grain d'une ligne source porte sa clé de lignage (`CLE_LIGNAGE`),
+    remplacée par id_chargement à l'insertion.
+    """
+    from .confidentialite import charger_sensibilite
+
+    sensibles = charger_sensibilite() if sensibles is None else sensibles
+    brut, nettoye = {"etat": ETAT_BRUT}, {"etat": ETAT_NETTOYE}
+    return {
+        "anomalie": _lignes(sorties.anomalies_brutes, brut)
+        + _lignes(sorties.anomalies_nettoyees, nettoye),
+        "non_evaluable": _lignes(sorties.non_evaluables_brutes, brut)
+        + _lignes(sorties.non_evaluables_nettoyees, nettoye),
+        "bilan_controle": _lignes(sorties.bilan_brut, brut, lignage=False)
+        + _lignes(sorties.bilan_nettoye, nettoye, lignage=False),
+        "journal_nettoyage": _lignes(sorties.journal_nettoyage, {}),
+        "bilan_nettoyage": _lignes(sorties.bilan_nettoyage, {}, lignage=False),
+        "decision": lignes_decisions(
+            sorties.decisions, sorties.dictionnaire, sensibles, sorties.cle_empreinte
+        ),
+    }
+
+
+def problemes_sorties(
+    sorties: SortiesQualite,
+    periode_fin: str,
+    sensibles: dict | None = None,
+    declarations: dict | None = None,
+) -> list[str]:
+    """Les refus de l'écriture des fichiers CSV, appliqués aux sorties avant leur
+    écriture en base : colonnes attendues, table qualifiée, valeur ou clé sensible
+    non masquée, empreintes du journal, fichier des décisions."""
+    from .anomalies import _problemes_ecriture, _problemes_non_evaluables
+    from .decisions import problemes_decisions
+    from .nettoyage import (
+        COLONNES_BILAN_NETTOYAGE,
+        COLONNES_JOURNAL,
+        empreintes_incoherentes,
+        journal_non_masque,
+    )
+
+    problemes = []
+    for etat, anomalies, bilan, non_evaluables, nettoyees in (
+        (ETAT_BRUT, sorties.anomalies_brutes, sorties.bilan_brut, sorties.non_evaluables_brutes, False),
+        (ETAT_NETTOYE, sorties.anomalies_nettoyees, sorties.bilan_nettoye,
+         sorties.non_evaluables_nettoyees, True),
+    ):
+        trouves = _problemes_ecriture(anomalies, bilan, periode_fin, sensibles, declarations, nettoyees)
+        if not trouves:
+            trouves = _problemes_non_evaluables(non_evaluables, bilan, sensibles, declarations)
+        problemes += [f"anomalies, état {etat} : {p}" for p in trouves]
+    for nom, donnees, attendues in (
+        ("journal du nettoyage", sorties.journal_nettoyage, COLONNES_JOURNAL),
+        ("bilan du nettoyage", sorties.bilan_nettoyage, COLONNES_BILAN_NETTOYAGE),
+    ):
+        if list(donnees.columns) != list(attendues):
+            problemes.append(f"{nom} : colonnes attendues, dans cet ordre, {', '.join(attendues)}")
+    if list(sorties.journal_nettoyage.columns) == list(COLONNES_JOURNAL):
+        fautives = journal_non_masque(sorties.journal_nettoyage, sensibles, declarations)
+        if not fautives.empty:
+            problemes.append(
+                f"journal du nettoyage : {len(fautives)} lignes dont une valeur ou la clé "
+                "d'une colonne sensible n'est pas masquée"
+            )
+        if not empreintes_incoherentes(sorties.journal_nettoyage).empty:
+            problemes.append("journal du nettoyage : empreintes qui ne suivent pas le masquage")
+    problemes += [f"décisions : {p}" for p in problemes_decisions(sorties.decisions)]
+    return problemes
+
+
+def valeur_sql(valeur, type_sql: str, echelle=None):
+    """Valeur transmise pour une colonne de qualite, selon son type en base.
+
+    Entier : int (None si vide; un numéro lu 2.0 vaut 2); décimal : texte arrondi à
+    l'échelle de la colonne, comme le taux des fichiers; bit : 0 ou 1; tout autre
+    type : texte tel que dans les fichiers (`texte_livre`).
+    """
+    from .anomalies import _numero
+
+    if type_sql in TYPES_ENTIERS:
+        return _numero(valeur)
+    if type_sql in ("decimal", "numeric"):
+        if _vide(valeur):
+            return None
+        return f"{float(valeur):.{int(echelle or 0)}f}"
+    if type_sql == "bit":
+        return None if _absente(valeur) else int(bool(valeur))
+    return texte_livre(valeur)
+
+
+def convertir_lignes(
+    table: str,
+    lignes: list[dict],
+    colonnes_base: dict[str, tuple],
+    ids_chargement: dict[tuple, int],
+    communs: dict,
+) -> tuple[list[str], list[list], list[str]]:
+    """Colonnes, valeurs et problèmes d'une table de qualite avant insertion.
+
+    `colonnes_base` donne, par colonne de la table en base, (type, longueur maximale
+    en caractères, échelle). Problèmes, sans aucune valeur : colonne inconnue de la
+    table, texte plus long que sa colonne, fichier source absent du journal des
+    chargements.
+    """
+    problemes: list[str] = []
+    if not lignes:
+        return [], [], problemes
+    # Colonnes de toutes les lignes, dans l'ordre de leur première apparition : les
+    # anomalies brutes n'ont pas la colonne decision_metier des anomalies nettoyées.
+    noms = list(communs)
+    for ligne in lignes:
+        noms += [c for c in ligne if c != CLE_LIGNAGE and c not in noms]
+    if any(CLE_LIGNAGE in ligne for ligne in lignes):
+        noms.append("id_chargement")
+    inconnues = [c for c in noms if c not in colonnes_base]
+    if inconnues:
+        return noms, [], [f"qualite.{table} : colonnes inconnues en base {', '.join(inconnues)}"]
+    trop_longues: dict[str, int] = {}
+    hors_journal = 0
+    valeurs = []
+    for ligne in lignes:
+        complete = {**communs, **ligne}
+        if CLE_LIGNAGE in ligne:
+            cle = ligne[CLE_LIGNAGE]
+            if cle is not None and cle not in ids_chargement:
+                hors_journal += 1
+            complete["id_chargement"] = None if cle is None else ids_chargement.get(cle)
+        rangee = []
+        for nom in noms:
+            type_sql, longueur, echelle = colonnes_base[nom]
+            valeur = valeur_sql(complete.get(nom), type_sql, echelle)
+            if isinstance(valeur, str) and longueur and longueur > 0 and longueur_sql(valeur) > longueur:
+                trop_longues[nom] = trop_longues.get(nom, 0) + 1
+            rangee.append(valeur)
+        valeurs.append(rangee)
+    for nom, nombre in trop_longues.items():
+        longueur = colonnes_base[nom][1]
+        problemes.append(
+            f"qualite.{table}.{nom} : {nombre} valeur(s) de plus de {longueur} caractères"
+        )
+    if hors_journal:
+        problemes.append(
+            f"qualite.{table} : {hors_journal} ligne(s) dont le fichier source n'est pas "
+            "dans le journal des chargements"
+        )
+    return noms, valeurs, problemes
+
+
+def _inserer_qualite(curseur, table: str, noms: list[str], valeurs: list[list], colonnes_base) -> None:
+    import pyodbc
+
+    instruction = (
+        f"INSERT INTO qualite.{table} ({', '.join(noms)}) VALUES ({', '.join('?' * len(noms))})"
+    )
+    try:
+        for debut in range(0, len(valeurs), TAILLE_LOT):
+            lot = valeurs[debut:debut + TAILLE_LOT]
+            tailles = []
+            for position, nom in enumerate(noms):
+                type_sql = colonnes_base[nom][0]
+                if type_sql == "bigint":
+                    tailles.append((pyodbc.SQL_BIGINT, 0, 0))
+                elif type_sql in TYPES_ENTIERS or type_sql == "bit":
+                    tailles.append((pyodbc.SQL_INTEGER, 0, 0))
+                else:
+                    longueur = max(
+                        (longueur_sql(l[position]) for l in lot if l[position] is not None),
+                        default=1,
+                    )
+                    tailles.append((pyodbc.SQL_WVARCHAR, max(1, longueur), 0))
+            curseur.setinputsizes(tailles)
+            curseur.executemany(instruction, lot)
+    finally:
+        curseur.setinputsizes(None)
+
+
+class CompleterQualite:
+    """Fonction `completer` de `ecrire_base` qui écrit les sorties dans qualite.
+
+    Les refus (`problemes_sorties`, longueurs, lignage) sont tous listés dans une
+    seule `ErreurEcriture`, avant la première insertion : la transaction est annulée
+    et l'exécution inscrite « échouée ». Après l'écriture, `comptes` donne le nombre
+    de lignes écrites par table.
+    """
+
+    def __init__(self, sorties: SortiesQualite, periode_fin: str,
+                 sensibles: dict | None = None, declarations: dict | None = None):
+        self.sorties = sorties
+        self.periode_fin = periode_fin
+        self.sensibles = sensibles
+        self.declarations = declarations
+        self.comptes: dict[str, int] = {}
+
+    def __call__(self, curseur, id_execution: int, ids_chargement: dict[tuple, int]) -> None:
+        problemes = problemes_sorties(self.sorties, self.periode_fin, self.sensibles, self.declarations)
+        if problemes:
+            raise ErreurEcriture(
+                "Écriture de qualite refusée\n  " + "\n  ".join(problemes)
+            )
+        colonnes_base: dict[str, dict[str, tuple]] = {}
+        for table, colonne, type_sql, longueur, echelle in curseur.execute(
+            REQUETE_COLONNES_QUALITE
+        ).fetchall():
+            colonnes_base.setdefault(table, {})[colonne] = (type_sql, longueur, echelle)
+        preparees = []
+        for table, lignes in lignes_qualite(self.sorties, self.sensibles).items():
+            noms, valeurs, trouves = convertir_lignes(
+                table, lignes, colonnes_base.get(table, {}), ids_chargement,
+                {"id_execution": id_execution},
+            )
+            problemes += trouves
+            preparees.append((table, noms, valeurs))
+        if problemes:
+            raise ErreurEcriture("Écriture de qualite refusée\n  " + "\n  ".join(problemes))
+        for table, noms, valeurs in preparees:
+            if valeurs:
+                _inserer_qualite(curseur, table, noms, valeurs, colonnes_base[table])
+            self.comptes[table] = len(valeurs)

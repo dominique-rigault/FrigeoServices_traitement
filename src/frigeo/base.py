@@ -319,7 +319,9 @@ def construire(recreer: bool) -> None:
             detail = "\n".join(f"  {nom} : {motif}" for nom, motif in problemes)
             raise ErreurBase(
                 "aucun script appliqué, car des scripts déjà appliqués ont changé :\n"
-                f"{detail}\nÉcrire un nouveau script plutôt que modifier un script appliqué."
+                f"{detail}\nÉcrire un nouveau script plutôt que modifier un script appliqué; tant "
+                "qu'aucune base n'est à conserver (avant le premier déploiement), on peut aussi "
+                "recréer la base par --recreer."
             )
         a_faire = scripts_a_appliquer(scripts, appliques)
         if not a_faire:

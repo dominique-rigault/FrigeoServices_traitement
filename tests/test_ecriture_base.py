@@ -8,20 +8,30 @@ import pandas as pd
 import pytest
 
 from frigeo.ecriture_base import (
+    CLE_LIGNAGE,
+    SortiesQualite,
+    champ_sensible,
+    convertir_lignes,
     PROBLEME_DECIMALES,
     PROBLEME_GRAND,
     PROBLEME_HEURE,
     PROBLEME_LONGUEUR,
     ErreurEcriture,
     empreinte_fichier,
+    lignes_decisions,
     lignes_journal_chargement,
+    lignes_qualite,
     longueur_sql,
     message_sans_valeur,
     preparer,
+    problemes_sorties,
     texte_livre,
     valeurs_chargement,
     valeurs_propre,
+    valeur_sql,
 )
+from frigeo.dictionnaire import MOTIF_SENSIBLE, est_masquee
+from frigeo.nettoyage import empreinte_valeur
 from frigeo.structure_base import construire_structure
 
 
@@ -306,3 +316,185 @@ def test_message_sans_valeur_tronquee():
     assert "column 'adresse'" in message
     francais = message_sans_valeur(Exception("Valeur tronquée : 'Dupont'."))
     assert "Dupont" not in francais
+
+
+# --- Tables de qualite (7.2d) -------------------------------------------------------
+
+
+def regles_colonne(nature="texte"):
+    """Règles d'une colonne avec le motif de chaque règle, comme au dictionnaire."""
+    resultat = regles(nature)
+    for regle in resultat.values():
+        regle["motif"] = "proposé"
+    return resultat
+
+
+def decisions_exemple():
+    commun = {
+        "fichier_source": "clients.csv", "feuille_source": None, "num_ligne_source": 12,
+        "constat": "constat", "empreinte": "e" * 16, "nature": None, "commentaire": None,
+        "decide_le": "2026-10-20 10:15:00", "classeur": "arbitrage_2026-03.xlsx",
+    }
+    return {
+        "meta": {"structure": 1, "imports": [], "retraits": []},
+        "decisions": {
+            "a1": {**commun, "sorte": "cellule", "table": "clients", "champ": "adresse",
+                   "decision": "corriger", "valeur_retenue": "12 rue des Lilas"},
+            "b2": {**commun, "sorte": "cellule", "table": "clients", "champ": "cp",
+                   "decision": "corriger", "valeur_retenue": "27000"},
+            "c3": {**commun, "sorte": "ligne", "table": "clients", "champ": None,
+                   "decision": "retirer", "valeur_retenue": None},
+        },
+    }
+
+
+CLE_TEST = "0123456789abcdef" * 4
+
+
+def test_lignes_decisions_masquent_les_champs_sensibles():
+    dictionnaire = {"clients": {"adresse": regles_colonne(), "cp": regles_colonne()}}
+    lignes = lignes_decisions(
+        decisions_exemple(), dictionnaire, {"clients": frozenset({"adresse"})}, CLE_TEST
+    )
+    par_id = {l["id_decision"]: l for l in lignes}
+    assert par_id["a1"]["valeur_retenue"] is None
+    assert par_id["a1"]["empreinte_valeur_retenue"] == empreinte_valeur("12 rue des Lilas", CLE_TEST)
+    assert par_id["b2"]["valeur_retenue"] == "27000"
+    assert par_id["b2"]["empreinte_valeur_retenue"] is None
+    assert par_id["c3"]["empreinte_valeur_retenue"] is None
+    assert par_id["a1"]["table_source"] == "clients"
+    assert "table" not in par_id["a1"]
+    assert all("Lilas" not in str(v) for l in lignes for v in l.values())
+
+
+def test_champ_sensible_par_le_dictionnaire():
+    masquee = regles_colonne()
+    masquee["valeurs"]["motif"] = MOTIF_SENSIBLE
+    assert est_masquee(masquee["valeurs"])
+    dictionnaire = {"t": {"a": masquee, "b": regles_colonne()}}
+    assert champ_sensible({}, dictionnaire, "t", "a")
+    assert champ_sensible({"t": frozenset({"b"})}, dictionnaire, "t", "b")
+    assert not champ_sensible({}, dictionnaire, "t", "b")
+    assert not champ_sensible({}, dictionnaire, "t", None)
+    assert not champ_sensible({}, dictionnaire, "autre", "x")
+
+
+def sorties_exemple():
+    anomalies = pd.DataFrame(
+        {"id_anomalie": ["x1"], "table": ["clients"], "fichier_source": ["clients.csv"],
+         "feuille_source": [""], "num_ligne_source": [2.0], "valeur": ["masqué"]}
+    )
+    sans_ligne = pd.DataFrame(
+        {"id_anomalie": ["y2"], "table": ["fec"], "fichier_source": [None],
+         "feuille_source": [None], "num_ligne_source": [None], "valeur": [None]}
+    )
+    nettoyees = pd.DataFrame(
+        anomalies.to_dict("records") + sans_ligne.to_dict("records")
+    ).assign(decision_metier=["garder", None])
+    bilan = pd.DataFrame({"controle": ["c"], "table": ["clients"], "taux": [0.123456]})
+    return SortiesQualite(
+        anomalies_brutes=anomalies, bilan_brut=bilan, non_evaluables_brutes=anomalies.iloc[0:0],
+        anomalies_nettoyees=nettoyees, bilan_nettoye=bilan,
+        non_evaluables_nettoyees=anomalies.iloc[0:0],
+        journal_nettoyage=pd.DataFrame(
+            {"regle_nettoyage": ["espaces"], "table": ["clients"],
+             "fichier_source": ["clients.csv"], "feuille_source": [None]}
+        ),
+        bilan_nettoyage=pd.DataFrame({"regle_nettoyage": ["espaces"], "table": ["clients"]}),
+        decisions=decisions_exemple(),
+        dictionnaire={"clients": {"adresse": regles_colonne(), "cp": regles_colonne()}},
+        cle_empreinte=CLE_TEST,
+    )
+
+
+def test_lignes_qualite():
+    lignes = lignes_qualite(sorties_exemple(), sensibles={"clients": frozenset({"adresse"})})
+    assert list(lignes) == [
+        "anomalie", "non_evaluable", "bilan_controle", "journal_nettoyage",
+        "bilan_nettoyage", "decision",
+    ]
+    anomalies = lignes["anomalie"]
+    assert [(l["etat"], l["id_anomalie"]) for l in anomalies] == [
+        ("brut", "x1"), ("nettoyé", "x1"), ("nettoyé", "y2"),
+    ]
+    assert anomalies[0]["table_source"] == "clients"
+    assert anomalies[0]["valeur"] == "masqué"
+    assert anomalies[0][CLE_LIGNAGE] == ("clients.csv", None)
+    assert anomalies[2][CLE_LIGNAGE] is None
+    assert CLE_LIGNAGE not in lignes["bilan_controle"][0]
+    assert lignes["journal_nettoyage"][0][CLE_LIGNAGE] == ("clients.csv", None)
+    assert "etat" not in lignes["journal_nettoyage"][0]
+    assert len(lignes["decision"]) == 3
+
+
+@pytest.mark.parametrize(
+    "valeur, type_sql, echelle, attendu",
+    [
+        (2.0, "int", None, 2),
+        ("12", "int", None, 12),
+        (None, "int", None, None),
+        ("", "int", None, None),
+        (0.123456, "decimal", 4, "0.1235"),
+        (None, "decimal", 4, None),
+        (True, "bit", None, 1),
+        ("masqué", "nvarchar", None, "masqué"),
+        ("", "nvarchar", None, ""),
+        (12.5, "nvarchar", None, "12.5"),
+        ("2026-10-20 10:15:00", "datetime2", None, "2026-10-20 10:15:00"),
+    ],
+)
+def test_valeur_sql(valeur, type_sql, echelle, attendu):
+    assert valeur_sql(valeur, type_sql, echelle) == attendu
+
+
+COLONNES_ANOMALIE_TEST = {
+    "id_execution": ("int", None, 0),
+    "etat": ("nvarchar", 10, None),
+    "id_anomalie": ("nvarchar", 32, None),
+    "table_source": ("nvarchar", 128, None),
+    "fichier_source": ("nvarchar", 260, None),
+    "feuille_source": ("nvarchar", 128, None),
+    "num_ligne_source": ("int", None, 0),
+    "valeur": ("nvarchar", 4000, None),
+    "decision_metier": ("nvarchar", 50, None),
+    "id_chargement": ("int", None, 0),
+}
+
+
+def test_convertir_lignes():
+    lignes = lignes_qualite(sorties_exemple(), sensibles={})["anomalie"]
+    noms, valeurs, problemes = convertir_lignes(
+        "anomalie", lignes, COLONNES_ANOMALIE_TEST, {("clients.csv", None): 7},
+        {"id_execution": 3},
+    )
+    assert problemes == []
+    assert noms == [
+        "id_execution", "etat", "id_anomalie", "table_source", "fichier_source",
+        "feuille_source", "num_ligne_source", "valeur", "decision_metier", "id_chargement",
+    ]
+    assert valeurs[0] == [3, "brut", "x1", "clients", "clients.csv", "", 2, "masqué", None, 7]
+    assert valeurs[1][-2:] == ["garder", 7]
+    assert valeurs[2][-1] is None
+    assert valeurs[2][6] is None
+
+
+def test_convertir_lignes_refus_sans_valeur():
+    lignes = lignes_qualite(sorties_exemple(), sensibles={})["anomalie"]
+    lignes[0]["valeur"] = "secret " * 1000
+    noms, valeurs, problemes = convertir_lignes(
+        "anomalie", lignes, COLONNES_ANOMALIE_TEST, {}, {"id_execution": 3}
+    )
+    assert "qualite.anomalie.valeur" in problemes[0] and "1 valeur(s) de plus de 4000" in problemes[0]
+    assert "2 ligne(s) dont le fichier source n'est pas dans le journal" in problemes[1]
+    assert all("secret" not in p for p in problemes)
+    inconnues = convertir_lignes("anomalie", [{"autre": 1}], COLONNES_ANOMALIE_TEST, {}, {})[2]
+    assert inconnues == ["qualite.anomalie : colonnes inconnues en base autre"]
+    assert convertir_lignes("anomalie", [], COLONNES_ANOMALIE_TEST, {}, {}) == ([], [], [])
+
+
+def test_problemes_sorties_colonnes():
+    problemes = problemes_sorties(sorties_exemple(), "2026-03", sensibles={}, declarations={})
+    assert any(p.startswith("anomalies, état brut : ") for p in problemes)
+    assert any(p.startswith("anomalies, état nettoyé : ") for p in problemes)
+    assert any(p.startswith("journal du nettoyage : colonnes attendues") for p in problemes)
+    assert any(p.startswith("bilan du nettoyage : colonnes attendues") for p in problemes)

@@ -40,7 +40,7 @@ produit leurs instructions CREATE TABLE, exécutées par l'écriture (7.2c) apr�
 suppression de toutes les tables des deux schémas (`ddl_suppression`). Les tables
 reflètent donc toujours la dernière exécution; les vues construites sur elles ne
 doivent pas être créées WITH SCHEMABINDING. `lignes_correspondance` donne les lignes
-de qualite.correspondance_colonne (sql/socle/003_qualite_structure.sql).
+de qualite.correspondance_colonne (sql/socle/002_qualite.sql).
 
 Essai, depuis la racine du dépôt : python -m frigeo.structure_base --essai crée
 toutes les tables dans une transaction annulée, pour vérifier le SQL généré.

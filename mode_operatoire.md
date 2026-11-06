@@ -205,11 +205,13 @@ Cette phase met en place la base SQL Server qui recevra les données chargées e
 | 9.4 | Créer la base par `python -m frigeo.base --recreer`, depuis la racine du dépôt : la commande supprime la base si elle existe, la recrée, puis applique les scripts de `sql/socle/` par ordre de nom et ceux de chaque pack | C | terminal | opérationnel |
 | 9.5 | Vérifier dans SSMS que `qualite.script_applique` liste chaque script appliqué, avec son empreinte et la version du code | C | SSMS | opérationnel |
 | 9.6 | Après l'ajout d'un script, l'appliquer par `python -m frigeo.base` (une base à jour affiche « aucun script à appliquer ») | C | terminal | opérationnel |
-| 9.7 | Après le notebook 07, exécuter sa cellule `# BASE` : elle écrit en base les tables chargées (schéma `chargement`, valeurs telles que livrées) et nettoyées (schéma `propre`, valeurs typées), les fichiers chargés (`qualite.journal_chargement`, avec leur empreinte) et la correspondance des colonnes (`qualite.correspondance_colonne`); la table des anomalies, les bilans, le journal du nettoyage et les décisions suivront (7.2d) | C | notebook 07 | en cours |
+| 9.7 | Après le notebook 07, exécuter sa cellule `# BASE` : elle écrit en base les tables chargées (schéma `chargement`, valeurs telles que livrées) et nettoyées (schéma `propre`, valeurs typées), les fichiers chargés (`qualite.journal_chargement`, avec leur empreinte) et la correspondance des colonnes (`qualite.correspondance_colonne`), puis, dans la même transaction, les anomalies avant nettoyage (état « brut », celles du fichier `anomalies_AAAA-MM.csv`) et après nettoyage (état « nettoyé »), leurs bilans et lignes non évaluables, le journal et le bilan du nettoyage et les décisions du métier appliquées | C | notebook 07 | en cours |
 
 Repères pour la phase 9 :
 
-- un script appliqué ne se modifie plus : toute évolution de la base passe par un nouveau script numéroté; un script appliqué puis modifié ou supprimé arrête la commande avant toute application, avec la liste des scripts en cause (une modification involontaire s'annule par `git restore` du script);
+- un script appliqué puis modifié ou supprimé arrête la commande avant toute application, avec la liste des scripts en cause (une modification involontaire s'annule par `git restore` du script); deux régimes, séparés par un jalon :
+  - jusqu'au premier déploiement d'une base dont le contenu est à conserver (étape 10, ou première base d'un client), les scripts du socle et des packs peuvent être réécrits pour rester lisibles et exacts, la base se reconstruisant par `--recreer` (la base de développement se régénère entièrement à partir des fichiers);
+  - ce déploiement est marqué par un tag Git; ensuite, un script appliqué ne se modifie plus, et toute évolution de la base passe par un nouveau script numéroté (`ALTER TABLE`, reprise des données);
 - chaque script est appliqué dans sa propre transaction : en cas d'échec, la commande s'arrête en nommant le script et le lot fautifs, les scripts précédents restent appliqués, et il suffit de corriger le script fautif, pas encore inscrit, puis de relancer;
 - dans un script, les lots sont séparés par une ligne qui ne contient que `GO`;
 - `--recreer` efface toute la base, données comprises, et coupe les connexions ouvertes, SSMS compris; il est refusé hors d'un serveur local (localhost, ., (local), 127.0.0.1);
@@ -220,6 +222,8 @@ Repères pour la phase 9 :
 - rejouer la même `PERIODE_FIN` remplace l'exécution précédente de cette période, une nouvelle période s'ajoute à l'historique de `qualite`;
 - une écriture arrêtée par un garde-fou (texte de plus de 4 000 caractères, date avec une heure, nombre de plus de 8 décimales ou trop grand) ou par une erreur du serveur ne modifie rien : l'exécution précédente et ses tables restent en place, et la nouvelle est inscrite « échouée » dans `qualite.execution`, avec le message (sans valeur du client);
 - une valeur restée illisible après nettoyage est écrite vide dans `propre`, sa valeur livrée restant dans `chargement`;
+- dans `qualite`, les valeurs sont celles des fichiers CSV de `data/anomalies` et `data/nettoyage` : une valeur d'une colonne sensible y reste « masqué » (et non vide), et les mêmes refus s'appliquent avant toute écriture (valeur sensible non masquée, table non qualifiée), ainsi qu'un texte plus long que sa colonne en base;
+- pour une décision du métier sur une colonne sensible, `qualite.decision.valeur_retenue` reste vide et seule son empreinte est écrite (`empreinte_valeur_retenue`, avec la clé de `data/config/cle_empreintes.txt`);
 - les tests sans base se lancent par `python -m pytest tests/test_base.py tests/test_structure_base.py tests/test_ecriture_base.py`.
 
 ## Cycle mensuel (un mois de plus)
