@@ -195,7 +195,7 @@ Repères pour la phase 8 :
 
 ### Phase 9, base de données (étape 7, en cours)
 
-Cette phase met en place la base SQL Server qui recevra les données chargées et nettoyées. Seule la construction de la structure (sous-étape 7.1) est faite; l'écriture des données et les calculs suivront.
+Cette phase met en place la base SQL Server qui recevra les données chargées et nettoyées. La structure de la base est construite (sous-étape 7.1); l'écriture des données depuis Python (sous-étape 7.2) est en cours, les calculs suivront.
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
@@ -205,7 +205,7 @@ Cette phase met en place la base SQL Server qui recevra les données chargées e
 | 9.4 | Créer la base par `python -m frigeo.base --recreer`, depuis la racine du dépôt : la commande supprime la base si elle existe, la recrée, puis applique les scripts de `sql/socle/` par ordre de nom et ceux de chaque pack | C | terminal | opérationnel |
 | 9.5 | Vérifier dans SSMS que `qualite.script_applique` liste chaque script appliqué, avec son empreinte et la version du code | C | SSMS | opérationnel |
 | 9.6 | Après l'ajout d'un script, l'appliquer par `python -m frigeo.base` (une base à jour affiche « aucun script à appliquer ») | C | terminal | opérationnel |
-| 9.7 | Écrire dans la base les données chargées et nettoyées et la table des anomalies (sous-étape 7.2) | A, puis C | `src`, `tests` | à créer |
+| 9.7 | Après le notebook 07, exécuter sa cellule `# BASE` : elle écrit en base les tables chargées (schéma `chargement`, valeurs telles que livrées) et nettoyées (schéma `propre`, valeurs typées), les fichiers chargés (`qualite.journal_chargement`, avec leur empreinte) et la correspondance des colonnes (`qualite.correspondance_colonne`); la table des anomalies, les bilans, le journal du nettoyage et les décisions suivront (7.2d) | C | notebook 07 | en cours |
 
 Repères pour la phase 9 :
 
@@ -215,7 +215,12 @@ Repères pour la phase 9 :
 - `--recreer` efface toute la base, données comprises, et coupe les connexions ouvertes, SSMS compris; il est refusé hors d'un serveur local (localhost, ., (local), 127.0.0.1);
 - la version du code inscrite à chaque application est celle de `git describe`, suivie de « -dirty » si un fichier suivi est modifié ou si un fichier nouveau n'est pas encore commité : commiter avant une application à tracer;
 - `.env` n'est pas versionné; `.env.exemple` donne la liste des variables;
-- les tests sans base se lancent par `python -m pytest tests/test_base.py`.
+- les tables des schémas `chargement` et `propre` ne sont créées par aucun script numéroté : la cellule `# BASE` les génère à partir du dictionnaire revu, les supprime et les recrée à chaque exécution; elles reflètent donc toujours la dernière exécution, et une vue construite sur elles ne doit pas être créée `WITH SCHEMABINDING`;
+- `python -m frigeo.structure_base --essai` vérifie le SQL généré (création des tables dans une transaction annulée), sans rien laisser en base;
+- rejouer la même `PERIODE_FIN` remplace l'exécution précédente de cette période, une nouvelle période s'ajoute à l'historique de `qualite`;
+- une écriture arrêtée par un garde-fou (texte de plus de 4 000 caractères, date avec une heure, nombre de plus de 8 décimales ou trop grand) ou par une erreur du serveur ne modifie rien : l'exécution précédente et ses tables restent en place, et la nouvelle est inscrite « échouée » dans `qualite.execution`, avec le message (sans valeur du client);
+- une valeur restée illisible après nettoyage est écrite vide dans `propre`, sa valeur livrée restant dans `chargement`;
+- les tests sans base se lancent par `python -m pytest tests/test_base.py tests/test_structure_base.py tests/test_ecriture_base.py`.
 
 ## Cycle mensuel (un mois de plus)
 
