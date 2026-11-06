@@ -9,7 +9,10 @@ même transaction par le paramètre `completer`, avec `CompleterQualite` (7.2d),
 que les tables de référence issues de la configuration (7.3a) : jours fériés de
 config/gestion.yaml et valeurs admises des listes fermées du dictionnaire. Si un
 pack déclare la procédure dw.reconstruire, elle est appelée en dernier, dans la même
-transaction (7.3b) : propre et dw ne peuvent pas être désaccordés.
+transaction (7.3b) : propre et dw ne peuvent pas être désaccordés. Avant lui, le
+rattachement des lignes à leurs référentiels (7.3d, module `rattachement`) est écrit
+dans qualite.regle_rattachement et qualite.rattachement, pour que dw relie chaque
+fait au bon membre de dimension.
 
 Cycle d'une exécution :
 
@@ -90,6 +93,8 @@ STATUT_ECHOUEE = "échouée"
 # Tables de qualite rattachées à une exécution, dans l'ordre où leurs lignes sont
 # supprimées : d'abord celles qui pointent vers journal_chargement.
 TABLES_FILLES_EXECUTION = (
+    "rattachement",
+    "regle_rattachement",
     "anomalie",
     "non_evaluable",
     "journal_nettoyage",
@@ -651,6 +656,11 @@ RENOMMAGES = {"table": "table_source"}
 # Clé provisoire d'une ligne : (fichier_source, feuille_source) de sa ligne source,
 # remplacée à l'insertion par id_chargement.
 CLE_LIGNAGE = "__lignage"
+# Clé provisoire de la ligne du référentiel d'un rattachement, remplacée à l'insertion
+# par id_chargement_reference.
+CLE_LIGNAGE_REFERENCE = "__lignage_reference"
+# Clé provisoire vers la colonne d'id_chargement qui la remplace, dans cet ordre.
+CLES_LIGNAGE = {CLE_LIGNAGE: "id_chargement", CLE_LIGNAGE_REFERENCE: "id_chargement_reference"}
 
 REQUETE_COLONNES_QUALITE = (
     "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_SCALE "
@@ -678,13 +688,17 @@ class SortiesQualite:
     cle_empreinte: str
     # Jours fériés de config/gestion.yaml (`gestion.charger_jours_feries`).
     jours_feries: dict = field(default_factory=dict)
+    # Rattachement des lignes aux référentiels (`rattachement.rattacher`), None s'il
+    # n'est pas calculé : aucune ligne dans les deux tables du rattachement.
+    rattachements: object = None
 
 
-def _cle_lignage(enregistrement: dict) -> tuple | None:
-    fichier = enregistrement.get("fichier_source")
-    if _vide(fichier):
+def _cle_lignage(enregistrement: dict, fichier: str = "fichier_source",
+                 feuille: str = "feuille_source") -> tuple | None:
+    valeur = enregistrement.get(fichier)
+    if _vide(valeur):
         return None
-    return (str(fichier), _feuille(enregistrement.get("feuille_source")))
+    return (str(valeur), _feuille(enregistrement.get(feuille)))
 
 
 def _lignes(donnees: pd.DataFrame, communs: dict, lignage: bool = True) -> list[dict]:
@@ -789,12 +803,47 @@ def lignes_valeurs_liste(dictionnaire: dict, sensibles: dict) -> list[dict]:
     return lignes
 
 
+def lignes_regles_rattachement(rattachements) -> list[dict]:
+    """Lignes de qualite.regle_rattachement, sans id_execution : une par rattachement,
+    numéroté par son rang (id_regle), colonnes reliées par « , »."""
+    if rattachements is None:
+        return []
+    return [
+        {"id_regle": rang, "table_source": r.table, "cle": ", ".join(r.cle),
+         "table_reference": r.table_reference, "cle_reference": ", ".join(r.cle_reference),
+         "comparaison": r.comparaison, "colonne_date": r.date, "debut": r.debut,
+         "fin": r.fin, "refs": ", ".join(r.refs)}
+        for rang, r in enumerate(rattachements.regles, start=1)
+    ]
+
+
+def lignes_rattachement(rattachements) -> list[dict]:
+    """Lignes de qualite.rattachement, sans id_execution : une par ligne rattachée, la
+    ligne source et celle du référentiel portant chacune sa clé de lignage
+    (`CLE_LIGNAGE`, `CLE_LIGNAGE_REFERENCE`), remplacée à l'insertion par leur
+    id_chargement."""
+    if rattachements is None:
+        return []
+    return [
+        {"id_regle": int(l["regle"]),
+         "num_ligne_source": int(l["num_ligne_source"]),
+         CLE_LIGNAGE: _cle_lignage(l),
+         "num_ligne_reference": int(l["num_ligne_reference"]),
+         CLE_LIGNAGE_REFERENCE: _cle_lignage(l, "fichier_reference", "feuille_reference"),
+         "candidates": int(l["candidates"]),
+         "choix_par_date": bool(l["choix_par_date"])}
+        for l in rattachements.lignes.to_dict("records")
+    ]
+
+
 def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> dict[str, list[dict]]:
     """Lignes de chaque table de qualite, sans id_execution, valeurs telles que dans
     les fichiers du traitement (une valeur masquée reste « masqué »).
 
     Chaque ligne au grain d'une ligne source porte sa clé de lignage (`CLE_LIGNAGE`),
-    remplacée par id_chargement à l'insertion.
+    remplacée par id_chargement à l'insertion; une ligne de rattachement porte en plus
+    celle de la ligne du référentiel (`CLE_LIGNAGE_REFERENCE`). Les tables suivent
+    l'ordre d'insertion : une règle de rattachement avant ses lignes.
     """
     sensibles = _sensibles(sensibles)
     brut, nettoye = {"etat": ETAT_BRUT}, {"etat": ETAT_NETTOYE}
@@ -812,6 +861,8 @@ def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> di
         ),
         "jour_ferie": lignes_jours_feries(sorties.jours_feries),
         "valeur_liste": lignes_valeurs_liste(sorties.dictionnaire, sensibles),
+        "regle_rattachement": lignes_regles_rattachement(sorties.rattachements),
+        "rattachement": lignes_rattachement(sorties.rattachements),
     }
 
 
@@ -893,8 +944,10 @@ def convertir_lignes(
 
     `colonnes_base` donne, par colonne de la table en base, (type, longueur maximale
     en caractères, échelle). Problèmes, sans aucune valeur : colonne inconnue de la
-    table, texte plus long que sa colonne, fichier source absent du journal des
-    chargements.
+    table, texte plus long que sa colonne, fichier source (ou fichier du référentiel)
+    absent du journal des chargements. Chaque clé provisoire de lignage
+    (`CLES_LIGNAGE`) présente dans une ligne devient sa colonne d'id_chargement, en
+    fin de ligne, dans l'ordre de `CLES_LIGNAGE`.
     """
     problemes: list[str] = []
     if not lignes:
@@ -903,9 +956,9 @@ def convertir_lignes(
     # anomalies brutes n'ont pas la colonne decision_metier des anomalies nettoyées.
     noms = list(communs)
     for ligne in lignes:
-        noms += [c for c in ligne if c != CLE_LIGNAGE and c not in noms]
-    if any(CLE_LIGNAGE in ligne for ligne in lignes):
-        noms.append("id_chargement")
+        noms += [c for c in ligne if c not in CLES_LIGNAGE and c not in noms]
+    cles_presentes = [c for c in CLES_LIGNAGE if any(c in ligne for ligne in lignes)]
+    noms += [CLES_LIGNAGE[c] for c in cles_presentes]
     inconnues = [c for c in noms if c not in colonnes_base]
     if inconnues:
         return noms, [], [f"qualite.{table} : colonnes inconnues en base {', '.join(inconnues)}"]
@@ -914,11 +967,16 @@ def convertir_lignes(
     valeurs = []
     for ligne in lignes:
         complete = {**communs, **ligne}
-        if CLE_LIGNAGE in ligne:
-            cle = ligne[CLE_LIGNAGE]
-            if cle is not None and cle not in ids_chargement:
-                hors_journal += 1
-            complete["id_chargement"] = None if cle is None else ids_chargement.get(cle)
+        absente = False
+        for cle_provisoire in cles_presentes:
+            if cle_provisoire not in ligne:
+                continue
+            cle = ligne[cle_provisoire]
+            absente = absente or (cle is not None and cle not in ids_chargement)
+            complete[CLES_LIGNAGE[cle_provisoire]] = (
+                None if cle is None else ids_chargement.get(cle)
+            )
+        hors_journal += absente
         rangee = []
         for nom in noms:
             type_sql, longueur, echelle = colonnes_base[nom]
@@ -1093,8 +1151,10 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     table de chargement et de propre, sommes, minimums et maximums de propre;
     cellules illisibles de propre rattachées à une anomalie après nettoyage (même
     ligne source, même champ); avec `sorties`, lignes de chaque table de qualite par
-    état (jours fériés et valeurs des listes fermées compris, `sensibles` étant celui
-    de l'écriture), et id_chargement renseigné pour toute ligne qui a un fichier source;
+    état (jours fériés, valeurs des listes fermées et rattachements compris,
+    `sensibles` étant celui de l'écriture), id_chargement renseigné pour toute ligne qui
+    a un fichier source, et, par rattachement, lignes rattachées, choisies parmi
+    plusieurs candidates et choisies par la date;
     pour dw, procédure de reconstruction présente si et seulement si l'écriture l'a
     appelée, et, si elle l'a été, journal de la reconstruction identique à celui de
     l'écriture et contrat d'entrée respecté par propre.
@@ -1166,6 +1226,10 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
                 ("valeur_liste", None): len(lignes_valeurs_liste(
                     sorties.dictionnaire, _sensibles(sensibles)
                 )),
+                ("regle_rattachement", None): len(lignes_regles_rattachement(
+                    sorties.rattachements
+                )),
+                ("rattachement", None): len(lignes_rattachement(sorties.rattachements)),
             }
             for (table, etat), attendu in attendus_qualite.items():
                 filtre = " AND etat = :etat" if etat else ""
@@ -1184,8 +1248,36 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
                 ).scalar()
                 ajouter(FAMILLE_QUALITE, f"qualite.{table} : lignes avec un fichier source "
                         "sans id_chargement", 0, obtenu)
+            if sorties.rattachements is not None:
+                _verifier_rattachements(conn, ecriture.id_execution, sorties.rattachements,
+                                        ajouter)
         _verifier_dw(conn, ecriture, ajouter)
     return pd.DataFrame(controles, columns=COLONNES_VERIFICATION)
+
+
+def _verifier_rattachements(conn, id_execution: int, rattachements, ajouter) -> None:
+    """Lignes de qualite.rattachement par rattachement, et parmi elles celles choisies
+    entre plusieurs lignes du référentiel, puis par la date, comparées au calcul."""
+    from sqlalchemy import text
+
+    lues = {
+        int(regle): (int(lignes), int(plusieurs), int(par_date))
+        for regle, lignes, plusieurs, par_date in conn.execute(
+            text("SELECT id_regle, COUNT(*), "
+                 "SUM(CASE WHEN candidates > 1 THEN 1 ELSE 0 END), "
+                 "SUM(CAST(choix_par_date AS int)) "
+                 "FROM qualite.rattachement WHERE id_execution = :e GROUP BY id_regle"),
+            {"e": id_execution},
+        ).all()
+    }
+    bilan = rattachements.bilan.set_index("regle")
+    for rang, regle in enumerate(rattachements.regles, start=1):
+        attendu = (int(bilan.loc[rang, "rattachees"]), int(bilan.loc[rang, "plusieurs_candidates"]),
+                   int(bilan.loc[rang, "choisies_par_date"]))
+        ajouter(FAMILLE_QUALITE,
+                f"qualite.rattachement {rang} ({regle.libelle()}) : lignes, parmi plusieurs "
+                "candidates, choisies par la date",
+                " / ".join(map(str, attendu)), " / ".join(map(str, lues.get(rang, (0, 0, 0)))))
 
 
 def _journal_en_texte(journal) -> str | None:

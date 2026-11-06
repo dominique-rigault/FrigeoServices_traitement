@@ -11,6 +11,7 @@ import pytest
 from frigeo.ecriture_base import (
     COLONNES_CELLULES_ILLISIBLES,
     CLE_LIGNAGE,
+    CLE_LIGNAGE_REFERENCE,
     SortiesQualite,
     attendus_table,
     champ_sensible,
@@ -419,6 +420,7 @@ def test_lignes_qualite():
     assert list(lignes) == [
         "anomalie", "non_evaluable", "bilan_controle", "journal_nettoyage",
         "bilan_nettoyage", "decision", "jour_ferie", "valeur_liste",
+        "regle_rattachement", "rattachement",
     ]
     anomalies = lignes["anomalie"]
     assert [(l["etat"], l["id_anomalie"]) for l in anomalies] == [
@@ -434,6 +436,70 @@ def test_lignes_qualite():
     assert len(lignes["decision"]) == 3
     assert lignes["jour_ferie"] == []
     assert lignes["valeur_liste"] == []
+    assert lignes["regle_rattachement"] == []
+    assert lignes["rattachement"] == []
+
+
+def rattachements_exemple():
+    from frigeo.rattachement import RegleRattachement, rattacher
+
+    interventions = pd.DataFrame(
+        {"fichier_source": ["interventions_2025.csv"] * 2, "feuille_source": [None, None],
+         "num_ligne_source": [2, 3], "intervenant": ["LEROUX Mathieu", ""]}, dtype=object
+    )
+    intervenants = pd.DataFrame(
+        {"fichier_source": ["intervenants.xlsx"], "feuille_source": ["Intervenants"],
+         "num_ligne_source": [2], "nom": ["LEROUX"], "prenom": ["Mathieu"]}, dtype=object
+    )
+    regle = {"ref": "R10", "libelle": "l", "type": "existence_dans_reference",
+             "table": "interventions", "cle": ["intervenant"],
+             "table_reference": "intervenants", "cle_reference": ["nom", "prenom"],
+             "comparaison": "mots dans le désordre"}
+    resultat = rattacher(
+        {"interventions": interventions, "intervenants": intervenants}, {}, [regle]
+    )
+    assert resultat.regles == [RegleRattachement(
+        "interventions", ("intervenant",), "intervenants", ("nom", "prenom"),
+        "mots dans le désordre", refs=("R10",),
+    )]
+    return resultat
+
+
+def test_lignes_rattachement():
+    sorties = sorties_exemple()
+    sorties.rattachements = rattachements_exemple()
+    lignes = lignes_qualite(sorties, sensibles={})
+    assert lignes["regle_rattachement"] == [
+        {"id_regle": 1, "table_source": "interventions", "cle": "intervenant",
+         "table_reference": "intervenants", "cle_reference": "nom, prenom",
+         "comparaison": "mots dans le désordre", "colonne_date": None, "debut": None,
+         "fin": None, "refs": "R10"},
+    ]
+    assert lignes["rattachement"] == [
+        {"id_regle": 1, "num_ligne_source": 2, CLE_LIGNAGE: ("interventions_2025.csv", None),
+         "num_ligne_reference": 2, CLE_LIGNAGE_REFERENCE: ("intervenants.xlsx", "Intervenants"),
+         "candidates": 1, "choix_par_date": False},
+    ]
+    colonnes = {nom: ("int", None, 0) for nom in (
+        "id_execution", "id_regle", "num_ligne_source", "num_ligne_reference", "candidates",
+        "id_chargement", "id_chargement_reference")}
+    colonnes["choix_par_date"] = ("bit", None, None)
+    ids = {("interventions_2025.csv", None): 5, ("intervenants.xlsx", "Intervenants"): 9}
+    noms, valeurs, problemes = convertir_lignes(
+        "rattachement", lignes["rattachement"], colonnes, ids, {"id_execution": 3}
+    )
+    assert problemes == []
+    assert noms == ["id_execution", "id_regle", "num_ligne_source", "num_ligne_reference",
+                    "candidates", "choix_par_date", "id_chargement", "id_chargement_reference"]
+    assert valeurs == [[3, 1, 2, 2, 1, 0, 5, 9]]
+    # Le fichier du référentiel absent du journal est refusé, la ligne n'est comptée qu'une fois.
+    problemes = convertir_lignes(
+        "rattachement", lignes["rattachement"], colonnes, {}, {"id_execution": 3}
+    )[2]
+    assert problemes == [
+        "qualite.rattachement : 1 ligne(s) dont le fichier source n'est pas dans le journal "
+        "des chargements"
+    ]
 
 
 def test_lignes_jours_feries():
