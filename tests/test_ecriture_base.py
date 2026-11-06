@@ -24,7 +24,9 @@ from frigeo.ecriture_base import (
     empreinte_fichier,
     lignes_decisions,
     lignes_journal_chargement,
+    lignes_jours_feries,
     lignes_qualite,
+    lignes_valeurs_liste,
     longueur_sql,
     message_sans_valeur,
     preparer,
@@ -416,7 +418,7 @@ def test_lignes_qualite():
     lignes = lignes_qualite(sorties_exemple(), sensibles={"clients": frozenset({"adresse"})})
     assert list(lignes) == [
         "anomalie", "non_evaluable", "bilan_controle", "journal_nettoyage",
-        "bilan_nettoyage", "decision",
+        "bilan_nettoyage", "decision", "jour_ferie", "valeur_liste",
     ]
     anomalies = lignes["anomalie"]
     assert [(l["etat"], l["id_anomalie"]) for l in anomalies] == [
@@ -430,6 +432,72 @@ def test_lignes_qualite():
     assert lignes["journal_nettoyage"][0][CLE_LIGNAGE] == ("clients.csv", None)
     assert "etat" not in lignes["journal_nettoyage"][0]
     assert len(lignes["decision"]) == 3
+    assert lignes["jour_ferie"] == []
+    assert lignes["valeur_liste"] == []
+
+
+def test_lignes_jours_feries():
+    jours = {2025: [dt.date(2025, 1, 1), dt.date(2025, 5, 1)], 2026: []}
+    assert lignes_jours_feries(jours) == [
+        {"annee": 2025, "jour": dt.date(2025, 1, 1)},
+        {"annee": 2025, "jour": dt.date(2025, 5, 1)},
+        {"annee": 2026, "jour": None},
+    ]
+    assert lignes_jours_feries({}) == []
+    colonnes = {"id_execution": ("int", None, 0), "annee": ("smallint", None, 0),
+                "jour": ("date", None, None)}
+    noms, valeurs, problemes = convertir_lignes(
+        "jour_ferie", lignes_jours_feries(jours), colonnes, {}, {"id_execution": 4}
+    )
+    assert problemes == []
+    assert noms == ["id_execution", "annee", "jour"]
+    assert valeurs == [[4, 2025, "2025-01-01"], [4, 2025, "2025-05-01"], [4, 2026, None]]
+
+
+def _element(valeur, statut, origine="liste proposée"):
+    return {"valeur": valeur, "statut": statut, "origine": origine}
+
+
+def test_lignes_valeurs_liste():
+    categorie = regles_colonne()
+    categorie["valeurs"] = {"regle": "liste fermée", "motif": "proposé", "liste": [
+        _element("Dépannage", "valide"),
+        _element("SAV", "invalide"),
+        _element("Maintenance", "observé"),
+        _element("Divers", "observé", "à arbitrer"),
+        _element("Installation", "documenté", "ajoutée"),
+    ]}
+    ouverte = regles_colonne()
+    ouverte["valeurs"] = {"regle": "aucune", "motif": "proposé",
+                          "liste": [_element("x", "valide")]}
+    ecartee = regles_colonne()
+    ecartee["valeurs"] = {"regle": "aucune", "motif": "proposé",
+                          "liste": [_element("y", "observé")]}
+    masquee = regles_colonne()
+    masquee["valeurs"] = {"regle": "liste fermée", "motif": MOTIF_SENSIBLE,
+                          "liste": [_element("CDI", "valide")]}
+    classee = regles_colonne()
+    classee["valeurs"] = {"regle": "liste fermée", "motif": "proposé",
+                          "liste": [_element("Secret", "valide")]}
+    dictionnaire = {
+        "interventions": {"categorie": categorie, "commentaire": ouverte, "statut": ecartee},
+        "intervenants": {"type_contrat": masquee, "poste": classee},
+    }
+    lignes = lignes_valeurs_liste(dictionnaire, {"intervenants": frozenset({"poste"})})
+    assert lignes == [
+        {"table_source": "interventions", "colonne_source": "categorie", "rang": 1,
+         "valeur": "Dépannage", "statut": "valide"},
+        {"table_source": "interventions", "colonne_source": "categorie", "rang": 2,
+         "valeur": "Maintenance", "statut": "observé"},
+        {"table_source": "interventions", "colonne_source": "categorie", "rang": 3,
+         "valeur": "Installation", "statut": "documenté"},
+    ]
+    sorties = sorties_exemple()
+    sorties.dictionnaire = dictionnaire
+    sorties.jours_feries = {2025: [dt.date(2025, 1, 1)]}
+    par_table = lignes_qualite(sorties, sensibles={"intervenants": frozenset({"poste"})})
+    assert par_table["valeur_liste"] == lignes
+    assert par_table["jour_ferie"] == [{"annee": 2025, "jour": dt.date(2025, 1, 1)}]
 
 
 @pytest.mark.parametrize(

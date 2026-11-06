@@ -5,7 +5,9 @@ valeurs telles que livrées, en texte) et les tables nettoyées (schéma propre,
 valeurs typées), avec leur lignage, et les inscrit dans le schéma qualite
 (execution, journal_chargement, correspondance_colonne). Les autres tables de
 qualite (anomalies, bilans, journal du nettoyage, décisions) s'ajoutent dans la
-même transaction par le paramètre `completer`, avec `CompleterQualite` (7.2d).
+même transaction par le paramètre `completer`, avec `CompleterQualite` (7.2d), ainsi
+que les tables de référence issues de la configuration (7.3a) : jours fériés de
+config/gestion.yaml et valeurs admises des listes fermées du dictionnaire.
 
 Cycle d'une exécution :
 
@@ -91,6 +93,8 @@ TABLES_FILLES_EXECUTION = (
     "bilan_controle",
     "bilan_nettoyage",
     "decision",
+    "jour_ferie",
+    "valeur_liste",
     "correspondance_cle",
     "correspondance_colonne",
     "journal_chargement",
@@ -661,6 +665,8 @@ class SortiesQualite:
     decisions: dict
     dictionnaire: dict
     cle_empreinte: str
+    # Jours fériés de config/gestion.yaml (`gestion.charger_jours_feries`).
+    jours_feries: dict = field(default_factory=dict)
 
 
 def _cle_lignage(enregistrement: dict) -> tuple | None:
@@ -720,6 +726,58 @@ def lignes_decisions(decisions: dict, dictionnaire: dict, sensibles: dict, cle: 
     return lignes
 
 
+def _sensibles(sensibles: dict | None) -> dict:
+    """Colonnes sensibles données, ou celles de config/sensibilite.yaml."""
+    from .confidentialite import charger_sensibilite
+
+    return charger_sensibilite() if sensibles is None else sensibles
+
+
+def lignes_jours_feries(jours_feries: dict) -> list[dict]:
+    """Lignes de qualite.jour_ferie, sans id_execution : une par jour férié déclaré,
+    dans l'ordre des années puis des jours. Une année déclarée sans jour férié donne
+    une ligne sans jour, pour qu'elle reste distincte d'une année non déclarée."""
+    lignes = []
+    for annee, jours in jours_feries.items():
+        if not jours:
+            lignes.append({"annee": annee, "jour": None})
+        lignes += [{"annee": annee, "jour": jour} for jour in jours]
+    return lignes
+
+
+def lignes_valeurs_liste(dictionnaire: dict, sensibles: dict) -> list[dict]:
+    """Lignes de qualite.valeur_liste, sans id_execution : une par valeur admise de
+    chaque colonne dont la règle `valeurs` en vigueur est une liste fermée.
+
+    Une valeur est admise quand le contrôle de la liste ne la signale pas : valide,
+    documentée, ou proposée par la génération et pas encore revue (statut observé).
+    Les valeurs invalides, à arbitrer ou écartées ne sont pas reprises. Le rang suit
+    l'ordre de la liste du dictionnaire, à partir de 1, parmi les valeurs admises. Une
+    colonne sensible (`champ_sensible`) n'est pas reprise.
+    """
+    from .controles import _issue_element
+    from .dictionnaire import LISTE_FERMEE
+
+    lignes = []
+    for table, colonnes in dictionnaire.items():
+        for colonne, regles in colonnes.items():
+            valeurs = regles["valeurs"]
+            if valeurs["regle"] != LISTE_FERMEE or champ_sensible(
+                sensibles, dictionnaire, table, colonne
+            ):
+                continue
+            admises = [
+                element for element in valeurs["liste"]
+                if _issue_element(element) in (None, "non revue")
+            ]
+            lignes += [
+                {"table_source": table, "colonne_source": colonne, "rang": rang,
+                 "valeur": element["valeur"], "statut": element["statut"]}
+                for rang, element in enumerate(admises, start=1)
+            ]
+    return lignes
+
+
 def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> dict[str, list[dict]]:
     """Lignes de chaque table de qualite, sans id_execution, valeurs telles que dans
     les fichiers du traitement (une valeur masquée reste « masqué »).
@@ -727,9 +785,7 @@ def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> di
     Chaque ligne au grain d'une ligne source porte sa clé de lignage (`CLE_LIGNAGE`),
     remplacée par id_chargement à l'insertion.
     """
-    from .confidentialite import charger_sensibilite
-
-    sensibles = charger_sensibilite() if sensibles is None else sensibles
+    sensibles = _sensibles(sensibles)
     brut, nettoye = {"etat": ETAT_BRUT}, {"etat": ETAT_NETTOYE}
     return {
         "anomalie": _lignes(sorties.anomalies_brutes, brut)
@@ -743,6 +799,8 @@ def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> di
         "decision": lignes_decisions(
             sorties.decisions, sorties.dictionnaire, sensibles, sorties.cle_empreinte
         ),
+        "jour_ferie": lignes_jours_feries(sorties.jours_feries),
+        "valeur_liste": lignes_valeurs_liste(sorties.dictionnaire, sensibles),
     }
 
 
@@ -1011,7 +1069,8 @@ def conformite(attendu, obtenu) -> bool:
 
 
 def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
-                  sorties: SortiesQualite | None = None) -> pd.DataFrame:
+                  sorties: SortiesQualite | None = None,
+                  sensibles: dict | None = None) -> pd.DataFrame:
     """Relit la base après une écriture et compare avec ce que Python a préparé.
 
     Une ligne par contrôle (`COLONNES_VERIFICATION`), en décomptes et agrégats
@@ -1020,7 +1079,8 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     table de chargement et de propre, sommes, minimums et maximums de propre;
     cellules illisibles de propre rattachées à une anomalie après nettoyage (même
     ligne source, même champ); avec `sorties`, lignes de chaque table de qualite par
-    état, et id_chargement renseigné pour toute ligne qui a un fichier source.
+    état (jours fériés et valeurs des listes fermées compris, `sensibles` étant celui
+    de l'écriture), et id_chargement renseigné pour toute ligne qui a un fichier source.
     """
     from sqlalchemy import text
 
@@ -1085,6 +1145,10 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
                 ("journal_nettoyage", None): len(sorties.journal_nettoyage),
                 ("bilan_nettoyage", None): len(sorties.bilan_nettoyage),
                 ("decision", None): len(sorties.decisions.get("decisions") or {}),
+                ("jour_ferie", None): len(lignes_jours_feries(sorties.jours_feries)),
+                ("valeur_liste", None): len(lignes_valeurs_liste(
+                    sorties.dictionnaire, _sensibles(sensibles)
+                )),
             }
             for (table, etat), attendu in attendus_qualite.items():
                 filtre = " AND etat = :etat" if etat else ""
