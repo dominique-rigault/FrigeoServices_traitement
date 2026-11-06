@@ -13,6 +13,9 @@
   vue ne porte sur elles : seules des procédures les lisent (résolution
   différée des noms), et les vues ne portent que sur dw.
 
+  La procédure dw.reconstruire est créée par le dernier script du pack
+  (900_reconstruire.sql), après les procédures qu'elle appelle.
+
   Contrat d'entrée : les colonnes de propre que le pack lit, avec leur
   famille (texte, date, heure, entier, décimal). Il est vérifié avant toute
   construction, tous les écarts étant listés en un seul message, sans valeur
@@ -113,27 +116,18 @@ BEGIN
 END;
 GO
 
-/* Reconstruit dw pour une exécution, dans la transaction de l'appelant. Les
-   étapes de construction (dimensions, faits) s'ajoutent après la vérification
-   du contrat, chacune inscrite dans dw.journal_reconstruction. */
-CREATE PROCEDURE dw.reconstruire
-    @id_execution int
+/* Inscrit une étape de la reconstruction dans dw.journal_reconstruction, à la
+   suite des précédentes. */
+CREATE PROCEDURE dw.inscrire_etape
+    @id_execution int,
+    @etape nvarchar(128),
+    @lignes int,
+    @debut datetime2(0)
 AS
 BEGIN
     SET NOCOUNT ON;
-    SET XACT_ABORT ON;
-
-    IF @@TRANCOUNT = 0
-        THROW 50001, N'dw.reconstruire s''exécute dans une transaction ouverte par l''appelant (cellule # BASE ou python -m frigeo.base --reconstruire).', 1;
-    IF NOT EXISTS (SELECT 1 FROM qualite.execution WHERE id_execution = @id_execution)
-        THROW 50002, N'dw.reconstruire : exécution inconnue de qualite.execution.', 1;
-
-    DELETE FROM dw.journal_reconstruction;
-
-    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
-    EXEC dw.verifier_contrat;
     INSERT INTO dw.journal_reconstruction (id_execution, ordre, etape, lignes, debut, fin)
-    SELECT @id_execution, 1, N'contrat d''entrée', COUNT(*), @debut, SYSUTCDATETIME()
-    FROM dw.contrat_entree;
+    SELECT @id_execution, COALESCE(MAX(ordre), 0) + 1, @etape, @lignes, @debut, SYSUTCDATETIME()
+    FROM dw.journal_reconstruction;
 END;
 GO
