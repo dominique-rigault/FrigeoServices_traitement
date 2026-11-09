@@ -1157,7 +1157,8 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     plusieurs candidates et choisies par la date;
     pour dw, procédure de reconstruction présente si et seulement si l'écriture l'a
     appelée, et, si elle l'a été, journal de la reconstruction identique à celui de
-    l'écriture et contrat d'entrée respecté par propre.
+    l'écriture et contrat d'entrée respecté par propre et par les rattachements de
+    l'exécution.
     """
     from sqlalchemy import text
 
@@ -1307,13 +1308,13 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter) -> None:
         ajouter(FAMILLE_DW, f"dw.journal_reconstruction de l'exécution {ecriture.id_execution}",
                 _journal_en_texte(ecriture.journal_dw), _journal_en_texte(lu))
         try:
-            curseur.execute("EXEC dw.verifier_contrat")
+            curseur.execute("EXEC dw.verifier_contrat ?", ecriture.id_execution)
             while curseur.nextset():
                 pass
             contrat = CONTRAT_RESPECTE
         except pyodbc.Error:
             contrat = CONTRAT_NON_RESPECTE
-        ajouter(FAMILLE_DW, "contrat d'entrée du pack respecté par propre",
+        ajouter(FAMILLE_DW, "contrat d'entrée du pack respecté par propre et les rattachements",
                 CONTRAT_RESPECTE, contrat)
     finally:
         curseur.close()

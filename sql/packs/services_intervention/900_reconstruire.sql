@@ -2,9 +2,10 @@
   Pack services_intervention, script 900 : procédure dw.reconstruire.
 
   Dernier script du pack, pour être créé après les procédures qu'il appelle.
-  Il enchaîne la vérification du contrat d'entrée, puis la construction des
-  dimensions (script 002) et, à venir, celle des faits. Chaque étape est
-  inscrite dans dw.journal_reconstruction.
+  Il enchaîne la vérification du contrat d'entrée (colonnes de propre et
+  rattachements de l'exécution), le vidage des faits, la construction des
+  dimensions (script 002) et, à venir, celle des faits. Chaque étape de
+  construction est inscrite dans dw.journal_reconstruction.
 */
 
 /* Reconstruit dw pour une exécution, dans la transaction de l'appelant. */
@@ -23,9 +24,12 @@ BEGIN
     DELETE FROM dw.journal_reconstruction;
 
     DECLARE @debut datetime2(0) = SYSUTCDATETIME();
-    EXEC dw.verifier_contrat;
+    EXEC dw.verifier_contrat @id_execution;
     DECLARE @colonnes int = (SELECT COUNT(*) FROM dw.contrat_entree);
     EXEC dw.inscrire_etape @id_execution, N'contrat d''entrée', @colonnes, @debut;
+
+    /* Faits vidés avant les dimensions qu'ils référencent. */
+    EXEC dw.vider_faits;
 
     /* Dimensions (script 002). */
     EXEC dw.construire_dim_date @id_execution;
