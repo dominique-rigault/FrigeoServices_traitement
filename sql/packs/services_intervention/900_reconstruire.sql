@@ -45,5 +45,7 @@ BEGIN
     /* Faits (script 003). */
     EXEC dw.construire_fait_intervention @id_execution;
     EXEC dw.construire_fait_consommation @id_execution;
+    EXEC dw.construire_fait_ligne_facture @id_execution;
+    EXEC dw.construire_fait_achat @id_execution;
 END;
 GO

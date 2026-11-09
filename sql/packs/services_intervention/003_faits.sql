@@ -26,10 +26,17 @@
   Les rattachements lus sont déclarés dans dw.contrat_rattachement : un
   rattachement absent de l'exécution fait échouer la reconstruction.
 
-  Lien vers une autre ligne de fait (une consommation vers son
-  intervention) : la clé de la ligne de fait que désigne le rattachement,
-  NULL sinon, avec lien_intervention qui dit pourquoi (rattachée, non
-  renseignée, introuvable).
+  Lien vers une autre ligne de fait (une consommation ou une ligne de facture
+  vers son intervention) : la clé de la ligne de fait que désigne le
+  rattachement, NULL sinon, avec lien_intervention qui dit pourquoi
+  (rattachée, non renseignée, introuvable).
+
+  Document à en-tête et lignes (facture, pièce d'achat) : un fait par ligne,
+  les attributs de l'en-tête (dates, client ou fournisseur, type de pièce)
+  descendant sur ses lignes par le rattachement de la ligne à son en-tête;
+  les totaux de l'en-tête ne sont pas repris, la somme des lignes les donnant.
+  lien_entete dit si l'en-tête est trouvé; sans en-tête, ses dimensions
+  pointent vers -1 si le numéro du document est vide, -2 sinon.
 
   Données personnelles : l'intervenant et le client d'une intervention ne
   sont portés que par leur dimension; le nom du client, l'adresse et le
@@ -251,5 +258,347 @@ BEGIN
 
     DECLARE @lignes int = @@ROWCOUNT;
     EXEC dw.inscrire_etape @id_execution, N'fait_consommation', @lignes, @debut;
+END;
+GO
+
+/* Colonnes de propre lues par les faits des documents. */
+INSERT INTO dw.contrat_entree (table_propre, colonne, famille) VALUES
+    (N'factures_entetes', N'num_facture', N'texte'),
+    (N'factures_entetes', N'type_piece', N'texte'),
+    (N'factures_entetes', N'date_facture', N'date'),
+    (N'factures_entetes', N'code_client', N'texte'),
+    (N'factures_entetes', N'date_echeance', N'date'),
+    (N'factures_entetes', N'mode_reglement', N'texte'),
+    (N'factures_entetes', N'facture_origine', N'texte'),
+    (N'factures_lignes', N'num_facture', N'texte'),
+    (N'factures_lignes', N'num_ligne', N'décimal'),
+    (N'factures_lignes', N'id_intervention', N'texte'),
+    (N'factures_lignes', N'ref_piece', N'texte'),
+    (N'factures_lignes', N'quantite', N'décimal'),
+    (N'factures_lignes', N'unite', N'texte'),
+    (N'factures_lignes', N'pu_ht', N'décimal'),
+    (N'factures_lignes', N'remise_pct', N'décimal'),
+    (N'factures_lignes', N'montant_ht', N'décimal'),
+    (N'factures_lignes', N'taux_tva', N'décimal'),
+    (N'achats_entetes', N'num_piece_achat', N'texte'),
+    (N'achats_entetes', N'ref_facture_fournisseur', N'texte'),
+    (N'achats_entetes', N'type_piece', N'texte'),
+    (N'achats_entetes', N'code_fournisseur', N'texte'),
+    (N'achats_entetes', N'date_facture', N'date'),
+    (N'achats_entetes', N'date_echeance', N'date'),
+    (N'achats_lignes', N'num_piece_achat', N'texte'),
+    (N'achats_lignes', N'num_ligne', N'décimal'),
+    (N'achats_lignes', N'ref_piece', N'texte'),
+    (N'achats_lignes', N'quantite', N'décimal'),
+    (N'achats_lignes', N'unite', N'texte'),
+    (N'achats_lignes', N'pu_achat_ht', N'décimal'),
+    (N'achats_lignes', N'montant_ht', N'décimal'),
+    (N'achats_lignes', N'compte_charge', N'texte');
+GO
+
+/* Rattachements lus par les faits des documents. */
+INSERT INTO dw.contrat_rattachement (table_source, cle, table_reference) VALUES
+    (N'factures_lignes', N'num_facture', N'factures_entetes'),
+    (N'factures_entetes', N'code_client', N'clients'),
+    (N'factures_lignes', N'ref_piece', N'catalogue_pieces'),
+    (N'factures_lignes', N'id_intervention', N'interventions'),
+    (N'achats_lignes', N'num_piece_achat', N'achats_entetes'),
+    (N'achats_entetes', N'code_fournisseur', N'fournisseurs'),
+    (N'achats_lignes', N'ref_piece', N'catalogue_pieces');
+GO
+
+/*
+  Lignes de facture : une ligne par ligne de propre.factures_lignes. En-tête
+  par le rattachement factures_lignes.num_facture vers factures_entetes, dont
+  la ligne donne la date de facture, la date d'échéance, le type de pièce
+  (facture ou avoir), le mode de règlement, la facture d'origine d'un avoir et
+  le client (rattachement factures_entetes.code_client vers clients). Article
+  par égalité du code (aucun référentiel), pièce par le rattachement
+  factures_lignes.ref_piece vers catalogue_pieces, intervention par
+  factures_lignes.id_intervention vers interventions.
+*/
+CREATE TABLE dw.fait_ligne_facture (
+    id_fait_ligne_facture  int             NOT NULL,
+    num_facture            nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    num_ligne              decimal(28, 8)  NULL,
+    lien_entete            nvarchar(20)    NOT NULL,
+    type_piece             nvarchar(4000)  NULL,
+    mode_reglement         nvarchar(4000)  NULL,
+    facture_origine        nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    id_date                int             NOT NULL,
+    id_date_echeance       int             NOT NULL,
+    id_client              int             NOT NULL,
+    id_article             int             NOT NULL,
+    id_piece               int             NOT NULL,
+    id_fait_intervention   int             NULL,
+    lien_intervention      nvarchar(20)    NOT NULL,
+    quantite               decimal(28, 8)  NULL,
+    unite                  nvarchar(4000)  NULL,
+    pu_ht                  decimal(28, 8)  NULL,
+    remise_pct             decimal(28, 8)  NULL,
+    montant_ht             decimal(28, 8)  NULL,
+    taux_tva               decimal(28, 8)  NULL,
+    id_chargement          int             NOT NULL,
+    fichier_source         nvarchar(260)   NOT NULL,
+    feuille_source         nvarchar(128)   NULL,
+    num_ligne_source       int             NOT NULL,
+    CONSTRAINT pk_fait_ligne_facture PRIMARY KEY (id_fait_ligne_facture),
+    CONSTRAINT uq_fait_ligne_facture_lignage UNIQUE (id_chargement, num_ligne_source),
+    CONSTRAINT ck_fait_ligne_facture_entete
+        CHECK (lien_entete IN (N'rattachée', N'non renseignée', N'introuvable')),
+    CONSTRAINT ck_fait_ligne_facture_lien
+        CHECK ((lien_intervention = N'rattachée' AND id_fait_intervention IS NOT NULL)
+               OR (lien_intervention IN (N'non renseignée', N'introuvable')
+                   AND id_fait_intervention IS NULL)),
+    CONSTRAINT fk_fait_ligne_facture_intervention
+        FOREIGN KEY (id_fait_intervention)
+        REFERENCES dw.fait_intervention (id_fait_intervention),
+    CONSTRAINT fk_fait_ligne_facture_date
+        FOREIGN KEY (id_date) REFERENCES dw.dim_date (id_date),
+    CONSTRAINT fk_fait_ligne_facture_echeance
+        FOREIGN KEY (id_date_echeance) REFERENCES dw.dim_date (id_date),
+    CONSTRAINT fk_fait_ligne_facture_client
+        FOREIGN KEY (id_client) REFERENCES dw.dim_client (id_client),
+    CONSTRAINT fk_fait_ligne_facture_article
+        FOREIGN KEY (id_article) REFERENCES dw.dim_article (id_article),
+    CONSTRAINT fk_fait_ligne_facture_piece
+        FOREIGN KEY (id_piece) REFERENCES dw.dim_piece (id_piece)
+);
+GO
+
+CREATE PROCEDURE dw.construire_fait_ligne_facture
+    @id_execution int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
+    DECLARE @r_entete int =
+        dw.regle_rattachement(@id_execution, N'factures_lignes', N'num_facture',
+                              N'factures_entetes');
+    DECLARE @r_client int =
+        dw.regle_rattachement(@id_execution, N'factures_entetes', N'code_client', N'clients');
+    DECLARE @r_piece int =
+        dw.regle_rattachement(@id_execution, N'factures_lignes', N'ref_piece',
+                              N'catalogue_pieces');
+    DECLARE @r_intervention int =
+        dw.regle_rattachement(@id_execution, N'factures_lignes', N'id_intervention',
+                              N'interventions');
+
+    DELETE FROM dw.fait_ligne_facture;
+    WITH lignes AS (
+        SELECT p.*,
+               h.id_chargement AS entete_trouve,
+               CASE WHEN h.id_chargement IS NOT NULL THEN NULL
+                    WHEN p.num_facture IS NULL THEN -1 ELSE -2 END AS sans_entete,
+               h.type_piece, h.mode_reglement, h.facture_origine,
+               h.date_facture, h.date_echeance, h.code_client,
+               dd.id_date AS jour, de.id_date AS echeance, dc.id_client AS client,
+               da.id_article AS article, dp.id_piece AS piece,
+               fi.id_fait_intervention AS intervention_liee
+        FROM propre.factures_lignes AS p
+        LEFT JOIN qualite.rattachement AS re
+            ON re.id_execution = @id_execution AND re.id_regle = @r_entete
+           AND re.id_chargement = p.id_chargement AND re.num_ligne_source = p.num_ligne_source
+        LEFT JOIN propre.factures_entetes AS h
+            ON h.id_chargement = re.id_chargement_reference
+           AND h.num_ligne_source = re.num_ligne_reference
+        LEFT JOIN dw.dim_date AS dd ON dd.date_jour = h.date_facture
+        LEFT JOIN dw.dim_date AS de ON de.date_jour = h.date_echeance
+        LEFT JOIN qualite.rattachement AS rc
+            ON rc.id_execution = @id_execution AND rc.id_regle = @r_client
+           AND rc.id_chargement = h.id_chargement AND rc.num_ligne_source = h.num_ligne_source
+        LEFT JOIN propre.clients AS tc
+            ON tc.id_chargement = rc.id_chargement_reference
+           AND tc.num_ligne_source = rc.num_ligne_reference
+        LEFT JOIN dw.dim_client AS dc
+            ON dc.code_client = tc.code_client COLLATE Latin1_General_100_BIN2
+        LEFT JOIN dw.dim_article AS da
+            ON da.code_article = p.code_article COLLATE Latin1_General_100_BIN2
+        LEFT JOIN qualite.rattachement AS rp
+            ON rp.id_execution = @id_execution AND rp.id_regle = @r_piece
+           AND rp.id_chargement = p.id_chargement AND rp.num_ligne_source = p.num_ligne_source
+        LEFT JOIN propre.catalogue_pieces AS tp
+            ON tp.id_chargement = rp.id_chargement_reference
+           AND tp.num_ligne_source = rp.num_ligne_reference
+        LEFT JOIN dw.dim_piece AS dp
+            ON dp.ref_piece = tp.ref_piece COLLATE Latin1_General_100_BIN2
+        LEFT JOIN qualite.rattachement AS rv
+            ON rv.id_execution = @id_execution AND rv.id_regle = @r_intervention
+           AND rv.id_chargement = p.id_chargement AND rv.num_ligne_source = p.num_ligne_source
+        LEFT JOIN dw.fait_intervention AS fi
+            ON fi.id_chargement = rv.id_chargement_reference
+           AND fi.num_ligne_source = rv.num_ligne_reference
+    )
+    INSERT INTO dw.fait_ligne_facture (
+        id_fait_ligne_facture, num_facture, num_ligne, lien_entete, type_piece, mode_reglement,
+        facture_origine, id_date, id_date_echeance, id_client, id_article, id_piece,
+        id_fait_intervention, lien_intervention, quantite, unite, pu_ht, remise_pct, montant_ht,
+        taux_tva, id_chargement, fichier_source, feuille_source, num_ligne_source)
+    SELECT ROW_NUMBER() OVER (ORDER BY l.fichier_source, l.feuille_source, l.num_ligne_source),
+           l.num_facture,
+           l.num_ligne,
+           CASE WHEN l.entete_trouve IS NOT NULL THEN N'rattachée'
+                WHEN l.num_facture IS NULL THEN N'non renseignée'
+                ELSE N'introuvable' END,
+           l.type_piece,
+           l.mode_reglement,
+           l.facture_origine,
+           COALESCE(l.sans_entete,
+                    CASE WHEN l.date_facture IS NULL THEN -1 ELSE COALESCE(l.jour, -2) END),
+           COALESCE(l.sans_entete,
+                    CASE WHEN l.date_echeance IS NULL THEN -1 ELSE COALESCE(l.echeance, -2) END),
+           COALESCE(l.sans_entete,
+                    CASE WHEN l.code_client IS NULL THEN -1 ELSE COALESCE(l.client, -2) END),
+           CASE WHEN l.code_article IS NULL THEN -1 ELSE COALESCE(l.article, -2) END,
+           CASE WHEN l.ref_piece IS NULL THEN -1 ELSE COALESCE(l.piece, -2) END,
+           l.intervention_liee,
+           CASE WHEN l.intervention_liee IS NOT NULL THEN N'rattachée'
+                WHEN l.id_intervention IS NULL THEN N'non renseignée'
+                ELSE N'introuvable' END,
+           l.quantite,
+           l.unite,
+           l.pu_ht,
+           l.remise_pct,
+           l.montant_ht,
+           l.taux_tva,
+           l.id_chargement, l.fichier_source, l.feuille_source, l.num_ligne_source
+    FROM lignes AS l;
+
+    DECLARE @lignes int = @@ROWCOUNT;
+    EXEC dw.inscrire_etape @id_execution, N'fait_ligne_facture', @lignes, @debut;
+END;
+GO
+
+/*
+  Lignes d'achat : une ligne par ligne de propre.achats_lignes. En-tête par
+  le rattachement achats_lignes.num_piece_achat vers achats_entetes, dont la
+  ligne donne la date de facture, la date d'échéance, le type de pièce, la
+  référence de la facture du fournisseur et le fournisseur (rattachement
+  achats_entetes.code_fournisseur vers fournisseurs). Pièce par le
+  rattachement achats_lignes.ref_piece vers catalogue_pieces, compte de
+  charge par égalité du code avec les comptes du FEC.
+*/
+CREATE TABLE dw.fait_achat (
+    id_fait_achat            int             NOT NULL,
+    num_piece_achat          nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    num_ligne                decimal(28, 8)  NULL,
+    lien_entete              nvarchar(20)    NOT NULL,
+    type_piece               nvarchar(4000)  NULL,
+    ref_facture_fournisseur  nvarchar(4000)  NULL,
+    id_date                  int             NOT NULL,
+    id_date_echeance         int             NOT NULL,
+    id_fournisseur           int             NOT NULL,
+    id_piece                 int             NOT NULL,
+    id_compte                int             NOT NULL,
+    quantite                 decimal(28, 8)  NULL,
+    unite                    nvarchar(4000)  NULL,
+    pu_achat_ht              decimal(28, 8)  NULL,
+    montant_ht               decimal(28, 8)  NULL,
+    id_chargement            int             NOT NULL,
+    fichier_source           nvarchar(260)   NOT NULL,
+    feuille_source           nvarchar(128)   NULL,
+    num_ligne_source         int             NOT NULL,
+    CONSTRAINT pk_fait_achat PRIMARY KEY (id_fait_achat),
+    CONSTRAINT uq_fait_achat_lignage UNIQUE (id_chargement, num_ligne_source),
+    CONSTRAINT ck_fait_achat_entete
+        CHECK (lien_entete IN (N'rattachée', N'non renseignée', N'introuvable')),
+    CONSTRAINT fk_fait_achat_date
+        FOREIGN KEY (id_date) REFERENCES dw.dim_date (id_date),
+    CONSTRAINT fk_fait_achat_echeance
+        FOREIGN KEY (id_date_echeance) REFERENCES dw.dim_date (id_date),
+    CONSTRAINT fk_fait_achat_fournisseur
+        FOREIGN KEY (id_fournisseur) REFERENCES dw.dim_fournisseur (id_fournisseur),
+    CONSTRAINT fk_fait_achat_piece
+        FOREIGN KEY (id_piece) REFERENCES dw.dim_piece (id_piece),
+    CONSTRAINT fk_fait_achat_compte
+        FOREIGN KEY (id_compte) REFERENCES dw.dim_compte (id_compte)
+);
+GO
+
+CREATE PROCEDURE dw.construire_fait_achat
+    @id_execution int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
+    DECLARE @r_entete int =
+        dw.regle_rattachement(@id_execution, N'achats_lignes', N'num_piece_achat',
+                              N'achats_entetes');
+    DECLARE @r_fournisseur int =
+        dw.regle_rattachement(@id_execution, N'achats_entetes', N'code_fournisseur',
+                              N'fournisseurs');
+    DECLARE @r_piece int =
+        dw.regle_rattachement(@id_execution, N'achats_lignes', N'ref_piece',
+                              N'catalogue_pieces');
+
+    DELETE FROM dw.fait_achat;
+    WITH lignes AS (
+        SELECT p.*,
+               h.id_chargement AS entete_trouve,
+               CASE WHEN h.id_chargement IS NOT NULL THEN NULL
+                    WHEN p.num_piece_achat IS NULL THEN -1 ELSE -2 END AS sans_entete,
+               h.type_piece, h.ref_facture_fournisseur, h.date_facture, h.date_echeance,
+               h.code_fournisseur,
+               dd.id_date AS jour, de.id_date AS echeance, df.id_fournisseur AS fournisseur,
+               dp.id_piece AS piece, dk.id_compte AS compte
+        FROM propre.achats_lignes AS p
+        LEFT JOIN qualite.rattachement AS re
+            ON re.id_execution = @id_execution AND re.id_regle = @r_entete
+           AND re.id_chargement = p.id_chargement AND re.num_ligne_source = p.num_ligne_source
+        LEFT JOIN propre.achats_entetes AS h
+            ON h.id_chargement = re.id_chargement_reference
+           AND h.num_ligne_source = re.num_ligne_reference
+        LEFT JOIN dw.dim_date AS dd ON dd.date_jour = h.date_facture
+        LEFT JOIN dw.dim_date AS de ON de.date_jour = h.date_echeance
+        LEFT JOIN qualite.rattachement AS rf
+            ON rf.id_execution = @id_execution AND rf.id_regle = @r_fournisseur
+           AND rf.id_chargement = h.id_chargement AND rf.num_ligne_source = h.num_ligne_source
+        LEFT JOIN propre.fournisseurs AS tf
+            ON tf.id_chargement = rf.id_chargement_reference
+           AND tf.num_ligne_source = rf.num_ligne_reference
+        LEFT JOIN dw.dim_fournisseur AS df
+            ON df.code_fournisseur = tf.code_fournisseur COLLATE Latin1_General_100_BIN2
+        LEFT JOIN qualite.rattachement AS rp
+            ON rp.id_execution = @id_execution AND rp.id_regle = @r_piece
+           AND rp.id_chargement = p.id_chargement AND rp.num_ligne_source = p.num_ligne_source
+        LEFT JOIN propre.catalogue_pieces AS tp
+            ON tp.id_chargement = rp.id_chargement_reference
+           AND tp.num_ligne_source = rp.num_ligne_reference
+        LEFT JOIN dw.dim_piece AS dp
+            ON dp.ref_piece = tp.ref_piece COLLATE Latin1_General_100_BIN2
+        LEFT JOIN dw.dim_compte AS dk
+            ON dk.compte_num = p.compte_charge COLLATE Latin1_General_100_BIN2
+    )
+    INSERT INTO dw.fait_achat (
+        id_fait_achat, num_piece_achat, num_ligne, lien_entete, type_piece,
+        ref_facture_fournisseur, id_date, id_date_echeance, id_fournisseur, id_piece, id_compte,
+        quantite, unite, pu_achat_ht, montant_ht, id_chargement, fichier_source, feuille_source,
+        num_ligne_source)
+    SELECT ROW_NUMBER() OVER (ORDER BY l.fichier_source, l.feuille_source, l.num_ligne_source),
+           l.num_piece_achat,
+           l.num_ligne,
+           CASE WHEN l.entete_trouve IS NOT NULL THEN N'rattachée'
+                WHEN l.num_piece_achat IS NULL THEN N'non renseignée'
+                ELSE N'introuvable' END,
+           l.type_piece,
+           l.ref_facture_fournisseur,
+           COALESCE(l.sans_entete,
+                    CASE WHEN l.date_facture IS NULL THEN -1 ELSE COALESCE(l.jour, -2) END),
+           COALESCE(l.sans_entete,
+                    CASE WHEN l.date_echeance IS NULL THEN -1 ELSE COALESCE(l.echeance, -2) END),
+           COALESCE(l.sans_entete,
+                    CASE WHEN l.code_fournisseur IS NULL THEN -1
+                         ELSE COALESCE(l.fournisseur, -2) END),
+           CASE WHEN l.ref_piece IS NULL THEN -1 ELSE COALESCE(l.piece, -2) END,
+           CASE WHEN l.compte_charge IS NULL THEN -1 ELSE COALESCE(l.compte, -2) END,
+           l.quantite,
+           l.unite,
+           l.pu_achat_ht,
+           l.montant_ht,
+           l.id_chargement, l.fichier_source, l.feuille_source, l.num_ligne_source
+    FROM lignes AS l;
+
+    DECLARE @lignes int = @@ROWCOUNT;
+    EXEC dw.inscrire_etape @id_execution, N'fait_achat', @lignes, @debut;
 END;
 GO
