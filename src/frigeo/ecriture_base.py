@@ -100,10 +100,10 @@ TABLES_FILLES_EXECUTION = (
     "journal_nettoyage",
     "bilan_controle",
     "bilan_nettoyage",
+    "correspondance_cle",
     "decision",
     "jour_ferie",
     "valeur_liste",
-    "correspondance_cle",
     "correspondance_colonne",
     "journal_chargement",
 )
@@ -691,6 +691,9 @@ class SortiesQualite:
     # Rattachement des lignes aux référentiels (`rattachement.rattacher`), None s'il
     # n'est pas calculé : aucune ligne dans les deux tables du rattachement.
     rattachements: object = None
+    # Codes en doublon regroupés sous un code principal (`nettoyage.nettoyer`,
+    # membre correspondances), None : aucune ligne dans qualite.correspondance_cle.
+    correspondances: pd.DataFrame | None = None
 
 
 def _cle_lignage(enregistrement: dict, fichier: str = "fichier_source",
@@ -836,6 +839,19 @@ def lignes_rattachement(rattachements) -> list[dict]:
     ]
 
 
+def lignes_correspondances(correspondances: pd.DataFrame | None) -> list[dict]:
+    """Lignes de qualite.correspondance_cle, sans id_execution : une par code en
+    doublon regroupé sous son code principal."""
+    if correspondances is None:
+        return []
+    return [
+        {"table_source": c["table"], "colonne_cle": c["colonne"],
+         "code_doublon": c["code_doublon"], "code_principal": c["code_principal"],
+         "id_decision": c["id_decision"]}
+        for c in correspondances.to_dict("records")
+    ]
+
+
 def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> dict[str, list[dict]]:
     """Lignes de chaque table de qualite, sans id_execution, valeurs telles que dans
     les fichiers du traitement (une valeur masquée reste « masqué »).
@@ -843,7 +859,8 @@ def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> di
     Chaque ligne au grain d'une ligne source porte sa clé de lignage (`CLE_LIGNAGE`),
     remplacée par id_chargement à l'insertion; une ligne de rattachement porte en plus
     celle de la ligne du référentiel (`CLE_LIGNAGE_REFERENCE`). Les tables suivent
-    l'ordre d'insertion : une règle de rattachement avant ses lignes.
+    l'ordre d'insertion : une règle de rattachement avant ses lignes, une décision
+    avant les correspondances de codes qui la citent.
     """
     sensibles = _sensibles(sensibles)
     brut, nettoye = {"etat": ETAT_BRUT}, {"etat": ETAT_NETTOYE}
@@ -863,6 +880,7 @@ def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> di
         "valeur_liste": lignes_valeurs_liste(sorties.dictionnaire, sensibles),
         "regle_rattachement": lignes_regles_rattachement(sorties.rattachements),
         "rattachement": lignes_rattachement(sorties.rattachements),
+        "correspondance_cle": lignes_correspondances(sorties.correspondances),
     }
 
 
@@ -910,7 +928,30 @@ def problemes_sorties(
         if not empreintes_incoherentes(sorties.journal_nettoyage).empty:
             problemes.append("journal du nettoyage : empreintes qui ne suivent pas le masquage")
     problemes += [f"décisions : {p}" for p in problemes_decisions(sorties.decisions)]
+    problemes += _problemes_correspondances(sorties.correspondances, sorties.decisions)
     return problemes
+
+
+def _problemes_correspondances(correspondances, decisions: dict) -> list[str]:
+    """Colonnes des correspondances de codes, et décision citée présente dans le
+    fichier des décisions."""
+    from .nettoyage import COLONNES_CORRESPONDANCES
+
+    if correspondances is None:
+        return []
+    if list(correspondances.columns) != list(COLONNES_CORRESPONDANCES):
+        return [
+            "correspondances des codes : colonnes attendues, dans cet ordre, "
+            + ", ".join(COLONNES_CORRESPONDANCES)
+        ]
+    connues = set((decisions or {}).get("decisions") or {})
+    absentes = sorted({str(i) for i in correspondances["id_decision"] if i not in connues})
+    if absentes:
+        return [
+            "correspondances des codes : décisions absentes du fichier des décisions "
+            f"({', '.join(absentes)})"
+        ]
+    return []
 
 
 def valeur_sql(valeur, type_sql: str, echelle=None):
@@ -1151,10 +1192,11 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     table de chargement et de propre, sommes, minimums et maximums de propre;
     cellules illisibles de propre rattachées à une anomalie après nettoyage (même
     ligne source, même champ); avec `sorties`, lignes de chaque table de qualite par
-    état (jours fériés, valeurs des listes fermées et rattachements compris,
-    `sensibles` étant celui de l'écriture), id_chargement renseigné pour toute ligne qui
-    a un fichier source, et, par rattachement, lignes rattachées, choisies parmi
-    plusieurs candidates et choisies par la date;
+    état (jours fériés, valeurs des listes fermées, rattachements et
+    correspondances des codes en doublon compris, `sensibles` étant celui de
+    l'écriture), id_chargement renseigné pour toute ligne qui a un fichier source,
+    et, par rattachement, lignes rattachées, choisies parmi plusieurs candidates et
+    choisies par la date;
     pour dw, procédure de reconstruction présente si et seulement si l'écriture l'a
     appelée, et, si elle l'a été, journal de la reconstruction identique à celui de
     l'écriture et contrat d'entrée respecté par propre et par les rattachements de
@@ -1234,6 +1276,9 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
                     sorties.rattachements
                 )),
                 ("rattachement", None): len(lignes_rattachement(sorties.rattachements)),
+                ("correspondance_cle", None): len(lignes_correspondances(
+                    sorties.correspondances
+                )),
             }
             for (table, etat), attendu in attendus_qualite.items():
                 filtre = " AND etat = :etat" if etat else ""

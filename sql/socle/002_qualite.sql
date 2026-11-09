@@ -279,19 +279,30 @@ CREATE TABLE qualite.decision (
 GO
 
 /*
-  Un code en doublon et le code principal retenu (clients, fournisseurs).
-  Table encore vide : la source de ces correspondances sera arrêtée avec
-  le dédoublonnage des dimensions (étape 7.3).
+  Un code en doublon regroupé sous son code principal (clients, fournisseurs),
+  d'après une décision « rattacher » du métier retenue par le nettoyage : la
+  ligne du code en doublon reste dans propre, et dw compte ses faits avec ceux
+  du code principal. Noms de table et de colonne du dictionnaire (comme dans
+  correspondance_colonne); codes tels que dans propre, comparés en classement
+  binaire comme les codes des dimensions. id_decision désigne la décision
+  (qualite.decision), la première dans l'ordre d'examen quand plusieurs
+  décisions rattachent le même code. Un code principal n'est jamais lui-même
+  un code en doublon (le nettoyage écarte les chaînes).
 */
 CREATE TABLE qualite.correspondance_cle (
     id_execution    int            NOT NULL,
     table_source    nvarchar(128)  NOT NULL,
-    code_doublon    nvarchar(100)  NOT NULL,
-    code_principal  nvarchar(100)  NOT NULL,
-    origine         nvarchar(260)  NULL,
+    colonne_cle     nvarchar(128)  NOT NULL,
+    code_doublon    nvarchar(450)  COLLATE Latin1_General_100_BIN2 NOT NULL,
+    code_principal  nvarchar(450)  COLLATE Latin1_General_100_BIN2 NOT NULL,
+    id_decision     nvarchar(32)   NOT NULL,
     CONSTRAINT pk_correspondance_cle
         PRIMARY KEY (id_execution, table_source, code_doublon),
+    CONSTRAINT ck_correspondance_cle_codes CHECK (code_doublon <> code_principal),
     CONSTRAINT fk_correspondance_cle_execution
-        FOREIGN KEY (id_execution) REFERENCES qualite.execution (id_execution)
+        FOREIGN KEY (id_execution) REFERENCES qualite.execution (id_execution),
+    CONSTRAINT fk_correspondance_cle_decision
+        FOREIGN KEY (id_execution, id_decision)
+        REFERENCES qualite.decision (id_execution, id_decision)
 );
 GO

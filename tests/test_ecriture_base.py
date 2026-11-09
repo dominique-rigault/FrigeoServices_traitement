@@ -25,6 +25,7 @@ from frigeo.ecriture_base import (
     PROBLEME_LONGUEUR,
     ErreurEcriture,
     empreinte_fichier,
+    lignes_correspondances,
     lignes_decisions,
     lignes_journal_chargement,
     lignes_jours_feries,
@@ -422,7 +423,7 @@ def test_lignes_qualite():
     assert list(lignes) == [
         "anomalie", "non_evaluable", "bilan_controle", "journal_nettoyage",
         "bilan_nettoyage", "decision", "jour_ferie", "valeur_liste",
-        "regle_rattachement", "rattachement",
+        "regle_rattachement", "rattachement", "correspondance_cle",
     ]
     anomalies = lignes["anomalie"]
     assert [(l["etat"], l["id_anomalie"]) for l in anomalies] == [
@@ -440,6 +441,46 @@ def test_lignes_qualite():
     assert lignes["valeur_liste"] == []
     assert lignes["regle_rattachement"] == []
     assert lignes["rattachement"] == []
+    assert lignes["correspondance_cle"] == []
+
+
+def correspondances_exemple():
+    from frigeo.nettoyage import COLONNES_CORRESPONDANCES
+
+    return pd.DataFrame(
+        [{"table": "clients", "colonne": "code_client", "code_doublon": "CLI-00002",
+          "code_principal": "CLI-00001", "id_decision": "c3"}],
+        columns=list(COLONNES_CORRESPONDANCES), dtype=object,
+    )
+
+
+def test_lignes_correspondances():
+    assert lignes_correspondances(None) == []
+    assert lignes_correspondances(correspondances_exemple()) == [
+        {"table_source": "clients", "colonne_cle": "code_client",
+         "code_doublon": "CLI-00002", "code_principal": "CLI-00001", "id_decision": "c3"}
+    ]
+    sorties = sorties_exemple()
+    sorties.correspondances = correspondances_exemple()
+    lignes = lignes_qualite(sorties, sensibles={})
+    assert len(lignes["correspondance_cle"]) == 1
+    # La décision citée est insérée avant la correspondance.
+    ordre = list(lignes)
+    assert ordre.index("decision") < ordre.index("correspondance_cle")
+
+
+def test_problemes_des_correspondances():
+    sorties = sorties_exemple()
+    sorties.correspondances = correspondances_exemple().assign(id_decision="zz")
+    problemes = problemes_sorties(sorties, "2026-03", sensibles={}, declarations={})
+    assert "correspondances des codes : décisions absentes du fichier des décisions " \
+        "(zz)" in problemes
+    sorties.correspondances = correspondances_exemple().drop(columns="id_decision")
+    problemes = problemes_sorties(sorties, "2026-03", sensibles={}, declarations={})
+    assert any(p.startswith("correspondances des codes : colonnes attendues") for p in problemes)
+    sorties.correspondances = correspondances_exemple()
+    problemes = problemes_sorties(sorties, "2026-03", sensibles={}, declarations={})
+    assert not any(p.startswith("correspondances") for p in problemes)
 
 
 def rattachements_exemple():

@@ -22,6 +22,7 @@ from frigeo.doublons import detecter_doublons
 from frigeo.nettoyage import (
     COLONNES_BILAN_NETTOYAGE,
     COLONNES_CATALOGUE_NETTOYAGE,
+    COLONNES_CORRESPONDANCES,
     COLONNES_JOURNAL,
     MAX_PASSES,
     RAISON_DESACCORD,
@@ -955,17 +956,76 @@ def test_decision_corriger():
     assert _du_regle(resultat.bilan).empty and _du_regle(resultat.journal).empty
 
 
-def test_decision_rattacher_ne_change_pas_les_tables():
-    # Le regroupement des codes se fait dans la base : la ligne reste telle quelle.
-    tables = {"t": _table(code=["a", "b"], siret=["1", "1"])}
-    decision = {
-        **_decision(3, "siret", "rattacher", _empreinte_ligne(code="b", siret="1"), "a"),
+REGROUPEES = {"t": {"cle": ["code"], "unique": [["siret"]], "regrouper_codes": True}}
+
+
+def _rattacher(ligne, code, siret, principal, **autres):
+    return {
+        **_decision(ligne, "siret", "rattacher", _empreinte_ligne(code=code, siret=siret),
+                    principal, **autres),
         "sorte": "code",
     }
-    resultat = _nettoyer_avec(tables, _decisions(a1=decision))
-    assert list(resultat.tables["t"]["code"]) == ["a", "b"]
-    assert _du_regle(resultat.journal).empty and _du_regle(resultat.bilan).empty
-    assert resultat.caduques.empty
+
+
+def test_decision_rattacher_donne_une_correspondance():
+    # Le regroupement des codes se fait dans la base : la ligne reste telle quelle.
+    tables = {"t": _table(code=["a", "b", "b"], siret=["1", "1", "2"])}
+    resultat = _nettoyer_avec(tables, _decisions(a1=_rattacher(3, "b", "1", " a ")),
+                              declarations=REGROUPEES)
+    assert list(resultat.tables["t"]["code"]) == ["a", "b", "b"]
+    assert _du_regle(resultat.journal).empty and resultat.caduques.empty
+    assert list(resultat.correspondances.columns) == list(COLONNES_CORRESPONDANCES)
+    assert _lignes(resultat.correspondances, *COLONNES_CORRESPONDANCES) == [
+        ("t", "code", "b", "a", "a1")
+    ]
+    assert _lignes(_du_regle(resultat.bilan), "table", "colonne", "visees", "corrigees",
+                   "non_corrigees", "raisons") == [("t", "code", 1, 1, 0, None)]
+    # Sans regroupement déclaré : rien n'est regroupé, le bilan le dit.
+    resultat = _nettoyer_avec(tables, _decisions(a1=_rattacher(3, "b", "1", "a")))
+    assert resultat.correspondances.empty
+    assert list(resultat.correspondances.columns) == list(COLONNES_CORRESPONDANCES)
+    assert _lignes(_du_regle(resultat.bilan), "colonne", "corrigees", "raisons") == [
+        (None, 0, "table non déclarée regrouper_codes 1")
+    ]
+
+
+def test_decisions_rattacher_non_retenues():
+    tables = {"t": _table(code=["a", "b", "c", "d", "e", "f", "g"],
+                          siret=["1", "1", "2", "2", "3", "4", "4"])}
+    decisions = _decisions(
+        # Retenue, deux fois pour le même code (une ligne dans deux groupes).
+        ok=_rattacher(3, "b", "1", "a"),
+        ok2={**_rattacher(3, "b", "1", "a"), "champ": "nom"},
+        # Ligne modifiée depuis la décision : caduque.
+        mod=_rattacher(4, "c", "9", "a"),
+        # Ligne introuvable.
+        absente=_rattacher(99, "z", "1", "a"),
+        # Code principal absent de la table nettoyée.
+        inconnu=_rattacher(6, "e", "3", "x"),
+        # f rattaché à g, et g rattaché à a : chaîne, f n'est pas retenu, g l'est.
+        chaine=_rattacher(7, "f", "4", "g"),
+        tete=_rattacher(8, "g", "4", "a"),
+        # d rattaché à deux codes principaux : aucune des deux décisions n'est retenue.
+        deux1=_rattacher(5, "d", "2", "a"),
+        deux2={**_rattacher(5, "d", "2", "c"), "champ": "nom"},
+        # Code principal retiré par une autre décision : absent.
+        retrait=_decision(2, "code", "retirer", _empreinte_ligne(code="a", siret="1")),
+    )
+    resultat = _nettoyer_avec(tables, decisions, declarations=REGROUPEES)
+    assert _lignes(resultat.correspondances, "code_doublon", "code_principal",
+                   "id_decision") == []
+    # Sans le retrait de a : b et g sont regroupés sous a.
+    del decisions["decisions"]["retrait"]
+    resultat = _nettoyer_avec(tables, decisions, declarations=REGROUPEES)
+    assert _lignes(resultat.correspondances, "code_doublon", "code_principal",
+                   "id_decision") == [("b", "a", "ok"), ("g", "a", "tete")]
+    assert _lignes(resultat.caduques, "id_anomalie", "decision") == [("mod", "rattacher")]
+    assert _lignes(_du_regle(resultat.bilan), "colonne", "visees", "corrigees",
+                   "raisons") == [
+        ("code", 9, 3, "source modifiée depuis la décision 1; ligne source introuvable 1; "
+         "code rattaché à plusieurs codes principaux 2; code principal lui-même "
+         "rattaché 1; code principal absent de la table nettoyée 1"),
+    ]
 
 
 def test_decision_apres_les_regles_automatiques():
@@ -1852,9 +1912,9 @@ def test_decisions_caduques():
     # Sans décision : aucune ligne, mêmes colonnes.
     vide = _nettoyer_avec(tables, AUCUNE_DECISION).caduques
     assert vide.empty and list(vide.columns) == list(COLONNES_DECISIONS_CADUQUES)
-    # Le tuple rendu a quatre membres.
-    tables_nettoyees, journal, bilan, caduques = resultat
-    assert caduques is resultat.caduques
+    # Le tuple rendu a cinq membres.
+    tables_nettoyees, journal, bilan, caduques, correspondances = resultat
+    assert caduques is resultat.caduques and correspondances is resultat.correspondances
 
 
 def test_retrait_des_decisions_caduques_puis_nouveau_nettoyage(tmp_path, monkeypatch):
