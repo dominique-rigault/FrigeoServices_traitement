@@ -38,6 +38,10 @@
   lien_entete dit si l'en-tête est trouvé; sans en-tête, ses dimensions
   pointent vers -1 si le numéro du document est vide, -2 sinon.
 
+  Client et fournisseur : la ligne du référentiel désignée par le
+  rattachement donne un code; si le métier l'a rattaché à un code principal
+  (dw.correspondances), le membre est celui du code principal.
+
   Écritures comptables : une ligne par ligne du FEC, sans client ni
   fournisseur (le compte auxiliaire n'a pas la forme de leur code). La
   référence de pièce est rapprochée des factures et des pièces d'achat par
@@ -179,8 +183,11 @@ BEGIN
     LEFT JOIN propre.clients AS tc
         ON tc.id_chargement = rc.id_chargement_reference
        AND tc.num_ligne_source = rc.num_ligne_reference
+    LEFT JOIN dw.correspondances(@id_execution, N'clients') AS cc
+        ON cc.code_doublon = tc.code_client COLLATE Latin1_General_100_BIN2
     LEFT JOIN dw.dim_client AS dc
-        ON dc.code_client = tc.code_client COLLATE Latin1_General_100_BIN2
+        ON dc.code_client = COALESCE(cc.code_principal,
+                                     tc.code_client COLLATE Latin1_General_100_BIN2)
     LEFT JOIN dw.dim_categorie AS dk
         ON dk.categorie = p.categorie COLLATE Latin1_General_100_BIN2;
 
@@ -440,8 +447,11 @@ BEGIN
         LEFT JOIN propre.clients AS tc
             ON tc.id_chargement = rc.id_chargement_reference
            AND tc.num_ligne_source = rc.num_ligne_reference
+        LEFT JOIN dw.correspondances(@id_execution, N'clients') AS cc
+            ON cc.code_doublon = tc.code_client COLLATE Latin1_General_100_BIN2
         LEFT JOIN dw.dim_client AS dc
-            ON dc.code_client = tc.code_client COLLATE Latin1_General_100_BIN2
+            ON dc.code_client = COALESCE(cc.code_principal,
+                                         tc.code_client COLLATE Latin1_General_100_BIN2)
         LEFT JOIN dw.dim_article AS da
             ON da.code_article = p.code_article COLLATE Latin1_General_100_BIN2
         LEFT JOIN qualite.rattachement AS rp
@@ -586,8 +596,11 @@ BEGIN
         LEFT JOIN propre.fournisseurs AS tf
             ON tf.id_chargement = rf.id_chargement_reference
            AND tf.num_ligne_source = rf.num_ligne_reference
+        LEFT JOIN dw.correspondances(@id_execution, N'fournisseurs') AS cf
+            ON cf.code_doublon = tf.code_fournisseur COLLATE Latin1_General_100_BIN2
         LEFT JOIN dw.dim_fournisseur AS df
-            ON df.code_fournisseur = tf.code_fournisseur COLLATE Latin1_General_100_BIN2
+            ON df.code_fournisseur = COALESCE(cf.code_principal,
+                                              tf.code_fournisseur COLLATE Latin1_General_100_BIN2)
         LEFT JOIN qualite.rattachement AS rp
             ON rp.id_execution = @id_execution AND rp.id_regle = @r_piece
            AND rp.id_chargement = p.id_chargement AND rp.num_ligne_source = p.num_ligne_source

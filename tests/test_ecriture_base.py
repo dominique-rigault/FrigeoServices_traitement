@@ -15,6 +15,7 @@ from frigeo.ecriture_base import (
     ControleFait,
     SortiesQualite,
     controles_faits,
+    controles_regroupements,
     attendus_table,
     champ_sensible,
     conformite,
@@ -799,3 +800,30 @@ def test_controles_faits_impossibles_sans_requete():
         "nom de fait ou de colonne invalide", "rattachement absent du bilan", "forme inconnue",
     ]
     assert all(c.requete is None and c.attendu is None for c in controles)
+
+
+def test_controles_regroupements():
+    regroupements = [("clients", "dim_client", "code_client"),
+                     ("fournisseurs", "dim_fournisseur", "code_fournisseur"),
+                     ("x", "dim-x", "code")]
+    controles = controles_regroupements(regroupements, correspondances_exemple(), 7)
+    assert [(c.libelle, c.attendu, c.probleme) for c in controles] == [
+        ("dw.dim_client : codes en doublon de clients, aucun n'a de membre", 0, None),
+        ("dw.dim_client : codes en doublon de clients, comptés sur les membres principaux "
+         "(codes_en_doublon)", 1, None),
+        ("dw.dim_fournisseur : codes en doublon de fournisseurs, aucun n'a de membre", 0, None),
+        ("dw.dim_fournisseur : codes en doublon de fournisseurs, comptés sur les membres "
+         "principaux (codes_en_doublon)", 0, None),
+        ("dw.dim-x : codes en doublon de x", None,
+         "nom de table, de dimension ou de colonne invalide"),
+    ]
+    assert controles[0].requete == (
+        "SELECT COUNT(*) FROM dw.dim_client AS d JOIN qualite.correspondance_cle AS c "
+        "ON c.code_doublon = d.code_client WHERE c.id_execution = 7 "
+        "AND c.table_source = N'clients'"
+    )
+    assert controles[1].requete == "SELECT COALESCE(SUM(codes_en_doublon), 0) FROM dw.dim_client"
+    # Sans les correspondances calculées par Python, seul le premier contrôle reste.
+    assert [c.libelle for c in controles_regroupements(regroupements[:1], None, 7)] == [
+        "dw.dim_client : codes en doublon de clients, aucun n'a de membre"
+    ]

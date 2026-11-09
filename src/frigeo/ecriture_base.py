@@ -1203,7 +1203,9 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     l'exécution; pour chaque fait déclaré par le pack, autant de lignes que dans propre
     et, avec `sorties`, membres -1 et -2 (ou liens non renseignés et introuvables, ou
     numéros renseignés) égaux aux clés vides, introuvables (ou lignes rattachées) du
-    bilan des rattachements (`controles_faits`).
+    bilan des rattachements (`controles_faits`); pour chaque table dont le pack regroupe
+    les codes en doublon, aucun membre pour un code en doublon et, avec `sorties`, les
+    codes en doublon comptés sur les membres principaux (`controles_regroupements`).
     """
     from sqlalchemy import text
 
@@ -1301,7 +1303,8 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
                 _verifier_rattachements(conn, ecriture.id_execution, sorties.rattachements,
                                         ajouter)
         _verifier_dw(conn, ecriture, ajouter,
-                     None if sorties is None else sorties.rattachements)
+                     None if sorties is None else sorties.rattachements,
+                     None if sorties is None else sorties.correspondances)
     return pd.DataFrame(controles, columns=COLONNES_VERIFICATION)
 
 
@@ -1341,6 +1344,10 @@ REQUETE_FAITS_SOURCES = "SELECT table_fait, table_source FROM dw.source_fait ORD
 REQUETE_CONTRATS_FAITS = (
     "SELECT table_source, cle, table_reference, table_fait, colonne_fait, forme "
     "FROM dw.contrat_rattachement WHERE table_fait IS NOT NULL ORDER BY id_contrat"
+)
+REQUETE_REGROUPEMENTS = (
+    "SELECT table_source, table_dimension, colonne_code FROM dw.regroupement_codes "
+    "ORDER BY table_source"
 )
 
 
@@ -1430,6 +1437,41 @@ def controles_faits(sources: list[tuple], contrats: list[tuple], lignes: pd.Data
     return controles
 
 
+def controles_regroupements(regroupements: list[tuple], correspondances: pd.DataFrame | None,
+                            id_execution: int) -> list[ControleFait]:
+    """Contrôles des codes en doublon regroupés par le pack, sans valeur du client.
+
+    `regroupements` : (table du dictionnaire, dimension, colonne du code) de
+    dw.regroupement_codes. Pour chacun, aucun membre de la dimension n'a pour code un
+    code en doublon de la table dans qualite.correspondance_cle; avec `correspondances`
+    (`nettoyage.nettoyer`), la somme de codes_en_doublon des membres est le nombre de
+    codes en doublon de la table, ce qui suppose que chaque code principal a son
+    membre. Les faits qui citent un code en doublon sont couverts par les membres -1
+    et -2 de `controles_faits` : un code en doublon sans membre y serait introuvable.
+    """
+    controles = []
+    for table, dimension, colonne in regroupements:
+        libelle = f"dw.{dimension} : codes en doublon de {table}"
+        if not (_nom_dw(table) and _nom_dw(dimension) and _nom_dw(colonne)):
+            controles.append(ControleFait(libelle, None, None,
+                                          "nom de table, de dimension ou de colonne invalide"))
+            continue
+        controles.append(ControleFait(
+            libelle + ", aucun n'a de membre",
+            0,
+            f"SELECT COUNT(*) FROM dw.{dimension} AS d "
+            f"JOIN qualite.correspondance_cle AS c ON c.code_doublon = d.{colonne} "
+            f"WHERE c.id_execution = {int(id_execution)} AND c.table_source = N'{table}'",
+        ))
+        if correspondances is not None:
+            controles.append(ControleFait(
+                libelle + ", comptés sur les membres principaux (codes_en_doublon)",
+                int((correspondances["table"] == table).sum()),
+                f"SELECT COALESCE(SUM(codes_en_doublon), 0) FROM dw.{dimension}",
+            ))
+    return controles
+
+
 def _obtenu(rangee: tuple):
     """Valeur obtenue d'un contrôle de fait : un nombre, ou « n / m »."""
     nombres = [0 if v is None else int(v) for v in rangee]
@@ -1440,9 +1482,11 @@ def _journal_en_texte(journal) -> str | None:
     return "; ".join(f"{ordre}. {etape} {lignes}" for ordre, etape, lignes in journal) or None
 
 
-def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None) -> None:
+def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
+                 correspondances=None) -> None:
     """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte, puis
-    ceux des faits déclarés par le pack (`controles_faits`)."""
+    ceux des faits déclarés par le pack (`controles_faits`) et des codes en doublon
+    qu'il regroupe (`controles_regroupements`)."""
     import pyodbc
 
     from .base import procedure_reconstruction_presente
@@ -1477,7 +1521,10 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None) -> None:
         curseur.execute(REQUETE_CONTRATS_FAITS)
         contrats = [tuple(r) for r in curseur.fetchall()]
         bilan = None if rattachements is None else rattachements.bilan
-        for controle in controles_faits(sources, contrats, ecriture.lignes, bilan):
+        curseur.execute(REQUETE_REGROUPEMENTS)
+        regroupements = [tuple(r) for r in curseur.fetchall()]
+        for controle in controles_faits(sources, contrats, ecriture.lignes, bilan) + \
+                controles_regroupements(regroupements, correspondances, ecriture.id_execution):
             if controle.requete is None:
                 ajouter(FAMILLE_DW, controle.libelle, controle.probleme, None)
                 continue

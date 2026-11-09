@@ -26,6 +26,14 @@
   l'exécution, au lieu d'envoyer toutes les lignes vers le membre
   « introuvable ».
 
+  Codes en doublon : un code que le métier a rattaché à un code principal
+  (qualite.correspondance_cle, décisions « rattacher » retenues par le
+  nettoyage) n'a pas de membre dans sa dimension, et les faits qui le citent
+  sont comptés sur le membre du code principal. Le pack déclare dans
+  dw.regroupement_codes les tables dont il regroupe les codes; une
+  correspondance sur une autre table fait échouer la vérification du contrat,
+  au lieu d'être ignorée.
+
   Ordre de reconstruction : les tables de faits ont des clés étrangères vers
   les dimensions (aucune ligne orpheline). dw.vider_faits les vide d'abord,
   puis chaque dimension est vidée et remplie par sa procédure, puis chaque
@@ -79,6 +87,34 @@ CREATE TABLE dw.source_fait (
 );
 GO
 
+/* Une table du dictionnaire dont le pack regroupe les codes en doublon sous
+   leur code principal, avec la dimension et la colonne du code de celle-ci
+   (pour la vérification de l'écriture, frigeo.ecriture_base). */
+CREATE TABLE dw.regroupement_codes (
+    table_source     nvarchar(128)  NOT NULL,
+    table_dimension  nvarchar(128)  NOT NULL,
+    colonne_code     nvarchar(128)  NOT NULL,
+    CONSTRAINT pk_regroupement_codes PRIMARY KEY (table_source)
+);
+GO
+
+/* Codes en doublon d'une table pour une exécution, avec leur code principal
+   (qualite.correspondance_cle), en classement binaire. Un code principal
+   n'est jamais lui-même un code en doublon : une seule jointure suffit. */
+CREATE FUNCTION dw.correspondances (
+    @id_execution int,
+    @table_source nvarchar(128)
+)
+RETURNS TABLE
+AS
+RETURN (
+    SELECT code_doublon, code_principal
+    FROM qualite.correspondance_cle
+    WHERE id_execution = @id_execution
+      AND table_source = @table_source
+);
+GO
+
 /* Numéro (id_regle) du rattachement d'une exécution pour une table, une clé
    et un référentiel; NULL s'il n'existe pas. Deux rattachements de même
    table, clé et référentiel ne diffèrent que par la comparaison : le premier
@@ -119,8 +155,9 @@ CREATE TABLE dw.journal_reconstruction (
 GO
 
 /* Vérifie le contrat d'entrée contre les colonnes réelles de propre (table
-   absente, colonne absente, famille différente) et contre les rattachements
-   de l'exécution (rattachement absent). Lève une erreur qui liste tous les
+   absente, colonne absente, famille différente), contre les rattachements
+   de l'exécution (rattachement absent) et contre ses codes en doublon
+   (correspondance sur une table que le pack ne regroupe pas). Lève une erreur qui liste tous les
    écarts (tronquée au-delà de la longueur admise par THROW). */
 CREATE PROCEDURE dw.verifier_contrat
     @id_execution int
@@ -173,6 +210,14 @@ BEGIN
         FROM dw.contrat_rattachement AS k
         WHERE dw.regle_rattachement(@id_execution, k.table_source, k.cle,
                                     k.table_reference) IS NULL
+        UNION ALL
+        SELECT DISTINCT 3, c.table_source, NULL,
+               CONCAT(N'codes en doublon de ', c.table_source,
+                      N' : non regroupés par le pack (dw.regroupement_codes)')
+        FROM qualite.correspondance_cle AS c
+        WHERE c.id_execution = @id_execution
+          AND NOT EXISTS (SELECT 1 FROM dw.regroupement_codes AS r
+                          WHERE r.table_source = c.table_source)
     )
     INSERT INTO @ecarts (texte)
     SELECT texte FROM constats ORDER BY rang, table_propre, colonne;

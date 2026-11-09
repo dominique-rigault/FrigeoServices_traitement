@@ -21,6 +21,12 @@
   donne leur nombre. Le lignage de la ligne retenue est conservé. Une
   dimension déduite d'une table de faits (article, compte) n'a pas de lignage.
 
+  Codes en doublon (clients, fournisseurs, déclarés dans dw.regroupement_codes) :
+  un code que le métier a rattaché à un code principal n'a pas de membre;
+  codes_en_doublon donne, pour le membre du code principal, le nombre de codes
+  qui lui sont rattachés. Les faits qui citent un code en doublon sont comptés
+  sur le membre du code principal (script 003).
+
   Données personnelles : dw garde ce qui nomme un membre (raison sociale, nom
   et prénom); adresse, téléphone, courriel, SIRET et motif de sortie n'y
   entrent pas. Ce qui est exposé à Power BI se décide dans les vues pbi.
@@ -253,7 +259,8 @@ BEGIN
 END;
 GO
 
-/* Pièces du catalogue. Prix de vente, stock et CUMP initiaux sont repris par les calculs (étape 7.4). */
+/* Pièces du catalogue. Prix de vente, stock et CUMP initiaux sont repris par les calculs (étape 7.4).
+   Un fournisseur principal dont le code est en doublon est remplacé par son code principal. */
 CREATE TABLE dw.dim_piece (
     id_piece            int             NOT NULL,
     ref_piece           nvarchar(450)   COLLATE Latin1_General_100_BIN2 NOT NULL,
@@ -298,10 +305,12 @@ BEGIN
            l.libelle,
            l.famille,
            l.unite,
-           l.fournisseur_principal,
+           COALESCE(c.code_principal COLLATE DATABASE_DEFAULT, l.fournisseur_principal),
            l.lignes,
            l.id_chargement, l.fichier_source, l.feuille_source, l.num_ligne_source
     FROM l
+    LEFT JOIN dw.correspondances(@id_execution, N'fournisseurs') AS c
+        ON c.code_doublon = l.fournisseur_principal COLLATE Latin1_General_100_BIN2
     WHERE l.rang = 1;
 
     DECLARE @lignes int = @@ROWCOUNT;
@@ -433,7 +442,13 @@ BEGIN
 END;
 GO
 
-/* Clients. Le dédoublonnage des codes par qualite.correspondance_cle viendra avec l'étape 7.3f. */
+/* Tables dont le pack regroupe les codes en doublon. */
+INSERT INTO dw.regroupement_codes (table_source, table_dimension, colonne_code) VALUES
+    (N'clients', N'dim_client', N'code_client'),
+    (N'fournisseurs', N'dim_fournisseur', N'code_fournisseur');
+GO
+
+/* Clients : un membre par code, sauf les codes en doublon rattachés à un code principal. */
 CREATE TABLE dw.dim_client (
     id_client           int             NOT NULL,
     code_client         nvarchar(450)   COLLATE Latin1_General_100_BIN2 NOT NULL,
@@ -446,6 +461,7 @@ CREATE TABLE dw.dim_client (
     date_fin_relation   date            NULL,
     statut              nvarchar(4000)  NULL,
     lignes_source       int             NOT NULL,
+    codes_en_doublon    int             NOT NULL,
     id_chargement       int             NULL,
     fichier_source      nvarchar(260)   NULL,
     feuille_source      nvarchar(128)   NULL,
@@ -463,9 +479,9 @@ BEGIN
     DECLARE @debut datetime2(0) = SYSUTCDATETIME();
 
     DELETE FROM dw.dim_client;
-    INSERT INTO dw.dim_client (id_client, code_client, raison_sociale, type_commerce, cp, ville, contrat_maintenance, date_creation, date_fin_relation, statut, lignes_source, id_chargement, fichier_source, feuille_source, num_ligne_source)
-    VALUES (-1, N'(non renseigné)', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL),
-           (-2, N'(introuvable)', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL);
+    INSERT INTO dw.dim_client (id_client, code_client, raison_sociale, type_commerce, cp, ville, contrat_maintenance, date_creation, date_fin_relation, statut, lignes_source, codes_en_doublon, id_chargement, fichier_source, feuille_source, num_ligne_source)
+    VALUES (-1, N'(non renseigné)', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL),
+           (-2, N'(introuvable)', NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL);
 
     WITH l AS (
         SELECT p.*,
@@ -475,8 +491,15 @@ BEGIN
                COUNT(*) OVER (PARTITION BY p.code_client COLLATE Latin1_General_100_BIN2) AS lignes
         FROM propre.clients AS p
         WHERE p.code_client IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM dw.correspondances(@id_execution, N'clients') AS c
+                          WHERE c.code_doublon = p.code_client COLLATE Latin1_General_100_BIN2)
+    ),
+    r AS (
+        SELECT code_principal, COUNT(*) AS codes
+        FROM dw.correspondances(@id_execution, N'clients')
+        GROUP BY code_principal
     )
-    INSERT INTO dw.dim_client (id_client, code_client, raison_sociale, type_commerce, cp, ville, contrat_maintenance, date_creation, date_fin_relation, statut, lignes_source, id_chargement, fichier_source, feuille_source, num_ligne_source)
+    INSERT INTO dw.dim_client (id_client, code_client, raison_sociale, type_commerce, cp, ville, contrat_maintenance, date_creation, date_fin_relation, statut, lignes_source, codes_en_doublon, id_chargement, fichier_source, feuille_source, num_ligne_source)
     SELECT ROW_NUMBER() OVER (ORDER BY l.code_client COLLATE Latin1_General_100_BIN2),
            l.code_client,
            l.raison_sociale,
@@ -488,8 +511,10 @@ BEGIN
            l.date_fin_relation,
            l.statut,
            l.lignes,
+           COALESCE(r.codes, 0),
            l.id_chargement, l.fichier_source, l.feuille_source, l.num_ligne_source
     FROM l
+    LEFT JOIN r ON r.code_principal = l.code_client COLLATE Latin1_General_100_BIN2
     WHERE l.rang = 1;
 
     DECLARE @lignes int = @@ROWCOUNT;
@@ -497,7 +522,7 @@ BEGIN
 END;
 GO
 
-/* Fournisseurs. */
+/* Fournisseurs : un membre par code, sauf les codes en doublon rattachés à un code principal. */
 CREATE TABLE dw.dim_fournisseur (
     id_fournisseur      int             NOT NULL,
     code_fournisseur    nvarchar(450)   COLLATE Latin1_General_100_BIN2 NOT NULL,
@@ -508,6 +533,7 @@ CREATE TABLE dw.dim_fournisseur (
     delai_paiement      nvarchar(4000)  NULL,
     statut              nvarchar(4000)  NULL,
     lignes_source       int             NOT NULL,
+    codes_en_doublon    int             NOT NULL,
     id_chargement       int             NULL,
     fichier_source      nvarchar(260)   NULL,
     feuille_source      nvarchar(128)   NULL,
@@ -525,9 +551,9 @@ BEGIN
     DECLARE @debut datetime2(0) = SYSUTCDATETIME();
 
     DELETE FROM dw.dim_fournisseur;
-    INSERT INTO dw.dim_fournisseur (id_fournisseur, code_fournisseur, raison_sociale, categorie, cp, ville, delai_paiement, statut, lignes_source, id_chargement, fichier_source, feuille_source, num_ligne_source)
-    VALUES (-1, N'(non renseigné)', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL),
-           (-2, N'(introuvable)', NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL, NULL, NULL, NULL);
+    INSERT INTO dw.dim_fournisseur (id_fournisseur, code_fournisseur, raison_sociale, categorie, cp, ville, delai_paiement, statut, lignes_source, codes_en_doublon, id_chargement, fichier_source, feuille_source, num_ligne_source)
+    VALUES (-1, N'(non renseigné)', NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL),
+           (-2, N'(introuvable)', NULL, NULL, NULL, NULL, NULL, NULL, 0, 0, NULL, NULL, NULL, NULL);
 
     WITH l AS (
         SELECT p.*,
@@ -537,8 +563,15 @@ BEGIN
                COUNT(*) OVER (PARTITION BY p.code_fournisseur COLLATE Latin1_General_100_BIN2) AS lignes
         FROM propre.fournisseurs AS p
         WHERE p.code_fournisseur IS NOT NULL
+          AND NOT EXISTS (SELECT 1 FROM dw.correspondances(@id_execution, N'fournisseurs') AS c
+                          WHERE c.code_doublon = p.code_fournisseur COLLATE Latin1_General_100_BIN2)
+    ),
+    r AS (
+        SELECT code_principal, COUNT(*) AS codes
+        FROM dw.correspondances(@id_execution, N'fournisseurs')
+        GROUP BY code_principal
     )
-    INSERT INTO dw.dim_fournisseur (id_fournisseur, code_fournisseur, raison_sociale, categorie, cp, ville, delai_paiement, statut, lignes_source, id_chargement, fichier_source, feuille_source, num_ligne_source)
+    INSERT INTO dw.dim_fournisseur (id_fournisseur, code_fournisseur, raison_sociale, categorie, cp, ville, delai_paiement, statut, lignes_source, codes_en_doublon, id_chargement, fichier_source, feuille_source, num_ligne_source)
     SELECT ROW_NUMBER() OVER (ORDER BY l.code_fournisseur COLLATE Latin1_General_100_BIN2),
            l.code_fournisseur,
            l.raison_sociale,
@@ -548,8 +581,10 @@ BEGIN
            l.delai_paiement,
            l.statut,
            l.lignes,
+           COALESCE(r.codes, 0),
            l.id_chargement, l.fichier_source, l.feuille_source, l.num_ligne_source
     FROM l
+    LEFT JOIN r ON r.code_principal = l.code_fournisseur COLLATE Latin1_General_100_BIN2
     WHERE l.rang = 1;
 
     DECLARE @lignes int = @@ROWCOUNT;
