@@ -47,5 +47,6 @@ BEGIN
     EXEC dw.construire_fait_consommation @id_execution;
     EXEC dw.construire_fait_ligne_facture @id_execution;
     EXEC dw.construire_fait_achat @id_execution;
+    EXEC dw.construire_fait_ecriture @id_execution;
 END;
 GO

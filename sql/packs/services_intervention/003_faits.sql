@@ -38,6 +38,12 @@
   lien_entete dit si l'en-tête est trouvé; sans en-tête, ses dimensions
   pointent vers -1 si le numéro du document est vide, -2 sinon.
 
+  Écritures comptables : une ligne par ligne du FEC, sans client ni
+  fournisseur (le compte auxiliaire n'a pas la forme de leur code). La
+  référence de pièce est rapprochée des factures et des pièces d'achat par
+  les rattachements, sans filtre par journal : une écriture de tout journal
+  dont la référence de pièce est le numéro d'un document le désigne.
+
   Données personnelles : l'intervenant et le client d'une intervention ne
   sont portés que par leur dimension; le nom du client, l'adresse et le
   commentaire de l'intervention n'entrent pas dans dw.
@@ -600,5 +606,120 @@ BEGIN
 
     DECLARE @lignes int = @@ROWCOUNT;
     EXEC dw.inscrire_etape @id_execution, N'fait_achat', @lignes, @debut;
+END;
+GO
+
+/* Colonnes de propre lues par le fait des écritures (compte_num et
+   compte_lib le sont déjà par dim_compte). */
+INSERT INTO dw.contrat_entree (table_propre, colonne, famille) VALUES
+    (N'fec', N'journal_code', N'texte'),
+    (N'fec', N'ecriture_num', N'texte'),
+    (N'fec', N'ecriture_date', N'date'),
+    (N'fec', N'comp_aux_num', N'texte'),
+    (N'fec', N'piece_ref', N'texte'),
+    (N'fec', N'piece_date', N'date'),
+    (N'fec', N'debit', N'décimal'),
+    (N'fec', N'credit', N'décimal'),
+    (N'fec', N'ecriture_let', N'texte');
+GO
+
+/* Rattachements lus par le fait des écritures (PieceRef est le nom du
+   dictionnaire, piece_ref celui de propre). */
+INSERT INTO dw.contrat_rattachement (table_source, cle, table_reference) VALUES
+    (N'fec', N'PieceRef', N'factures_entetes'),
+    (N'fec', N'PieceRef', N'achats_entetes');
+GO
+
+/*
+  Écritures : une ligne par ligne de propre.fec. Date d'écriture et date de
+  pièce, compte par égalité du code avec dim_compte (construite à partir du
+  FEC). solde vaut débit moins crédit, un montant vide comptant pour zéro.
+  num_facture et num_piece_achat sont les numéros des en-têtes que désigne la
+  référence de pièce (rattachements fec.PieceRef vers factures_entetes et vers
+  achats_entetes), NULL sinon : ils mènent aux lignes de fait_ligne_facture et
+  de fait_achat. Le libellé du compte auxiliaire, sensible, n'entre pas dans
+  dw.
+*/
+CREATE TABLE dw.fait_ecriture (
+    id_fait_ecriture  int             NOT NULL,
+    journal_code      nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    ecriture_num      nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    id_date           int             NOT NULL,
+    id_date_piece     int             NOT NULL,
+    id_compte         int             NOT NULL,
+    comp_aux_num      nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    piece_ref         nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    num_facture       nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    num_piece_achat   nvarchar(450)   COLLATE Latin1_General_100_BIN2 NULL,
+    ecriture_let      nvarchar(4000)  NULL,
+    debit             decimal(28, 8)  NULL,
+    credit            decimal(28, 8)  NULL,
+    solde             decimal(28, 8)  NOT NULL,
+    id_chargement     int             NOT NULL,
+    fichier_source    nvarchar(260)   NOT NULL,
+    feuille_source    nvarchar(128)   NULL,
+    num_ligne_source  int             NOT NULL,
+    CONSTRAINT pk_fait_ecriture PRIMARY KEY (id_fait_ecriture),
+    CONSTRAINT uq_fait_ecriture_lignage UNIQUE (id_chargement, num_ligne_source),
+    CONSTRAINT fk_fait_ecriture_date
+        FOREIGN KEY (id_date) REFERENCES dw.dim_date (id_date),
+    CONSTRAINT fk_fait_ecriture_date_piece
+        FOREIGN KEY (id_date_piece) REFERENCES dw.dim_date (id_date),
+    CONSTRAINT fk_fait_ecriture_compte
+        FOREIGN KEY (id_compte) REFERENCES dw.dim_compte (id_compte)
+);
+GO
+
+CREATE PROCEDURE dw.construire_fait_ecriture
+    @id_execution int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
+    DECLARE @r_facture int =
+        dw.regle_rattachement(@id_execution, N'fec', N'PieceRef', N'factures_entetes');
+    DECLARE @r_achat int =
+        dw.regle_rattachement(@id_execution, N'fec', N'PieceRef', N'achats_entetes');
+
+    DELETE FROM dw.fait_ecriture;
+    INSERT INTO dw.fait_ecriture (
+        id_fait_ecriture, journal_code, ecriture_num, id_date, id_date_piece, id_compte,
+        comp_aux_num, piece_ref, num_facture, num_piece_achat, ecriture_let, debit, credit,
+        solde, id_chargement, fichier_source, feuille_source, num_ligne_source)
+    SELECT ROW_NUMBER() OVER (ORDER BY p.fichier_source, p.feuille_source, p.num_ligne_source),
+           p.journal_code,
+           p.ecriture_num,
+           CASE WHEN p.ecriture_date IS NULL THEN -1 ELSE COALESCE(dd.id_date, -2) END,
+           CASE WHEN p.piece_date IS NULL THEN -1 ELSE COALESCE(dp.id_date, -2) END,
+           CASE WHEN p.compte_num IS NULL THEN -1 ELSE COALESCE(dk.id_compte, -2) END,
+           p.comp_aux_num,
+           p.piece_ref,
+           hf.num_facture,
+           ha.num_piece_achat,
+           p.ecriture_let,
+           p.debit,
+           p.credit,
+           COALESCE(p.debit, 0) - COALESCE(p.credit, 0),
+           p.id_chargement, p.fichier_source, p.feuille_source, p.num_ligne_source
+    FROM propre.fec AS p
+    LEFT JOIN dw.dim_date AS dd ON dd.date_jour = p.ecriture_date
+    LEFT JOIN dw.dim_date AS dp ON dp.date_jour = p.piece_date
+    LEFT JOIN dw.dim_compte AS dk
+        ON dk.compte_num = p.compte_num COLLATE Latin1_General_100_BIN2
+    LEFT JOIN qualite.rattachement AS rf
+        ON rf.id_execution = @id_execution AND rf.id_regle = @r_facture
+       AND rf.id_chargement = p.id_chargement AND rf.num_ligne_source = p.num_ligne_source
+    LEFT JOIN propre.factures_entetes AS hf
+        ON hf.id_chargement = rf.id_chargement_reference
+       AND hf.num_ligne_source = rf.num_ligne_reference
+    LEFT JOIN qualite.rattachement AS ra
+        ON ra.id_execution = @id_execution AND ra.id_regle = @r_achat
+       AND ra.id_chargement = p.id_chargement AND ra.num_ligne_source = p.num_ligne_source
+    LEFT JOIN propre.achats_entetes AS ha
+        ON ha.id_chargement = ra.id_chargement_reference
+       AND ha.num_ligne_source = ra.num_ligne_reference;
+
+    DECLARE @lignes int = @@ROWCOUNT;
+    EXEC dw.inscrire_etape @id_execution, N'fait_ecriture', @lignes, @debut;
 END;
 GO
