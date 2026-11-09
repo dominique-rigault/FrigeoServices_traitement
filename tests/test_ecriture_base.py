@@ -12,7 +12,9 @@ from frigeo.ecriture_base import (
     COLONNES_CELLULES_ILLISIBLES,
     CLE_LIGNAGE,
     CLE_LIGNAGE_REFERENCE,
+    ControleFait,
     SortiesQualite,
+    controles_faits,
     attendus_table,
     champ_sensible,
     conformite,
@@ -705,3 +707,54 @@ def test_conformite():
     assert conformite("2025-03-14", "2025-03-14")
     assert not conformite(Decimal("12.5"), Decimal("12.4"))
     assert not conformite(2, Decimal(3))
+
+
+def _bilan_rattachements():
+    return pd.DataFrame([
+        {"regle": 1, "table": "t", "cle": "code", "table_reference": "r",
+         "cles_vides": 3, "introuvables": 2, "rattachees": 95},
+        {"regle": 2, "table": "t", "cle": "code", "table_reference": "r",
+         "cles_vides": 9, "introuvables": 9, "rattachees": 9},
+        {"regle": 3, "table": "e", "cle": "Ref", "table_reference": "r",
+         "cles_vides": 0, "introuvables": 40, "rattachees": 60},
+    ])
+
+
+def test_controles_faits():
+    lignes = pd.DataFrame({"table": ["t", "e"], "chargement": [101, 100], "propre": [100, 100]})
+    sources = [("fait_t", "t"), ("fait_e", "e")]
+    contrats = [
+        ("t", "code", "r", "fait_t", "id_r", "membre"),
+        ("t", "code", "r", "fait_t", "lien_r", "lien"),
+        ("e", "Ref", "r", "fait_e", "num_r", "numero"),
+    ]
+    controles = controles_faits(sources, contrats, lignes, _bilan_rattachements())
+    assert [c.attendu for c in controles] == [100, 100, "3 / 2", "3 / 2", 60]
+    assert controles[0] == ControleFait(
+        "dw.fait_t : une ligne par ligne de propre.t", 100, "SELECT COUNT(*) FROM dw.fait_t"
+    )
+    # Le premier rattachement de même table, clé et référentiel fait foi.
+    assert controles[2].libelle.endswith("rattachement t.code vers r, membres -1 / -2")
+    assert "id_r = -1" in controles[2].requete and "id_r = -2" in controles[2].requete
+    assert "lien_r = N'non renseignée'" in controles[3].requete
+    assert "lien_r = N'introuvable'" in controles[3].requete
+    assert controles[4].requete == "SELECT COUNT(num_r) FROM dw.fait_e"
+    assert all(c.probleme is None for c in controles)
+    # Sans bilan, seuls les nombres de lignes.
+    assert len(controles_faits(sources, contrats, lignes, None)) == 2
+
+
+def test_controles_faits_impossibles_sans_requete():
+    lignes = pd.DataFrame({"table": ["t"], "chargement": [1], "propre": [1]})
+    sources = [("fait_t; DROP TABLE x", "t"), ("fait_u", "u")]
+    contrats = [
+        ("t", "code", "r", "fait_t", "id r", "membre"),
+        ("t", "autre", "r", "fait_t", "id_r", "membre"),
+        ("t", "code", "r", "fait_t", "id_r", "autre"),
+    ]
+    controles = controles_faits(sources, contrats, lignes, _bilan_rattachements())
+    assert [c.probleme for c in controles] == [
+        "nom de fait invalide", "table absente de l'écriture",
+        "nom de fait ou de colonne invalide", "rattachement absent du bilan", "forme inconnue",
+    ]
+    assert all(c.requete is None and c.attendu is None for c in controles)

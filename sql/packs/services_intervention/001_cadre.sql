@@ -47,13 +47,35 @@ GO
 
 /* Un rattachement lu par le pack : table, clé et référentiel, avec les noms
    du dictionnaire et les colonnes d'une clé reliées par « , », comme dans
-   qualite.regle_rattachement. */
+   qualite.regle_rattachement. table_fait, colonne_fait et forme disent, pour
+   la vérification de l'écriture (frigeo.ecriture_base.controles_faits), quelle
+   colonne d'un fait doit refléter ce rattachement ligne à ligne : forme membre
+   (autant de -1 et de -2 que de clés vides et introuvables), lien (autant de
+   « non renseignée » et d'« introuvable »), numero (autant de valeurs
+   renseignées que de lignes rattachées). Un rattachement porté par un
+   en-tête, qui se compte par document et non par ligne du fait, n'en a pas. */
 CREATE TABLE dw.contrat_rattachement (
     id_contrat       int IDENTITY(1, 1) NOT NULL,
     table_source     nvarchar(128)   NOT NULL,
     cle              nvarchar(1000)  NOT NULL,
     table_reference  nvarchar(128)   NOT NULL,
-    CONSTRAINT pk_contrat_rattachement PRIMARY KEY (id_contrat)
+    table_fait       nvarchar(128)   NULL,
+    colonne_fait     nvarchar(128)   NULL,
+    forme            nvarchar(10)    NULL,
+    CONSTRAINT pk_contrat_rattachement PRIMARY KEY (id_contrat),
+    CONSTRAINT ck_contrat_rattachement_forme
+        CHECK ((table_fait IS NULL AND colonne_fait IS NULL AND forme IS NULL)
+               OR (table_fait IS NOT NULL AND colonne_fait IS NOT NULL
+                   AND forme IN (N'membre', N'lien', N'numero')))
+);
+GO
+
+/* Un fait de dw et la table du dictionnaire dont il a une ligne par ligne de
+   propre : la vérification de l'écriture compare leurs nombres de lignes. */
+CREATE TABLE dw.source_fait (
+    table_fait    nvarchar(128)  NOT NULL,
+    table_source  nvarchar(128)  NOT NULL,
+    CONSTRAINT pk_source_fait PRIMARY KEY (table_fait)
 );
 GO
 
@@ -187,7 +209,8 @@ BEGIN
 END;
 GO
 
-/* Vide les tables de faits de dw (nom commençant par fait_), avant la
+/* Vide les tables de faits de dw (nom commençant par fait_, préfixe réservé
+   aux faits : une table du cadre ne doit pas le porter), avant la
    reconstruction des dimensions qu'elles référencent. Une table de faits
    référencée par une autre (une consommation vers son intervention) est
    vidée après celle-ci. Générique : un fait ajouté par le pack est vidé sans

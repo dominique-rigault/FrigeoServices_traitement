@@ -1158,7 +1158,10 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     pour dw, procédure de reconstruction présente si et seulement si l'écriture l'a
     appelée, et, si elle l'a été, journal de la reconstruction identique à celui de
     l'écriture et contrat d'entrée respecté par propre et par les rattachements de
-    l'exécution.
+    l'exécution; pour chaque fait déclaré par le pack, autant de lignes que dans propre
+    et, avec `sorties`, membres -1 et -2 (ou liens non renseignés et introuvables, ou
+    numéros renseignés) égaux aux clés vides, introuvables (ou lignes rattachées) du
+    bilan des rattachements (`controles_faits`).
     """
     from sqlalchemy import text
 
@@ -1252,7 +1255,8 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
             if sorties.rattachements is not None:
                 _verifier_rattachements(conn, ecriture.id_execution, sorties.rattachements,
                                         ajouter)
-        _verifier_dw(conn, ecriture, ajouter)
+        _verifier_dw(conn, ecriture, ajouter,
+                     None if sorties is None else sorties.rattachements)
     return pd.DataFrame(controles, columns=COLONNES_VERIFICATION)
 
 
@@ -1281,12 +1285,119 @@ def _verifier_rattachements(conn, id_execution: int, rattachements, ajouter) -> 
                 " / ".join(map(str, attendu)), " / ".join(map(str, lues.get(rang, (0, 0, 0)))))
 
 
+# Formes du contrôle d'un rattachement sur un fait (dw.contrat_rattachement.forme).
+FORME_MEMBRE = "membre"
+FORME_LIEN = "lien"
+FORME_NUMERO = "numero"
+LIEN_NON_RENSEIGNE = "non renseignée"
+LIEN_INTROUVABLE = "introuvable"
+_NOM_DW = re.compile(r"[a-z_][a-z0-9_]*")
+REQUETE_FAITS_SOURCES = "SELECT table_fait, table_source FROM dw.source_fait ORDER BY table_fait"
+REQUETE_CONTRATS_FAITS = (
+    "SELECT table_source, cle, table_reference, table_fait, colonne_fait, forme "
+    "FROM dw.contrat_rattachement WHERE table_fait IS NOT NULL ORDER BY id_contrat"
+)
+
+
+@dataclass(frozen=True)
+class ControleFait:
+    """Un contrôle d'un fait de dw : libellé, valeur attendue (calculée en Python) et
+    requête qui rend la valeur obtenue en une ligne, une colonne par nombre (None si
+    le contrôle est impossible, `probleme` disant pourquoi)."""
+
+    libelle: str
+    attendu: object
+    requete: str | None
+    probleme: str | None = None
+
+
+def _nom_dw(nom) -> bool:
+    return isinstance(nom, str) and _NOM_DW.fullmatch(nom) is not None
+
+
+def controles_faits(sources: list[tuple], contrats: list[tuple], lignes: pd.DataFrame,
+                    bilan: pd.DataFrame | None) -> list[ControleFait]:
+    """Contrôles des faits déclarés par le pack, sans valeur du client.
+
+    `sources` : (fait, table du dictionnaire) de dw.source_fait; chaque fait doit avoir
+    autant de lignes que Python en a écrit dans propre pour sa table (`lignes`, colonnes
+    table et propre de `Ecriture.lignes`). `contrats` : (table, clé, référentiel, fait,
+    colonne, forme) de dw.contrat_rattachement; avec le bilan des rattachements
+    (`rattachement.Rattachements.bilan`, le premier rattachement de même table, clé et
+    référentiel faisant foi, comme dw.regle_rattachement), la colonne du fait doit
+    compter :
+
+    - forme membre : autant de -1 que de clés vides et de -2 que de clés introuvables;
+    - forme lien : autant de « non renseignée » et d'« introuvable »;
+    - forme numero : autant de valeurs renseignées que de lignes rattachées.
+
+    Sans bilan, seuls les nombres de lignes sont contrôlés. Un nom de fait ou de colonne
+    qui n'est pas un identifiant simple, un fait sans table dans propre ou un
+    rattachement absent du bilan rendent un contrôle impossible (`probleme`).
+    """
+    controles = []
+    propre = {str(t): int(n) for t, n in zip(lignes["table"], lignes[SCHEMA_PROPRE])}
+    for fait, table in sources:
+        libelle = f"dw.{fait} : une ligne par ligne de propre.{table}"
+        if not _nom_dw(fait):
+            controles.append(ControleFait(libelle, None, None, "nom de fait invalide"))
+        elif table not in propre:
+            controles.append(ControleFait(libelle, None, None, "table absente de l'écriture"))
+        else:
+            controles.append(
+                ControleFait(libelle, propre[table], f"SELECT COUNT(*) FROM dw.{fait}")
+            )
+    if bilan is None:
+        return controles
+    premiers: dict[tuple, dict] = {}
+    for ligne in bilan.to_dict("records"):
+        premiers.setdefault((ligne["table"], ligne["cle"], ligne["table_reference"]), ligne)
+    for table, cle, reference, fait, colonne, forme in contrats:
+        libelle = f"dw.{fait}.{colonne} ({forme}) : rattachement {table}.{cle} vers {reference}"
+        ligne = premiers.get((table, cle, reference))
+        if not (_nom_dw(fait) and _nom_dw(colonne)):
+            controles.append(ControleFait(libelle, None, None, "nom de fait ou de colonne invalide"))
+        elif ligne is None:
+            controles.append(ControleFait(libelle, None, None, "rattachement absent du bilan"))
+        elif forme == FORME_MEMBRE:
+            controles.append(ControleFait(
+                libelle + ", membres -1 / -2",
+                f"{int(ligne['cles_vides'])} / {int(ligne['introuvables'])}",
+                f"SELECT SUM(CASE WHEN {colonne} = -1 THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN {colonne} = -2 THEN 1 ELSE 0 END) FROM dw.{fait}",
+            ))
+        elif forme == FORME_LIEN:
+            controles.append(ControleFait(
+                libelle + f", {LIEN_NON_RENSEIGNE} / {LIEN_INTROUVABLE}",
+                f"{int(ligne['cles_vides'])} / {int(ligne['introuvables'])}",
+                f"SELECT SUM(CASE WHEN {colonne} = N'{LIEN_NON_RENSEIGNE}' THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN {colonne} = N'{LIEN_INTROUVABLE}' THEN 1 ELSE 0 END) "
+                f"FROM dw.{fait}",
+            ))
+        elif forme == FORME_NUMERO:
+            controles.append(ControleFait(
+                libelle + ", renseignés",
+                int(ligne["rattachees"]),
+                f"SELECT COUNT({colonne}) FROM dw.{fait}",
+            ))
+        else:
+            controles.append(ControleFait(libelle, None, None, "forme inconnue"))
+    return controles
+
+
+def _obtenu(rangee: tuple):
+    """Valeur obtenue d'un contrôle de fait : un nombre, ou « n / m »."""
+    nombres = [0 if v is None else int(v) for v in rangee]
+    return nombres[0] if len(nombres) == 1 else " / ".join(map(str, nombres))
+
+
 def _journal_en_texte(journal) -> str | None:
     return "; ".join(f"{ordre}. {etape} {lignes}" for ordre, etape, lignes in journal) or None
 
 
-def _verifier_dw(conn, ecriture: Ecriture, ajouter) -> None:
-    """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte."""
+def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None) -> None:
+    """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte, puis
+    ceux des faits déclarés par le pack (`controles_faits`)."""
     import pyodbc
 
     from .base import procedure_reconstruction_presente
@@ -1316,5 +1427,16 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter) -> None:
             contrat = CONTRAT_NON_RESPECTE
         ajouter(FAMILLE_DW, "contrat d'entrée du pack respecté par propre et les rattachements",
                 CONTRAT_RESPECTE, contrat)
+        curseur.execute(REQUETE_FAITS_SOURCES)
+        sources = [tuple(r) for r in curseur.fetchall()]
+        curseur.execute(REQUETE_CONTRATS_FAITS)
+        contrats = [tuple(r) for r in curseur.fetchall()]
+        bilan = None if rattachements is None else rattachements.bilan
+        for controle in controles_faits(sources, contrats, ecriture.lignes, bilan):
+            if controle.requete is None:
+                ajouter(FAMILLE_DW, controle.libelle, controle.probleme, None)
+                continue
+            curseur.execute(controle.requete)
+            ajouter(FAMILLE_DW, controle.libelle, controle.attendu, _obtenu(tuple(curseur.fetchone())))
     finally:
         curseur.close()

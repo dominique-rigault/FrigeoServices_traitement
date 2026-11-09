@@ -72,12 +72,27 @@ INSERT INTO dw.contrat_entree (table_propre, colonne, famille) VALUES
     (N'pieces_interventions', N'unite', N'texte');
 GO
 
-/* Rattachements lus par les faits (noms du dictionnaire). */
-INSERT INTO dw.contrat_rattachement (table_source, cle, table_reference) VALUES
-    (N'interventions', N'intervenant', N'intervenants'),
-    (N'interventions', N'code_client', N'clients'),
-    (N'pieces_interventions', N'ref_piece', N'catalogue_pieces'),
-    (N'pieces_interventions', N'id_intervention', N'interventions');
+/* Rattachements lus par les faits (noms du dictionnaire), avec la colonne du
+   fait qui les reflète ligne à ligne. */
+INSERT INTO dw.contrat_rattachement
+    (table_source, cle, table_reference, table_fait, colonne_fait, forme) VALUES
+    (N'interventions', N'intervenant', N'intervenants',
+     N'fait_intervention', N'id_intervenant', N'membre'),
+    (N'interventions', N'code_client', N'clients',
+     N'fait_intervention', N'id_client', N'membre'),
+    (N'pieces_interventions', N'ref_piece', N'catalogue_pieces',
+     N'fait_consommation', N'id_piece', N'membre'),
+    (N'pieces_interventions', N'id_intervention', N'interventions',
+     N'fait_consommation', N'lien_intervention', N'lien');
+GO
+
+/* Faits et tables dont ils ont une ligne par ligne de propre. */
+INSERT INTO dw.source_fait (table_fait, table_source) VALUES
+    (N'fait_intervention', N'interventions'),
+    (N'fait_consommation', N'pieces_interventions'),
+    (N'fait_ligne_facture', N'factures_lignes'),
+    (N'fait_achat', N'achats_lignes'),
+    (N'fait_ecriture', N'fec');
 GO
 
 /*
@@ -302,15 +317,24 @@ INSERT INTO dw.contrat_entree (table_propre, colonne, famille) VALUES
     (N'achats_lignes', N'compte_charge', N'texte');
 GO
 
-/* Rattachements lus par les faits des documents. */
-INSERT INTO dw.contrat_rattachement (table_source, cle, table_reference) VALUES
-    (N'factures_lignes', N'num_facture', N'factures_entetes'),
-    (N'factures_entetes', N'code_client', N'clients'),
-    (N'factures_lignes', N'ref_piece', N'catalogue_pieces'),
-    (N'factures_lignes', N'id_intervention', N'interventions'),
-    (N'achats_lignes', N'num_piece_achat', N'achats_entetes'),
-    (N'achats_entetes', N'code_fournisseur', N'fournisseurs'),
-    (N'achats_lignes', N'ref_piece', N'catalogue_pieces');
+/* Rattachements lus par les faits des documents. Le client d'une facture et
+   le fournisseur d'une pièce d'achat sont rattachés par en-tête : ils se
+   comptent par document, pas par ligne du fait, et n'ont pas de colonne à
+   vérifier. */
+INSERT INTO dw.contrat_rattachement
+    (table_source, cle, table_reference, table_fait, colonne_fait, forme) VALUES
+    (N'factures_lignes', N'num_facture', N'factures_entetes',
+     N'fait_ligne_facture', N'lien_entete', N'lien'),
+    (N'factures_entetes', N'code_client', N'clients', NULL, NULL, NULL),
+    (N'factures_lignes', N'ref_piece', N'catalogue_pieces',
+     N'fait_ligne_facture', N'id_piece', N'membre'),
+    (N'factures_lignes', N'id_intervention', N'interventions',
+     N'fait_ligne_facture', N'lien_intervention', N'lien'),
+    (N'achats_lignes', N'num_piece_achat', N'achats_entetes',
+     N'fait_achat', N'lien_entete', N'lien'),
+    (N'achats_entetes', N'code_fournisseur', N'fournisseurs', NULL, NULL, NULL),
+    (N'achats_lignes', N'ref_piece', N'catalogue_pieces',
+     N'fait_achat', N'id_piece', N'membre');
 GO
 
 /*
@@ -625,9 +649,10 @@ GO
 
 /* Rattachements lus par le fait des écritures (PieceRef est le nom du
    dictionnaire, piece_ref celui de propre). */
-INSERT INTO dw.contrat_rattachement (table_source, cle, table_reference) VALUES
-    (N'fec', N'PieceRef', N'factures_entetes'),
-    (N'fec', N'PieceRef', N'achats_entetes');
+INSERT INTO dw.contrat_rattachement
+    (table_source, cle, table_reference, table_fait, colonne_fait, forme) VALUES
+    (N'fec', N'PieceRef', N'factures_entetes', N'fait_ecriture', N'num_facture', N'numero'),
+    (N'fec', N'PieceRef', N'achats_entetes', N'fait_ecriture', N'num_piece_achat', N'numero');
 GO
 
 /*
