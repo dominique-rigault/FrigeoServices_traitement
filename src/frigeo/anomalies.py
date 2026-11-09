@@ -154,6 +154,22 @@ def _controle_doublons(table, constat, colonnes) -> str:
     return f"{table} {constat} ({colonnes})"
 
 
+_GROUPE_DOUBLON = re.compile(r", groupe (\d+) de \d+ lignes$")
+
+
+def _detail_doublon(portee, comparaison, groupe, taille_groupe) -> str:
+    """Détail d'un doublon : portée, comparaison, numéro et taille du groupe."""
+    return f"{portee}, {comparaison}, groupe {groupe} de {taille_groupe} lignes"
+
+
+def groupe_doublon(detail) -> int | None:
+    """Numéro du groupe dans le détail d'un doublon (`_detail_doublon`), ou None."""
+    if not isinstance(detail, str):
+        return None
+    trouve = _GROUPE_DOUBLON.search(detail)
+    return int(trouve.group(1)) if trouve else None
+
+
 def _controle_gestion(ref, libelle) -> str:
     return f"{ref} {libelle}"
 
@@ -353,8 +369,9 @@ def reunir_anomalies(
                 "constat": ligne.constat,
                 "issue": ligne.issue,
                 "statut_regle": None,
-                "detail": f"{ligne.portee}, {ligne.comparaison}, groupe {ligne.groupe} "
-                f"de {ligne.taille_groupe} lignes",
+                "detail": _detail_doublon(
+                    ligne.portee, ligne.comparaison, ligne.groupe, ligne.taille_groupe
+                ),
                 "proposition": None,
             }
         )

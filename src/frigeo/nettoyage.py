@@ -1032,7 +1032,8 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
     lignage, après les corrections, pour un retrait. Une valeur retenue est écrite
     telle qu'enregistrée si la nature de la colonne n'a pas changé depuis la
     décision, sinon relue dans la nature en vigueur (`decisions.lire_valeur_retenue`).
-    Une décision « garder » ne change rien.
+    Une décision « garder » ne change rien, ni une décision « rattacher » : le
+    regroupement des codes se fait dans la base.
     """
     from .decisions import (
         DECISION_CORRIGER,

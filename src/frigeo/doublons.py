@@ -68,9 +68,14 @@ SEPARATEUR = " | "
 # Clé qui nomme la table des lignes d'une table d'en-têtes de documents.
 CLE_TABLE_DES_LIGNES = "table_des_lignes"
 
+# Clé d'un référentiel dont les codes différents d'une même entité peuvent être
+# regroupés sous un code principal par le métier (voir `codes_a_regrouper`).
+CLE_REGROUPER_CODES = "regrouper_codes"
+
 # Clés admises dans la déclaration d'une table.
 CLES_DECLARATION = (
-    "cle", "unique", "presume_unique", "identique_hors_cle", CLE_TABLE_DES_LIGNES
+    "cle", "unique", "presume_unique", "identique_hors_cle", CLE_TABLE_DES_LIGNES,
+    CLE_REGROUPER_CODES,
 )
 
 # Colonne ajoutée aux textes d'une table d'en-têtes pour comparer leurs lignes (un
@@ -181,6 +186,30 @@ def problemes_declarations_doublons(declarations) -> list[str]:
                 )
         if CLE_TABLE_DES_LIGNES in declaration:
             problemes += _problemes_table_des_lignes(table, declaration, declarations)
+        if CLE_REGROUPER_CODES in declaration:
+            problemes += _problemes_regrouper_codes(table, declaration)
+    return problemes
+
+
+def _problemes_regrouper_codes(table, declaration: dict) -> list[str]:
+    """Problèmes de la clé regrouper_codes d'un référentiel."""
+    ou = f"{table}, {CLE_REGROUPER_CODES}"
+    if declaration[CLE_REGROUPER_CODES] is not True:
+        return [f"{ou} : la valeur attendue est true (pour ne pas regrouper, retirer la ligne)"]
+    problemes = []
+    cle = declaration.get("cle")
+    if cle is None:
+        problemes.append(f"{ou} : sans clé déclarée, il n'y a pas de code à regrouper")
+    elif _probleme_groupe(cle) is None and len(cle) != 1:
+        problemes.append(f"{ou} : la clé doit tenir sur une seule colonne (un code)")
+    if CLE_TABLE_DES_LIGNES in declaration:
+        problemes.append(f"{ou} : sans objet pour une table d'en-têtes de documents")
+    cherches = "unique" in declaration or "presume_unique" in declaration
+    if not cherches and declaration.get("identique_hors_cle") is False:
+        problemes.append(
+            f"{ou} : aucun constat ne peut proposer de regroupement (déclarer unique ou "
+            "presume_unique, ou chercher les lignes identiques hors clé)"
+        )
     return problemes
 
 
@@ -232,7 +261,12 @@ def charger_declarations_doublons(chemin: str | Path | None = None) -> dict:
       de leurs lignes, déclarée avec une clé qui contient celle de l'en-tête et au
       moins une autre colonne (`[num_facture, num_ligne]` pour `[num_facture]`). Deux
       en-têtes identiques hors clé ne sont alors signalés que si leurs lignes sont
-      identiques aussi (voir `detecter_doublons`).
+      identiques aussi (voir `detecter_doublons`);
+    - `regrouper_codes: true` : pour un référentiel à clé d'une seule colonne
+      (clients, fournisseurs), deux codes différents d'une même entité, repérés par
+      une valeur en double hors de la clé ou par des lignes identiques hors clé,
+      peuvent être regroupés par le métier sous un code principal (décision
+      « rattacher » du classeur d'arbitrage, voir `codes_a_regrouper`).
 
     Un fichier absent, ou sans clé `doublons`, ne donne aucune déclaration : seuls
     les doublons exacts sont alors cherchés. Un fichier mal formé est refusé, tous
@@ -245,6 +279,19 @@ def charger_declarations_doublons(chemin: str | Path | None = None) -> dict:
     if problemes:
         raise ValueError("Déclarations de doublons invalides\n  " + "\n  ".join(problemes))
     return declarations
+
+
+def codes_a_regrouper(declarations: dict) -> dict[str, str]:
+    """Colonne de la clé de chaque table déclarée `regrouper_codes: true`.
+
+    Les déclarations sont supposées valides (`charger_declarations_doublons`) : la
+    clé d'une telle table tient sur une seule colonne.
+    """
+    return {
+        table: declaration["cle"][0]
+        for table, declaration in declarations.items()
+        if isinstance(declaration, dict) and declaration.get(CLE_REGROUPER_CODES) is True
+    }
 
 
 def _groupes_declares(declaration: dict) -> list[tuple[str, list[str]]]:

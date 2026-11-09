@@ -955,6 +955,19 @@ def test_decision_corriger():
     assert _du_regle(resultat.bilan).empty and _du_regle(resultat.journal).empty
 
 
+def test_decision_rattacher_ne_change_pas_les_tables():
+    # Le regroupement des codes se fait dans la base : la ligne reste telle quelle.
+    tables = {"t": _table(code=["a", "b"], siret=["1", "1"])}
+    decision = {
+        **_decision(3, "siret", "rattacher", _empreinte_ligne(code="b", siret="1"), "a"),
+        "sorte": "code",
+    }
+    resultat = _nettoyer_avec(tables, _decisions(a1=decision))
+    assert list(resultat.tables["t"]["code"]) == ["a", "b"]
+    assert _du_regle(resultat.journal).empty and _du_regle(resultat.bilan).empty
+    assert resultat.caduques.empty
+
+
 def test_decision_apres_les_regles_automatiques():
     # L'empreinte est celle de la valeur laissée par les règles 1 à 4 (encodage réparé).
     tables = {"t": _table(code=["a", "b"], nom=[_mal("Café"), "Thé"])}
