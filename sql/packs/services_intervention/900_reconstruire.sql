@@ -4,8 +4,9 @@
   Dernier script du pack, pour être créé après les procédures qu'il appelle.
   Il enchaîne la vérification du contrat d'entrée (colonnes de propre et
   rattachements de l'exécution), le vidage des faits, la construction des
-  dimensions (script 002) et, à venir, celle des faits. Chaque étape de
-  construction est inscrite dans dw.journal_reconstruction.
+  dimensions (script 002), puis celle des faits (script 003), un fait lié à
+  un autre (une consommation à son intervention) après celui-ci. Chaque étape
+  de construction est inscrite dans dw.journal_reconstruction.
 */
 
 /* Reconstruit dw pour une exécution, dans la transaction de l'appelant. */
@@ -40,5 +41,9 @@ BEGIN
     EXEC dw.construire_dim_intervenant @id_execution;
     EXEC dw.construire_dim_client @id_execution;
     EXEC dw.construire_dim_fournisseur @id_execution;
+
+    /* Faits (script 003). */
+    EXEC dw.construire_fait_intervention @id_execution;
+    EXEC dw.construire_fait_consommation @id_execution;
 END;
 GO
