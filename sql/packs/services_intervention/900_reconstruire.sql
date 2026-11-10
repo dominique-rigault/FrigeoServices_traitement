@@ -4,10 +4,11 @@
   Dernier script du pack, pour être créé après les procédures qu'il appelle.
   Il enchaîne la vérification du contrat d'entrée (colonnes de propre,
   rattachements et codes en doublon de l'exécution) et celle des paramètres
-  de calcul (script 004), le vidage des faits, la construction des
-  dimensions (script 002), puis celle des faits (script 003), un fait lié à
-  un autre (une consommation à son intervention) après celui-ci, puis les
-  calculs (script 004). Chaque étape est inscrite dans
+  de calcul (script 004), le vidage des faits et des tables de calcul, la
+  construction des dimensions (script 002), puis celle des faits
+  (script 003), un fait lié à un autre (une consommation à son
+  intervention) après celui-ci, puis les calculs (script 004 : chantiers,
+  CUMP et coût des pièces). Chaque étape est inscrite dans
   dw.journal_reconstruction.
 */
 
@@ -34,8 +35,9 @@ BEGIN
     /* Paramètres de calcul (script 004). */
     EXEC dw.verifier_parametres @id_execution;
 
-    /* Faits vidés avant les dimensions qu'ils référencent. */
+    /* Faits et tables de calcul vidés avant les dimensions qu'ils référencent. */
     EXEC dw.vider_faits;
+    EXEC dw.vider_calculs;
 
     /* Dimensions (script 002). */
     EXEC dw.construire_dim_date @id_execution;
@@ -56,5 +58,6 @@ BEGIN
 
     /* Calculs (script 004). */
     EXEC dw.calculer_chantiers @id_execution;
+    EXEC dw.calculer_cump @id_execution;
 END;
 GO

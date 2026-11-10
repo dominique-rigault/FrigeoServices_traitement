@@ -28,7 +28,52 @@
   (jour_chantier) et le nombre de jours (nb_jours_chantier). Une autre
   intervention est son propre chantier, d'un jour. Le chantier décrit
   l'activité : les interventions non retenues en font partie.
+
+  CUMP (coût unitaire moyen pondéré) : dw.calculer_cump le calcule pour
+  chaque pièce et chaque mois, de celui du stock initial du catalogue à celui
+  de la période de fin de l'exécution, dans dw.cump_mensuel :
+
+    CUMP de fin de mois = (stock de début × CUMP de début + valeur des achats)
+                          / (stock de début + quantités achetées)
+
+  Le stock de début d'un mois est celui de fin du mois précédent (achats
+  moins consommations), le premier étant le stock initial du catalogue, et le
+  CUMP de début celui de fin du mois précédent, le premier étant le CUMP
+  initial. Un achat compte au mois de la date de sa facture, un avoir comme
+  un achat négatif (quantité et montant négatifs); seules les lignes retenues
+  comptent, d'une pièce connue, avec leur quantité (et leur montant pour un
+  achat). Un stock de début négatif, ou sans CUMP connu, pèse zéro; un mois
+  sans achat, ou dont le dénominateur n'est pas positif, garde le CUMP de
+  début. Le CUMP est arrondi à 4 décimales chaque mois, et c'est la valeur
+  arrondie qui sert au mois suivant.
+
+  Coût des pièces : une consommation est valorisée au CUMP de début de son
+  mois (celui de la fin du mois précédent, le CUMP initial pour le premier
+  mois) : cout_ht = quantité × CUMP, arrondi au centime. Quand il ne peut pas
+  l'être, cump_applique et cout_ht restent vides et motif_calcul dit
+  pourquoi (quantité vide, pièce non renseignée ou introuvable, date vide ou
+  hors des mois du calcul, CUMP inconnu); le coût est calculé aussi pour une
+  consommation non retenue.
+
+  Arrondis et types : les opérandes sont ramenés à 6 décimales au plus pour
+  que les produits et le quotient gardent toutes leurs décimales utiles
+  (règles de précision de T-SQL); le seul arrondi est donc celui qui est
+  annoncé, que la vérification en Python refait à l'identique (au plus
+  proche, la moitié s'éloignant de zéro).
 */
+
+/* Colonnes de propre lues par les calculs. */
+INSERT INTO dw.contrat_entree (table_propre, colonne, famille) VALUES
+    (N'catalogue_pieces', N'stock_initial', N'décimal'),
+    (N'catalogue_pieces', N'cump_initial', N'décimal');
+GO
+
+/* Mesures des faits calculées par ce script. */
+INSERT INTO dw.mesure_calculee (table_fait, colonne_fait, description) VALUES
+    (N'fait_consommation', N'cump_applique',
+     N'CUMP de la pièce à la fin du mois précédant la consommation'),
+    (N'fait_consommation', N'cout_ht', N'Quantité consommée × CUMP appliqué, au centime');
+GO
 
 /* Une valeur propre au client utilisée par les calculs. table_source et
    colonne_source (noms du dictionnaire) désignent la liste fermée dont la
@@ -264,5 +309,209 @@ BEGIN
 
     DECLARE @lignes int = @@ROWCOUNT;
     EXEC dw.inscrire_etape @id_execution, N'chantiers', @lignes, @debut;
+END;
+GO
+
+/* CUMP d'une pièce pour un mois du calcul (voir l'en-tête du script). */
+CREATE TABLE dw.cump_mensuel (
+    id_piece            int             NOT NULL,
+    mois                date            NOT NULL,
+    stock_debut         decimal(28, 8)  NOT NULL,
+    cump_debut          decimal(19, 4)  NULL,
+    quantite_achetee    decimal(28, 8)  NOT NULL,
+    valeur_achats       decimal(28, 8)  NOT NULL,
+    quantite_consommee  decimal(28, 8)  NOT NULL,
+    stock_fin           decimal(28, 8)  NOT NULL,
+    cump_fin            decimal(19, 4)  NULL,
+    CONSTRAINT pk_cump_mensuel PRIMARY KEY (id_piece, mois),
+    CONSTRAINT ck_cump_mensuel_mois CHECK (DAY(mois) = 1),
+    CONSTRAINT fk_cump_mensuel_piece FOREIGN KEY (id_piece) REFERENCES dw.dim_piece (id_piece)
+);
+GO
+
+/* Vide les tables de calcul qui référencent les dimensions, avant leur
+   reconstruction (comme dw.vider_faits pour les faits). */
+CREATE PROCEDURE dw.vider_calculs
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DELETE FROM dw.cump_mensuel;
+END;
+GO
+
+/* CUMP de fin de mois d'une pièce, à partir du stock et du CUMP de début et
+   des achats du mois (quantité et valeur). Un stock de début négatif ou sans
+   CUMP pèse zéro; sans achat, ou si le dénominateur n'est pas positif, le
+   CUMP de début est gardé (NULL s'il est inconnu). Les opérandes sont ramenés
+   à 6 décimales : le quotient garde alors 18 décimales avant l'arrondi à 4. */
+CREATE FUNCTION dw.cump_fin_de_mois (
+    @stock_debut decimal(28, 8),
+    @cump_debut decimal(19, 4),
+    @quantite decimal(28, 8),
+    @valeur decimal(28, 8)
+)
+RETURNS decimal(19, 4)
+AS
+BEGIN
+    DECLARE @stock decimal(16, 6) =
+        CASE WHEN @stock_debut > 0 AND @cump_debut IS NOT NULL
+             THEN CAST(@stock_debut AS decimal(16, 6)) ELSE 0 END;
+    DECLARE @achetee decimal(18, 6) = CAST(@quantite AS decimal(18, 6));
+    IF @achetee = 0 OR @stock + @achetee <= 0
+        RETURN @cump_debut;
+    DECLARE @numerateur decimal(24, 10) = CAST(
+        @stock * COALESCE(@cump_debut, 0) + CAST(@valeur AS decimal(18, 6))
+        AS decimal(24, 10));
+    DECLARE @denominateur decimal(18, 6) = CAST(@stock + @achetee AS decimal(18, 6));
+    RETURN CAST(ROUND(@numerateur / @denominateur, 4) AS decimal(19, 4));
+END;
+GO
+
+/*
+  CUMP mensuel de chaque pièce, puis coût des consommations (voir l'en-tête
+  du script). Les mois vont de celui de la date du stock initial
+  (dw.parametre_calcul, premier jour d'un mois) à celui de la période de fin
+  de l'exécution, tous dans le calendrier. Les mouvements (achats et
+  consommations retenus) sont totalisés par pièce et par mois, toutes les
+  pièces ayant une ligne pour chaque mois, puis le CUMP est calculé mois
+  après mois par une expression de table récursive, chaque mois partant de la
+  fin du précédent.
+*/
+CREATE PROCEDURE dw.calculer_cump
+    @id_execution int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
+    DECLARE @date_initiale date = TRY_CONVERT(date, dw.parametre(N'date_stock_initial'), 23);
+    DECLARE @periode char(7) =
+        (SELECT periode_fin FROM qualite.execution WHERE id_execution = @id_execution);
+    IF @date_initiale IS NULL OR DAY(@date_initiale) <> 1
+        THROW 50022, N'dw.calculer_cump : date_stock_initial de dw.parametre_calcul absente ou autre que le premier jour d''un mois.', 1;
+    DECLARE @premier_mois date = @date_initiale;
+    DECLARE @dernier_mois date =
+        DATEFROMPARTS(CAST(LEFT(@periode, 4) AS int), CAST(RIGHT(@periode, 2) AS int), 1);
+    IF @dernier_mois < @premier_mois
+       OR @premier_mois < (SELECT MIN(date_jour) FROM dw.dim_date)
+       OR EOMONTH(@dernier_mois) > (SELECT MAX(date_jour) FROM dw.dim_date)
+        THROW 50023, N'dw.calculer_cump : mois du calcul hors du calendrier, ou période de fin antérieure au stock initial.', 1;
+
+    DELETE FROM dw.cump_mensuel;
+
+    DECLARE @pieces TABLE (
+        id_piece       int             PRIMARY KEY,
+        stock_initial  decimal(28, 8)  NOT NULL,
+        cump_initial   decimal(19, 4)  NULL
+    );
+    INSERT INTO @pieces (id_piece, stock_initial, cump_initial)
+    SELECT dp.id_piece,
+           COALESCE(c.stock_initial, 0),
+           CAST(ROUND(c.cump_initial, 4) AS decimal(19, 4))
+    FROM dw.dim_piece AS dp
+    LEFT JOIN propre.catalogue_pieces AS c
+        ON c.id_chargement = dp.id_chargement AND c.num_ligne_source = dp.num_ligne_source
+    WHERE dp.id_piece > 0;
+
+    DECLARE @mouvements TABLE (
+        id_piece            int             NOT NULL,
+        mois                date            NOT NULL,
+        quantite_achetee    decimal(28, 8)  NOT NULL,
+        valeur_achats       decimal(28, 8)  NOT NULL,
+        quantite_consommee  decimal(28, 8)  NOT NULL,
+        PRIMARY KEY (id_piece, mois)
+    );
+    WITH mois AS (
+        SELECT @premier_mois AS mois
+        UNION ALL
+        SELECT DATEADD(month, 1, mois) FROM mois WHERE mois < @dernier_mois
+    ),
+    lignes AS (
+        SELECT a.id_piece, DATEFROMPARTS(YEAR(d.date_jour), MONTH(d.date_jour), 1) AS mois,
+               a.quantite AS quantite_achetee, a.montant_ht AS valeur_achats,
+               CAST(0 AS decimal(28, 8)) AS quantite_consommee
+        FROM dw.fait_achat AS a
+        JOIN dw.dim_date AS d ON d.id_date = a.id_date
+        WHERE a.retenue = 1 AND a.id_piece > 0
+          AND a.quantite IS NOT NULL AND a.montant_ht IS NOT NULL
+        UNION ALL
+        SELECT c.id_piece, DATEFROMPARTS(YEAR(d.date_jour), MONTH(d.date_jour), 1),
+               CAST(0 AS decimal(28, 8)), CAST(0 AS decimal(28, 8)), c.quantite
+        FROM dw.fait_consommation AS c
+        JOIN dw.dim_date AS d ON d.id_date = c.id_date
+        WHERE c.retenue = 1 AND c.id_piece > 0 AND c.quantite IS NOT NULL
+    ),
+    totaux AS (
+        SELECT id_piece, mois, SUM(quantite_achetee) AS quantite_achetee,
+               SUM(valeur_achats) AS valeur_achats, SUM(quantite_consommee) AS quantite_consommee
+        FROM lignes
+        WHERE mois BETWEEN @premier_mois AND @dernier_mois
+        GROUP BY id_piece, mois
+    )
+    INSERT INTO @mouvements (id_piece, mois, quantite_achetee, valeur_achats, quantite_consommee)
+    SELECT p.id_piece, m.mois,
+           COALESCE(t.quantite_achetee, 0), COALESCE(t.valeur_achats, 0),
+           COALESCE(t.quantite_consommee, 0)
+    FROM @pieces AS p
+    CROSS JOIN mois AS m
+    LEFT JOIN totaux AS t ON t.id_piece = p.id_piece AND t.mois = m.mois
+    OPTION (MAXRECURSION 1200);
+
+    WITH calcul AS (
+        SELECT m.id_piece, m.mois,
+               p.stock_initial AS stock_debut,
+               p.cump_initial AS cump_debut,
+               m.quantite_achetee, m.valeur_achats, m.quantite_consommee,
+               CAST(p.stock_initial + m.quantite_achetee - m.quantite_consommee
+                    AS decimal(28, 8)) AS stock_fin,
+               dw.cump_fin_de_mois(p.stock_initial, p.cump_initial, m.quantite_achetee,
+                                   m.valeur_achats) AS cump_fin
+        FROM @mouvements AS m
+        JOIN @pieces AS p ON p.id_piece = m.id_piece
+        WHERE m.mois = @premier_mois
+        UNION ALL
+        SELECT m.id_piece, m.mois,
+               c.stock_fin,
+               c.cump_fin,
+               m.quantite_achetee, m.valeur_achats, m.quantite_consommee,
+               CAST(c.stock_fin + m.quantite_achetee - m.quantite_consommee AS decimal(28, 8)),
+               dw.cump_fin_de_mois(c.stock_fin, c.cump_fin, m.quantite_achetee,
+                                   m.valeur_achats)
+        FROM calcul AS c
+        JOIN @mouvements AS m
+            ON m.id_piece = c.id_piece AND m.mois = DATEADD(month, 1, c.mois)
+    )
+    INSERT INTO dw.cump_mensuel (id_piece, mois, stock_debut, cump_debut, quantite_achetee,
+                                 valeur_achats, quantite_consommee, stock_fin, cump_fin)
+    SELECT id_piece, mois, stock_debut, cump_debut, quantite_achetee, valeur_achats,
+           quantite_consommee, stock_fin, cump_fin
+    FROM calcul
+    OPTION (MAXRECURSION 1200);
+    DECLARE @lignes_cump int = @@ROWCOUNT;
+    EXEC dw.inscrire_etape @id_execution, N'cump_mensuel', @lignes_cump, @debut;
+
+    SET @debut = SYSUTCDATETIME();
+    UPDATE f
+    SET motif_calcul = x.motif,
+        cump_applique = CASE WHEN x.motif IS NULL THEN k.cump_debut END,
+        cout_ht = CASE WHEN x.motif IS NULL
+                       THEN CAST(ROUND(CAST(f.quantite AS decimal(18, 6)) * k.cump_debut, 2)
+                                 AS decimal(19, 2)) END
+    FROM dw.fait_consommation AS f
+    LEFT JOIN dw.dim_date AS d ON d.id_date = f.id_date
+    OUTER APPLY (SELECT DATEFROMPARTS(YEAR(d.date_jour), MONTH(d.date_jour), 1) AS mois) AS j
+    LEFT JOIN dw.cump_mensuel AS k ON k.id_piece = f.id_piece AND k.mois = j.mois
+    CROSS APPLY (
+        SELECT CASE
+                   WHEN f.quantite IS NULL THEN N'quantité vide'
+                   WHEN f.id_piece = -1 THEN N'pièce non renseignée'
+                   WHEN f.id_piece = -2 THEN N'pièce introuvable'
+                   WHEN f.id_date = -1 THEN N'date vide'
+                   WHEN j.mois IS NULL OR j.mois < @premier_mois OR j.mois > @dernier_mois
+                       THEN N'date hors des mois du calcul'
+                   WHEN k.cump_debut IS NULL THEN N'CUMP inconnu'
+               END AS motif
+    ) AS x;
+    DECLARE @lignes int = (SELECT COUNT(*) FROM dw.fait_consommation WHERE cout_ht IS NOT NULL);
+    EXEC dw.inscrire_etape @id_execution, N'coût des pièces', @lignes, @debut;
 END;
 GO

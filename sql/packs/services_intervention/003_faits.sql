@@ -247,7 +247,9 @@ GO
   Pièce par le rattachement pieces_interventions.ref_piece vers
   catalogue_pieces, date de sortie, intervention par le rattachement
   pieces_interventions.id_intervention vers interventions (la ligne de
-  fait_intervention de même lignage que la ligne rattachée).
+  fait_intervention de même lignage que la ligne rattachée). cump_applique,
+  cout_ht et motif_calcul restent vides ici : le calcul du CUMP
+  (script 004) les renseigne.
 */
 CREATE TABLE dw.fait_consommation (
     id_fait_consommation  int             NOT NULL,
@@ -258,6 +260,9 @@ CREATE TABLE dw.fait_consommation (
     id_piece              int             NOT NULL,
     quantite              decimal(28, 8)  NULL,
     unite                 nvarchar(4000)  NULL,
+    cump_applique         decimal(19, 4)  NULL,
+    cout_ht               decimal(19, 2)  NULL,
+    motif_calcul          nvarchar(100)   NULL,
     retenue               bit             NOT NULL,
     id_chargement         int             NOT NULL,
     fichier_source        nvarchar(260)   NOT NULL,

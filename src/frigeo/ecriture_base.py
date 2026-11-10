@@ -1428,7 +1428,8 @@ REQUETE_DATES = (
     "FROM dw.contrat_date ORDER BY table_fait, colonne_fait"
 )
 # Colonnes numériques (hors int, réservé aux clés et au lignage) des tables de faits
-# qui ne sont pas déclarées dans dw.contrat_mesure.
+# qui ne sont déclarées ni dans dw.contrat_mesure, ni comme mesures calculées par le
+# pack (dw.mesure_calculee, vérifiées par son module de vérification).
 REQUETE_MESURES_NON_DECLAREES = (
     "SELECT COUNT(*) FROM sys.columns AS c "
     "JOIN sys.tables AS t ON t.object_id = c.object_id "
@@ -1438,7 +1439,9 @@ REQUETE_MESURES_NON_DECLAREES = (
     "AND ty.name IN (N'bigint', N'decimal', N'numeric', N'float', N'real', N'money', "
     "N'smallmoney') "
     "AND NOT EXISTS (SELECT 1 FROM dw.contrat_mesure AS m "
-    "WHERE m.table_fait = t.name AND m.colonne_fait = c.name)"
+    "WHERE m.table_fait = t.name AND m.colonne_fait = c.name) "
+    "AND NOT EXISTS (SELECT 1 FROM dw.mesure_calculee AS k "
+    "WHERE k.table_fait = t.name AND k.colonne_fait = c.name)"
 )
 
 
@@ -1782,7 +1785,8 @@ def controles_mesures(mesures: list[tuple], dates: list[tuple],
             ))
     if mesures:
         controles.append(ControleFait(
-            "dw : colonnes numériques des faits sans mesure déclarée (dw.contrat_mesure)",
+            "dw : colonnes numériques des faits sans mesure déclarée (dw.contrat_mesure, "
+            "dw.mesure_calculee)",
             0, REQUETE_MESURES_NON_DECLAREES,
         ))
     for fait, colonne, table, source in dates:

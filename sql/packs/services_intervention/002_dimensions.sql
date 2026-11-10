@@ -259,7 +259,7 @@ BEGIN
 END;
 GO
 
-/* Pièces du catalogue. Prix de vente, stock et CUMP initiaux sont repris par les calculs (étape 7.4).
+/* Pièces du catalogue. Le stock et le CUMP initiaux de la ligne retenue sont lus par le calcul du CUMP (script 004); le prix de vente n'est pas repris.
    Un fournisseur principal dont le code est en doublon est remplacé par son code principal. */
 CREATE TABLE dw.dim_piece (
     id_piece            int             NOT NULL,

@@ -916,8 +916,8 @@ def test_controles_mesures():
          Decimal("62.05"), True),
         ("dw.fait_e.credit : somme, égale à propre.fec.credit", Decimal("41.05"), True),
         ("dw.fait_e.credit : valeurs renseignées, comme propre.fec.credit", 2, False),
-        ("dw : colonnes numériques des faits sans mesure déclarée (dw.contrat_mesure)", 0,
-         False),
+        ("dw : colonnes numériques des faits sans mesure déclarée (dw.contrat_mesure, "
+         "dw.mesure_calculee)", 0, False),
         ("dw.fait_t.id_date : jour du calendrier égal à propre.t.jour, lignes en écart", 0,
          False),
         ("dw.fait_t.id_date : jour du calendrier égal à propre.t.jour, membres -1 / -2",

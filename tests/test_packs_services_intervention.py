@@ -1,14 +1,22 @@
 import datetime as dt
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pandas as pd
 
 from frigeo.ecriture_base import modules_verification
 from frigeo.packs.services_intervention import (
+    achats_retenus,
     chantiers_attendus,
     comparer_chantiers,
+    consommations,
+    couts_attendus,
+    cump_attendus,
+    cump_fin_de_mois,
     dates_stock_initial,
     liens,
+    mois_du_calcul,
+    pieces_catalogue,
     table_propre,
     verifier,
 )
@@ -160,24 +168,28 @@ def test_liens_par_le_premier_rattachement():
     assert liens(rattachements, "factures_lignes", "ref_piece", "catalogue_pieces") == {}
 
 
+def _table(source, colonnes, lignes, schema="propre"):
+    techniques = ["periode_export", "fichier_source", "feuille_source", "num_ligne_source",
+                  "retenue"]
+    return SimpleNamespace(schema=schema, table=SimpleNamespace(source=source),
+                           colonnes=techniques + colonnes, lignes=lignes)
+
+
 def _preparation():
-    colonnes = ["periode_export", "fichier_source", "feuille_source", "num_ligne_source",
-                "retenue", "categorie", "date_debut", "heure_debut"]
-    interventions = SimpleNamespace(
-        schema="propre", table=SimpleNamespace(source="interventions"), colonnes=colonnes,
-        lignes=[["2025", "interventions.csv", None, 2, 1, "Installation", "2025-03-11",
-                 "08:00:00"]],
-    )
-    chargement = SimpleNamespace(
-        schema="chargement", table=SimpleNamespace(source="interventions"),
-        colonnes=colonnes, lignes=[],
-    )
-    vides = [
-        SimpleNamespace(schema="propre", table=SimpleNamespace(source=nom),
-                        colonnes=colonnes[:5], lignes=[])
-        for nom in ("factures_lignes", "factures_entetes")
-    ]
-    return SimpleNamespace(tables=[chargement, interventions, *vides])
+    colonnes = ["categorie", "date_debut", "heure_debut"]
+    return SimpleNamespace(tables=[
+        _table("interventions", colonnes, [], schema="chargement"),
+        _table("interventions", colonnes,
+               [["2025", "interventions.csv", None, 2, 1, "Installation", "2025-03-11",
+                 "08:00:00"]]),
+        _table("factures_lignes", [], []),
+        _table("factures_entetes", [], []),
+        _table("catalogue_pieces", ["ref_piece", "stock_initial", "cump_initial"],
+               [[None, "catalogue.xlsx", None, 2, 1, "PCE-1", "2", "10.5"]]),
+        _table("achats_lignes", [], []),
+        _table("achats_entetes", [], []),
+        _table("pieces_interventions", [], []),
+    ])
 
 
 def test_table_propre():
@@ -187,37 +199,188 @@ def test_table_propre():
 
 
 class _Curseur:
-    def __init__(self, parametres, chantiers):
-        self.resultats = {"parametre_calcul": parametres, "fait_intervention": chantiers}
+    """Faux curseur : rend, pour chaque requête, les lignes de la première table citée."""
+
+    def __init__(self, parametres, chantiers, cump=(), couts=(), periode="2025-02"):
+        self.resultats = {
+            "dw.parametre_calcul": parametres, "dw.cump_mensuel": list(cump),
+            "dw.fait_consommation": list(couts), "dw.fait_intervention": chantiers,
+            "qualite.execution": [(periode,)],
+        }
         self.courant = None
 
     def execute(self, requete, *parametres):
-        self.courant = next(v for k, v in self.resultats.items() if f"dw.{k}" in requete)
+        self.courant = next(v for k, v in self.resultats.items() if k in requete)
 
     def fetchall(self):
         return self.courant
 
 
 def test_verifier():
+    cump = [("PCE-1", dt.date(2025, mois, 1), Decimal(2), Decimal("10.5"), Decimal(0),
+             Decimal(0), Decimal(0), Decimal(2), Decimal("10.5")) for mois in (1, 2)]
     curseur = _Curseur(
         list(PARAMETRES.items()),
         [("interventions.csv", None, 2, "interventions.csv", None, 2, 1, 1)],
+        cump,
     )
     controles = []
-    ecriture = SimpleNamespace(preparation=_preparation())
+    ecriture = SimpleNamespace(preparation=_preparation(), id_execution=1)
     sorties = SimpleNamespace(rattachements=SimpleNamespace(regles=[], lignes=pd.DataFrame()))
     regles = [{"type": "solde_jamais_negatif", "date_initial": dt.date(2025, 1, 1)}]
     verifier(curseur, ecriture, sorties, lambda *c: controles.append(c), regles)
-    assert [c[1:] for c in controles] == [("2025-01-01", "2025-01-01"), (0, 0), ("0 / 0", "0 / 0")]
+    assert [c[1:] for c in controles] == [
+        ("2025-01-01", "2025-01-01"), (0, 0), ("0 / 0", "0 / 0"),
+        (2, 2), (0, 0), (0, 0), ("aucun", "aucun"), (Decimal(0), Decimal(0)),
+    ]
+    # Un CUMP qui diffère d'un mois sort en écart.
+    cump[1] = cump[1][:-1] + (Decimal("10.4"),)
+    controles.clear()
+    verifier(_Curseur(list(PARAMETRES.items()), [], cump), ecriture, sorties,
+             lambda *c: controles.append(c), regles)
+    assert controles[4][1:] == (0, 1)
 
 
 def test_verifier_sans_rattachements():
     curseur = _Curseur(list(PARAMETRES.items()), [])
     controles = []
-    ecriture = SimpleNamespace(preparation=_preparation())
+    ecriture = SimpleNamespace(preparation=_preparation(), id_execution=1)
     verifier(curseur, ecriture, None, lambda *c: controles.append(c), [])
     assert controles[0][1:] == (None, "2025-01-01")
     assert controles[1][1:] == ("rattachements absents", None)
+    assert len(controles) == 2
+
+
+# --- CUMP et coût des pièces -----------------------------------------------------
+
+
+def _c(numero):
+    return ("catalogue.xlsx", None, numero)
+
+
+def _a(numero):
+    return ("achats.xlsx", "Lignes", numero)
+
+
+def _ea(numero):
+    return ("achats.xlsx", "Entetes", numero)
+
+
+def _p(numero):
+    return ("pieces.csv", None, numero)
+
+
+def test_mois_du_calcul():
+    mois = mois_du_calcul("2025-11-01", "2026-02")
+    assert mois == ["2025-11-01", "2025-12-01", "2026-01-01", "2026-02-01"]
+    assert mois_du_calcul("2025-01-01", "2025-01") == ["2025-01-01"]
+    assert mois_du_calcul("2025-03-01", "2025-02") == []
+
+
+def test_pieces_catalogue():
+    catalogue = {
+        _c(3): {"ref_piece": "PCE-1", "stock_initial": "9", "cump_initial": "1"},
+        _c(2): {"ref_piece": "PCE-1", "stock_initial": "2", "cump_initial": "30.85005"},
+        _c(4): {"ref_piece": "PCE-2", "stock_initial": None, "cump_initial": None},
+        _c(5): {"ref_piece": None, "stock_initial": "1", "cump_initial": "1"},
+    }
+    assert pieces_catalogue(catalogue) == {
+        "PCE-1": (Decimal(2), Decimal("30.8501")),  # première ligne, moitié vers le haut
+        "PCE-2": (Decimal(0), None),
+    }
+
+
+def test_cump_fin_de_mois():
+    d = Decimal
+    # (2 × 10 + 3 × 12) / 5
+    assert cump_fin_de_mois(d(2), d("10.0000"), d(3), d(36)) == d("11.2000")
+    # Sans achat, ou avoir qui rend le dénominateur nul : CUMP de début gardé.
+    assert cump_fin_de_mois(d(2), d("10.0000"), d(0), d(0)) == d("10.0000")
+    assert cump_fin_de_mois(d(1), d("10.0000"), d(-1), d(-12)) == d("10.0000")
+    # Stock négatif, ou sans CUMP connu : il pèse zéro.
+    assert cump_fin_de_mois(d(-3), d("10.0000"), d(2), d(25)) == d("12.5000")
+    assert cump_fin_de_mois(d(4), None, d(2), d(25)) == d("12.5000")
+    assert cump_fin_de_mois(d(0), None, d(0), d(0)) is None
+    # Arrondi à 4 décimales, la moitié s'éloignant de zéro.
+    assert cump_fin_de_mois(d(1), d("1.0000"), d(1), d("1.0001")) == d("1.0001")
+    # Opérandes ramenés à 6 décimales.
+    assert cump_fin_de_mois(d("0.0000004"), d("1.0000"), d(1), d(3)) == d(3)
+
+
+def test_achats_retenus():
+    lignes = {
+        _a(2): {"retenue": 1, "ref_piece": "PCE-1", "quantite": "3", "montant_ht": "36"},
+        _a(3): {"retenue": 1, "ref_piece": "PCE-1", "quantite": "-1", "montant_ht": "-12"},
+        _a(4): {"retenue": 0, "ref_piece": "PCE-1", "quantite": "1", "montant_ht": "1"},
+        _a(5): {"retenue": 1, "ref_piece": "PCE-1", "quantite": "1", "montant_ht": "1"},
+        _a(6): {"retenue": 1, "ref_piece": None, "quantite": "1", "montant_ht": "1"},
+        _a(7): {"retenue": 1, "ref_piece": "PCE-1", "quantite": None, "montant_ht": "1"},
+        _a(8): {"retenue": 1, "ref_piece": "PCE-1", "quantite": "1", "montant_ht": "1"},
+    }
+    entetes = {
+        _ea(2): {"retenue": 1, "date_facture": "2025-01-15"},
+        _ea(3): {"retenue": 1, "date_facture": "2025-02-01"},
+        _ea(4): {"retenue": 0, "date_facture": "2025-01-15"},
+    }
+    lien_entete = {_a(2): _ea(2), _a(3): _ea(3), _a(4): _ea(2), _a(5): _ea(4),
+                   _a(6): _ea(2), _a(7): _ea(2)}  # 8 : sans en-tête
+    lien_piece = {_a(n): _c(2) for n in (2, 3, 4, 5, 7, 8)}
+    catalogue = {_c(2): {"ref_piece": "PCE-1"}}
+    assert achats_retenus(lignes, entetes, lien_entete, lien_piece, catalogue) == [
+        ("PCE-1", "2025-01-01", Decimal(3), Decimal(36)),
+        ("PCE-1", "2025-02-01", Decimal(-1), Decimal(-12)),
+    ]
+
+
+def test_consommations_et_motifs():
+    mois = ["2025-01-01", "2025-02-01"]
+    lignes = {
+        _p(2): {"retenue": 1, "ref_piece": "PCE-1", "quantite": "2", "date_sortie": "2025-01-20"},
+        _p(3): {"retenue": 0, "ref_piece": "PCE-1", "quantite": "1", "date_sortie": "2025-02-03"},
+        _p(4): {"retenue": 1, "ref_piece": "PCE-1", "quantite": None, "date_sortie": None},
+        _p(5): {"retenue": 1, "ref_piece": None, "quantite": "1", "date_sortie": "2025-01-20"},
+        _p(6): {"retenue": 1, "ref_piece": "PCE-9", "quantite": "1", "date_sortie": "2025-01-20"},
+        _p(7): {"retenue": 1, "ref_piece": "PCE-1", "quantite": "1", "date_sortie": None},
+        _p(8): {"retenue": 1, "ref_piece": "PCE-1", "quantite": "1", "date_sortie": "2024-12-31"},
+    }
+    lien_piece = {_p(n): _c(2) for n in (2, 3, 4, 7, 8)}
+    catalogue = {_c(2): {"ref_piece": "PCE-1"}}
+    consommees = consommations(lignes, lien_piece, catalogue, mois)
+    assert {cle: v[4] for cle, v in consommees.items()} == {
+        _p(2): None, _p(3): None, _p(4): "quantité vide", _p(5): "pièce non renseignée",
+        _p(6): "pièce introuvable", _p(7): "date vide", _p(8): "date hors des mois du calcul",
+    }
+    assert consommees[_p(3)] == ("PCE-1", "2025-02-01", Decimal(1), False, None)
+
+
+def test_cump_attendus_et_couts():
+    mois = ["2025-01-01", "2025-02-01"]
+    pieces = {"PCE-1": (Decimal(2), Decimal("10.0000")), "PCE-2": (Decimal(0), None)}
+    achats = [("PCE-1", "2025-01-01", Decimal(3), Decimal(36)),
+              ("PCE-1", "2024-12-01", Decimal(5), Decimal(5))]  # hors des mois du calcul
+    consommees = {
+        _p(2): ("PCE-1", "2025-01-01", Decimal(2), True, None),
+        _p(3): ("PCE-1", "2025-02-01", Decimal("1.5"), True, None),
+        _p(4): ("PCE-1", "2025-02-01", Decimal(1), False, None),  # non retenue : hors stock
+        _p(5): ("PCE-2", "2025-01-01", Decimal(1), True, None),
+        _p(6): (None, None, None, True, "quantité vide"),
+    }
+    cump = cump_attendus(pieces, achats, consommees, mois)
+    d = Decimal
+    assert cump[("PCE-1", "2025-01-01")] == (d(2), d("10.0000"), d(3), d(36), d(2), d(3),
+                                            d("11.2000"))
+    assert cump[("PCE-1", "2025-02-01")] == (d(3), d("11.2000"), d(0), d(0), d("1.5"),
+                                            d("1.5"), d("11.2000"))
+    assert cump[("PCE-2", "2025-01-01")][5:] == (d(-1), None)
+    assert len(cump) == 4
+    couts = couts_attendus(consommees, cump)
+    assert couts == {
+        _p(2): (d("10.0000"), d("20.00"), None),  # CUMP de début du mois
+        _p(3): (d("11.2000"), d("16.80"), None),
+        _p(4): (d("11.2000"), d("11.20"), None),  # coût calculé, même non retenue
+        _p(5): (None, None, "CUMP inconnu"),
+        _p(6): (None, None, "quantité vide"),
+    }
 
 
 def test_modules_verification():

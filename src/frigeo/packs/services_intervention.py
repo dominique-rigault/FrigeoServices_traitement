@@ -19,12 +19,22 @@ Date du stock initial : la valeur de dw.parametre_calcul doit être celle de la
 de stock de config/gestion.yaml (type solde_jamais_negatif, clé date_initial),
 la même date étant déclarée aux deux endroits.
 
+CUMP et coût des pièces (`cump_attendus`, `couts_attendus`) : pour chaque pièce du
+catalogue et chaque mois, du mois du stock initial à celui de la période de fin, les
+achats (au mois de la date de leur facture, un avoir comptant en négatif) et les
+consommations retenus, d'une pièce connue et avec leur quantité, donnent le stock
+et le CUMP de fin de mois; chaque consommation est valorisée au CUMP de début de son
+mois, ou reçoit le motif qui l'en empêche. Les arrondis sont ceux du pack : opérandes
+à 6 décimales, CUMP à 4 décimales chaque mois, coût au centime, la moitié
+s'éloignant de zéro.
+
 Aucune valeur du client n'est affichée : seulement des décomptes et des dates de
 paramètres.
 """
 
 from __future__ import annotations
 
+from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Callable
 
 import pandas as pd
@@ -36,6 +46,30 @@ Lignage = tuple[str, "str | None", int]
 TYPE_STOCK = "solde_jamais_negatif"
 
 REQUETE_PARAMETRES = "SELECT cle, valeur FROM dw.parametre_calcul ORDER BY cle"
+REQUETE_PERIODE = "SELECT periode_fin FROM qualite.execution WHERE id_execution = ?"
+REQUETE_CUMP = (
+    "SELECT p.ref_piece, k.mois, k.stock_debut, k.cump_debut, k.quantite_achetee, "
+    "k.valeur_achats, k.quantite_consommee, k.stock_fin, k.cump_fin "
+    "FROM dw.cump_mensuel AS k JOIN dw.dim_piece AS p ON p.id_piece = k.id_piece"
+)
+REQUETE_COUTS = (
+    "SELECT fichier_source, feuille_source, num_ligne_source, cump_applique, cout_ht, "
+    "motif_calcul FROM dw.fait_consommation"
+)
+
+MOTIF_QUANTITE = "quantité vide"
+MOTIF_PIECE_VIDE = "pièce non renseignée"
+MOTIF_PIECE_INTROUVABLE = "pièce introuvable"
+MOTIF_DATE_VIDE = "date vide"
+MOTIF_HORS_MOIS = "date hors des mois du calcul"
+MOTIF_CUMP = "CUMP inconnu"
+MOTIFS = (MOTIF_QUANTITE, MOTIF_PIECE_VIDE, MOTIF_PIECE_INTROUVABLE, MOTIF_DATE_VIDE,
+          MOTIF_HORS_MOIS, MOTIF_CUMP)
+
+SIX = Decimal("0.000001")
+QUATRE = Decimal("0.0001")
+DEUX = Decimal("0.01")
+
 REQUETE_CHANTIERS = (
     "SELECT f.fichier_source, f.feuille_source, f.num_ligne_source, "
     "c.fichier_source, c.feuille_source, c.num_ligne_source, "
@@ -179,6 +213,185 @@ def comparer_chantiers(
     return ecarts, resume(attendu_complet), resume(obtenus)
 
 
+# --- CUMP et coût des pièces ----------------------------------------------------
+
+
+def _decimal(valeur) -> Decimal | None:
+    return None if valeur is None else Decimal(str(valeur))
+
+
+def _arrondi(nombre: Decimal, pas: Decimal) -> Decimal:
+    """Arrondi au plus proche, la moitié s'éloignant de zéro (ROUND de T-SQL)."""
+    return nombre.quantize(pas, rounding=ROUND_HALF_UP)
+
+
+def _mois(date) -> str | None:
+    """Premier jour du mois d'une date AAAA-MM-JJ."""
+    return None if date is None else str(date)[:7] + "-01"
+
+
+def mois_du_calcul(date_initiale: str, periode_fin: str) -> list[str]:
+    """Mois du calcul, du mois de la date du stock initial à celui de `periode_fin`
+    (AAAA-MM), en premiers jours de mois AAAA-MM-JJ."""
+    annee, mois = int(date_initiale[:4]), int(date_initiale[5:7])
+    fin = (int(periode_fin[:4]), int(periode_fin[5:7]))
+    resultat = []
+    while (annee, mois) <= fin:
+        resultat.append(f"{annee:04d}-{mois:02d}-01")
+        annee, mois = (annee + 1, 1) if mois == 12 else (annee, mois + 1)
+    return resultat
+
+
+def pieces_catalogue(catalogue: dict[Lignage, dict]) -> dict[str, tuple[Decimal, Decimal | None]]:
+    """Stock et CUMP initiaux de chaque pièce, par code : ceux de la première ligne du
+    catalogue de ce code dans l'ordre du lignage (comme dw.dim_piece); stock vide
+    compté zéro, CUMP arrondi à 4 décimales."""
+    pieces = {}
+    for cle in sorted(catalogue, key=_ordre_lignage):
+        ligne = catalogue[cle]
+        code = ligne.get("ref_piece")
+        if code is None or code in pieces:
+            continue
+        stock = _decimal(ligne.get("stock_initial")) or Decimal(0)
+        cump = _decimal(ligne.get("cump_initial"))
+        pieces[code] = (stock, None if cump is None else _arrondi(cump, QUATRE))
+    return pieces
+
+
+def _code_piece(cle: Lignage, ligne: dict, lien_piece: dict, catalogue: dict) -> tuple:
+    """(code de la pièce, motif) d'une ligne qui cite une pièce par ref_piece."""
+    if ligne.get("ref_piece") is None:
+        return None, MOTIF_PIECE_VIDE
+    reference = lien_piece.get(cle)
+    if reference is None or reference not in catalogue:
+        return None, MOTIF_PIECE_INTROUVABLE
+    return catalogue[reference].get("ref_piece"), None
+
+
+def achats_retenus(lignes: dict[Lignage, dict], entetes: dict[Lignage, dict],
+                   lien_entete: dict, lien_piece: dict,
+                   catalogue: dict[Lignage, dict]) -> list[tuple[str, str, Decimal, Decimal]]:
+    """Achats qui comptent dans le CUMP : (code, mois, quantité, montant HT) de chaque
+    ligne d'achat retenue (son en-tête trouvé retenu aussi), d'une pièce connue, avec
+    quantité, montant et date de facture de l'en-tête."""
+    resultat = []
+    for cle, ligne in lignes.items():
+        entete = entetes.get(lien_entete.get(cle)) if lien_entete.get(cle) else None
+        if ligne.get("retenue") != 1 or (entete is not None and entete.get("retenue") != 1):
+            continue
+        code, motif = _code_piece(cle, ligne, lien_piece, catalogue)
+        quantite, montant = _decimal(ligne.get("quantite")), _decimal(ligne.get("montant_ht"))
+        if motif or quantite is None or montant is None or entete is None:
+            continue
+        mois = _mois(entete.get("date_facture"))
+        if mois is not None:
+            resultat.append((code, mois, quantite, montant))
+    return resultat
+
+
+def consommations(lignes: dict[Lignage, dict], lien_piece: dict,
+                  catalogue: dict[Lignage, dict], mois: list[str]) -> dict[Lignage, tuple]:
+    """Chaque consommation, par lignage : (code, mois, quantité, retenue, motif), le
+    motif étant celui qui empêche de la valoriser avant le CUMP (quantité vide, pièce
+    non renseignée ou introuvable, date vide ou hors des mois du calcul), None sinon."""
+    resultat = {}
+    for cle, ligne in lignes.items():
+        quantite = _decimal(ligne.get("quantite"))
+        code, motif_piece = _code_piece(cle, ligne, lien_piece, catalogue)
+        date = ligne.get("date_sortie")
+        mois_ligne = _mois(date)
+        if quantite is None:
+            motif = MOTIF_QUANTITE
+        elif motif_piece:
+            motif = motif_piece
+        elif date is None:
+            motif = MOTIF_DATE_VIDE
+        elif mois_ligne not in mois:
+            motif = MOTIF_HORS_MOIS
+        else:
+            motif = None
+        resultat[cle] = (code, mois_ligne, quantite, ligne.get("retenue") == 1, motif)
+    return resultat
+
+
+def cump_fin_de_mois(stock_debut: Decimal, cump_debut: Decimal | None, quantite: Decimal,
+                     valeur: Decimal) -> Decimal | None:
+    """CUMP de fin de mois, comme dw.cump_fin_de_mois : stock négatif ou sans CUMP
+    pesant zéro, CUMP de début gardé sans achat ou si le dénominateur n'est pas
+    positif, opérandes à 6 décimales, résultat arrondi à 4 décimales."""
+    stock = _arrondi(stock_debut, SIX) if stock_debut > 0 and cump_debut is not None else Decimal(0)
+    achetee = _arrondi(quantite, SIX)
+    if achetee == 0 or stock + achetee <= 0:
+        return cump_debut
+    with localcontext() as contexte:
+        contexte.prec = 60
+        numerateur = stock * (cump_debut or Decimal(0)) + _arrondi(valeur, SIX)
+        return _arrondi(numerateur / (stock + achetee), QUATRE)
+
+
+def cump_attendus(pieces: dict[str, tuple[Decimal, Decimal | None]],
+                  achats: list[tuple], consommees: dict[Lignage, tuple],
+                  mois: list[str]) -> dict[tuple[str, str], tuple]:
+    """CUMP mensuel de chaque pièce, par (code, mois) : (stock de début, CUMP de début,
+    quantité achetée, valeur des achats, quantité consommée, stock de fin, CUMP de
+    fin), comme dw.cump_mensuel. Seules les consommations retenues, sans motif,
+    comptent."""
+    zero = Decimal(0)
+    totaux: dict[tuple[str, str], list[Decimal]] = {}
+    for code, mois_achat, quantite, montant in achats:
+        if code in pieces and mois_achat in mois:
+            total = totaux.setdefault((code, mois_achat), [zero, zero, zero])
+            total[0] += quantite
+            total[1] += montant
+    for code, mois_sortie, quantite, retenue, motif in consommees.values():
+        if retenue and motif is None and code in pieces:
+            totaux.setdefault((code, mois_sortie), [zero, zero, zero])[2] += quantite
+    resultat = {}
+    for code, (stock, cump) in pieces.items():
+        for mois_calcul in mois:
+            achetee, valeur, consommee = totaux.get((code, mois_calcul), (zero, zero, zero))
+            stock_fin = stock + achetee - consommee
+            cump_fin = cump_fin_de_mois(stock, cump, achetee, valeur)
+            resultat[(code, mois_calcul)] = (stock, cump, achetee, valeur, consommee,
+                                             stock_fin, cump_fin)
+            stock, cump = stock_fin, cump_fin
+    return resultat
+
+
+def couts_attendus(consommees: dict[Lignage, tuple],
+                   cump: dict[tuple[str, str], tuple]) -> dict[Lignage, tuple]:
+    """Chaque consommation, par lignage : (CUMP appliqué, coût HT, motif), au CUMP de
+    début de son mois, le coût arrondi au centime; vides avec le motif sinon."""
+    resultat = {}
+    for cle, (code, mois_sortie, quantite, _, motif) in consommees.items():
+        cump_debut = None if motif else cump[(code, mois_sortie)][1]
+        if motif is None and cump_debut is None:
+            motif = MOTIF_CUMP
+        if motif:
+            resultat[cle] = (None, None, motif)
+        else:
+            with localcontext() as contexte:
+                contexte.prec = 60
+                cout = _arrondi(_arrondi(quantite, SIX) * cump_debut, DEUX)
+            resultat[cle] = (cump_debut, cout, None)
+    return resultat
+
+
+def _ecarts(attendus: dict, obtenus: dict) -> int:
+    """Clés dont la valeur diffère, une clé absente d'un côté comptant comme un écart."""
+    return sum(1 for c in set(attendus) | set(obtenus) if attendus.get(c) != obtenus.get(c))
+
+
+def _motifs(couts: dict) -> str:
+    """« motif n » pour chaque motif présent, dans l'ordre de `MOTIFS`, ou « aucun »."""
+    comptes = {m: sum(1 for v in couts.values() if v[2] == m) for m in MOTIFS}
+    return "; ".join(f"{m} {n}" for m, n in comptes.items() if n) or "aucun"
+
+
+def _total(couts: dict) -> Decimal:
+    return sum((v[1] for v in couts.values() if v[1] is not None), Decimal(0))
+
+
 # --- Date du stock initial -------------------------------------------------------
 
 
@@ -244,3 +457,54 @@ def verifier(curseur, ecriture, sorties, ajouter: Callable, regles: list | None 
     )
     ajouter(libelle, 0, ecarts)
     ajouter(libelle_resume, resume_attendu, resume_obtenu)
+    _verifier_cump(curseur, ecriture, rattachements, parametres, ajouter)
+
+
+def _verifier_cump(curseur, ecriture, rattachements, parametres: dict, ajouter) -> None:
+    """Contrôles du CUMP mensuel et du coût des pièces (voir l'en-tête du module)."""
+    libelle_cump = ("dw.cump_mensuel : pièces et mois dont le stock, les mouvements ou le "
+                    "CUMP diffèrent du recalcul")
+    curseur.execute(REQUETE_PERIODE, ecriture.id_execution)
+    periode = curseur.fetchall()
+    date_initiale = parametres.get("date_stock_initial")
+    if not periode or date_initiale is None:
+        ajouter(libelle_cump, "période de fin ou date du stock initial absente", None)
+        return
+    mois = mois_du_calcul(date_initiale, str(periode[0][0]))
+    preparation = ecriture.preparation
+    catalogue = table_propre(preparation, "catalogue_pieces")
+    pieces = pieces_catalogue(catalogue)
+    achats = achats_retenus(
+        table_propre(preparation, "achats_lignes"),
+        table_propre(preparation, "achats_entetes"),
+        liens(rattachements, "achats_lignes", "num_piece_achat", "achats_entetes"),
+        liens(rattachements, "achats_lignes", "ref_piece", "catalogue_pieces"),
+        catalogue,
+    )
+    consommees = consommations(
+        table_propre(preparation, "pieces_interventions"),
+        liens(rattachements, "pieces_interventions", "ref_piece", "catalogue_pieces"),
+        catalogue, mois,
+    )
+    cump = cump_attendus(pieces, achats, consommees, mois)
+    couts = couts_attendus(consommees, cump)
+
+    curseur.execute(REQUETE_CUMP)
+    cump_obtenu = {
+        (str(code), mois_lu.isoformat() if hasattr(mois_lu, "isoformat") else str(mois_lu)):
+            tuple(_decimal(v) for v in valeurs)
+        for code, mois_lu, *valeurs in curseur.fetchall()
+    }
+    curseur.execute(REQUETE_COUTS)
+    couts_obtenus = {
+        lignage(f, fe, n): (_decimal(c), _decimal(t), m)
+        for f, fe, n, c, t, m in curseur.fetchall()
+    }
+    ajouter("dw.cump_mensuel : lignes (pièces × mois)", len(cump), len(cump_obtenu))
+    ajouter(libelle_cump, 0, _ecarts(cump, cump_obtenu))
+    ajouter("dw.fait_consommation : consommations dont le CUMP appliqué, le coût ou le "
+            "motif diffère du recalcul", 0, _ecarts(couts, couts_obtenus))
+    ajouter("dw.fait_consommation : consommations sans coût, par motif",
+            _motifs(couts), _motifs(couts_obtenus))
+    ajouter("dw.fait_consommation : coût total des pièces", _total(couts),
+            _total(couts_obtenus))

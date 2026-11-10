@@ -33,7 +33,10 @@
   La vérification compare les sommes des mesures à celles que Python a
   écrites dans propre, et contrôle ligne à ligne le jour du calendrier de
   chaque date déclarée. Toute colonne numérique d'une table de faits (hors
-  int, réservé aux clés et au lignage) doit avoir sa mesure déclarée.
+  int, réservé aux clés et au lignage) doit avoir sa mesure déclarée, ou
+  être déclarée comme mesure calculée par le pack (dw.mesure_calculee) : un
+  coût, un CUMP, que le module de vérification du pack refait en Python
+  (frigeo.packs.<pack>).
 
   Codes en doublon : un code que le métier a rattaché à un code principal
   (qualite.correspondance_cle, décisions « rattacher » retenues par le
@@ -120,6 +123,17 @@ CREATE TABLE dw.contrat_mesure (
     CONSTRAINT pk_contrat_mesure
         PRIMARY KEY (table_fait, colonne_fait, table_propre, colonne_propre),
     CONSTRAINT ck_contrat_mesure_signe CHECK (signe IN (1, -1))
+);
+GO
+
+/* Une mesure d'un fait de dw calculée par le pack (étape 7.4), et non reprise
+   de propre : elle n'a pas de colonne source, et sa vérification revient au
+   module de vérification du pack, qui la refait en Python. */
+CREATE TABLE dw.mesure_calculee (
+    table_fait    nvarchar(128)   NOT NULL,
+    colonne_fait  nvarchar(128)   NOT NULL,
+    description   nvarchar(4000)  NOT NULL,
+    CONSTRAINT pk_mesure_calculee PRIMARY KEY (table_fait, colonne_fait)
 );
 GO
 
