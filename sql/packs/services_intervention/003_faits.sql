@@ -26,6 +26,10 @@
   Les rattachements lus sont déclarés dans dw.contrat_rattachement : un
   rattachement absent de l'exécution fait échouer la reconstruction.
 
+  Mesures et dates : chaque colonne numérique d'un fait reprise de propre est
+  déclarée dans dw.contrat_mesure, et chaque date lue sur la ligne même du
+  fait dans dw.contrat_date, pour la vérification de l'écriture.
+
   Lien vers une autre ligne de fait (une consommation ou une ligne de facture
   vers son intervention) : la clé de la ligne de fait que désigne le
   rattachement, NULL sinon, avec lien_intervention qui dit pourquoi
@@ -97,6 +101,20 @@ INSERT INTO dw.source_fait (table_fait, table_source) VALUES
     (N'fait_ligne_facture', N'factures_lignes'),
     (N'fait_achat', N'achats_lignes'),
     (N'fait_ecriture', N'fec');
+GO
+
+/* Mesures et dates des faits des interventions et des consommations. */
+INSERT INTO dw.contrat_mesure
+    (table_fait, colonne_fait, table_propre, colonne_propre, signe) VALUES
+    (N'fait_intervention', N'duree_min', N'interventions', N'duree_min', 1),
+    (N'fait_intervention', N'duree_trajet_min', N'interventions', N'duree_trajet_min', 1),
+    (N'fait_intervention', N'distance_km', N'interventions', N'distance_km', 1),
+    (N'fait_consommation', N'quantite', N'pieces_interventions', N'quantite', 1);
+GO
+
+INSERT INTO dw.contrat_date (table_fait, colonne_fait, table_propre, colonne_propre) VALUES
+    (N'fait_intervention', N'id_date', N'interventions', N'date_debut'),
+    (N'fait_consommation', N'id_date', N'pieces_interventions', N'date_sortie');
 GO
 
 /*
@@ -342,6 +360,22 @@ INSERT INTO dw.contrat_rattachement
     (N'achats_entetes', N'code_fournisseur', N'fournisseurs', NULL, NULL, NULL),
     (N'achats_lignes', N'ref_piece', N'catalogue_pieces',
      N'fait_achat', N'id_piece', N'membre');
+GO
+
+/* Mesures des faits des documents. Leurs dates venant de l'en-tête, elles ne
+   sont pas déclarées dans dw.contrat_date. */
+INSERT INTO dw.contrat_mesure
+    (table_fait, colonne_fait, table_propre, colonne_propre, signe) VALUES
+    (N'fait_ligne_facture', N'num_ligne', N'factures_lignes', N'num_ligne', 1),
+    (N'fait_ligne_facture', N'quantite', N'factures_lignes', N'quantite', 1),
+    (N'fait_ligne_facture', N'pu_ht', N'factures_lignes', N'pu_ht', 1),
+    (N'fait_ligne_facture', N'remise_pct', N'factures_lignes', N'remise_pct', 1),
+    (N'fait_ligne_facture', N'montant_ht', N'factures_lignes', N'montant_ht', 1),
+    (N'fait_ligne_facture', N'taux_tva', N'factures_lignes', N'taux_tva', 1),
+    (N'fait_achat', N'num_ligne', N'achats_lignes', N'num_ligne', 1),
+    (N'fait_achat', N'quantite', N'achats_lignes', N'quantite', 1),
+    (N'fait_achat', N'pu_achat_ht', N'achats_lignes', N'pu_achat_ht', 1),
+    (N'fait_achat', N'montant_ht', N'achats_lignes', N'montant_ht', 1);
 GO
 
 /*
@@ -666,6 +700,21 @@ INSERT INTO dw.contrat_rattachement
     (table_source, cle, table_reference, table_fait, colonne_fait, forme) VALUES
     (N'fec', N'PieceRef', N'factures_entetes', N'fait_ecriture', N'num_facture', N'numero'),
     (N'fec', N'PieceRef', N'achats_entetes', N'fait_ecriture', N'num_piece_achat', N'numero');
+GO
+
+/* Mesures et dates du fait des écritures : le solde est la somme du débit et
+   de l'opposé du crédit. */
+INSERT INTO dw.contrat_mesure
+    (table_fait, colonne_fait, table_propre, colonne_propre, signe) VALUES
+    (N'fait_ecriture', N'debit', N'fec', N'debit', 1),
+    (N'fait_ecriture', N'credit', N'fec', N'credit', 1),
+    (N'fait_ecriture', N'solde', N'fec', N'debit', 1),
+    (N'fait_ecriture', N'solde', N'fec', N'credit', -1);
+GO
+
+INSERT INTO dw.contrat_date (table_fait, colonne_fait, table_propre, colonne_propre) VALUES
+    (N'fait_ecriture', N'id_date', N'fec', N'ecriture_date'),
+    (N'fait_ecriture', N'id_date_piece', N'fec', N'piece_date');
 GO
 
 /*

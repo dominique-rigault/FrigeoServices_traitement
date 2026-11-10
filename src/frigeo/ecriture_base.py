@@ -1205,7 +1205,12 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     numéros renseignés) égaux aux clés vides, introuvables (ou lignes rattachées) du
     bilan des rattachements (`controles_faits`); pour chaque table dont le pack regroupe
     les codes en doublon, aucun membre pour un code en doublon et, avec `sorties`, les
-    codes en doublon comptés sur les membres principaux (`controles_regroupements`).
+    codes en doublon comptés sur les membres principaux (`controles_regroupements`);
+    pour chaque mesure déclarée par le pack, somme (et, pour une mesure à une seule
+    source, valeurs renseignées) égale à celle de ses colonnes de propre, aucune
+    colonne numérique d'un fait sans mesure déclarée, et, pour chaque date d'un fait
+    lue sur sa ligne de propre, jour du calendrier égal à celui de propre ligne à
+    ligne, autant de -1 que de dates vides et aucun -2 (`controles_mesures`).
     """
     from sqlalchemy import text
 
@@ -1349,18 +1354,42 @@ REQUETE_REGROUPEMENTS = (
     "SELECT table_source, table_dimension, colonne_code FROM dw.regroupement_codes "
     "ORDER BY table_source"
 )
+REQUETE_MESURES = (
+    "SELECT table_fait, colonne_fait, table_propre, colonne_propre, signe "
+    "FROM dw.contrat_mesure ORDER BY table_fait, colonne_fait, signe DESC, table_propre, "
+    "colonne_propre"
+)
+REQUETE_DATES = (
+    "SELECT table_fait, colonne_fait, table_propre, colonne_propre "
+    "FROM dw.contrat_date ORDER BY table_fait, colonne_fait"
+)
+# Colonnes numériques (hors int, réservé aux clés et au lignage) des tables de faits
+# qui ne sont pas déclarées dans dw.contrat_mesure.
+REQUETE_MESURES_NON_DECLAREES = (
+    "SELECT COUNT(*) FROM sys.columns AS c "
+    "JOIN sys.tables AS t ON t.object_id = c.object_id "
+    "JOIN sys.schemas AS s ON s.schema_id = t.schema_id "
+    "JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id "
+    "WHERE s.name = N'dw' AND t.name LIKE N'fait[_]%' "
+    "AND ty.name IN (N'bigint', N'decimal', N'numeric', N'float', N'real', N'money', "
+    "N'smallmoney') "
+    "AND NOT EXISTS (SELECT 1 FROM dw.contrat_mesure AS m "
+    "WHERE m.table_fait = t.name AND m.colonne_fait = c.name)"
+)
 
 
 @dataclass(frozen=True)
 class ControleFait:
     """Un contrôle d'un fait de dw : libellé, valeur attendue (calculée en Python) et
     requête qui rend la valeur obtenue en une ligne, une colonne par nombre (None si
-    le contrôle est impossible, `probleme` disant pourquoi)."""
+    le contrôle est impossible, `probleme` disant pourquoi). `masque` : agrégat d'une
+    colonne sensible, affiché « masqué »."""
 
     libelle: str
     attendu: object
     requete: str | None
     probleme: str | None = None
+    masque: bool = False
 
 
 def _nom_dw(nom) -> bool:
@@ -1472,10 +1501,143 @@ def controles_regroupements(regroupements: list[tuple], correspondances: pd.Data
     return controles
 
 
+def _tables_propre(preparation: Preparation) -> dict[str, TablePreparee]:
+    return {p.table.nom: p for p in preparation.tables if p.schema == SCHEMA_PROPRE}
+
+
+def _valeurs_propre(propres: dict[str, TablePreparee], table, colonne):
+    """Valeurs écrites dans propre.table.colonne et sa colonne de données, ou le
+    problème qui l'en empêche (texte)."""
+    if not (_nom_dw(table) and _nom_dw(colonne)):
+        return None, None, "nom de table ou de colonne de propre invalide"
+    preparee = propres.get(table)
+    if preparee is None:
+        return None, None, "table absente de l'écriture"
+    if colonne not in preparee.colonnes:
+        return None, None, "colonne absente de l'écriture"
+    rang = preparee.colonnes.index(colonne)
+    donnees = [c for c in preparee.table.colonnes if c.nom == colonne]
+    return [l[rang] for l in preparee.lignes], (donnees[0] if donnees else None), None
+
+
+def _terme(rang: int, table: str, colonne: str, signe) -> str:
+    nom = f"propre.{table}.{colonne}"
+    if rang == 0:
+        return nom if signe == 1 else f"-{nom}"
+    return f" + {nom}" if signe == 1 else f" - {nom}"
+
+
+def controles_mesures(mesures: list[tuple], dates: list[tuple],
+                      preparation: Preparation) -> list[ControleFait]:
+    """Contrôles des mesures et des dates des faits déclarés par le pack, sans valeur
+    du client, contre les lignes que Python a écrites dans propre (`preparation`).
+
+    `mesures` : (fait, mesure, table de propre, colonne de propre, signe) de
+    dw.contrat_mesure, une mesure calculée ayant une ligne par colonne source. Pour
+    chaque mesure, la somme de la colonne du fait est égale à la somme, affectée du
+    signe, de ses colonnes sources (exacte, un vide ne comptant pas); pour une mesure
+    à une seule source, leurs nombres de valeurs renseignées sont égaux aussi. La
+    somme est masquée à l'affichage si une colonne source est sensible. Enfin, toute
+    colonne numérique (hors int) d'une table de faits doit être déclarée.
+
+    `dates` : (fait, colonne, table de propre, colonne de propre) de dw.contrat_date,
+    pour une date lue sur la ligne même de propre dont le fait a une ligne : aucune
+    ligne du fait dont la clé du calendrier ne désigne pas le jour de propre de même
+    lignage (-1 pour une date vide, un jour hors calendrier étant un écart), puis
+    autant de -1 que de dates vides et aucun -2.
+
+    Un nom qui n'est pas un identifiant simple, un signe autre que 1 ou -1, une table
+    ou une colonne absente de l'écriture ou une date qui n'en est pas une rendent un
+    contrôle impossible (`probleme`).
+    """
+    propres = _tables_propre(preparation)
+    controles = []
+    groupes: dict[tuple, list[tuple]] = {}
+    for fait, mesure, table, colonne, signe in mesures:
+        groupes.setdefault((fait, mesure), []).append((table, colonne, signe))
+    for (fait, mesure), sources in groupes.items():
+        termes = "".join(_terme(r, t, c, s) for r, (t, c, s) in enumerate(sources))
+        libelle = f"dw.{fait}.{mesure} : somme, égale à {termes}"
+        probleme = None
+        if not (_nom_dw(fait) and _nom_dw(mesure)):
+            probleme = "nom de fait ou de mesure invalide"
+        elif any(s not in (1, -1) for _, _, s in sources):
+            probleme = "signe invalide"
+        lues = []
+        for table, colonne, signe in sources:
+            valeurs, donnee, absente = _valeurs_propre(propres, table, colonne)
+            probleme = probleme or absente
+            lues.append((valeurs, donnee, signe))
+        if probleme:
+            controles.append(ControleFait(libelle, None, None, probleme))
+            continue
+        with localcontext() as contexte:
+            contexte.prec = 60
+            somme = sum(
+                (int(signe) * Decimal(v) for valeurs, _, signe in lues for v in valeurs
+                 if v is not None),
+                Decimal(0),
+            )
+        masque = any(d is not None and d.sensible for _, d, _ in lues)
+        controles.append(ControleFait(
+            libelle, somme, f"SELECT COALESCE(SUM({mesure}), 0) FROM dw.{fait}", masque=masque
+        ))
+        if len(sources) == 1:
+            table, colonne, _ = sources[0]
+            controles.append(ControleFait(
+                f"dw.{fait}.{mesure} : valeurs renseignées, comme propre.{table}.{colonne}",
+                sum(1 for v in lues[0][0] if v is not None),
+                f"SELECT COUNT({mesure}) FROM dw.{fait}",
+            ))
+    if mesures:
+        controles.append(ControleFait(
+            "dw : colonnes numériques des faits sans mesure déclarée (dw.contrat_mesure)",
+            0, REQUETE_MESURES_NON_DECLAREES,
+        ))
+    for fait, colonne, table, source in dates:
+        libelle = f"dw.{fait}.{colonne} : jour du calendrier égal à propre.{table}.{source}"
+        valeurs, donnee, probleme = _valeurs_propre(propres, table, source)
+        if not (_nom_dw(fait) and _nom_dw(colonne)):
+            probleme = "nom de fait ou de colonne invalide"
+        elif probleme is None and (donnee is None or donnee.famille != FAMILLE_DATE):
+            probleme = "colonne de propre qui n'est pas une date"
+        if probleme:
+            controles.append(ControleFait(libelle, None, None, probleme))
+            continue
+        controles.append(ControleFait(
+            libelle + ", lignes en écart",
+            0,
+            f"SELECT COUNT(*) FROM dw.{fait} AS f "
+            f"LEFT JOIN propre.{table} AS p ON p.id_chargement = f.id_chargement "
+            f"AND p.num_ligne_source = f.num_ligne_source "
+            f"LEFT JOIN dw.dim_date AS d ON d.id_date = f.{colonne} "
+            f"WHERE p.id_chargement IS NULL "
+            f"OR (p.{source} IS NULL AND f.{colonne} <> -1) "
+            f"OR (p.{source} IS NOT NULL AND (d.date_jour IS NULL OR d.date_jour <> p.{source}))",
+        ))
+        controles.append(ControleFait(
+            libelle + ", membres -1 / -2",
+            f"{sum(1 for v in valeurs if v is None)} / 0",
+            f"SELECT SUM(CASE WHEN {colonne} = -1 THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN {colonne} = -2 THEN 1 ELSE 0 END) FROM dw.{fait}",
+        ))
+    return controles
+
+
+def _nombre_lu(valeur):
+    """Nombre rendu par le serveur : entier tel quel, autre nombre en Decimal, NULL
+    compté comme zéro."""
+    if valeur is None:
+        return 0
+    if isinstance(valeur, int) and not isinstance(valeur, bool):
+        return valeur
+    return valeur_lue(valeur)
+
+
 def _obtenu(rangee: tuple):
     """Valeur obtenue d'un contrôle de fait : un nombre, ou « n / m »."""
-    nombres = [0 if v is None else int(v) for v in rangee]
-    return nombres[0] if len(nombres) == 1 else " / ".join(map(str, nombres))
+    nombres = [_nombre_lu(v) for v in rangee]
+    return nombres[0] if len(nombres) == 1 else " / ".join(str(_affiche(n)) for n in nombres)
 
 
 def _journal_en_texte(journal) -> str | None:
@@ -1485,8 +1647,9 @@ def _journal_en_texte(journal) -> str | None:
 def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
                  correspondances=None) -> None:
     """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte, puis
-    ceux des faits déclarés par le pack (`controles_faits`) et des codes en doublon
-    qu'il regroupe (`controles_regroupements`)."""
+    ceux des faits déclarés par le pack (`controles_faits`), des codes en doublon
+    qu'il regroupe (`controles_regroupements`) et des mesures et des dates des faits
+    (`controles_mesures`)."""
     import pyodbc
 
     from .base import procedure_reconstruction_presente
@@ -1523,12 +1686,20 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
         bilan = None if rattachements is None else rattachements.bilan
         curseur.execute(REQUETE_REGROUPEMENTS)
         regroupements = [tuple(r) for r in curseur.fetchall()]
-        for controle in controles_faits(sources, contrats, ecriture.lignes, bilan) + \
-                controles_regroupements(regroupements, correspondances, ecriture.id_execution):
+        curseur.execute(REQUETE_MESURES)
+        mesures = [(f, m, t, c, int(s)) for f, m, t, c, s in curseur.fetchall()]
+        curseur.execute(REQUETE_DATES)
+        dates = [tuple(r) for r in curseur.fetchall()]
+        controles = controles_faits(sources, contrats, ecriture.lignes, bilan) + \
+            controles_regroupements(regroupements, correspondances, ecriture.id_execution)
+        if ecriture.preparation is not None:
+            controles += controles_mesures(mesures, dates, ecriture.preparation)
+        for controle in controles:
             if controle.requete is None:
                 ajouter(FAMILLE_DW, controle.libelle, controle.probleme, None)
                 continue
             curseur.execute(controle.requete)
-            ajouter(FAMILLE_DW, controle.libelle, controle.attendu, _obtenu(tuple(curseur.fetchone())))
+            ajouter(FAMILLE_DW, controle.libelle, controle.attendu,
+                    _obtenu(tuple(curseur.fetchone())), controle.masque)
     finally:
         curseur.close()

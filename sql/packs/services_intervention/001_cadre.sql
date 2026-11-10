@@ -26,6 +26,15 @@
   l'exécution, au lieu d'envoyer toutes les lignes vers le membre
   « introuvable ».
 
+  Contrat des mesures et des dates : pour la vérification de l'écriture
+  (frigeo.ecriture_base.controles_mesures), le pack déclare de quelles
+  colonnes de propre chaque mesure d'un fait est tirée (dw.contrat_mesure) et
+  quelles dates d'un fait sont lues sur sa ligne de propre (dw.contrat_date).
+  La vérification compare les sommes des mesures à celles que Python a
+  écrites dans propre, et contrôle ligne à ligne le jour du calendrier de
+  chaque date déclarée. Toute colonne numérique d'une table de faits (hors
+  int, réservé aux clés et au lignage) doit avoir sa mesure déclarée.
+
   Codes en doublon : un code que le métier a rattaché à un code principal
   (qualite.correspondance_cle, décisions « rattacher » retenues par le
   nettoyage) n'a pas de membre dans sa dimension, et les faits qui le citent
@@ -84,6 +93,42 @@ CREATE TABLE dw.source_fait (
     table_fait    nvarchar(128)  NOT NULL,
     table_source  nvarchar(128)  NOT NULL,
     CONSTRAINT pk_source_fait PRIMARY KEY (table_fait)
+);
+GO
+
+/* Une mesure d'un fait de dw et la colonne de propre dont elle est tirée,
+   avec son signe (noms en base, comme dans dw.contrat_entree). Une mesure
+   calculée a une ligne par colonne source : le solde d'une écriture, débit
+   moins crédit, a la ligne du débit (signe 1) et celle du crédit (signe -1).
+   La vérification de l'écriture compare la somme de la mesure à la somme,
+   affectée du signe, de ses colonnes sources dans propre (un vide ne comptant
+   pas), et, pour une mesure à une seule source, leurs nombres de valeurs
+   renseignées. */
+CREATE TABLE dw.contrat_mesure (
+    table_fait      nvarchar(128)  NOT NULL,
+    colonne_fait    nvarchar(128)  NOT NULL,
+    table_propre    nvarchar(128)  NOT NULL,
+    colonne_propre  nvarchar(128)  NOT NULL,
+    signe           smallint       NOT NULL,
+    CONSTRAINT pk_contrat_mesure
+        PRIMARY KEY (table_fait, colonne_fait, table_propre, colonne_propre),
+    CONSTRAINT ck_contrat_mesure_signe CHECK (signe IN (1, -1))
+);
+GO
+
+/* Une date d'un fait de dw (sa clé vers dw.dim_date) lue sur la ligne de
+   propre dont le fait a une ligne, de même lignage (noms en base). La
+   vérification de l'écriture contrôle ligne à ligne que la clé désigne le
+   jour de propre, -1 pour une date vide, une date hors calendrier étant un
+   écart. Une date reprise d'un en-tête (date de facture d'une ligne de
+   facture) n'y figure pas : ses -1 et -2 mêlent un en-tête absent et une date
+   vide. */
+CREATE TABLE dw.contrat_date (
+    table_fait      nvarchar(128)  NOT NULL,
+    colonne_fait    nvarchar(128)  NOT NULL,
+    table_propre    nvarchar(128)  NOT NULL,
+    colonne_propre  nvarchar(128)  NOT NULL,
+    CONSTRAINT pk_contrat_date PRIMARY KEY (table_fait, colonne_fait)
 );
 GO
 

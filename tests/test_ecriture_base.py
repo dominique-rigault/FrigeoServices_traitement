@@ -13,9 +13,13 @@ from frigeo.ecriture_base import (
     CLE_LIGNAGE,
     CLE_LIGNAGE_REFERENCE,
     ControleFait,
+    Preparation,
     SortiesQualite,
+    TablePreparee,
     controles_faits,
+    controles_mesures,
     controles_regroupements,
+    _obtenu,
     attendus_table,
     champ_sensible,
     conformite,
@@ -44,7 +48,7 @@ from frigeo.ecriture_base import (
 )
 from frigeo.dictionnaire import MOTIF_SENSIBLE, est_masquee
 from frigeo.nettoyage import empreinte_valeur
-from frigeo.structure_base import construire_structure
+from frigeo.structure_base import ColonneBase, TableBase, construire_structure
 
 
 # --- Valeurs de chargement ---------------------------------------------------------
@@ -827,3 +831,106 @@ def test_controles_regroupements():
     assert [c.libelle for c in controles_regroupements(regroupements[:1], None, 7)] == [
         "dw.dim_client : codes en doublon de clients, aucun n'a de membre"
     ]
+
+
+def _preparation_mesures():
+    """Deux tables de propre (lignage puis données), puis la première en chargement,
+    qui ne doit pas être lue."""
+    lignage = ["periode_export", "fichier_source", "feuille_source", "num_ligne_source"]
+    fait = TableBase("t", "t", (
+        ColonneBase("Qte", "qte", "décimal", "décimal", False),
+        ColonneBase("Duree", "duree", "entier", "entier", False),
+        ColonneBase("Jour", "jour", "date", "date", False),
+        ColonneBase("Code", "code", "texte", "texte", False),
+    ))
+    fec = TableBase("fec", "fec", (
+        ColonneBase("Debit", "debit", "décimal", "décimal", False),
+        ColonneBase("Credit", "credit", "décimal", "décimal", True),
+    ))
+    def lignes(*valeurs):
+        return [["2025", "f.csv", None, i + 2, *v] for i, v in enumerate(valeurs)]
+    return Preparation(
+        [
+            TablePreparee(fait, "propre", lignage + ["qte", "duree", "jour", "code"], [],
+                          lignes(("1.5", "10", "2025-01-02", "a"), (None, "20", None, "b"),
+                                 ("0.25", None, "2025-03-04", None))),
+            TablePreparee(fec, "propre", lignage + ["debit", "credit"], [],
+                          lignes(("100.10", None), (None, "40.05"), ("3", "1"))),
+            TablePreparee(fait, "chargement", lignage + ["qte", "duree", "jour", "code"], [],
+                          lignes(("999", "999", "x", "x"))),
+        ],
+        [], pd.DataFrame(), pd.DataFrame(),
+    )
+
+
+def test_controles_mesures():
+    mesures = [
+        ("fait_t", "quantite", "t", "qte", 1),
+        ("fait_t", "duree_min", "t", "duree", 1),
+        ("fait_e", "solde", "fec", "debit", 1),
+        ("fait_e", "solde", "fec", "credit", -1),
+        ("fait_e", "credit", "fec", "credit", 1),
+    ]
+    dates = [("fait_t", "id_date", "t", "jour")]
+    controles = controles_mesures(mesures, dates, _preparation_mesures())
+    assert [(c.libelle, c.attendu, c.masque) for c in controles] == [
+        ("dw.fait_t.quantite : somme, égale à propre.t.qte", Decimal("1.75"), False),
+        ("dw.fait_t.quantite : valeurs renseignées, comme propre.t.qte", 2, False),
+        ("dw.fait_t.duree_min : somme, égale à propre.t.duree", Decimal(30), False),
+        ("dw.fait_t.duree_min : valeurs renseignées, comme propre.t.duree", 2, False),
+        ("dw.fait_e.solde : somme, égale à propre.fec.debit - propre.fec.credit",
+         Decimal("62.05"), True),
+        ("dw.fait_e.credit : somme, égale à propre.fec.credit", Decimal("41.05"), True),
+        ("dw.fait_e.credit : valeurs renseignées, comme propre.fec.credit", 2, False),
+        ("dw : colonnes numériques des faits sans mesure déclarée (dw.contrat_mesure)", 0,
+         False),
+        ("dw.fait_t.id_date : jour du calendrier égal à propre.t.jour, lignes en écart", 0,
+         False),
+        ("dw.fait_t.id_date : jour du calendrier égal à propre.t.jour, membres -1 / -2",
+         "1 / 0", False),
+    ]
+    assert all(c.probleme is None for c in controles)
+    assert controles[0].requete == "SELECT COALESCE(SUM(quantite), 0) FROM dw.fait_t"
+    assert controles[1].requete == "SELECT COUNT(quantite) FROM dw.fait_t"
+    assert "NOT EXISTS (SELECT 1 FROM dw.contrat_mesure" in controles[7].requete
+    ecart = controles[8].requete
+    assert "LEFT JOIN propre.t AS p ON p.id_chargement = f.id_chargement" in ecart
+    assert "LEFT JOIN dw.dim_date AS d ON d.id_date = f.id_date" in ecart
+    assert "(p.jour IS NULL AND f.id_date <> -1)" in ecart
+    assert "d.date_jour <> p.jour" in ecart
+    assert "id_date = -2" in controles[9].requete
+    # Sans mesure déclarée, pas de contrôle des colonnes non déclarées.
+    assert controles_mesures([], [], _preparation_mesures()) == []
+
+
+def test_controles_mesures_impossibles_sans_requete():
+    mesures = [
+        ("fait t", "quantite", "t", "qte", 1),
+        ("fait_t", "quantite2", "t", "qte", 2),
+        ("fait_t", "quantite3", "u", "qte", 1),
+        ("fait_t", "quantite4", "t", "absente", 1),
+        ("fait_t", "quantite5", "t", "qte;", 1),
+    ]
+    dates = [
+        ("fait_t", "id_date", "t", "code"),
+        ("fait_t", "id-date", "t", "jour"),
+        ("fait_t", "id_date", "t", "absente"),
+    ]
+    controles = controles_mesures(mesures, dates, _preparation_mesures())
+    assert [c.probleme for c in controles] == [
+        "nom de fait ou de mesure invalide", "signe invalide", "table absente de l'écriture",
+        "colonne absente de l'écriture", "nom de table ou de colonne de propre invalide",
+        None,
+        "colonne de propre qui n'est pas une date", "nom de fait ou de colonne invalide",
+        "colonne absente de l'écriture",
+    ]
+    assert all(c.requete is None and c.attendu is None
+               for c in controles if c.probleme is not None)
+
+
+def test_obtenu():
+    assert _obtenu((5,)) == 5
+    assert _obtenu((None,)) == 0
+    assert _obtenu((Decimal("12.50000000"),)) == Decimal("12.5")
+    assert _obtenu((3, None)) == "3 / 0"
+    assert _obtenu((Decimal("1.50000000"), 2)) == "1.5 / 2"
