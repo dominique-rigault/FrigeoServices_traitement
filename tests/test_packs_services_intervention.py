@@ -230,7 +230,7 @@ def test_verifier():
     cump = [("PCE-1", dt.date(2025, mois, 1), Decimal(2), Decimal("10.5"), Decimal(0),
              Decimal(0), Decimal(0), Decimal(2), Decimal("10.5")) for mois in (1, 2)]
     marges = [("interventions.csv", None, 2, Decimal(0), None, None, Decimal(0), None,
-               "intervenant non rattaché", False)]
+               "intervenant non rattaché")]
     curseur = _Curseur(
         list(PARAMETRES.items()),
         [("interventions.csv", None, 2, "interventions.csv", None, 2, 1, 1)],
@@ -431,23 +431,28 @@ REMUNERATIONS = {
             "salaire_brut_mensuel": "1000", "taux_activite": "0.5"},
 }
 PARAMETRES_COUTS = {
-    _pc(3): {"retenue": 1, "annee": "2025", "cout_km": "0.45", "taux_charges_cdi_cdd": "0.42",
+    _pc(2): {"retenue": 1, "annee": "2025", "cout_km": "0.45", "taux_charges_cdi_cdd": "0.42",
              "taux_charges_apprenti": "0.05", "heures_annuelles": "1607"},
-    _pc(2): {"retenue": 0, "annee": "2025", "cout_km": "9", "taux_charges_cdi_cdd": "9",
+    _pc(3): {"retenue": 1, "annee": "2025", "cout_km": "9", "taux_charges_cdi_cdd": "9",
              "taux_charges_apprenti": "9", "heures_annuelles": "1"},
+    _pc(4): {"retenue": 0, "annee": "2026", "cout_km": "0.46", "taux_charges_cdi_cdd": "0.42",
+             "taux_charges_apprenti": "0.05", "heures_annuelles": "1607"},
 }
 
 
 def test_remuneration_en_vigueur():
-    assert remuneration_en_vigueur(REMUNERATIONS, "TEC-1", "2025-12-31")["salaire_brut_mensuel"] == "2400"
+    assert remuneration_en_vigueur(REMUNERATIONS, "TEC-1", "2025-05-31")["salaire_brut_mensuel"] == "2400"
+    # Une ligne non retenue reste la rémunération en vigueur : elle n'est pas remplacée.
+    assert remuneration_en_vigueur(REMUNERATIONS, "TEC-1", "2025-12-31")["retenue"] == 0
     assert remuneration_en_vigueur(REMUNERATIONS, "TEC-1", "2026-01-01")["salaire_brut_mensuel"] == "2460"
     assert remuneration_en_vigueur(REMUNERATIONS, "TEC-1", "2024-12-31") is None
     assert remuneration_en_vigueur(REMUNERATIONS, "TEC-9", "2025-06-01") is None
 
 
 def test_parametres_annee():
-    assert parametres_annee(PARAMETRES_COUTS, 2025)["cout_km"] == "0.45"  # ligne retenue
-    assert parametres_annee(PARAMETRES_COUTS, 2026) is None
+    assert parametres_annee(PARAMETRES_COUTS, 2025)["cout_km"] == "0.45"  # première ligne
+    assert parametres_annee(PARAMETRES_COUTS, 2026)["retenue"] == 0  # même non retenue
+    assert parametres_annee(PARAMETRES_COUTS, 2027) is None
 
 
 def test_cout_horaire():
@@ -474,8 +479,9 @@ def test_marges_attendues():
         _i(7): {"date_debut": "2025-03-12", "duree_min": "45", "duree_trajet_min": "15",
                 "distance_km": "10"},
     }
-    intervenants = {_t(2): {"matricule": "TEC-1", "type_contrat": "CDI"},
-                    _t(3): {"matricule": "TEC-2", "type_contrat": "Stage"}}
+    intervenants = {_t(2): {"retenue": 1, "matricule": "TEC-1", "type_contrat": "CDI"},
+                    _t(3): {"retenue": 1, "matricule": "TEC-2", "type_contrat": "Stage"},
+                    _t(4): {"retenue": 0, "matricule": "TEC-1", "type_contrat": "CDI"}}
     lien = {_i(2): _t(2), _i(3): _t(2), _i(4): _t(2), _i(5): _t(2), _i(6): _t(2),
             _i(7): _t(3)}
     taux = {"CDI": "taux_charges_cdi_cdd"}
@@ -486,22 +492,45 @@ def test_marges_attendues():
                               PARAMETRES_COUTS, taux, lignes, consommees)
     d = Decimal
     # 90 min × 25,4487 / 60 = 38,17305; 18,4 km × 0,45 = 8,28; 129,50 - 38,17 - 8,28 - 30,85
-    assert marges[_i(2)] == (d("129.50"), d("38.17"), d("8.28"), d("30.85"), d("52.20"), None, 0)
+    # Une ligne de facture liée est exclue : ni CA ni marge.
+    assert marges[_i(2)] == (None, d("38.17"), d("8.28"), d("30.85"), None,
+                             "ligne de facture non retenue")
     assert marges[_i(3)] == (d("0.00"), d("25.45"), d("4.50"), None, None,
-                             "coût d'une pièce inconnu", 0)
-    assert marges[_i(4)][5:] == ("date vide", 0)
+                             "coût d'une pièce inconnu")
+    assert marges[_i(4)][5] == "date vide"
     assert marges[_i(5)][5] == "paramètres de coûts de l'année absents"
     assert marges[_i(6)][5] == "durée vide"
     assert marges[_i(7)][5] == "taux de charges inconnu"
+    # Ligne de référence non retenue : pas de coût, et pas de repli sur une autre ligne.
+    exclues = {
+        _i(20): dict(interventions[_i(2)], date_debut="2025-07-01"),  # rémunération
+        _i(21): dict(interventions[_i(2)], date_debut="2026-02-02"),  # paramètres de l'année
+        _i(22): interventions[_i(2)],  # période d'emploi
+    }
+    resultat = marges_attendues(exclues, intervenants,
+                                {_i(20): _t(2), _i(21): _t(2), _i(22): _t(4)}, REMUNERATIONS,
+                                PARAMETRES_COUTS, taux, [], [])
+    assert resultat[_i(20)] == (d("0.00"), None, d("8.28"), d(0), None,
+                                "rémunération non retenue")
+    assert resultat[_i(21)] == (d("0.00"), None, None, d(0), None,
+                                "paramètres de coûts de l'année non retenus")
+    assert resultat[_i(22)] == (d("0.00"), None, d("8.28"), d(0), None,
+                                "intervenant non retenu")
     # Sans intervenant rattaché.
     autres = marges_attendues({_i(9): interventions[_i(2)]}, intervenants, {}, REMUNERATIONS,
                               PARAMETRES_COUTS, taux, [], [])
-    assert autres[_i(9)] == (d("0.00"), None, d("8.28"), d(0), None, "intervenant non rattaché", 0)
-    # Calcul complet : marge calculée et aucune ligne liée exclue.
+    assert autres[_i(9)] == (d("0.00"), None, d("8.28"), d(0), None, "intervenant non rattaché")
+    # Une consommation liée est exclue : ni coût des pièces ni marge.
+    sans_piece = marges_attendues({_i(2): interventions[_i(2)]}, intervenants, lien,
+                                  REMUNERATIONS, PARAMETRES_COUTS, taux,
+                                  [(_i(2), True, d(100))], [(_i(2), False, d(5))])
+    assert sans_piece[_i(2)] == (d("100.00"), d("38.17"), d("8.28"), None, None,
+                                 "consommation non retenue")
+    # Toutes les composantes calculées.
     complet = marges_attendues({_i(2): interventions[_i(2)]}, intervenants, lien,
                                REMUNERATIONS, PARAMETRES_COUTS, taux,
                                [(_i(2), True, d(100))], [])
-    assert complet[_i(2)] == (d("100.00"), d("38.17"), d("8.28"), d(0), d("53.55"), None, 1)
+    assert complet[_i(2)] == (d("100.00"), d("38.17"), d("8.28"), d(0), d("53.55"), None)
 
 
 def test_lignes_facture_liees():

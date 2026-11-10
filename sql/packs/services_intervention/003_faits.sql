@@ -134,7 +134,7 @@ GO
   Chantier : chaque intervention est d'abord son propre chantier, d'un jour
   (id_chantier, jour_chantier, nb_jours_chantier); dw.calculer_chantiers
   (script 004) regroupe ensuite les chantiers sur plusieurs jours. Le CA,
-  les coûts, la marge, motif_calcul et calcul_complet restent vides ici :
+  les coûts, la marge et motif_calcul restent vides ici :
   dw.calculer_marges (script 004) les renseigne.
 */
 CREATE TABLE dw.fait_intervention (
@@ -161,7 +161,6 @@ CREATE TABLE dw.fait_intervention (
     cout_pieces           decimal(19, 2)  NULL,
     marge                 decimal(19, 2)  NULL,
     motif_calcul          nvarchar(100)   NULL,
-    calcul_complet        bit             NULL,
     retenue               bit             NOT NULL,
     id_chargement         int             NOT NULL,
     fichier_source        nvarchar(260)   NOT NULL,

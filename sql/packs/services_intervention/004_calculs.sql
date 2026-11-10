@@ -63,8 +63,8 @@
     au centime, le coût horaire chargé étant
       salaire mensuel × 12 × (1 + taux de charges)
       / (heures annuelles × taux d'activité), arrondi à 4 décimales,
-    avec la rémunération en vigueur à la date (la dernière ligne retenue de
-    même matricule dont la date d'effet n'est pas postérieure), le type de
+    avec la rémunération en vigueur à la date (la dernière ligne de même
+    matricule dont la date d'effet n'est pas postérieure), le type de
     contrat de la période d'emploi que désigne le rattachement de
     l'intervenant, et les paramètres de coûts de l'année;
   - le coût de déplacement : distance × coût kilométrique de l'année, au
@@ -73,13 +73,20 @@
   - la marge : CA moins les trois coûts.
   Une composante impossible à calculer reste vide, jamais à zéro, ainsi que
   la marge, et motif_calcul donne la première raison dans l'ordre : date
-  vide, durée vide, intervenant non rattaché, rémunération inconnue à la
-  date, paramètres de coûts de l'année absents, taux de charges inconnu,
-  heures annuelles ou taux d'activité vides ou nuls, distance ou coût
-  kilométrique vide, coût d'une pièce inconnu.
-  calcul_complet vaut 1 si la marge est calculée et qu'aucune ligne de
-  facture ni consommation liée n'est exclue des indicateurs, 0 sinon. Le coût
-  horaire chargé, qui révèle le salaire, n'est gardé nulle part.
+  vide, durée vide, intervenant non rattaché, intervenant non retenu,
+  rémunération non retenue, rémunération inconnue à la date, paramètres de
+  coûts de l'année non retenus, paramètres de coûts de l'année absents, taux
+  de charges inconnu, heures annuelles ou taux d'activité vides ou nuls,
+  distance ou coût kilométrique vide, coût d'une pièce inconnu.
+  Une ligne de référence exclue des indicateurs (période d'emploi,
+  rémunération en vigueur, paramètres de l'année) ne sert à aucun calcul et
+  n'est pas remplacée par une autre : le coût qui en dépend reste vide, pour
+  ne pas donner une marge fausse (un salaire hors bornes, par exemple).
+  De même, si une ligne de facture ou une consommation liée à l'intervention
+  est exclue des indicateurs, le CA ou le coût des pièces serait incomplet :
+  il reste vide, ainsi que la marge (motifs ligne de facture non retenue,
+  consommation non retenue, en fin de liste). Le coût horaire chargé, qui
+  révèle le salaire, n'est gardé nulle part.
 
   Arrondis et types : les opérandes sont ramenés à 6 décimales au plus pour
   que les produits et le quotient gardent toutes leurs décimales utiles
@@ -561,8 +568,10 @@ GO
 /*
   Marge opérationnelle de chaque intervention (voir l'en-tête du script).
   Les lignes de référence (rémunération, paramètres de coûts de l'année) se
-  choisissent parmi les lignes retenues; à égalité de date d'effet ou d'année,
-  la première dans l'ordre du lignage.
+  choisissent parmi toutes les lignes, retenues ou non; à égalité de date
+  d'effet ou d'année, la première dans l'ordre du lignage. Si la ligne
+  choisie, ou la période d'emploi rattachée, n'est pas retenue, le coût qui
+  en dépend n'est pas calculé.
 */
 CREATE PROCEDURE dw.calculer_marges
     @id_execution int
@@ -576,7 +585,7 @@ BEGIN
     WITH base AS (
         SELECT f.id_fait_intervention,
                p.date_debut, p.duree_min, p.duree_trajet_min, p.distance_km,
-               ti.matricule, ti.type_contrat
+               ti.matricule, ti.type_contrat, ti.retenue AS intervenant_retenu
         FROM dw.fait_intervention AS f
         JOIN propre.interventions AS p
             ON p.id_chargement = f.id_chargement AND p.num_ligne_source = f.num_ligne_source
@@ -588,7 +597,7 @@ BEGIN
            AND ti.num_ligne_source = ri.num_ligne_reference
     ),
     remuneration AS (
-        SELECT b.id_fait_intervention, r.salaire_brut_mensuel, r.taux_activite,
+        SELECT b.id_fait_intervention, r.salaire_brut_mensuel, r.taux_activite, r.retenue,
                ROW_NUMBER() OVER (
                    PARTITION BY b.id_fait_intervention
                    ORDER BY r.date_effet DESC,
@@ -599,7 +608,6 @@ BEGIN
         JOIN propre.remunerations AS r
             ON r.matricule = b.matricule COLLATE Latin1_General_100_BIN2
            AND r.date_effet <= b.date_debut
-           AND r.retenue = 1
     ),
     couts_annee AS (
         SELECT c.*,
@@ -609,12 +617,12 @@ BEGIN
                             c.feuille_source COLLATE Latin1_General_100_BIN2,
                             c.num_ligne_source) AS rang
         FROM propre.parametres_couts AS c
-        WHERE c.retenue = 1 AND c.annee IS NOT NULL
+        WHERE c.annee IS NOT NULL
     ),
     entrees AS (
         SELECT b.*,
-               r.salaire_brut_mensuel, r.taux_activite,
-               c.annee, c.cout_km, c.heures_annuelles,
+               r.salaire_brut_mensuel, r.taux_activite, r.retenue AS remuneration_retenue,
+               c.annee, c.cout_km, c.heures_annuelles, c.retenue AS couts_retenus,
                CASE t.colonne_taux
                    WHEN N'taux_charges_cdi_cdd' THEN c.taux_charges_cdi_cdd
                    WHEN N'taux_charges_apprenti' THEN c.taux_charges_apprenti
@@ -629,6 +637,8 @@ BEGIN
         SELECT e.*,
                CASE WHEN e.salaire_brut_mensuel IS NOT NULL AND e.taux_charges IS NOT NULL
                          AND e.heures_annuelles > 0 AND e.taux_activite > 0
+                         AND e.intervenant_retenu = 1 AND e.remuneration_retenue = 1
+                         AND e.couts_retenus = 1
                     THEN CAST(ROUND(
                         CAST(CAST(CAST(e.salaire_brut_mensuel AS decimal(16, 6)) * 12
                                   AS decimal(18, 6))
@@ -659,7 +669,9 @@ BEGIN
     ),
     composantes AS (
         SELECT h.id_fait_intervention,
-               CAST(ROUND(COALESCE(l.ca, 0), 2) AS decimal(19, 2)) AS ca_ht,
+               CASE WHEN COALESCE(l.exclues, 0) = 0
+                    THEN CAST(ROUND(COALESCE(l.ca, 0), 2) AS decimal(19, 2))
+               END AS ca_ht,
                CASE WHEN h.cout_horaire IS NOT NULL AND h.duree_min IS NOT NULL
                          AND h.duree_trajet_min IS NOT NULL
                     THEN CAST(ROUND(
@@ -668,18 +680,22 @@ BEGIN
                         2) AS decimal(19, 2))
                END AS cout_salarial,
                CASE WHEN h.distance_km IS NOT NULL AND h.cout_km IS NOT NULL
+                         AND h.couts_retenus = 1
                     THEN CAST(ROUND(CAST(h.distance_km AS decimal(18, 6))
                                     * CAST(h.cout_km AS decimal(18, 6)), 2) AS decimal(19, 2))
                END AS cout_deplacement,
-               CASE WHEN COALESCE(k.inconnus, 0) = 0
+               CASE WHEN COALESCE(k.inconnus, 0) = 0 AND COALESCE(k.exclues, 0) = 0
                     THEN CAST(COALESCE(k.cout, 0) AS decimal(19, 2))
                END AS cout_pieces,
-               COALESCE(l.exclues, 0) + COALESCE(k.exclues, 0) AS exclues,
                CASE
                    WHEN h.date_debut IS NULL THEN N'date vide'
                    WHEN h.duree_min IS NULL OR h.duree_trajet_min IS NULL THEN N'durée vide'
                    WHEN h.matricule IS NULL THEN N'intervenant non rattaché'
+                   WHEN h.intervenant_retenu = 0 THEN N'intervenant non retenu'
+                   WHEN h.remuneration_retenue = 0 THEN N'rémunération non retenue'
                    WHEN h.salaire_brut_mensuel IS NULL THEN N'rémunération inconnue à la date'
+                   WHEN h.couts_retenus = 0
+                       THEN N'paramètres de coûts de l''année non retenus'
                    WHEN h.annee IS NULL THEN N'paramètres de coûts de l''année absents'
                    WHEN h.taux_charges IS NULL THEN N'taux de charges inconnu'
                    WHEN h.cout_horaire IS NULL
@@ -687,6 +703,8 @@ BEGIN
                    WHEN h.distance_km IS NULL OR h.cout_km IS NULL
                        THEN N'distance ou coût kilométrique vide'
                    WHEN COALESCE(k.inconnus, 0) > 0 THEN N'coût d''une pièce inconnu'
+                   WHEN COALESCE(l.exclues, 0) > 0 THEN N'ligne de facture non retenue'
+                   WHEN COALESCE(k.exclues, 0) > 0 THEN N'consommation non retenue'
                END AS motif
         FROM horaire AS h
         LEFT JOIN lignes AS l ON l.id_fait_intervention = h.id_fait_intervention
@@ -698,8 +716,7 @@ BEGIN
         cout_deplacement = c.cout_deplacement,
         cout_pieces = c.cout_pieces,
         marge = c.ca_ht - c.cout_salarial - c.cout_deplacement - c.cout_pieces,
-        motif_calcul = c.motif,
-        calcul_complet = CASE WHEN c.motif IS NULL AND c.exclues = 0 THEN 1 ELSE 0 END
+        motif_calcul = c.motif
     FROM dw.fait_intervention AS f
     JOIN composantes AS c ON c.id_fait_intervention = f.id_fait_intervention;
 
