@@ -1160,6 +1160,7 @@ FAMILLE_ILLISIBLES = "illisibles"
 FAMILLE_QUALITE = "qualite"
 FAMILLE_DW = "dw"
 FAMILLE_RETENUE = "retenue"
+FAMILLE_CALCULS = "calculs"
 CONTRAT_RESPECTE = "respecté"
 CONTRAT_NON_RESPECTE = "non respecté"
 VALEUR_MASQUEE = "masqué"
@@ -1266,7 +1267,9 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     lue sur sa ligne de propre, jour du calendrier égal à celui de propre ligne à
     ligne, autant de -1 que de dates vides et aucun -2 (`controles_mesures`); pour
     chaque fait, retenue égale ligne à ligne à celle de sa ligne de propre et des
-    lignes rattachées que le pack déclare (`controles_retenue_faits`).
+    lignes rattachées que le pack déclare (`controles_retenue_faits`); pour chaque pack
+    qui a un module de vérification (frigeo.packs.<pack>), ses calculs refaits en
+    Python et comparés à dw (famille calculs).
     """
     from sqlalchemy import text
 
@@ -1369,7 +1372,8 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
                                         ajouter)
         _verifier_dw(conn, ecriture, ajouter,
                      None if sorties is None else sorties.rattachements,
-                     None if sorties is None else sorties.correspondances)
+                     None if sorties is None else sorties.correspondances,
+                     sorties)
     return pd.DataFrame(controles, columns=COLONNES_VERIFICATION)
 
 
@@ -1832,11 +1836,12 @@ def _journal_en_texte(journal) -> str | None:
 
 
 def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
-                 correspondances=None) -> None:
+                 correspondances=None, sorties=None) -> None:
     """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte, puis
     ceux des faits déclarés par le pack (`controles_faits`), des codes en doublon
     qu'il regroupe (`controles_regroupements`), des mesures et des dates des faits
-    (`controles_mesures`) et de leur retenue (`controles_retenue_faits`)."""
+    (`controles_mesures`) et de leur retenue (`controles_retenue_faits`), enfin ceux
+    des calculs, par le module de vérification de chaque pack (`_verifier_packs`)."""
     import pyodbc
 
     from .base import procedure_reconstruction_presente
@@ -1892,5 +1897,33 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
             curseur.execute(controle.requete)
             ajouter(FAMILLE_DW, controle.libelle, controle.attendu,
                     _obtenu(tuple(curseur.fetchone())), controle.masque)
+        _verifier_packs(curseur, ecriture, sorties, ajouter)
     finally:
         curseur.close()
+
+
+def modules_verification(packs: list[str]) -> list[tuple[str, object]]:
+    """Modules de vérification des calculs (frigeo.packs.<pack>) des packs qui en ont
+    un, dans l'ordre de `packs`."""
+    import importlib
+    import importlib.util
+
+    modules = []
+    for pack in packs:
+        nom = f"{__package__}.packs.{pack}"
+        if importlib.util.find_spec(nom) is not None:
+            modules.append((pack, importlib.import_module(nom)))
+    return modules
+
+
+def _verifier_packs(curseur, ecriture: Ecriture, sorties, ajouter, packs=None) -> None:
+    """Contrôles de la famille calculs : la fonction `verifier` du module de chaque
+    pack de config/base.yaml qui en a un (voir frigeo.packs)."""
+    from .base import lire_packs
+
+    for _, module in modules_verification(lire_packs() if packs is None else packs):
+        module.verifier(
+            curseur, ecriture, sorties,
+            lambda controle, attendu, obtenu, masque=False:
+                ajouter(FAMILLE_CALCULS, controle, attendu, obtenu, masque),
+        )

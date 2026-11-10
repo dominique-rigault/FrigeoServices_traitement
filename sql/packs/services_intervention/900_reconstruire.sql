@@ -3,11 +3,12 @@
 
   Dernier script du pack, pour être créé après les procédures qu'il appelle.
   Il enchaîne la vérification du contrat d'entrée (colonnes de propre,
-  rattachements et codes en doublon de l'exécution), le vidage des faits,
-  la construction des dimensions (script 002), puis celle des faits
-  (script 003), un fait lié à un autre (une consommation à son
-  intervention) après celui-ci. Chaque étape de construction est inscrite
-  dans dw.journal_reconstruction.
+  rattachements et codes en doublon de l'exécution) et celle des paramètres
+  de calcul (script 004), le vidage des faits, la construction des
+  dimensions (script 002), puis celle des faits (script 003), un fait lié à
+  un autre (une consommation à son intervention) après celui-ci, puis les
+  calculs (script 004). Chaque étape est inscrite dans
+  dw.journal_reconstruction.
 */
 
 /* Reconstruit dw pour une exécution, dans la transaction de l'appelant. */
@@ -30,6 +31,9 @@ BEGIN
     DECLARE @colonnes int = (SELECT COUNT(*) FROM dw.contrat_entree);
     EXEC dw.inscrire_etape @id_execution, N'contrat d''entrée', @colonnes, @debut;
 
+    /* Paramètres de calcul (script 004). */
+    EXEC dw.verifier_parametres @id_execution;
+
     /* Faits vidés avant les dimensions qu'ils référencent. */
     EXEC dw.vider_faits;
 
@@ -49,5 +53,8 @@ BEGIN
     EXEC dw.construire_fait_ligne_facture @id_execution;
     EXEC dw.construire_fait_achat @id_execution;
     EXEC dw.construire_fait_ecriture @id_execution;
+
+    /* Calculs (script 004). */
+    EXEC dw.calculer_chantiers @id_execution;
 END;
 GO

@@ -131,6 +131,9 @@ GO
   Interventions : une ligne par ligne de propre.interventions. Intervenant par
   le rattachement interventions.intervenant vers intervenants (son matricule),
   client par interventions.code_client vers clients, date de début, catégorie.
+  Chantier : chaque intervention est d'abord son propre chantier, d'un jour
+  (id_chantier, jour_chantier, nb_jours_chantier); dw.calculer_chantiers
+  (script 004) regroupe ensuite les chantiers sur plusieurs jours.
 */
 CREATE TABLE dw.fait_intervention (
     id_fait_intervention  int             NOT NULL,
@@ -147,6 +150,9 @@ CREATE TABLE dw.fait_intervention (
     facturable            nvarchar(4000)  NULL,
     lieu_cp               nvarchar(4000)  NULL,
     lieu_ville            nvarchar(4000)  NULL,
+    id_chantier           int             NOT NULL,
+    jour_chantier         int             NOT NULL,
+    nb_jours_chantier     int             NOT NULL,
     retenue               bit             NOT NULL,
     id_chargement         int             NOT NULL,
     fichier_source        nvarchar(260)   NOT NULL,
@@ -154,6 +160,12 @@ CREATE TABLE dw.fait_intervention (
     num_ligne_source      int             NOT NULL,
     CONSTRAINT pk_fait_intervention PRIMARY KEY (id_fait_intervention),
     CONSTRAINT uq_fait_intervention_lignage UNIQUE (id_chargement, num_ligne_source),
+    CONSTRAINT ck_fait_intervention_chantier
+        CHECK (jour_chantier BETWEEN 1 AND nb_jours_chantier
+               AND ((jour_chantier = 1 AND id_chantier = id_fait_intervention)
+                    OR (jour_chantier > 1 AND id_chantier <> id_fait_intervention))),
+    CONSTRAINT fk_fait_intervention_chantier
+        FOREIGN KEY (id_chantier) REFERENCES dw.fait_intervention (id_fait_intervention),
     CONSTRAINT fk_fait_intervention_date
         FOREIGN KEY (id_date) REFERENCES dw.dim_date (id_date),
     CONSTRAINT fk_fait_intervention_intervenant
@@ -180,7 +192,8 @@ BEGIN
     INSERT INTO dw.fait_intervention (
         id_fait_intervention, id_intervention, id_date, heure_debut, id_intervenant, id_client,
         id_categorie, duree_min, duree_trajet_min, distance_km, statut, facturable, lieu_cp,
-        lieu_ville, retenue, id_chargement, fichier_source, feuille_source, num_ligne_source)
+        lieu_ville, id_chantier, jour_chantier, nb_jours_chantier, retenue, id_chargement,
+        fichier_source, feuille_source, num_ligne_source)
     SELECT ROW_NUMBER() OVER (ORDER BY p.fichier_source, p.feuille_source, p.num_ligne_source),
            p.id_intervention,
            CASE WHEN p.date_debut IS NULL THEN -1 ELSE COALESCE(dd.id_date, -2) END,
@@ -195,6 +208,9 @@ BEGIN
            p.facturable,
            p.lieu_cp,
            p.lieu_ville,
+           ROW_NUMBER() OVER (ORDER BY p.fichier_source, p.feuille_source, p.num_ligne_source),
+           1,
+           1,
            p.retenue,
            p.id_chargement, p.fichier_source, p.feuille_source, p.num_ligne_source
     FROM propre.interventions AS p
