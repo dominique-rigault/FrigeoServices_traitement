@@ -195,7 +195,7 @@ Repères pour la phase 8 :
 
 ### Phase 9, base de données (étape 7, en cours)
 
-Cette phase met en place la base SQL Server qui recevra les données chargées et nettoyées. La structure de la base est construite (sous-étape 7.1), et le notebook 07 y écrit les données chargées et nettoyées et les sorties de la qualité, puis vérifie ce qu'il a écrit (sous-étape 7.2). Les dimensions du modèle en étoile et le rattachement des lignes à leurs référentiels sont faits (sous-étape 7.3, en cours); les faits et les calculs suivront.
+Cette phase met en place la base SQL Server qui recevra les données chargées et nettoyées. La structure de la base est construite (sous-étape 7.1), et le notebook 07 y écrit les données chargées et nettoyées et les sorties de la qualité, puis vérifie ce qu'il a écrit (sous-étape 7.2). Le modèle en étoile est construit et vérifié de bout en bout (sous-étape 7.3) : dimensions, rattachement des lignes à leurs référentiels, faits, codes en doublon regroupés, mesures et dates comparées à `propre`; les indicateurs et les calculs suivront.
 
 | N° | Action | Qui | Outil | État |
 | --- | --- | --- | --- | --- |
@@ -237,7 +237,7 @@ Repères pour la phase 9 :
 - les tables de `propre` étant recréées à chaque exécution, seules les procédures du pack les lisent : une vue de `dw` ou de `pbi` ne porte que sur `dw`;
 - pour une décision du métier sur une colonne sensible, `qualite.decision.valeur_retenue` reste vide et seule son empreinte est écrite (`empreinte_valeur_retenue`, avec la clé de `data/config/cle_empreintes.txt`);
 - un notebook modifié hors de l'éditeur (par l'assistant, ou par `git pull`) se ferme sans l'enregistrer puis se rouvre avant de l'exécuter : sinon l'éditeur exécute l'ancienne version qu'il garde en mémoire, et peut la réenregistrer;
-- les tests sans base se lancent par `python -m pytest tests/test_base.py tests/test_structure_base.py tests/test_ecriture_base.py tests/test_gestion.py tests/test_rattachement.py`.
+- les tests se lancent tous sans base par `python -m pytest tests -q`, comme à l'installation (README, rubrique « Installation »).
 
 ## Cycle mensuel (un mois de plus)
 

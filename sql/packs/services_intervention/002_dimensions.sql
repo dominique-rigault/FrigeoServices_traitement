@@ -209,7 +209,7 @@ BEGIN
 END;
 GO
 
-/* Articles facturés (main d'œuvre, déplacement, forfaits){n}: codes distincts de factures_lignes.code_article, aucun référentiel ne les décrivant. Le compte de produit d'un article n'apparaît nulle part ligne à ligne. */
+/* Articles facturés (main d'œuvre, déplacement, forfaits) : codes distincts de factures_lignes.code_article, aucun référentiel ne les décrivant. Le compte de produit d'un article n'apparaît nulle part ligne à ligne. */
 CREATE TABLE dw.dim_article (
     id_article          int             NOT NULL,
     code_article        nvarchar(450)   COLLATE Latin1_General_100_BIN2 NOT NULL,
@@ -318,7 +318,7 @@ BEGIN
 END;
 GO
 
-/* Comptes du FEC{n}: numéros distincts de fec.compte_num, avec la classe (premier chiffre). Un compte d'achat absent du FEC pointera vers -2. */
+/* Comptes du FEC : numéros distincts de fec.compte_num, avec la classe (premier chiffre). Un compte d'achat absent du FEC pointera vers -2. */
 CREATE TABLE dw.dim_compte (
     id_compte           int             NOT NULL,
     compte_num          nvarchar(450)   COLLATE Latin1_General_100_BIN2 NOT NULL,

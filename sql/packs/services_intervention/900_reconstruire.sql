@@ -2,11 +2,12 @@
   Pack services_intervention, script 900 : procédure dw.reconstruire.
 
   Dernier script du pack, pour être créé après les procédures qu'il appelle.
-  Il enchaîne la vérification du contrat d'entrée (colonnes de propre et
-  rattachements de l'exécution), le vidage des faits, la construction des
-  dimensions (script 002), puis celle des faits (script 003), un fait lié à
-  un autre (une consommation à son intervention) après celui-ci. Chaque étape
-  de construction est inscrite dans dw.journal_reconstruction.
+  Il enchaîne la vérification du contrat d'entrée (colonnes de propre,
+  rattachements et codes en doublon de l'exécution), le vidage des faits,
+  la construction des dimensions (script 002), puis celle des faits
+  (script 003), un fait lié à un autre (une consommation à son
+  intervention) après celui-ci. Chaque étape de construction est inscrite
+  dans dw.journal_reconstruction.
 */
 
 /* Reconstruit dw pour une exécution, dans la transaction de l'appelant. */
