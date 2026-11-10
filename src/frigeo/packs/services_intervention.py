@@ -37,6 +37,16 @@ dw.calculer_marges; une ligne de facture ou une consommation liée exclue des
 indicateurs laisse vides le CA ou le coût des pièces, et la marge. Le coût salarial
 total, qui dépend des salaires, est affiché « masqué ».
 
+Rapprochement du CA (`rapprochement_ca`) : le total HT des lignes de facture
+retenues de propre doit égaler le CA des interventions de dw, plus les lignes
+retenues rattachées à aucune intervention, plus les lignes retenues d'une
+intervention dont le CA est vide (une autre de ses lignes étant exclue); le total de
+toutes les lignes doit égaler celui des lignes retenues et non retenues de
+dw.fait_ligne_facture. Aucune ligne n'est ainsi perdue ni comptée deux fois entre
+les lignes de facture et le CA. L'égalité est exacte pour des montants au centime :
+le CA de chaque intervention étant arrondi au centime, des montants plus fins
+donneraient un écart d'arrondi.
+
 Aucune valeur du client n'est affichée : seulement des décomptes et des dates de
 paramètres.
 """
@@ -106,6 +116,17 @@ MOTIFS_MARGE = (MOTIF_MARGE_DATE, MOTIF_MARGE_DUREE, MOTIF_MARGE_INTERVENANT,
                 MOTIF_MARGE_PARAMETRES, MOTIF_MARGE_TAUX,
                 MOTIF_MARGE_HEURES, MOTIF_MARGE_DISTANCE, MOTIF_MARGE_PIECE,
                 MOTIF_MARGE_FACTURE_EXCLUE, MOTIF_MARGE_CONSOMMATION_EXCLUE)
+
+REQUETE_RAPPROCHEMENT = (
+    "SELECT (SELECT SUM(ca_ht) FROM dw.fait_intervention), "
+    "SUM(CASE WHEN l.retenue = 1 AND l.id_fait_intervention IS NULL THEN l.montant_ht END), "
+    "SUM(CASE WHEN l.retenue = 1 AND l.id_fait_intervention IS NOT NULL AND i.ca_ht IS NULL "
+    "THEN l.montant_ht END), "
+    "SUM(CASE WHEN l.retenue = 0 THEN l.montant_ht END), "
+    "SUM(CASE WHEN l.retenue = 1 THEN l.montant_ht END) "
+    "FROM dw.fait_ligne_facture AS l "
+    "LEFT JOIN dw.fait_intervention AS i ON i.id_fait_intervention = l.id_fait_intervention"
+)
 
 REQUETE_CHANTIERS = (
     "SELECT f.fichier_source, f.feuille_source, f.num_ligne_source, "
@@ -594,20 +615,53 @@ def marges_attendues(
     return resultat
 
 
+def _ligne_facture_retenue(cle: Lignage, ligne: dict, entetes: dict[Lignage, dict],
+                           lien_entete: dict) -> bool:
+    """Retenue du fait d'une ligne de facture : la ligne, et son en-tête s'il est trouvé."""
+    reference = lien_entete.get(cle)
+    entete = entetes.get(reference) if reference is not None else None
+    return ligne.get("retenue") == 1 and (entete is None or entete.get("retenue") == 1)
+
+
 def lignes_facture_liees(lignes: dict[Lignage, dict], entetes: dict[Lignage, dict],
                          lien_entete: dict, lien_intervention: dict) -> list[tuple]:
     """Lignes de facture liées à une intervention : (lignage de l'intervention, retenue
     du fait, montant HT), la ligne n'étant retenue que si son en-tête trouvé l'est."""
-    resultat = []
+    return [
+        (lien_intervention[cle], _ligne_facture_retenue(cle, ligne, entetes, lien_entete),
+         _decimal(ligne.get("montant_ht")))
+        for cle, ligne in lignes.items() if cle in lien_intervention
+    ]
+
+
+def rapprochement_ca(lignes: dict[Lignage, dict], entetes: dict[Lignage, dict],
+                     lien_entete: dict, lien_intervention: dict,
+                     marges: dict[Lignage, tuple]) -> tuple[Decimal, ...]:
+    """Rapprochement du CA des interventions avec les lignes de facture : (total HT
+    des lignes retenues, total HT des lignes non retenues, CA des interventions,
+    lignes retenues rattachées à aucune intervention, lignes retenues d'une
+    intervention dont le CA est vide). Le total des lignes retenues est égal à la
+    somme des trois derniers termes quand les montants sont au centime. Un montant
+    vide compte pour zéro, comme dans le CA."""
+    zero = Decimal(0)
+    retenues = non_retenues = sans_intervention = sans_ca = zero
     for cle, ligne in lignes.items():
-        intervention = lien_intervention.get(cle)
-        if intervention is None:
+        montant = _decimal(ligne.get("montant_ht")) or zero
+        if not _ligne_facture_retenue(cle, ligne, entetes, lien_entete):
+            non_retenues += montant
             continue
-        reference = lien_entete.get(cle)
-        entete = entetes.get(reference) if reference is not None else None
-        retenue = ligne.get("retenue") == 1 and (entete is None or entete.get("retenue") == 1)
-        resultat.append((intervention, retenue, _decimal(ligne.get("montant_ht"))))
-    return resultat
+        retenues += montant
+        intervention = lien_intervention.get(cle)
+        if intervention is None or intervention not in marges:
+            sans_intervention += montant
+        elif marges[intervention][0] is None:
+            sans_ca += montant
+    return retenues, non_retenues, _somme(marges, 0), sans_intervention, sans_ca
+
+
+def _texte_montants(montants) -> str:
+    """Montants séparés par « / », sans zéro inutile après la virgule."""
+    return " / ".join(format((m or Decimal(0)).normalize(), "f") for m in montants)
 
 
 def _motifs_marge(marges: dict) -> str:
@@ -752,6 +806,11 @@ def _verifier_marges(curseur, ecriture, rattachements, consommees: dict, couts: 
         (lien_conso[cle], retenue, couts[cle][1])
         for cle, (_, _, _, retenue, _) in consommees.items() if cle in lien_conso
     ]
+    lignes = table_propre(preparation, "factures_lignes")
+    entetes = table_propre(preparation, "factures_entetes")
+    lien_entete = liens(rattachements, "factures_lignes", "num_facture", "factures_entetes")
+    lien_intervention = liens(rattachements, "factures_lignes", "id_intervention",
+                              "interventions")
     marges = marges_attendues(
         table_propre(preparation, "interventions"),
         table_propre(preparation, "intervenants"),
@@ -759,12 +818,7 @@ def _verifier_marges(curseur, ecriture, rattachements, consommees: dict, couts: 
         table_propre(preparation, "remunerations"),
         table_propre(preparation, "parametres_couts"),
         taux,
-        lignes_facture_liees(
-            table_propre(preparation, "factures_lignes"),
-            table_propre(preparation, "factures_entetes"),
-            liens(rattachements, "factures_lignes", "num_facture", "factures_entetes"),
-            liens(rattachements, "factures_lignes", "id_intervention", "interventions"),
-        ),
+        lignes_facture_liees(lignes, entetes, lien_entete, lien_intervention),
         consommations_liees,
     )
     curseur.execute(REQUETE_MARGES)
@@ -787,3 +841,21 @@ def _verifier_marges(curseur, ecriture, rattachements, consommees: dict, couts: 
     ajouter("dw.fait_intervention : coût des pièces total", _somme(marges, 3),
             _somme(obtenues, 3))
     ajouter("dw.fait_intervention : marge totale", _somme(marges, 4), _somme(obtenues, 4))
+
+    retenues, non_retenues, *detail = rapprochement_ca(lignes, entetes, lien_entete,
+                                                       lien_intervention, marges)
+    curseur.execute(REQUETE_RAPPROCHEMENT)
+    ca, sans_intervention, sans_ca, non_retenues_lues, retenues_lues = (
+        _decimal(v) or Decimal(0) for v in curseur.fetchall()[0]
+    )
+    ajouter("rapprochement du CA : lignes de facture retenues de propre = CA de "
+            "dw.fait_intervention + lignes retenues de dw.fait_ligne_facture sans "
+            "intervention ou d'une intervention sans CA", retenues,
+            ca + sans_intervention + sans_ca)
+    ajouter("rapprochement du CA : lignes de facture de propre = lignes retenues + lignes "
+            "non retenues de dw.fait_ligne_facture", retenues + non_retenues,
+            retenues_lues + non_retenues_lues)
+    ajouter("rapprochement du CA : CA des interventions / lignes retenues sans intervention "
+            "/ lignes retenues d'une intervention sans CA / lignes non retenues",
+            _texte_montants((*detail, non_retenues)),
+            _texte_montants((ca, sans_intervention, sans_ca, non_retenues_lues)))

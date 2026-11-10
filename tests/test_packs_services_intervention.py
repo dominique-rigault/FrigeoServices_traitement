@@ -21,6 +21,7 @@ from frigeo.packs.services_intervention import (
     mois_du_calcul,
     parametres_annee,
     pieces_catalogue,
+    rapprochement_ca,
     remuneration_en_vigueur,
     table_propre,
     verifier,
@@ -210,8 +211,10 @@ def test_table_propre():
 class _Curseur:
     """Faux curseur : rend, pour chaque requête, les lignes de la première table citée."""
 
-    def __init__(self, parametres, chantiers, cump=(), couts=(), marges=(), periode="2025-02"):
+    def __init__(self, parametres, chantiers, cump=(), couts=(), marges=(), periode="2025-02",
+                 rapprochement=((Decimal(0), None, None, None, None),)):
         self.resultats = {
+            "dw.fait_ligne_facture": list(rapprochement),
             "dw.parametre_taux_charges": [("CDI", "taux_charges_cdi_cdd")],
             "dw.parametre_calcul": parametres, "dw.cump_mensuel": list(cump),
             "dw.fait_consommation": list(couts), "cout_salarial": list(marges),
@@ -247,6 +250,7 @@ def test_verifier():
         (0, 0), ("intervenant non rattaché 1", "intervenant non rattaché 1"), (0, 0),
         (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)),
         (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)),
+        (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)), ("0 / 0 / 0 / 0", "0 / 0 / 0 / 0"),
     ]
     assert controles[12][3] is True  # coût salarial total masqué
     # Un CUMP qui diffère d'un mois sort en écart.
@@ -543,3 +547,22 @@ def test_lignes_facture_liees():
         (_i(2), True, Decimal(10)), (_i(2), False, Decimal(5)), (_i(2), False, Decimal(1)),
         (_i(3), True, Decimal(2)),
     ]
+
+
+def test_rapprochement_ca():
+    d = Decimal
+    lignes = {_l(2): {"retenue": 1, "montant_ht": "10"}, _l(3): {"retenue": 1, "montant_ht": "5"},
+              _l(4): {"retenue": 0, "montant_ht": "1"}, _l(5): {"retenue": 1, "montant_ht": "2"},
+              _l(6): {"retenue": 1, "montant_ht": "7"}, _l(7): {"retenue": 1, "montant_ht": None}}
+    entetes = {_e(2): {"retenue": 1}, _e(3): {"retenue": 0}}
+    lien_entete = {_l(2): _e(2), _l(3): _e(3), _l(4): _e(2)}
+    lien_intervention = {_l(2): _i(2), _l(3): _i(2), _l(4): _i(2), _l(5): _i(3), _l(7): _i(3)}
+    # Intervention 2 sans CA (une de ses lignes est exclue), intervention 3 avec un CA;
+    # la ligne 6 n'est rattachée à aucune intervention, la ligne 7 n'a pas de montant.
+    marges = {_i(2): (None, None, None, None, None, "ligne de facture non retenue"),
+              _i(3): (d("2.00"), None, None, None, None, None)}
+    retenues, non_retenues, ca, sans_intervention, sans_ca = rapprochement_ca(
+        lignes, entetes, lien_entete, lien_intervention, marges)
+    assert (retenues, non_retenues, ca, sans_intervention, sans_ca) == (
+        d(19), d(6), d(2), d(7), d(10))
+    assert retenues == ca + sans_intervention + sans_ca
