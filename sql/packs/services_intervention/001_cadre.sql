@@ -43,6 +43,13 @@
   correspondance sur une autre table fait échouer la vérification du contrat,
   au lieu d'être ignorée.
 
+  Lignes retenues (étape 7.4a) : chaque fait porte la colonne retenue de sa
+  ligne de propre (0 pour une ligne exclue des indicateurs). Quand la retenue
+  d'un fait dépend aussi d'une ligne rattachée (une ligne de facture et son
+  en-tête), le pack déclare ce rattachement dans dw.contrat_retenue : la
+  vérification de l'écriture contrôle ligne à ligne que le fait n'est retenu
+  que si sa ligne de propre et les lignes rattachées déclarées le sont.
+
   Ordre de reconstruction : les tables de faits ont des clés étrangères vers
   les dimensions (aucune ligne orpheline). dw.vider_faits les vide d'abord,
   puis chaque dimension est vidée et remplie par sa procédure, puis chaque
@@ -143,6 +150,20 @@ CREATE TABLE dw.regroupement_codes (
 );
 GO
 
+/* Un rattachement dont la ligne de référence transmet sa retenue au fait : le
+   fait n'est retenu que si sa ligne de propre et la ligne rattachée (quand
+   elle est trouvée) le sont toutes deux. Noms du dictionnaire, comme dans
+   dw.contrat_rattachement; le rattachement doit aussi y figurer. */
+CREATE TABLE dw.contrat_retenue (
+    id_contrat       int IDENTITY(1, 1) NOT NULL,
+    table_fait       nvarchar(128)   NOT NULL,
+    table_source     nvarchar(128)   NOT NULL,
+    cle              nvarchar(1000)  NOT NULL,
+    table_reference  nvarchar(128)   NOT NULL,
+    CONSTRAINT pk_contrat_retenue PRIMARY KEY (id_contrat)
+);
+GO
+
 /* Codes en doublon d'une table pour une exécution, avec leur code principal
    (qualite.correspondance_cle), en classement binaire. Un code principal
    n'est jamais lui-même un code en doublon : une seule jointure suffit. */
@@ -201,9 +222,11 @@ GO
 
 /* Vérifie le contrat d'entrée contre les colonnes réelles de propre (table
    absente, colonne absente, famille différente), contre les rattachements
-   de l'exécution (rattachement absent) et contre ses codes en doublon
-   (correspondance sur une table que le pack ne regroupe pas). Lève une erreur qui liste tous les
-   écarts (tronquée au-delà de la longueur admise par THROW). */
+   de l'exécution (rattachement absent), contre ses codes en doublon
+   (correspondance sur une table que le pack ne regroupe pas) et contre les
+   rattachements déclarés pour la retenue (absents du contrat des
+   rattachements). Lève une erreur qui liste tous les écarts (tronquée
+   au-delà de la longueur admise par THROW). */
 CREATE PROCEDURE dw.verifier_contrat
     @id_execution int
 AS
@@ -263,6 +286,15 @@ BEGIN
         WHERE c.id_execution = @id_execution
           AND NOT EXISTS (SELECT 1 FROM dw.regroupement_codes AS r
                           WHERE r.table_source = c.table_source)
+        UNION ALL
+        SELECT 4, k.table_fait, k.cle,
+               CONCAT(N'retenue de ', k.table_fait, N' par ', k.table_source, N'.', k.cle,
+                      N' vers ', k.table_reference,
+                      N' : rattachement absent de dw.contrat_rattachement')
+        FROM dw.contrat_retenue AS k
+        WHERE NOT EXISTS (SELECT 1 FROM dw.contrat_rattachement AS r
+                          WHERE r.table_source = k.table_source AND r.cle = k.cle
+                            AND r.table_reference = k.table_reference)
     )
     INSERT INTO @ecarts (texte)
     SELECT texte FROM constats ORDER BY rang, table_propre, colonne;

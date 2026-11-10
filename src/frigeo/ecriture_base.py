@@ -61,8 +61,10 @@ from typing import Callable
 
 import pandas as pd
 
+from .anomalies import GRAVITE_BLOQUANTE, ISSUES_NON_RESOLUES
 from .perimetre import tables_du_flux
 from .structure_base import (
+    COLONNE_RETENUE,
     FAMILLE_DATE,
     FAMILLE_DECIMAL,
     FAMILLE_ENTIER,
@@ -355,13 +357,22 @@ class Preparation:
     cellules_illisibles: pd.DataFrame
 
 
-def _lignage(donnees: pd.DataFrame, schema: str) -> tuple[list[tuple], list[list]]:
+def _lignage(donnees: pd.DataFrame, schema: str,
+             non_retenues: set | None = None) -> tuple[list[tuple], list[list]]:
+    """Lignage de chaque ligne, puis colonnes techniques du schéma : en propre,
+    retenue vaut 0 pour une ligne dont (fichier, feuille, numéro) est dans
+    `non_retenues`, 1 sinon."""
     n = len(donnees)
     fichiers = [str(v) for v in donnees["fichier_source"]]
     feuilles = [_feuille(v) for v in donnees.get("feuille_source", pd.Series([None] * n))]
     periodes = [None if _absente(v) else str(v) for v in donnees.get("periode_export", pd.Series([None] * n))]
     numeros = [int(v) for v in donnees["num_ligne_source"]]
     colonnes = [periodes, fichiers, feuilles, numeros]
+    if schema == SCHEMA_PROPRE:
+        exclues = non_retenues or set()
+        colonnes.append(
+            [0 if cle in exclues else 1 for cle in zip(fichiers, feuilles, numeros)]
+        )
     if schema == SCHEMA_CHARGEMENT:
         nb_champs = donnees.get("nb_champs_source", pd.Series([None] * n))
         colonnes.append([None if _absente(v) else int(v) for v in nb_champs])
@@ -376,13 +387,23 @@ def preparer(
     tables: dict[str, pd.DataFrame],
     tables_nettoyees: dict[str, pd.DataFrame],
     structure: dict[str, TableBase],
+    non_retenues: set[tuple] | None = None,
 ) -> Preparation:
     """Valeurs de toutes les tables, sans toucher la base.
 
     Les tables de la structure doivent toutes être présentes, chargées et nettoyées.
     Un garde-fou déclenché lève `ErreurEcriture`, qui liste tous les problèmes par
     table, colonne et nombre de cellules, sans aucune valeur.
+
+    `non_retenues` (`anomalies.lignes_non_retenues`) donne les lignes nettoyées
+    exclues des indicateurs, par (table, fichier, feuille, numéro de ligne) : leur
+    colonne retenue vaut 0 dans propre, celle des autres lignes 1. Une ligne non
+    retenue absente des tables nettoyées (table hors structure ou ligne introuvable)
+    est un problème : la table des anomalies ne correspondrait pas aux données.
     """
+    par_table: dict[str, set] = {}
+    for table, fichier, feuille, numero in non_retenues or set():
+        par_table.setdefault(table, set()).add((fichier, feuille, numero))
     problemes, illisibles, cellules, preparees = [], [], [], []
     manquantes = [
         f"{nom} ({etat})"
@@ -392,6 +413,11 @@ def preparer(
     ]
     if manquantes:
         raise ErreurEcriture("Tables absentes des données : " + ", ".join(manquantes))
+    for nom in sorted(set(par_table) - set(structure)):
+        problemes.append(
+            f"{nom} : {len(par_table[nom])} ligne(s) non retenue(s) d'une table absente de la "
+            "structure"
+        )
     for schema, source in ((SCHEMA_CHARGEMENT, tables), (SCHEMA_PROPRE, tables_nettoyees)):
         for nom, table in structure.items():
             donnees = source[nom]
@@ -399,7 +425,14 @@ def preparer(
             if absentes:
                 problemes.append(f"{schema}.{table.nom} : colonnes absentes {', '.join(absentes)}")
                 continue
-            lignage, colonnes = _lignage(donnees, schema)
+            lignage, colonnes = _lignage(donnees, schema, par_table.get(nom))
+            if schema == SCHEMA_PROPRE and nom in par_table:
+                introuvables = len(par_table[nom] - set(zip(*colonnes[1:4])))
+                if introuvables:
+                    problemes.append(
+                        f"{schema}.{table.nom} : {introuvables} ligne(s) non retenue(s) absente(s) "
+                        "des données nettoyées"
+                    )
             for c in table.colonnes:
                 if schema == SCHEMA_CHARGEMENT:
                     resultat = valeurs_chargement(donnees[c.source])
@@ -463,7 +496,7 @@ def _tailles(lot: list[list], types: list[str]) -> list:
 
     tailles = []
     for position, type_sql in enumerate(types):
-        if type_sql == "int":
+        if type_sql in ("int", "bit"):
             tailles.append((pyodbc.SQL_INTEGER, 0, 0))
         else:
             longueur = max(
@@ -476,7 +509,10 @@ def _tailles(lot: list[list], types: list[str]) -> list:
 def _inserer(curseur, preparee: TablePreparee, ids: dict[tuple, int]) -> int:
     colonnes = ["id_chargement", *preparee.colonnes]
     types_techniques = {t.nom: t.type_sql for t in colonnes_techniques(preparee.schema)}
-    types = ["int" if types_techniques.get(c) == "int" else "texte" for c in colonnes]
+    # Une colonne bit reçoit un entier (0 ou 1), que SQL Server convertit.
+    types = [
+        "int" if types_techniques.get(c) in ("int", "bit") else "texte" for c in colonnes
+    ]
     lignes = [[ids[cle], *ligne] for cle, ligne in zip(preparee.lignage, preparee.lignes)]
     instruction = (
         f"INSERT INTO {preparee.schema}.{preparee.table.nom} ({', '.join(colonnes)}) "
@@ -583,6 +619,7 @@ def ecrire_base(
     structure: dict[str, TableBase] | None = None,
     version: str | None = None,
     completer: Callable | None = None,
+    non_retenues: set[tuple] | None = None,
 ) -> Ecriture:
     """Écrit une exécution complète en base (voir le cycle en tête du module).
 
@@ -591,7 +628,11 @@ def ecrire_base(
     (fichier_source, feuille_source) à son id_chargement. `version` vaut par défaut
     la version du traitement lue dans Git. Après `completer`, la procédure
     dw.reconstruire est appelée si un pack la déclare : une erreur de sa part (contrat
-    d'entrée non respecté) fait échouer toute l'exécution.
+    d'entrée non respecté) fait échouer toute l'exécution. `non_retenues`
+    (`anomalies.lignes_non_retenues` de la table des anomalies après nettoyage) donne
+    les lignes dont la colonne retenue de propre vaut 0 (voir `preparer`); sans lui,
+    toutes les lignes sont retenues, ce que la vérification (`verifier_base`) signale
+    s'il existe des anomalies bloquantes non résolues.
     """
     from .base import reconstruire_dw, version_traitement
 
@@ -599,7 +640,7 @@ def ecrire_base(
     version = version if version is not None else version_traitement()
     id_execution = _inscrire_execution(moteur, periode_fin, version)
     try:
-        preparation = preparer(perimetre, tables, tables_nettoyees, structure)
+        preparation = preparer(perimetre, tables, tables_nettoyees, structure, non_retenues)
         comptes: dict[str, dict[str, int]] = {}
         journal_dw = None
         with moteur.begin() as conn:
@@ -1118,6 +1159,7 @@ FAMILLE_EXECUTION = "exécution"
 FAMILLE_ILLISIBLES = "illisibles"
 FAMILLE_QUALITE = "qualite"
 FAMILLE_DW = "dw"
+FAMILLE_RETENUE = "retenue"
 CONTRAT_RESPECTE = "respecté"
 CONTRAT_NON_RESPECTE = "non respecté"
 VALEUR_MASQUEE = "masqué"
@@ -1129,13 +1171,22 @@ def attendus_table(preparee: TablePreparee) -> list[tuple[str, str, object, bool
     """Agrégats attendus d'une table préparée : (libellé, expression SQL, valeur
     attendue, valeur à masquer).
 
-    Pour toute table : nombre de lignes, puis nombre de cellules renseignées de chaque
-    colonne de données. En propre, en plus : somme exacte d'une colonne entière ou
+    Pour toute table : nombre de lignes (et, en propre, de lignes non retenues), puis
+    nombre de cellules renseignées de chaque colonne de données. En propre, en plus :
+    somme exacte d'une colonne entière ou
     décimale, plus petite et plus grande valeur d'une date ou d'une heure (écriture ISO).
     Les agrégats d'une colonne sensible, hors décomptes, sont à masquer à l'affichage.
     """
     nom = f"{preparee.schema}.{preparee.table.nom}"
     attendus = [(f"{nom} : lignes", "COUNT(*)", len(preparee.lignes), False)]
+    if COLONNE_RETENUE in preparee.colonnes:
+        rang = preparee.colonnes.index(COLONNE_RETENUE)
+        attendus.append((
+            f"{nom} : lignes non retenues",
+            f"COUNT(CASE WHEN {COLONNE_RETENUE} = 0 THEN 1 END)",
+            sum(1 for l in preparee.lignes if l[rang] == 0),
+            False,
+        ))
     debut = len(preparee.colonnes) - len(preparee.table.colonnes)
     for rang, colonne in enumerate(preparee.table.colonnes):
         valeurs = [l[debut + rang] for l in preparee.lignes if l[debut + rang] is not None]
@@ -1191,10 +1242,13 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     unique de la période, au statut réussie; lignes et cellules renseignées de chaque
     table de chargement et de propre, sommes, minimums et maximums de propre;
     cellules illisibles de propre rattachées à une anomalie après nettoyage (même
-    ligne source, même champ); avec `sorties`, lignes de chaque table de qualite par
-    état (jours fériés, valeurs des listes fermées, rattachements et
-    correspondances des codes en doublon compris, `sensibles` étant celui de
-    l'écriture), id_chargement renseigné pour toute ligne qui a un fichier source,
+    ligne source, même champ); lignes non retenues de chaque table de propre égales,
+    ligne à ligne, à celles qui portent une anomalie bloquante non résolue de
+    qualite.anomalie (`controles_retenue_propre`); avec `sorties`, lignes de chaque
+    table de qualite par état (jours fériés, valeurs des listes fermées,
+    rattachements et correspondances des codes en doublon compris, `sensibles` étant
+    celui de l'écriture), id_chargement renseigné pour toute ligne qui a un fichier
+    source,
     et, par rattachement, lignes rattachées, choisies parmi plusieurs candidates et
     choisies par la date;
     pour dw, procédure de reconstruction présente si et seulement si l'écriture l'a
@@ -1210,7 +1264,9 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     source, valeurs renseignées) égale à celle de ses colonnes de propre, aucune
     colonne numérique d'un fait sans mesure déclarée, et, pour chaque date d'un fait
     lue sur sa ligne de propre, jour du calendrier égal à celui de propre ligne à
-    ligne, autant de -1 que de dates vides et aucun -2 (`controles_mesures`).
+    ligne, autant de -1 que de dates vides et aucun -2 (`controles_mesures`); pour
+    chaque fait, retenue égale ligne à ligne à celle de sa ligne de propre et des
+    lignes rattachées que le pack déclare (`controles_retenue_faits`).
     """
     from sqlalchemy import text
 
@@ -1263,6 +1319,10 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
         )
         ajouter(FAMILLE_ILLISIBLES, "cellules illisibles de propre rattachées à une anomalie "
                 "après nettoyage", len(cellules), rattachees)
+
+        for controle in controles_retenue_propre(preparation, ecriture.id_execution):
+            ajouter(FAMILLE_RETENUE, controle.libelle, controle.attendu,
+                    _obtenu(tuple(conn.execute(text(controle.requete)).one())))
 
         if sorties is not None:
             attendus_qualite = {
@@ -1501,6 +1561,133 @@ def controles_regroupements(regroupements: list[tuple], correspondances: pd.Data
     return controles
 
 
+REQUETE_RETENUES = (
+    "SELECT table_fait, table_source, cle, table_reference FROM dw.contrat_retenue "
+    "ORDER BY table_fait, id_contrat"
+)
+
+
+def _litteral(texte: str) -> str:
+    """Littéral nvarchar de T-SQL."""
+    return "N'" + str(texte).replace("'", "''") + "'"
+
+
+def _anomalie_bloquante_non_resolue(table_source: str, id_execution: int, alias: str) -> str:
+    """Condition SQL : la ligne de propre `alias` porte, dans qualite.anomalie (état
+    nettoyé de l'exécution), une anomalie bloquante non résolue de sa table, la règle
+    de `anomalies.lignes_non_retenues`."""
+    issues = ", ".join(_litteral(i) for i in ISSUES_NON_RESOLUES)
+    return (
+        "EXISTS (SELECT 1 FROM qualite.anomalie AS a "
+        f"WHERE a.id_execution = {int(id_execution)} AND a.etat = {_litteral(ETAT_NETTOYE)} "
+        f"AND a.table_source = {_litteral(table_source)} "
+        f"AND a.id_chargement = {alias}.id_chargement "
+        f"AND a.num_ligne_source = {alias}.num_ligne_source "
+        f"AND a.gravite = {_litteral(GRAVITE_BLOQUANTE)} AND a.issue IN ({issues}) "
+        "AND (a.decision_metier IS NULL OR LTRIM(RTRIM(a.decision_metier)) = N''))"
+    )
+
+
+def controles_retenue_propre(preparation: Preparation, id_execution: int) -> list[ControleFait]:
+    """Contrôles de la colonne retenue de chaque table de propre contre qualite.anomalie,
+    sans valeur du client : lignes dont la retenue ne suit pas la règle (0 si et
+    seulement si la ligne porte une anomalie bloquante non résolue) et anomalies
+    bloquantes non résolues dont la ligne n'est pas dans propre, « 0 / 0 » attendu.
+    Le contrôle est fait par le lignage, en base, indépendamment de la préparation :
+    il signale une écriture faite sans les lignes non retenues."""
+    controles = []
+    issues = ", ".join(_litteral(i) for i in ISSUES_NON_RESOLUES)
+    for preparee in preparation.tables:
+        if preparee.schema != SCHEMA_PROPRE:
+            continue
+        table, source = preparee.table.nom, preparee.table.source
+        ecarts = (
+            f"SELECT COUNT(*) FROM {SCHEMA_PROPRE}.{table} AS p WHERE p.{COLONNE_RETENUE} <> "
+            f"CASE WHEN {_anomalie_bloquante_non_resolue(source, id_execution, 'p')} "
+            "THEN 0 ELSE 1 END"
+        )
+        orphelines = (
+            "SELECT COUNT(*) FROM (SELECT DISTINCT a.id_chargement, a.num_ligne_source "
+            "FROM qualite.anomalie AS a "
+            f"WHERE a.id_execution = {int(id_execution)} AND a.etat = {_litteral(ETAT_NETTOYE)} "
+            f"AND a.table_source = {_litteral(source)} AND a.num_ligne_source IS NOT NULL "
+            f"AND a.gravite = {_litteral(GRAVITE_BLOQUANTE)} AND a.issue IN ({issues}) "
+            "AND (a.decision_metier IS NULL OR LTRIM(RTRIM(a.decision_metier)) = N'') "
+            f"AND NOT EXISTS (SELECT 1 FROM {SCHEMA_PROPRE}.{table} AS p "
+            "WHERE p.id_chargement = a.id_chargement "
+            "AND p.num_ligne_source = a.num_ligne_source)) AS o"
+        )
+        controles.append(ControleFait(
+            f"{SCHEMA_PROPRE}.{table} : lignes dont la retenue ne suit pas les anomalies "
+            "bloquantes non résolues / anomalies bloquantes non résolues hors de propre",
+            "0 / 0",
+            f"SELECT ({ecarts}), ({orphelines})",
+        ))
+    return controles
+
+
+def controles_retenue_faits(sources: list[tuple], retenues: list[tuple],
+                            preparation: Preparation, id_execution: int) -> list[ControleFait]:
+    """Contrôles de la colonne retenue des faits déclarés par le pack, sans valeur du
+    client.
+
+    `sources` : (fait, table du dictionnaire) de dw.source_fait; `retenues` : (fait,
+    table, clé, référentiel) de dw.contrat_retenue. Ligne à ligne, par le lignage, un
+    fait doit être retenu si et seulement si sa ligne de propre l'est et, pour chaque
+    rattachement déclaré pour lui, la ligne rattachée (quand elle est trouvée) l'est
+    aussi : 0 écart attendu. Un nom de fait invalide, une table absente de propre, un
+    rattachement déclaré sur une autre table que celle du fait, ou un référentiel
+    absent de propre rendent le contrôle impossible (`probleme`).
+    """
+    noms = {p.table.source: p.table.nom for p in preparation.tables if p.schema == SCHEMA_PROPRE}
+    par_fait: dict[str, list[tuple]] = {}
+    for fait, table, cle, reference in retenues:
+        par_fait.setdefault(fait, []).append((table, cle, reference))
+    controles = []
+    for fait, table in sources:
+        declares = par_fait.get(fait, [])
+        libelle = (f"dw.{fait} : lignes dont la retenue diffère de celle de propre.{table}"
+                   + "".join(f" et de {r} par {t}.{c}" for t, c, r in declares))
+        if not _nom_dw(fait):
+            controles.append(ControleFait(libelle, None, None, "nom de fait invalide"))
+            continue
+        if table not in noms:
+            controles.append(ControleFait(libelle, None, None, "table absente de propre"))
+            continue
+        if any(t != table for t, _, _ in declares):
+            controles.append(ControleFait(
+                libelle, None, None, "rattachement déclaré sur une autre table que celle du fait"
+            ))
+            continue
+        if any(r not in noms for _, _, r in declares):
+            controles.append(ControleFait(libelle, None, None, "référentiel absent de propre"))
+            continue
+        jointures, conditions = [], [f"p.{COLONNE_RETENUE} = 0"]
+        for rang, (t, cle, reference) in enumerate(declares, start=1):
+            regle = (f"dw.regle_rattachement({int(id_execution)}, {_litteral(t)}, "
+                     f"{_litteral(cle)}, {_litteral(reference)})")
+            jointures.append(
+                f"LEFT JOIN qualite.rattachement AS r{rang} "
+                f"ON r{rang}.id_execution = {int(id_execution)} AND r{rang}.id_regle = {regle} "
+                f"AND r{rang}.id_chargement = p.id_chargement "
+                f"AND r{rang}.num_ligne_source = p.num_ligne_source "
+                f"LEFT JOIN {SCHEMA_PROPRE}.{noms[reference]} AS h{rang} "
+                f"ON h{rang}.id_chargement = r{rang}.id_chargement_reference "
+                f"AND h{rang}.num_ligne_source = r{rang}.num_ligne_reference"
+            )
+            conditions.append(f"h{rang}.{COLONNE_RETENUE} = 0")
+        requete = (
+            f"SELECT COUNT(*) FROM dw.{fait} AS f "
+            f"JOIN {SCHEMA_PROPRE}.{noms[table]} AS p "
+            "ON p.id_chargement = f.id_chargement AND p.num_ligne_source = f.num_ligne_source "
+            + "".join(j + " " for j in jointures)
+            + f"WHERE f.{COLONNE_RETENUE} <> CASE WHEN {' OR '.join(conditions)} "
+            "THEN 0 ELSE 1 END"
+        )
+        controles.append(ControleFait(libelle, 0, requete))
+    return controles
+
+
 def _tables_propre(preparation: Preparation) -> dict[str, TablePreparee]:
     return {p.table.nom: p for p in preparation.tables if p.schema == SCHEMA_PROPRE}
 
@@ -1648,8 +1835,8 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
                  correspondances=None) -> None:
     """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte, puis
     ceux des faits déclarés par le pack (`controles_faits`), des codes en doublon
-    qu'il regroupe (`controles_regroupements`) et des mesures et des dates des faits
-    (`controles_mesures`)."""
+    qu'il regroupe (`controles_regroupements`), des mesures et des dates des faits
+    (`controles_mesures`) et de leur retenue (`controles_retenue_faits`)."""
     import pyodbc
 
     from .base import procedure_reconstruction_presente
@@ -1690,10 +1877,14 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
         mesures = [(f, m, t, c, int(s)) for f, m, t, c, s in curseur.fetchall()]
         curseur.execute(REQUETE_DATES)
         dates = [tuple(r) for r in curseur.fetchall()]
+        curseur.execute(REQUETE_RETENUES)
+        retenues = [tuple(r) for r in curseur.fetchall()]
         controles = controles_faits(sources, contrats, ecriture.lignes, bilan) + \
             controles_regroupements(regroupements, correspondances, ecriture.id_execution)
         if ecriture.preparation is not None:
             controles += controles_mesures(mesures, dates, ecriture.preparation)
+            controles += controles_retenue_faits(sources, retenues, ecriture.preparation,
+                                                 ecriture.id_execution)
         for controle in controles:
             if controle.requete is None:
                 ajouter(FAMILLE_DW, controle.libelle, controle.probleme, None)

@@ -26,6 +26,16 @@
   Les rattachements lus sont déclarés dans dw.contrat_rattachement : un
   rattachement absent de l'exécution fait échouer la reconstruction.
 
+  Lignes retenues (étape 7.4a) : retenue reprend la colonne retenue de la
+  ligne de propre (0 pour une ligne qui porte une anomalie bloquante que le
+  métier n'a pas résolue, exclue des indicateurs). Une ligne de document
+  (facture, pièce d'achat) n'est retenue que si son en-tête trouvé l'est
+  aussi; une ligne sans en-tête garde sa propre retenue, l'en-tête introuvable
+  étant une anomalie de la ligne. Ces héritages sont déclarés dans
+  dw.contrat_retenue, pour la vérification de l'écriture. Une ligne liée à une
+  intervention non retenue (consommation, ligne de facture) reste retenue : le
+  CA et le stock ne dépendent pas de l'intervention.
+
   Mesures et dates : chaque colonne numérique d'un fait reprise de propre est
   déclarée dans dw.contrat_mesure, et chaque date lue sur la ligne même du
   fait dans dw.contrat_date, pour la vérification de l'écriture.
@@ -137,6 +147,7 @@ CREATE TABLE dw.fait_intervention (
     facturable            nvarchar(4000)  NULL,
     lieu_cp               nvarchar(4000)  NULL,
     lieu_ville            nvarchar(4000)  NULL,
+    retenue               bit             NOT NULL,
     id_chargement         int             NOT NULL,
     fichier_source        nvarchar(260)   NOT NULL,
     feuille_source        nvarchar(128)   NULL,
@@ -169,7 +180,7 @@ BEGIN
     INSERT INTO dw.fait_intervention (
         id_fait_intervention, id_intervention, id_date, heure_debut, id_intervenant, id_client,
         id_categorie, duree_min, duree_trajet_min, distance_km, statut, facturable, lieu_cp,
-        lieu_ville, id_chargement, fichier_source, feuille_source, num_ligne_source)
+        lieu_ville, retenue, id_chargement, fichier_source, feuille_source, num_ligne_source)
     SELECT ROW_NUMBER() OVER (ORDER BY p.fichier_source, p.feuille_source, p.num_ligne_source),
            p.id_intervention,
            CASE WHEN p.date_debut IS NULL THEN -1 ELSE COALESCE(dd.id_date, -2) END,
@@ -184,6 +195,7 @@ BEGIN
            p.facturable,
            p.lieu_cp,
            p.lieu_ville,
+           p.retenue,
            p.id_chargement, p.fichier_source, p.feuille_source, p.num_ligne_source
     FROM propre.interventions AS p
     LEFT JOIN dw.dim_date AS dd ON dd.date_jour = p.date_debut
@@ -230,6 +242,7 @@ CREATE TABLE dw.fait_consommation (
     id_piece              int             NOT NULL,
     quantite              decimal(28, 8)  NULL,
     unite                 nvarchar(4000)  NULL,
+    retenue               bit             NOT NULL,
     id_chargement         int             NOT NULL,
     fichier_source        nvarchar(260)   NOT NULL,
     feuille_source        nvarchar(128)   NULL,
@@ -287,7 +300,7 @@ BEGIN
     )
     INSERT INTO dw.fait_consommation (
         id_fait_consommation, id_consommation, id_fait_intervention, lien_intervention, id_date,
-        id_piece, quantite, unite, id_chargement, fichier_source, feuille_source,
+        id_piece, quantite, unite, retenue, id_chargement, fichier_source, feuille_source,
         num_ligne_source)
     SELECT ROW_NUMBER() OVER (ORDER BY l.fichier_source, l.feuille_source, l.num_ligne_source),
            l.id_consommation,
@@ -299,6 +312,7 @@ BEGIN
            l.piece,
            l.quantite,
            l.unite,
+           l.retenue,
            l.id_chargement, l.fichier_source, l.feuille_source, l.num_ligne_source
     FROM lignes AS l;
 
@@ -362,6 +376,13 @@ INSERT INTO dw.contrat_rattachement
      N'fait_achat', N'id_piece', N'membre');
 GO
 
+/* Une ligne de document n'est retenue que si son en-tête l'est aussi : ses
+   date, client ou fournisseur et type de pièce viennent de l'en-tête. */
+INSERT INTO dw.contrat_retenue (table_fait, table_source, cle, table_reference) VALUES
+    (N'fait_ligne_facture', N'factures_lignes', N'num_facture', N'factures_entetes'),
+    (N'fait_achat', N'achats_lignes', N'num_piece_achat', N'achats_entetes');
+GO
+
 /* Mesures des faits des documents. Leurs dates venant de l'en-tête, elles ne
    sont pas déclarées dans dw.contrat_date. */
 INSERT INTO dw.contrat_mesure
@@ -409,6 +430,7 @@ CREATE TABLE dw.fait_ligne_facture (
     remise_pct             decimal(28, 8)  NULL,
     montant_ht             decimal(28, 8)  NULL,
     taux_tva               decimal(28, 8)  NULL,
+    retenue                bit             NOT NULL,
     id_chargement          int             NOT NULL,
     fichier_source         nvarchar(260)   NOT NULL,
     feuille_source         nvarchar(128)   NULL,
@@ -459,6 +481,7 @@ BEGIN
     WITH lignes AS (
         SELECT p.*,
                h.id_chargement AS entete_trouve,
+               h.retenue AS entete_retenue,
                CASE WHEN h.id_chargement IS NOT NULL THEN NULL
                     WHEN p.num_facture IS NULL THEN -1 ELSE -2 END AS sans_entete,
                h.type_piece, h.mode_reglement, h.facture_origine,
@@ -507,7 +530,7 @@ BEGIN
         id_fait_ligne_facture, num_facture, num_ligne, lien_entete, type_piece, mode_reglement,
         facture_origine, id_date, id_date_echeance, id_client, id_article, id_piece,
         id_fait_intervention, lien_intervention, quantite, unite, pu_ht, remise_pct, montant_ht,
-        taux_tva, id_chargement, fichier_source, feuille_source, num_ligne_source)
+        taux_tva, retenue, id_chargement, fichier_source, feuille_source, num_ligne_source)
     SELECT ROW_NUMBER() OVER (ORDER BY l.fichier_source, l.feuille_source, l.num_ligne_source),
            l.num_facture,
            l.num_ligne,
@@ -535,6 +558,7 @@ BEGIN
            l.remise_pct,
            l.montant_ht,
            l.taux_tva,
+           CASE WHEN l.retenue = 0 OR l.entete_retenue = 0 THEN 0 ELSE 1 END,
            l.id_chargement, l.fichier_source, l.feuille_source, l.num_ligne_source
     FROM lignes AS l;
 
@@ -568,6 +592,7 @@ CREATE TABLE dw.fait_achat (
     unite                    nvarchar(4000)  NULL,
     pu_achat_ht              decimal(28, 8)  NULL,
     montant_ht               decimal(28, 8)  NULL,
+    retenue                  bit             NOT NULL,
     id_chargement            int             NOT NULL,
     fichier_source           nvarchar(260)   NOT NULL,
     feuille_source           nvarchar(128)   NULL,
@@ -609,6 +634,7 @@ BEGIN
     WITH lignes AS (
         SELECT p.*,
                h.id_chargement AS entete_trouve,
+               h.retenue AS entete_retenue,
                CASE WHEN h.id_chargement IS NOT NULL THEN NULL
                     WHEN p.num_piece_achat IS NULL THEN -1 ELSE -2 END AS sans_entete,
                h.type_piece, h.ref_facture_fournisseur, h.date_facture, h.date_echeance,
@@ -649,8 +675,8 @@ BEGIN
     INSERT INTO dw.fait_achat (
         id_fait_achat, num_piece_achat, num_ligne, lien_entete, type_piece,
         ref_facture_fournisseur, id_date, id_date_echeance, id_fournisseur, id_piece, id_compte,
-        quantite, unite, pu_achat_ht, montant_ht, id_chargement, fichier_source, feuille_source,
-        num_ligne_source)
+        quantite, unite, pu_achat_ht, montant_ht, retenue, id_chargement, fichier_source,
+        feuille_source, num_ligne_source)
     SELECT ROW_NUMBER() OVER (ORDER BY l.fichier_source, l.feuille_source, l.num_ligne_source),
            l.num_piece_achat,
            l.num_ligne,
@@ -672,6 +698,7 @@ BEGIN
            l.unite,
            l.pu_achat_ht,
            l.montant_ht,
+           CASE WHEN l.retenue = 0 OR l.entete_retenue = 0 THEN 0 ELSE 1 END,
            l.id_chargement, l.fichier_source, l.feuille_source, l.num_ligne_source
     FROM lignes AS l;
 
@@ -742,6 +769,7 @@ CREATE TABLE dw.fait_ecriture (
     debit             decimal(28, 8)  NULL,
     credit            decimal(28, 8)  NULL,
     solde             decimal(28, 8)  NOT NULL,
+    retenue           bit             NOT NULL,
     id_chargement     int             NOT NULL,
     fichier_source    nvarchar(260)   NOT NULL,
     feuille_source    nvarchar(128)   NULL,
@@ -772,7 +800,7 @@ BEGIN
     INSERT INTO dw.fait_ecriture (
         id_fait_ecriture, journal_code, ecriture_num, id_date, id_date_piece, id_compte,
         comp_aux_num, piece_ref, num_facture, num_piece_achat, ecriture_let, debit, credit,
-        solde, id_chargement, fichier_source, feuille_source, num_ligne_source)
+        solde, retenue, id_chargement, fichier_source, feuille_source, num_ligne_source)
     SELECT ROW_NUMBER() OVER (ORDER BY p.fichier_source, p.feuille_source, p.num_ligne_source),
            p.journal_code,
            p.ecriture_num,
@@ -787,6 +815,7 @@ BEGIN
            p.debit,
            p.credit,
            COALESCE(p.debit, 0) - COALESCE(p.credit, 0),
+           p.retenue,
            p.id_chargement, p.fichier_source, p.feuille_source, p.num_ligne_source
     FROM propre.fec AS p
     LEFT JOIN dw.dim_date AS dd ON dd.date_jour = p.ecriture_date

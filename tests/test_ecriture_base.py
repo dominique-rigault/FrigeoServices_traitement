@@ -19,6 +19,8 @@ from frigeo.ecriture_base import (
     controles_faits,
     controles_mesures,
     controles_regroupements,
+    controles_retenue_faits,
+    controles_retenue_propre,
     _obtenu,
     attendus_table,
     champ_sensible,
@@ -270,17 +272,44 @@ def test_preparation(jeu):
     assert chargement.lignage == [("interventions_2025.csv", None)] * 2
     propre = tables[("propre", "interventions")]
     assert propre.colonnes == [
-        "periode_export", "fichier_source", "feuille_source", "num_ligne_source",
+        "periode_export", "fichier_source", "feuille_source", "num_ligne_source", "retenue",
         "id_intervention", "duree_min",
     ]
-    assert propre.lignes == [["2025", "interventions_2025.csv", None, 2, "I1", "45"]]
+    assert propre.lignes == [["2025", "interventions_2025.csv", None, 2, 1, "I1", "45"]]
     assert tables[("propre", "factures_entetes")].lignes == [
-        ["2025", "factures_2025.xlsx", "Entetes", 2, "F1", "100.5"]
+        ["2025", "factures_2025.xlsx", "Entetes", 2, 1, "F1", "100.5"]
     ]
     assert tables[("chargement", "factures_entetes")].lignes[0][-1] == "100.5"
     assert tables[("propre", "factures_lignes")].lignes == []
     assert preparation.illisibles.empty
     assert len(preparation.journal) == 3
+
+
+def test_preparation_marque_les_lignes_non_retenues(jeu):
+    non_retenues = {
+        ("interventions", "interventions_2025.csv", None, 2),
+        ("factures_entetes", "factures_2025.xlsx", "Entetes", 2),
+    }
+    preparation = preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure, non_retenues)
+    tables = {(p.schema, p.table.source): p for p in preparation.tables}
+    rang = tables[("propre", "interventions")].colonnes.index("retenue")
+    assert [l[rang] for l in tables[("propre", "interventions")].lignes] == [0]
+    assert [l[rang] for l in tables[("propre", "factures_entetes")].lignes] == [0]
+    assert "retenue" not in tables[("chargement", "interventions")].colonnes
+
+
+def test_preparation_refuse_une_ligne_non_retenue_introuvable(jeu):
+    non_retenues = {
+        ("interventions", "interventions_2025.csv", None, 3),  # retirée au nettoyage
+        ("factures_entetes", "factures_2025.xlsx", None, 2),  # feuille différente
+        ("inconnue", "x.csv", None, 2),
+    }
+    with pytest.raises(ErreurEcriture) as erreur:
+        preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure, non_retenues)
+    message = str(erreur.value)
+    assert "propre.interventions\u00a0: 1 ligne(s) non retenue(s) absente(s)" in message
+    assert "propre.factures_entetes\u00a0: 1 ligne(s) non retenue(s) absente(s)" in message
+    assert "inconnue\u00a0: 1 ligne(s) non retenue(s) d'une table absente" in message
 
 
 def test_preparation_compte_les_illisibles_de_propre(jeu):
@@ -711,10 +740,13 @@ def test_attendus_table(jeu):
         },
         {"factures_entetes": frozenset({"total_ht"})},
     )
-    preparation = preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure)
+    non_retenues = {("interventions", "interventions_2025.csv", None, 3)}
+    preparation = preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure, non_retenues)
     tables = {(p.schema, p.table.source): p for p in preparation.tables}
     assert attendus_table(tables[("propre", "interventions")]) == [
         ("propre.interventions : lignes", "COUNT(*)", 2, False),
+        ("propre.interventions : lignes non retenues", "COUNT(CASE WHEN retenue = 0 THEN 1 END)",
+         1, False),
         ("propre.interventions.id_intervention : cellules renseignées", "COUNT(id_intervention)", 2, False),
         ("propre.interventions.duree_min : cellules renseignées", "COUNT(duree_min)", 1, False),
         ("propre.interventions.duree_min : somme", "SUM(duree_min)", Decimal(45), False),
@@ -727,6 +759,8 @@ def test_attendus_table(jeu):
     ]
     assert attendus_table(tables[("propre", "factures_lignes")]) == [
         ("propre.factures_lignes : lignes", "COUNT(*)", 0, False),
+        ("propre.factures_lignes : lignes non retenues",
+         "COUNT(CASE WHEN retenue = 0 THEN 1 END)", 0, False),
         ("propre.factures_lignes.num_facture : cellules renseignées", "COUNT(num_facture)", 0, False),
     ]
 
@@ -934,3 +968,53 @@ def test_obtenu():
     assert _obtenu((Decimal("12.50000000"),)) == Decimal("12.5")
     assert _obtenu((3, None)) == "3 / 0"
     assert _obtenu((Decimal("1.50000000"), 2)) == "1.5 / 2"
+
+
+# --- Retenue (étape 7.4a) ------------------------------------------------------------
+
+
+def test_controles_retenue_propre(jeu):
+    preparation = preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure)
+    controles = controles_retenue_propre(preparation, 7)
+    assert [c.libelle.split(" :")[0] for c in controles] == [
+        "propre.interventions", "propre.factures_entetes", "propre.factures_lignes",
+    ]
+    controle = controles[0]
+    assert controle.attendu == "0 / 0"
+    assert "FROM propre.interventions AS p WHERE p.retenue <> CASE WHEN EXISTS" in controle.requete
+    assert "a.id_execution = 7 AND a.etat = N'nettoyé'" in controle.requete
+    assert "a.table_source = N'interventions'" in controle.requete
+    assert "a.gravite = N'bloquante' AND a.issue IN (N'anomalie', N'à arbitrer')" in controle.requete
+    assert controle.requete.count("decision_metier IS NULL") == 2
+
+
+def test_controles_retenue_faits(jeu):
+    preparation = preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure)
+    sources = [("fait_intervention", "interventions"), ("fait_ligne_facture", "factures_lignes")]
+    retenues = [("fait_ligne_facture", "factures_lignes", "num_facture", "factures_entetes")]
+    simple, documents = controles_retenue_faits(sources, retenues, preparation, 3)
+    assert simple.attendu == 0 and simple.probleme is None
+    assert simple.libelle == (
+        "dw.fait_intervention : lignes dont la retenue diffère de celle de propre.interventions"
+    )
+    assert "LEFT JOIN" not in simple.requete
+    assert simple.requete.endswith("WHERE f.retenue <> CASE WHEN p.retenue = 0 THEN 0 ELSE 1 END")
+    assert documents.libelle.endswith("et de factures_entetes par factures_lignes.num_facture")
+    assert ("r1.id_regle = dw.regle_rattachement(3, N'factures_lignes', N'num_facture', "
+            "N'factures_entetes')") in documents.requete
+    assert "LEFT JOIN propre.factures_entetes AS h1" in documents.requete
+    assert "CASE WHEN p.retenue = 0 OR h1.retenue = 0 THEN 0 ELSE 1 END" in documents.requete
+
+
+def test_controles_retenue_faits_impossibles_sans_requete(jeu):
+    preparation = preparer(jeu.perimetre, jeu.tables, jeu.nettoyees, jeu.structure)
+    sources = [("fait x", "interventions"), ("fait_u", "inconnue"),
+               ("fait_v", "factures_lignes"), ("fait_w", "factures_lignes")]
+    retenues = [("fait_v", "interventions", "id", "factures_entetes"),
+                ("fait_w", "factures_lignes", "num_facture", "inconnue")]
+    controles = controles_retenue_faits(sources, retenues, preparation, 1)
+    assert [c.probleme for c in controles] == [
+        "nom de fait invalide", "table absente de propre",
+        "rattachement déclaré sur une autre table que celle du fait", "référentiel absent de propre",
+    ]
+    assert all(c.requete is None and c.attendu is None for c in controles)

@@ -33,7 +33,9 @@ Colonnes techniques, communes aux deux schémas : id_ligne (identité, clé
 primaire), id_chargement (qualite.journal_chargement), periode_export (vide pour
 un référentiel), fichier_source, feuille_source et num_ligne_source (lignage, uniques
 ensemble). Le schéma chargement garde en plus nb_champs_source et
-champs_excedentaires, qui décrivent la ligne livrée.
+champs_excedentaires, qui décrivent la ligne livrée; le schéma propre garde en plus
+retenue (bit, étape 7.4a) : 0 pour une ligne exclue des indicateurs, qui porte une
+anomalie bloquante non résolue (`anomalies.lignes_non_retenues`), 1 sinon.
 
 SQL. Les tables de données ne sont pas créées par un script numéroté : `ddl_structure`
 produit leurs instructions CREATE TABLE, exécutées par l'écriture (7.2c) après la
@@ -114,10 +116,13 @@ COLONNES_TECHNIQUES_CHARGEMENT = (
     ColonneTechnique("nb_champs_source", "int", False),
     ColonneTechnique("champs_excedentaires", TYPE_TEXTE, False),
 )
+COLONNE_RETENUE = "retenue"
+COLONNES_TECHNIQUES_PROPRE = (ColonneTechnique(COLONNE_RETENUE, "bit", True),)
 # Colonnes de lignage, uniques ensemble dans chaque table.
 COLONNES_LIGNAGE = ("fichier_source", "feuille_source", "num_ligne_source")
 NOMS_TECHNIQUES = frozenset(
-    c.nom for c in (*COLONNES_TECHNIQUES, *COLONNES_TECHNIQUES_CHARGEMENT)
+    c.nom
+    for c in (*COLONNES_TECHNIQUES, *COLONNES_TECHNIQUES_CHARGEMENT, *COLONNES_TECHNIQUES_PROPRE)
 )
 
 # Mots réservés de T-SQL (documentation de SQL Server, « Reserved keywords »).
@@ -256,7 +261,7 @@ def colonnes_techniques(schema: str) -> tuple[ColonneTechnique, ...]:
     if schema == SCHEMA_CHARGEMENT:
         return (*COLONNES_TECHNIQUES, *COLONNES_TECHNIQUES_CHARGEMENT)
     if schema == SCHEMA_PROPRE:
-        return COLONNES_TECHNIQUES
+        return (*COLONNES_TECHNIQUES, *COLONNES_TECHNIQUES_PROPRE)
     raise ValueError(f"Schéma {schema!r} inconnu : {' ou '.join(SCHEMAS)} attendu")
 
 

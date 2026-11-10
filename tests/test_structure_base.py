@@ -108,7 +108,7 @@ def test_famille_propre(nature, code, attendue):
 def test_colonnes_techniques():
     propre = [c.nom for c in colonnes_techniques(SCHEMA_PROPRE)]
     chargement = [c.nom for c in colonnes_techniques(SCHEMA_CHARGEMENT)]
-    assert propre == [
+    communes = [
         "id_ligne",
         "id_chargement",
         "periode_export",
@@ -116,7 +116,8 @@ def test_colonnes_techniques():
         "feuille_source",
         "num_ligne_source",
     ]
-    assert chargement == [*propre, "nb_champs_source", "champs_excedentaires"]
+    assert propre == [*communes, "retenue"]
+    assert chargement == [*communes, "nb_champs_source", "champs_excedentaires"]
     identites = [c.nom for c in colonnes_techniques(SCHEMA_PROPRE) if c.identite]
     assert identites == ["id_ligne"]
     with pytest.raises(ValueError):
@@ -246,15 +247,16 @@ def test_ddl_table_propre():
     assert sql.startswith("CREATE TABLE propre.interventions (\n")
     assert sql.endswith("\n);")
     lignes = [ligne.strip().rstrip(",") for ligne in sql.splitlines()[1:-1]]
-    assert lignes[:6] == [
+    assert lignes[:7] == [
         "id_ligne bigint IDENTITY(1, 1) NOT NULL",
         "id_chargement int NOT NULL",
         "periode_export nvarchar(20) NULL",
         "fichier_source nvarchar(260) NOT NULL",
         "feuille_source nvarchar(128) NULL",
         "num_ligne_source int NOT NULL",
+        "retenue bit NOT NULL",
     ]
-    assert lignes[6:13] == [
+    assert lignes[7:14] == [
         "id_intervention nvarchar(4000) NULL",
         "date_debut date NULL",
         "heure_debut time(0) NULL",
@@ -263,7 +265,7 @@ def test_ddl_table_propre():
         "distance_km decimal(28, 8) NULL",
         "client nvarchar(4000) NULL",
     ]
-    assert lignes[13:] == [
+    assert lignes[14:] == [
         "CONSTRAINT pk_interventions PRIMARY KEY (id_ligne)",
         "CONSTRAINT uq_interventions_lignage UNIQUE "
         "(fichier_source, feuille_source, num_ligne_source)",

@@ -179,6 +179,9 @@ exceptions:
   - motif: '(intervenants\.date_entree|remunerations\.[a-z_]+|parametres_couts\.[a-z_]+) (obligatoire|nature)'
     etape: format
     gravite: bloquante
+  - controle: interventions valeur en double (id_intervention)
+    etape: doublons
+    gravite: bloquante
   - motif: '.* espaces'
     etape: format
     gravite: mineure
