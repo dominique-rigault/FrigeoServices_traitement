@@ -12,11 +12,16 @@ from frigeo.packs.services_intervention import (
     consommations,
     couts_attendus,
     cump_attendus,
+    cout_horaire,
     cump_fin_de_mois,
     dates_stock_initial,
     liens,
+    lignes_facture_liees,
+    marges_attendues,
     mois_du_calcul,
+    parametres_annee,
     pieces_catalogue,
+    remuneration_en_vigueur,
     table_propre,
     verifier,
 )
@@ -176,12 +181,16 @@ def _table(source, colonnes, lignes, schema="propre"):
 
 
 def _preparation():
-    colonnes = ["categorie", "date_debut", "heure_debut"]
+    colonnes = ["categorie", "date_debut", "heure_debut", "duree_min", "duree_trajet_min",
+                "distance_km"]
     return SimpleNamespace(tables=[
         _table("interventions", colonnes, [], schema="chargement"),
         _table("interventions", colonnes,
                [["2025", "interventions.csv", None, 2, 1, "Installation", "2025-03-11",
-                 "08:00:00"]]),
+                 "08:00:00", "60", "30", "10"]]),
+        _table("intervenants", [], []),
+        _table("remunerations", [], []),
+        _table("parametres_couts", [], []),
         _table("factures_lignes", [], []),
         _table("factures_entetes", [], []),
         _table("catalogue_pieces", ["ref_piece", "stock_initial", "cump_initial"],
@@ -201,11 +210,12 @@ def test_table_propre():
 class _Curseur:
     """Faux curseur : rend, pour chaque requête, les lignes de la première table citée."""
 
-    def __init__(self, parametres, chantiers, cump=(), couts=(), periode="2025-02"):
+    def __init__(self, parametres, chantiers, cump=(), couts=(), marges=(), periode="2025-02"):
         self.resultats = {
+            "dw.parametre_taux_charges": [("CDI", "taux_charges_cdi_cdd")],
             "dw.parametre_calcul": parametres, "dw.cump_mensuel": list(cump),
-            "dw.fait_consommation": list(couts), "dw.fait_intervention": chantiers,
-            "qualite.execution": [(periode,)],
+            "dw.fait_consommation": list(couts), "cout_salarial": list(marges),
+            "dw.fait_intervention": chantiers, "qualite.execution": [(periode,)],
         }
         self.courant = None
 
@@ -219,24 +229,30 @@ class _Curseur:
 def test_verifier():
     cump = [("PCE-1", dt.date(2025, mois, 1), Decimal(2), Decimal("10.5"), Decimal(0),
              Decimal(0), Decimal(0), Decimal(2), Decimal("10.5")) for mois in (1, 2)]
+    marges = [("interventions.csv", None, 2, Decimal(0), None, None, Decimal(0), None,
+               "intervenant non rattaché", False)]
     curseur = _Curseur(
         list(PARAMETRES.items()),
         [("interventions.csv", None, 2, "interventions.csv", None, 2, 1, 1)],
-        cump,
+        cump, (), marges,
     )
     controles = []
     ecriture = SimpleNamespace(preparation=_preparation(), id_execution=1)
     sorties = SimpleNamespace(rattachements=SimpleNamespace(regles=[], lignes=pd.DataFrame()))
     regles = [{"type": "solde_jamais_negatif", "date_initial": dt.date(2025, 1, 1)}]
     verifier(curseur, ecriture, sorties, lambda *c: controles.append(c), regles)
-    assert [c[1:] for c in controles] == [
+    assert [c[1:3] for c in controles] == [
         ("2025-01-01", "2025-01-01"), (0, 0), ("0 / 0", "0 / 0"),
         (2, 2), (0, 0), (0, 0), ("aucun", "aucun"), (Decimal(0), Decimal(0)),
+        (0, 0), ("intervenant non rattaché 1", "intervenant non rattaché 1"), (0, 0),
+        (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)),
+        (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)),
     ]
+    assert controles[12][3] is True  # coût salarial total masqué
     # Un CUMP qui diffère d'un mois sort en écart.
     cump[1] = cump[1][:-1] + (Decimal("10.4"),)
     controles.clear()
-    verifier(_Curseur(list(PARAMETRES.items()), [], cump), ecriture, sorties,
+    verifier(_Curseur(list(PARAMETRES.items()), [], cump, (), marges), ecriture, sorties,
              lambda *c: controles.append(c), regles)
     assert controles[4][1:] == (0, 1)
 
@@ -387,3 +403,114 @@ def test_modules_verification():
     modules = modules_verification(["services_intervention", "pack_sans_module"])
     assert [nom for nom, _ in modules] == ["services_intervention"]
     assert hasattr(modules[0][1], "verifier")
+
+
+# --- Marge opérationnelle --------------------------------------------------------
+
+
+def _r(numero):
+    return ("intervenants.xlsx", "Remunerations", numero)
+
+
+def _t(numero):
+    return ("intervenants.xlsx", "Intervenants", numero)
+
+
+def _pc(numero):
+    return ("parametres_couts.xlsx", None, numero)
+
+
+REMUNERATIONS = {
+    _r(2): {"retenue": 1, "matricule": "TEC-1", "date_effet": "2025-01-01",
+            "salaire_brut_mensuel": "2400", "taux_activite": "1"},
+    _r(3): {"retenue": 1, "matricule": "TEC-1", "date_effet": "2026-01-01",
+            "salaire_brut_mensuel": "2460", "taux_activite": "1"},
+    _r(4): {"retenue": 0, "matricule": "TEC-1", "date_effet": "2025-06-01",
+            "salaire_brut_mensuel": "9999", "taux_activite": "1"},
+    _r(5): {"retenue": 1, "matricule": "TEC-2", "date_effet": "2025-01-01",
+            "salaire_brut_mensuel": "1000", "taux_activite": "0.5"},
+}
+PARAMETRES_COUTS = {
+    _pc(3): {"retenue": 1, "annee": "2025", "cout_km": "0.45", "taux_charges_cdi_cdd": "0.42",
+             "taux_charges_apprenti": "0.05", "heures_annuelles": "1607"},
+    _pc(2): {"retenue": 0, "annee": "2025", "cout_km": "9", "taux_charges_cdi_cdd": "9",
+             "taux_charges_apprenti": "9", "heures_annuelles": "1"},
+}
+
+
+def test_remuneration_en_vigueur():
+    assert remuneration_en_vigueur(REMUNERATIONS, "TEC-1", "2025-12-31")["salaire_brut_mensuel"] == "2400"
+    assert remuneration_en_vigueur(REMUNERATIONS, "TEC-1", "2026-01-01")["salaire_brut_mensuel"] == "2460"
+    assert remuneration_en_vigueur(REMUNERATIONS, "TEC-1", "2024-12-31") is None
+    assert remuneration_en_vigueur(REMUNERATIONS, "TEC-9", "2025-06-01") is None
+
+
+def test_parametres_annee():
+    assert parametres_annee(PARAMETRES_COUTS, 2025)["cout_km"] == "0.45"  # ligne retenue
+    assert parametres_annee(PARAMETRES_COUTS, 2026) is None
+
+
+def test_cout_horaire():
+    # 2400 × 12 × 1,42 / 1607 = 25,44866...
+    assert cout_horaire("2400", "0.42", "1607", "1") == Decimal("25.4487")
+    assert cout_horaire("1000", "0.42", "1607", "0.5") == Decimal("21.2072")
+    assert cout_horaire(None, "0.42", "1607", "1") is None
+    assert cout_horaire("2400", "0.42", "0", "1") is None
+    assert cout_horaire("2400", "0.42", "1607", "0") is None
+
+
+def test_marges_attendues():
+    interventions = {
+        _i(2): {"date_debut": "2025-03-11", "duree_min": "60", "duree_trajet_min": "30",
+                "distance_km": "18.4"},
+        _i(3): {"date_debut": "2025-03-12", "duree_min": "45", "duree_trajet_min": "15",
+                "distance_km": "10"},
+        _i(4): {"date_debut": None, "duree_min": "45", "duree_trajet_min": "15",
+                "distance_km": "10"},
+        _i(5): {"date_debut": "2027-01-04", "duree_min": "45", "duree_trajet_min": "15",
+                "distance_km": "10"},
+        _i(6): {"date_debut": "2025-03-12", "duree_min": "45", "duree_trajet_min": None,
+                "distance_km": "10"},
+        _i(7): {"date_debut": "2025-03-12", "duree_min": "45", "duree_trajet_min": "15",
+                "distance_km": "10"},
+    }
+    intervenants = {_t(2): {"matricule": "TEC-1", "type_contrat": "CDI"},
+                    _t(3): {"matricule": "TEC-2", "type_contrat": "Stage"}}
+    lien = {_i(2): _t(2), _i(3): _t(2), _i(4): _t(2), _i(5): _t(2), _i(6): _t(2),
+            _i(7): _t(3)}
+    taux = {"CDI": "taux_charges_cdi_cdd"}
+    lignes = [(_i(2), True, Decimal("150")), (_i(2), True, Decimal("-20.5")),
+              (_i(2), False, Decimal("999")), (_i(3), True, None)]
+    consommees = [(_i(2), True, Decimal("30.85")), (_i(3), True, None), (_i(3), False, Decimal(5))]
+    marges = marges_attendues(interventions, intervenants, lien, REMUNERATIONS,
+                              PARAMETRES_COUTS, taux, lignes, consommees)
+    d = Decimal
+    # 90 min × 25,4487 / 60 = 38,17305; 18,4 km × 0,45 = 8,28; 129,50 - 38,17 - 8,28 - 30,85
+    assert marges[_i(2)] == (d("129.50"), d("38.17"), d("8.28"), d("30.85"), d("52.20"), None, 0)
+    assert marges[_i(3)] == (d("0.00"), d("25.45"), d("4.50"), None, None,
+                             "coût d'une pièce inconnu", 0)
+    assert marges[_i(4)][5:] == ("date vide", 0)
+    assert marges[_i(5)][5] == "paramètres de coûts de l'année absents"
+    assert marges[_i(6)][5] == "durée vide"
+    assert marges[_i(7)][5] == "taux de charges inconnu"
+    # Sans intervenant rattaché.
+    autres = marges_attendues({_i(9): interventions[_i(2)]}, intervenants, {}, REMUNERATIONS,
+                              PARAMETRES_COUTS, taux, [], [])
+    assert autres[_i(9)] == (d("0.00"), None, d("8.28"), d(0), None, "intervenant non rattaché", 0)
+    # Calcul complet : marge calculée et aucune ligne liée exclue.
+    complet = marges_attendues({_i(2): interventions[_i(2)]}, intervenants, lien,
+                               REMUNERATIONS, PARAMETRES_COUTS, taux,
+                               [(_i(2), True, d(100))], [])
+    assert complet[_i(2)] == (d("100.00"), d("38.17"), d("8.28"), d(0), d("53.55"), None, 1)
+
+
+def test_lignes_facture_liees():
+    lignes = {_l(2): {"retenue": 1, "montant_ht": "10"}, _l(3): {"retenue": 1, "montant_ht": "5"},
+              _l(4): {"retenue": 0, "montant_ht": "1"}, _l(5): {"retenue": 1, "montant_ht": "2"}}
+    entetes = {_e(2): {"retenue": 1}, _e(3): {"retenue": 0}}
+    lien_entete = {_l(2): _e(2), _l(3): _e(3), _l(4): _e(2)}
+    lien_intervention = {_l(2): _i(2), _l(3): _i(2), _l(4): _i(2), _l(5): _i(3)}
+    assert lignes_facture_liees(lignes, entetes, lien_entete, lien_intervention) == [
+        (_i(2), True, Decimal(10)), (_i(2), False, Decimal(5)), (_i(2), False, Decimal(1)),
+        (_i(3), True, Decimal(2)),
+    ]

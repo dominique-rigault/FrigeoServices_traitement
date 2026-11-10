@@ -8,7 +8,7 @@
   construction des dimensions (script 002), puis celle des faits
   (script 003), un fait lié à un autre (une consommation à son
   intervention) après celui-ci, puis les calculs (script 004 : chantiers,
-  CUMP et coût des pièces). Chaque étape est inscrite dans
+  CUMP et coût des pièces, puis marges, qui en dépendent). Chaque étape est inscrite dans
   dw.journal_reconstruction.
 */
 
@@ -59,5 +59,6 @@ BEGIN
     /* Calculs (script 004). */
     EXEC dw.calculer_chantiers @id_execution;
     EXEC dw.calculer_cump @id_execution;
+    EXEC dw.calculer_marges @id_execution;
 END;
 GO

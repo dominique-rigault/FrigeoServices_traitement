@@ -55,6 +55,32 @@
   hors des mois du calcul, CUMP inconnu); le coût est calculé aussi pour une
   consommation non retenue.
 
+  Marge opérationnelle : dw.calculer_marges donne à chaque intervention,
+  toutes issues confondues et retenue ou non :
+  - le CA : somme des montants HT de ses lignes de facture et d'avoir
+    retenues (le forfait d'un chantier est sur son premier jour);
+  - le coût salarial : (durée sur site + trajet) / 60 × coût horaire chargé,
+    au centime, le coût horaire chargé étant
+      salaire mensuel × 12 × (1 + taux de charges)
+      / (heures annuelles × taux d'activité), arrondi à 4 décimales,
+    avec la rémunération en vigueur à la date (la dernière ligne retenue de
+    même matricule dont la date d'effet n'est pas postérieure), le type de
+    contrat de la période d'emploi que désigne le rattachement de
+    l'intervenant, et les paramètres de coûts de l'année;
+  - le coût de déplacement : distance × coût kilométrique de l'année, au
+    centime;
+  - le coût des pièces : somme des coûts de ses consommations retenues;
+  - la marge : CA moins les trois coûts.
+  Une composante impossible à calculer reste vide, jamais à zéro, ainsi que
+  la marge, et motif_calcul donne la première raison dans l'ordre : date
+  vide, durée vide, intervenant non rattaché, rémunération inconnue à la
+  date, paramètres de coûts de l'année absents, taux de charges inconnu,
+  heures annuelles ou taux d'activité vides ou nuls, distance ou coût
+  kilométrique vide, coût d'une pièce inconnu.
+  calcul_complet vaut 1 si la marge est calculée et qu'aucune ligne de
+  facture ni consommation liée n'est exclue des indicateurs, 0 sinon. Le coût
+  horaire chargé, qui révèle le salaire, n'est gardé nulle part.
+
   Arrondis et types : les opérandes sont ramenés à 6 décimales au plus pour
   que les produits et le quotient gardent toutes leurs décimales utiles
   (règles de précision de T-SQL); le seul arrondi est donc celui qui est
@@ -65,14 +91,30 @@
 /* Colonnes de propre lues par les calculs. */
 INSERT INTO dw.contrat_entree (table_propre, colonne, famille) VALUES
     (N'catalogue_pieces', N'stock_initial', N'décimal'),
-    (N'catalogue_pieces', N'cump_initial', N'décimal');
+    (N'catalogue_pieces', N'cump_initial', N'décimal'),
+    (N'remunerations', N'matricule', N'texte'),
+    (N'remunerations', N'date_effet', N'date'),
+    (N'remunerations', N'salaire_brut_mensuel', N'décimal'),
+    (N'remunerations', N'taux_activite', N'décimal'),
+    (N'parametres_couts', N'annee', N'décimal'),
+    (N'parametres_couts', N'cout_km', N'décimal'),
+    (N'parametres_couts', N'taux_charges_cdi_cdd', N'décimal'),
+    (N'parametres_couts', N'taux_charges_apprenti', N'décimal'),
+    (N'parametres_couts', N'heures_annuelles', N'décimal');
 GO
 
 /* Mesures des faits calculées par ce script. */
 INSERT INTO dw.mesure_calculee (table_fait, colonne_fait, description) VALUES
     (N'fait_consommation', N'cump_applique',
      N'CUMP de la pièce à la fin du mois précédant la consommation'),
-    (N'fait_consommation', N'cout_ht', N'Quantité consommée × CUMP appliqué, au centime');
+    (N'fait_consommation', N'cout_ht', N'Quantité consommée × CUMP appliqué, au centime'),
+    (N'fait_intervention', N'ca_ht', N'Montants HT des lignes de facture et d''avoir retenues'),
+    (N'fait_intervention', N'cout_salarial',
+     N'(Durée sur site + trajet) / 60 × coût horaire chargé, au centime'),
+    (N'fait_intervention', N'cout_deplacement',
+     N'Distance × coût kilométrique de l''année, au centime'),
+    (N'fait_intervention', N'cout_pieces', N'Coûts des consommations retenues'),
+    (N'fait_intervention', N'marge', N'CA moins les coûts salarial, de déplacement et des pièces');
 GO
 
 /* Une valeur propre au client utilisée par les calculs. table_source et
@@ -513,5 +555,155 @@ BEGIN
     ) AS x;
     DECLARE @lignes int = (SELECT COUNT(*) FROM dw.fait_consommation WHERE cout_ht IS NOT NULL);
     EXEC dw.inscrire_etape @id_execution, N'coût des pièces', @lignes, @debut;
+END;
+GO
+
+/*
+  Marge opérationnelle de chaque intervention (voir l'en-tête du script).
+  Les lignes de référence (rémunération, paramètres de coûts de l'année) se
+  choisissent parmi les lignes retenues; à égalité de date d'effet ou d'année,
+  la première dans l'ordre du lignage.
+*/
+CREATE PROCEDURE dw.calculer_marges
+    @id_execution int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
+    DECLARE @r_intervenant int =
+        dw.regle_rattachement(@id_execution, N'interventions', N'intervenant', N'intervenants');
+
+    WITH base AS (
+        SELECT f.id_fait_intervention,
+               p.date_debut, p.duree_min, p.duree_trajet_min, p.distance_km,
+               ti.matricule, ti.type_contrat
+        FROM dw.fait_intervention AS f
+        JOIN propre.interventions AS p
+            ON p.id_chargement = f.id_chargement AND p.num_ligne_source = f.num_ligne_source
+        LEFT JOIN qualite.rattachement AS ri
+            ON ri.id_execution = @id_execution AND ri.id_regle = @r_intervenant
+           AND ri.id_chargement = p.id_chargement AND ri.num_ligne_source = p.num_ligne_source
+        LEFT JOIN propre.intervenants AS ti
+            ON ti.id_chargement = ri.id_chargement_reference
+           AND ti.num_ligne_source = ri.num_ligne_reference
+    ),
+    remuneration AS (
+        SELECT b.id_fait_intervention, r.salaire_brut_mensuel, r.taux_activite,
+               ROW_NUMBER() OVER (
+                   PARTITION BY b.id_fait_intervention
+                   ORDER BY r.date_effet DESC,
+                            r.fichier_source COLLATE Latin1_General_100_BIN2,
+                            r.feuille_source COLLATE Latin1_General_100_BIN2,
+                            r.num_ligne_source) AS rang
+        FROM base AS b
+        JOIN propre.remunerations AS r
+            ON r.matricule = b.matricule COLLATE Latin1_General_100_BIN2
+           AND r.date_effet <= b.date_debut
+           AND r.retenue = 1
+    ),
+    couts_annee AS (
+        SELECT c.*,
+               ROW_NUMBER() OVER (
+                   PARTITION BY c.annee
+                   ORDER BY c.fichier_source COLLATE Latin1_General_100_BIN2,
+                            c.feuille_source COLLATE Latin1_General_100_BIN2,
+                            c.num_ligne_source) AS rang
+        FROM propre.parametres_couts AS c
+        WHERE c.retenue = 1 AND c.annee IS NOT NULL
+    ),
+    entrees AS (
+        SELECT b.*,
+               r.salaire_brut_mensuel, r.taux_activite,
+               c.annee, c.cout_km, c.heures_annuelles,
+               CASE t.colonne_taux
+                   WHEN N'taux_charges_cdi_cdd' THEN c.taux_charges_cdi_cdd
+                   WHEN N'taux_charges_apprenti' THEN c.taux_charges_apprenti
+               END AS taux_charges
+        FROM base AS b
+        LEFT JOIN remuneration AS r ON r.id_fait_intervention = b.id_fait_intervention AND r.rang = 1
+        LEFT JOIN couts_annee AS c ON c.annee = YEAR(b.date_debut) AND c.rang = 1
+        LEFT JOIN dw.parametre_taux_charges AS t
+            ON t.type_contrat = b.type_contrat COLLATE Latin1_General_100_BIN2
+    ),
+    horaire AS (
+        SELECT e.*,
+               CASE WHEN e.salaire_brut_mensuel IS NOT NULL AND e.taux_charges IS NOT NULL
+                         AND e.heures_annuelles > 0 AND e.taux_activite > 0
+                    THEN CAST(ROUND(
+                        CAST(CAST(CAST(e.salaire_brut_mensuel AS decimal(16, 6)) * 12
+                                  AS decimal(18, 6))
+                             * (1 + CAST(e.taux_charges AS decimal(10, 6)))
+                             AS decimal(24, 12))
+                        / CAST(CAST(e.heures_annuelles AS decimal(12, 6))
+                               * CAST(e.taux_activite AS decimal(10, 6)) AS decimal(18, 6)),
+                        4) AS decimal(19, 4))
+               END AS cout_horaire
+        FROM entrees AS e
+    ),
+    lignes AS (
+        SELECT l.id_fait_intervention,
+               SUM(CASE WHEN l.retenue = 1 THEN l.montant_ht ELSE 0 END) AS ca,
+               SUM(CASE WHEN l.retenue = 0 THEN 1 ELSE 0 END) AS exclues
+        FROM dw.fait_ligne_facture AS l
+        WHERE l.id_fait_intervention IS NOT NULL
+        GROUP BY l.id_fait_intervention
+    ),
+    pieces AS (
+        SELECT c.id_fait_intervention,
+               SUM(CASE WHEN c.retenue = 1 THEN c.cout_ht ELSE 0 END) AS cout,
+               SUM(CASE WHEN c.retenue = 1 AND c.cout_ht IS NULL THEN 1 ELSE 0 END) AS inconnus,
+               SUM(CASE WHEN c.retenue = 0 THEN 1 ELSE 0 END) AS exclues
+        FROM dw.fait_consommation AS c
+        WHERE c.id_fait_intervention IS NOT NULL
+        GROUP BY c.id_fait_intervention
+    ),
+    composantes AS (
+        SELECT h.id_fait_intervention,
+               CAST(ROUND(COALESCE(l.ca, 0), 2) AS decimal(19, 2)) AS ca_ht,
+               CASE WHEN h.cout_horaire IS NOT NULL AND h.duree_min IS NOT NULL
+                         AND h.duree_trajet_min IS NOT NULL
+                    THEN CAST(ROUND(
+                        CAST(CAST(h.duree_min + h.duree_trajet_min AS decimal(12, 0))
+                             * h.cout_horaire AS decimal(28, 12)) / CAST(60 AS decimal(2, 0)),
+                        2) AS decimal(19, 2))
+               END AS cout_salarial,
+               CASE WHEN h.distance_km IS NOT NULL AND h.cout_km IS NOT NULL
+                    THEN CAST(ROUND(CAST(h.distance_km AS decimal(18, 6))
+                                    * CAST(h.cout_km AS decimal(18, 6)), 2) AS decimal(19, 2))
+               END AS cout_deplacement,
+               CASE WHEN COALESCE(k.inconnus, 0) = 0
+                    THEN CAST(COALESCE(k.cout, 0) AS decimal(19, 2))
+               END AS cout_pieces,
+               COALESCE(l.exclues, 0) + COALESCE(k.exclues, 0) AS exclues,
+               CASE
+                   WHEN h.date_debut IS NULL THEN N'date vide'
+                   WHEN h.duree_min IS NULL OR h.duree_trajet_min IS NULL THEN N'durée vide'
+                   WHEN h.matricule IS NULL THEN N'intervenant non rattaché'
+                   WHEN h.salaire_brut_mensuel IS NULL THEN N'rémunération inconnue à la date'
+                   WHEN h.annee IS NULL THEN N'paramètres de coûts de l''année absents'
+                   WHEN h.taux_charges IS NULL THEN N'taux de charges inconnu'
+                   WHEN h.cout_horaire IS NULL
+                       THEN N'heures annuelles ou taux d''activité vides ou nuls'
+                   WHEN h.distance_km IS NULL OR h.cout_km IS NULL
+                       THEN N'distance ou coût kilométrique vide'
+                   WHEN COALESCE(k.inconnus, 0) > 0 THEN N'coût d''une pièce inconnu'
+               END AS motif
+        FROM horaire AS h
+        LEFT JOIN lignes AS l ON l.id_fait_intervention = h.id_fait_intervention
+        LEFT JOIN pieces AS k ON k.id_fait_intervention = h.id_fait_intervention
+    )
+    UPDATE f
+    SET ca_ht = c.ca_ht,
+        cout_salarial = c.cout_salarial,
+        cout_deplacement = c.cout_deplacement,
+        cout_pieces = c.cout_pieces,
+        marge = c.ca_ht - c.cout_salarial - c.cout_deplacement - c.cout_pieces,
+        motif_calcul = c.motif,
+        calcul_complet = CASE WHEN c.motif IS NULL AND c.exclues = 0 THEN 1 ELSE 0 END
+    FROM dw.fait_intervention AS f
+    JOIN composantes AS c ON c.id_fait_intervention = f.id_fait_intervention;
+
+    DECLARE @lignes int = (SELECT COUNT(*) FROM dw.fait_intervention WHERE marge IS NOT NULL);
+    EXEC dw.inscrire_etape @id_execution, N'marges', @lignes, @debut;
 END;
 GO

@@ -28,6 +28,14 @@ mois, ou reçoit le motif qui l'en empêche. Les arrondis sont ceux du pack : o
 à 6 décimales, CUMP à 4 décimales chaque mois, coût au centime, la moitié
 s'éloignant de zéro.
 
+Marge opérationnelle (`marges_attendues`) : pour chaque intervention, le CA de ses
+lignes de facture retenues, les coûts salarial (coût horaire chargé de la
+rémunération en vigueur, du type de contrat de la période d'emploi rattachée et des
+paramètres de coûts de l'année, arrondi à 4 décimales), de déplacement et des pièces,
+la marge, le motif de la première composante impossible et l'indicateur de calcul
+complet, comme dw.calculer_marges. Le coût salarial total, qui dépend des salaires,
+est affiché « masqué ».
+
 Aucune valeur du client n'est affichée : seulement des décomptes et des dates de
 paramètres.
 """
@@ -69,6 +77,26 @@ MOTIFS = (MOTIF_QUANTITE, MOTIF_PIECE_VIDE, MOTIF_PIECE_INTROUVABLE, MOTIF_DATE_
 SIX = Decimal("0.000001")
 QUATRE = Decimal("0.0001")
 DEUX = Decimal("0.01")
+
+REQUETE_TAUX = "SELECT type_contrat, colonne_taux FROM dw.parametre_taux_charges"
+REQUETE_MARGES = (
+    "SELECT fichier_source, feuille_source, num_ligne_source, ca_ht, cout_salarial, "
+    "cout_deplacement, cout_pieces, marge, motif_calcul, calcul_complet "
+    "FROM dw.fait_intervention"
+)
+
+MOTIF_MARGE_DATE = "date vide"
+MOTIF_MARGE_DUREE = "durée vide"
+MOTIF_MARGE_INTERVENANT = "intervenant non rattaché"
+MOTIF_MARGE_REMUNERATION = "rémunération inconnue à la date"
+MOTIF_MARGE_PARAMETRES = "paramètres de coûts de l'année absents"
+MOTIF_MARGE_TAUX = "taux de charges inconnu"
+MOTIF_MARGE_HEURES = "heures annuelles ou taux d'activité vides ou nuls"
+MOTIF_MARGE_DISTANCE = "distance ou coût kilométrique vide"
+MOTIF_MARGE_PIECE = "coût d'une pièce inconnu"
+MOTIFS_MARGE = (MOTIF_MARGE_DATE, MOTIF_MARGE_DUREE, MOTIF_MARGE_INTERVENANT,
+                MOTIF_MARGE_REMUNERATION, MOTIF_MARGE_PARAMETRES, MOTIF_MARGE_TAUX,
+                MOTIF_MARGE_HEURES, MOTIF_MARGE_DISTANCE, MOTIF_MARGE_PIECE)
 
 REQUETE_CHANTIERS = (
     "SELECT f.fichier_source, f.feuille_source, f.num_ligne_source, "
@@ -392,7 +420,175 @@ def _total(couts: dict) -> Decimal:
     return sum((v[1] for v in couts.values() if v[1] is not None), Decimal(0))
 
 
+# --- Marge opérationnelle --------------------------------------------------------
+
+
+def _premiere(lignes: list[tuple[Lignage, dict]]) -> dict | None:
+    """Première ligne dans l'ordre du lignage, None s'il n'y en a pas."""
+    return min(lignes, key=lambda l: _ordre_lignage(l[0]))[1] if lignes else None
+
+
+def remuneration_en_vigueur(remunerations: dict[Lignage, dict], matricule: str,
+                            date: str) -> dict | None:
+    """Ligne retenue de rémunération du matricule de date d'effet la plus récente qui
+    ne dépasse pas `date`, la première dans l'ordre du lignage à égalité."""
+    candidates = [
+        (cle, l) for cle, l in remunerations.items()
+        if l.get("retenue") == 1 and l.get("matricule") == matricule
+        and l.get("date_effet") is not None and str(l["date_effet"]) <= date
+    ]
+    if not candidates:
+        return None
+    plus_recente = max(str(l["date_effet"]) for _, l in candidates)
+    return _premiere([(c, l) for c, l in candidates if str(l["date_effet"]) == plus_recente])
+
+
+def parametres_annee(parametres_couts: dict[Lignage, dict], annee: int) -> dict | None:
+    """Ligne retenue des paramètres de coûts de l'année, la première dans l'ordre du
+    lignage s'il y en a plusieurs."""
+    return _premiere([
+        (cle, l) for cle, l in parametres_couts.items()
+        if l.get("retenue") == 1 and l.get("annee") is not None
+        and _decimal(l["annee"]) == annee
+    ])
+
+
+def cout_horaire(salaire, taux_charges, heures, taux_activite) -> Decimal | None:
+    """Coût horaire chargé, comme dw.calculer_marges : salaire × 12 × (1 + taux de
+    charges) / (heures annuelles × taux d'activité), opérandes à 6 décimales, arrondi
+    à 4 décimales; None si une entrée manque ou si les heures ou le taux d'activité
+    ne sont pas positifs."""
+    salaire, taux_charges = _decimal(salaire), _decimal(taux_charges)
+    heures, taux_activite = _decimal(heures), _decimal(taux_activite)
+    if salaire is None or taux_charges is None or heures is None or taux_activite is None:
+        return None
+    if heures <= 0 or taux_activite <= 0:
+        return None
+    with localcontext() as contexte:
+        contexte.prec = 60
+        annuel = _arrondi(_arrondi(salaire, SIX) * 12, SIX)
+        charge = annuel * (1 + _arrondi(taux_charges, SIX))
+        denominateur = _arrondi(_arrondi(heures, SIX) * _arrondi(taux_activite, SIX), SIX)
+        return _arrondi(charge / denominateur, QUATRE)
+
+
+def marges_attendues(
+    interventions: dict[Lignage, dict],
+    intervenants: dict[Lignage, dict],
+    lien_intervenant: dict[Lignage, Lignage],
+    remunerations: dict[Lignage, dict],
+    parametres_couts: dict[Lignage, dict],
+    taux_charges: dict[str, str],
+    lignes_facture: list[tuple[Lignage, bool, Decimal | None]],
+    consommees: list[tuple[Lignage, bool, Decimal | None]],
+) -> dict[Lignage, tuple]:
+    """Marge de chaque intervention, par lignage : (CA, coût salarial, coût de
+    déplacement, coût des pièces, marge, motif, calcul complet 0 ou 1).
+
+    `taux_charges` : colonne du taux de charges de chaque type de contrat
+    (dw.parametre_taux_charges); `lignes_facture` et `consommees` : pour chaque ligne
+    liée à une intervention, (lignage de l'intervention, retenue du fait, montant HT
+    ou coût).
+    """
+    zero = Decimal(0)
+    ca: dict[Lignage, Decimal] = {}
+    pieces: dict[Lignage, Decimal] = {}
+    inconnus: set[Lignage] = set()
+    exclues: dict[Lignage, int] = {}
+    for intervention, retenue, montant in lignes_facture:
+        if retenue:
+            ca[intervention] = ca.get(intervention, zero) + (montant or zero)
+        else:
+            exclues[intervention] = exclues.get(intervention, 0) + 1
+    for intervention, retenue, cout in consommees:
+        if not retenue:
+            exclues[intervention] = exclues.get(intervention, 0) + 1
+        elif cout is None:
+            inconnus.add(intervention)
+        else:
+            pieces[intervention] = pieces.get(intervention, zero) + cout
+    resultat = {}
+    for cle, ligne in interventions.items():
+        date = ligne.get("date_debut")
+        duree = _decimal(ligne.get("duree_min"))
+        trajet = _decimal(ligne.get("duree_trajet_min"))
+        distance = _decimal(ligne.get("distance_km"))
+        reference = lien_intervenant.get(cle)
+        intervenant = intervenants.get(reference) if reference is not None else None
+        matricule = intervenant.get("matricule") if intervenant else None
+        remuneration = (remuneration_en_vigueur(remunerations, matricule, str(date))
+                        if matricule is not None and date is not None else None)
+        couts = parametres_annee(parametres_couts, int(str(date)[:4])) if date else None
+        colonne = taux_charges.get(intervenant.get("type_contrat")) if intervenant else None
+        taux = couts.get(colonne) if couts and colonne else None
+        salaire = remuneration.get("salaire_brut_mensuel") if remuneration else None
+        horaire = cout_horaire(salaire, taux, couts.get("heures_annuelles") if couts else None,
+                               remuneration.get("taux_activite") if remuneration else None)
+        cout_km = _decimal(couts.get("cout_km")) if couts else None
+        with localcontext() as contexte:
+            contexte.prec = 60
+            salarial = (_arrondi((duree + trajet) * horaire / 60, DEUX)
+                        if horaire is not None and duree is not None and trajet is not None
+                        else None)
+            deplacement = (_arrondi(_arrondi(distance, SIX) * _arrondi(cout_km, SIX), DEUX)
+                           if distance is not None and cout_km is not None else None)
+        cout_pieces = None if cle in inconnus else pieces.get(cle, zero)
+        chiffre = _arrondi(ca.get(cle, zero), DEUX)
+        if date is None:
+            motif = MOTIF_MARGE_DATE
+        elif duree is None or trajet is None:
+            motif = MOTIF_MARGE_DUREE
+        elif matricule is None:
+            motif = MOTIF_MARGE_INTERVENANT
+        elif salaire is None:
+            motif = MOTIF_MARGE_REMUNERATION
+        elif couts is None:
+            motif = MOTIF_MARGE_PARAMETRES
+        elif taux is None:
+            motif = MOTIF_MARGE_TAUX
+        elif horaire is None:
+            motif = MOTIF_MARGE_HEURES
+        elif deplacement is None:
+            motif = MOTIF_MARGE_DISTANCE
+        elif cout_pieces is None:
+            motif = MOTIF_MARGE_PIECE
+        else:
+            motif = None
+        marge = (chiffre - salarial - deplacement - cout_pieces
+                 if None not in (salarial, deplacement, cout_pieces) else None)
+        complet = 1 if motif is None and exclues.get(cle, 0) == 0 else 0
+        resultat[cle] = (chiffre, salarial, deplacement, cout_pieces, marge, motif, complet)
+    return resultat
+
+
+def lignes_facture_liees(lignes: dict[Lignage, dict], entetes: dict[Lignage, dict],
+                         lien_entete: dict, lien_intervention: dict) -> list[tuple]:
+    """Lignes de facture liées à une intervention : (lignage de l'intervention, retenue
+    du fait, montant HT), la ligne n'étant retenue que si son en-tête trouvé l'est."""
+    resultat = []
+    for cle, ligne in lignes.items():
+        intervention = lien_intervention.get(cle)
+        if intervention is None:
+            continue
+        reference = lien_entete.get(cle)
+        entete = entetes.get(reference) if reference is not None else None
+        retenue = ligne.get("retenue") == 1 and (entete is None or entete.get("retenue") == 1)
+        resultat.append((intervention, retenue, _decimal(ligne.get("montant_ht"))))
+    return resultat
+
+
+def _motifs_marge(marges: dict) -> str:
+    """« motif n » pour chaque motif présent, dans l'ordre de `MOTIFS_MARGE`, ou « aucun »."""
+    comptes = {m: sum(1 for v in marges.values() if v[5] == m) for m in MOTIFS_MARGE}
+    return "; ".join(f"{m} {n}" for m, n in comptes.items() if n) or "aucun"
+
+
+def _somme(marges: dict, rang: int) -> Decimal:
+    return sum((v[rang] for v in marges.values() if v[rang] is not None), Decimal(0))
+
+
 # --- Date du stock initial -------------------------------------------------------
+
 
 
 def dates_stock_initial(regles: list) -> list[str]:
@@ -508,3 +704,53 @@ def _verifier_cump(curseur, ecriture, rattachements, parametres: dict, ajouter) 
             _motifs(couts), _motifs(couts_obtenus))
     ajouter("dw.fait_consommation : coût total des pièces", _total(couts),
             _total(couts_obtenus))
+    _verifier_marges(curseur, ecriture, rattachements, consommees, couts, ajouter)
+
+
+def _verifier_marges(curseur, ecriture, rattachements, consommees: dict, couts: dict,
+                     ajouter) -> None:
+    """Contrôles de la marge opérationnelle de chaque intervention."""
+    preparation = ecriture.preparation
+    curseur.execute(REQUETE_TAUX)
+    taux = {str(t): str(c) for t, c in curseur.fetchall()}
+    lien_conso = liens(rattachements, "pieces_interventions", "id_intervention",
+                       "interventions")
+    consommations_liees = [
+        (lien_conso[cle], retenue, couts[cle][1])
+        for cle, (_, _, _, retenue, _) in consommees.items() if cle in lien_conso
+    ]
+    marges = marges_attendues(
+        table_propre(preparation, "interventions"),
+        table_propre(preparation, "intervenants"),
+        liens(rattachements, "interventions", "intervenant", "intervenants"),
+        table_propre(preparation, "remunerations"),
+        table_propre(preparation, "parametres_couts"),
+        taux,
+        lignes_facture_liees(
+            table_propre(preparation, "factures_lignes"),
+            table_propre(preparation, "factures_entetes"),
+            liens(rattachements, "factures_lignes", "num_facture", "factures_entetes"),
+            liens(rattachements, "factures_lignes", "id_intervention", "interventions"),
+        ),
+        consommations_liees,
+    )
+    curseur.execute(REQUETE_MARGES)
+    obtenues = {
+        lignage(f, fe, n): (*(_decimal(v) for v in montants), motif,
+                            None if complet is None else int(complet))
+        for f, fe, n, *montants, motif, complet in curseur.fetchall()
+    }
+    ajouter("dw.fait_intervention : interventions dont le CA, un coût, la marge, le motif "
+            "ou le calcul complet diffère du recalcul", 0, _ecarts(marges, obtenues))
+    ajouter("dw.fait_intervention : interventions sans marge, par motif",
+            _motifs_marge(marges), _motifs_marge(obtenues))
+    ajouter("dw.fait_intervention : interventions au calcul complet",
+            sum(v[6] for v in marges.values()), sum(v[6] or 0 for v in obtenues.values()))
+    ajouter("dw.fait_intervention : CA total", _somme(marges, 0), _somme(obtenues, 0))
+    ajouter("dw.fait_intervention : coût salarial total", _somme(marges, 1),
+            _somme(obtenues, 1), True)
+    ajouter("dw.fait_intervention : coût de déplacement total", _somme(marges, 2),
+            _somme(obtenues, 2))
+    ajouter("dw.fait_intervention : coût des pièces total", _somme(marges, 3),
+            _somme(obtenues, 3))
+    ajouter("dw.fait_intervention : marge totale", _somme(marges, 4), _somme(obtenues, 4))
