@@ -20,6 +20,7 @@ from frigeo.ecriture_base import (
     controles_mesures,
     controles_regroupements,
     controles_retenue_faits,
+    controles_tableau_qualite,
     controles_retenue_propre,
     _obtenu,
     attendus_table,
@@ -798,6 +799,30 @@ def _bilan_rattachements():
         {"regle": 3, "table": "e", "cle": "Ref", "table_reference": "r",
          "cles_vides": 0, "introuvables": 40, "rattachees": 60},
     ])
+
+
+def test_controles_tableau_qualite():
+    anomalies = pd.DataFrame({
+        "controle": ["c1", "c1", "c2", "c3"],
+        "issue": ["anomalie", "à arbitrer", "information", "anomalie"],
+        "fichier_source": ["f.csv", "f.csv", None, ""],
+    })
+    bilans = (pd.DataFrame({"controle": ["c1", "c2"]}),
+              pd.DataFrame({"controle": ["c1", "c2", "c3"]}))
+    controles = controles_tableau_qualite(anomalies, bilans)
+    assert [(c.libelle.split(" :")[0], c.attendu) for c in controles] == [
+        ("dw.dim_controle", 3),
+        ("dw.fait_anomalie", 4),
+        ("dw.fait_anomalie", "2 / 1 / 1"),
+        ("dw.fait_anomalie", 0),
+        ("dw.fait_anomalie", 2),
+    ]
+    assert controles[2].requete == (
+        "SELECT COUNT(CASE WHEN issue = N'anomalie' THEN 1 END), "
+        "COUNT(CASE WHEN issue = N'à arbitrer' THEN 1 END), "
+        "COUNT(CASE WHEN issue = N'information' THEN 1 END) FROM dw.fait_anomalie"
+    )
+    assert all(c.probleme is None for c in controles)
 
 
 def test_controles_faits():

@@ -1269,7 +1269,9 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     chaque fait, retenue égale ligne à ligne à celle de sa ligne de propre et des
     lignes rattachées que le pack déclare (`controles_retenue_faits`); pour chaque pack
     qui a un module de vérification (frigeo.packs.<pack>), ses calculs refaits en
-    Python et comparés à dw (famille calculs).
+    Python et comparés à dw (famille calculs); avec `sorties`, les tables génériques
+    du tableau qualité comparées au registre après nettoyage et aux bilans des
+    contrôles (`controles_tableau_qualite`).
     """
     from sqlalchemy import text
 
@@ -1568,6 +1570,10 @@ def controles_regroupements(regroupements: list[tuple], correspondances: pd.Data
     return controles
 
 
+REQUETE_TABLEAU_QUALITE = (
+    "SELECT COUNT(*) FROM sys.tables "
+    "WHERE schema_id = SCHEMA_ID(N'dw') AND name IN (N'dim_controle', N'fait_anomalie')"
+)
 REQUETE_RETENUES = (
     "SELECT table_fait, table_source, cle, table_reference FROM dw.contrat_retenue "
     "ORDER BY table_fait, id_contrat"
@@ -1829,6 +1835,46 @@ def _nombre_lu(valeur):
     return valeur_lue(valeur)
 
 
+def controles_tableau_qualite(anomalies: pd.DataFrame, bilans: tuple) -> list[ControleFait]:
+    """Contrôles des tables génériques du tableau qualité (socle, script 005), sans
+    valeur du client.
+
+    `anomalies` : registre après nettoyage (`SortiesQualite.anomalies_nettoyees`);
+    `bilans` : bilans des contrôles, brut et nettoyé. dw.dim_controle doit avoir un
+    membre par contrôle distinct des deux bilans, et dw.fait_anomalie une ligne par
+    anomalie du registre après nettoyage, chacune reliée à son contrôle (aucun
+    membre -2), les anomalies sans ligne source (les totaux par période) restant
+    sans id_chargement.
+    """
+    from .anomalies import ISSUE_A_ARBITRER, ISSUE_ANOMALIE, ISSUE_INFORMATION
+
+    membres = len({str(c) for bilan in bilans for c in bilan["controle"]})
+    issues = anomalies["issue"].astype(str)
+    par_issue = " / ".join(
+        str(int((issues == issue).sum()))
+        for issue in (ISSUE_ANOMALIE, ISSUE_A_ARBITRER, ISSUE_INFORMATION)
+    )
+    compte_issues = ", ".join(
+        f"COUNT(CASE WHEN issue = N'{issue}' THEN 1 END)"
+        for issue in (ISSUE_ANOMALIE, ISSUE_A_ARBITRER, ISSUE_INFORMATION)
+    )
+    sans_ligne = int(sum(1 for v in anomalies["fichier_source"] if _vide(v)))
+    return [
+        ControleFait("dw.dim_controle : membres (hors membres spéciaux)", membres,
+                     "SELECT COUNT(*) FROM dw.dim_controle WHERE id_controle >= 1"),
+        ControleFait("dw.fait_anomalie : anomalies du registre après nettoyage",
+                     len(anomalies), "SELECT COUNT(*) FROM dw.fait_anomalie"),
+        ControleFait("dw.fait_anomalie : anomalies / à arbitrer / informations", par_issue,
+                     f"SELECT {compte_issues} FROM dw.fait_anomalie"),
+        ControleFait("dw.fait_anomalie : anomalies dont le contrôle est absent de "
+                     "dw.dim_controle (membre -2)", 0,
+                     "SELECT COUNT(*) FROM dw.fait_anomalie WHERE id_controle = -2"),
+        ControleFait("dw.fait_anomalie : anomalies sans ligne source (totaux par période)",
+                     sans_ligne,
+                     "SELECT COUNT(*) FROM dw.fait_anomalie WHERE id_chargement IS NULL"),
+    ]
+
+
 def _obtenu(rangee: tuple):
     """Valeur obtenue d'un contrôle de fait : un nombre, ou « n / m »."""
     nombres = [_nombre_lu(v) for v in rangee]
@@ -1894,6 +1940,16 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
             controles += controles_mesures(mesures, dates, ecriture.preparation)
             controles += controles_retenue_faits(sources, retenues, ecriture.preparation,
                                                  ecriture.id_execution)
+        if sorties is not None:
+            curseur.execute(REQUETE_TABLEAU_QUALITE)
+            if int(curseur.fetchone()[0]) < 2:
+                ajouter(FAMILLE_DW, "tables du tableau qualité (dw.dim_controle, "
+                        "dw.fait_anomalie)", "présentes",
+                        "absentes (script sql/socle/005 non appliqué ?)")
+            else:
+                controles += controles_tableau_qualite(
+                    sorties.anomalies_nettoyees, (sorties.bilan_brut, sorties.bilan_nettoye)
+                )
         for controle in controles:
             if controle.requete is None:
                 ajouter(FAMILLE_DW, controle.libelle, controle.probleme, None)

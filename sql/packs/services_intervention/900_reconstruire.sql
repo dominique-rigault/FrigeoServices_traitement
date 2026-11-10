@@ -8,8 +8,9 @@
   construction des dimensions (script 002), puis celle des faits
   (script 003), un fait lié à un autre (une consommation à son
   intervention) après celui-ci, puis les calculs (script 004 : chantiers,
-  CUMP et coût des pièces, puis marges, qui en dépendent). Chaque étape est inscrite dans
-  dw.journal_reconstruction.
+  CUMP et coût des pièces, puis marges, qui en dépendent), enfin les tables
+  génériques du tableau qualité (socle, script 005). Chaque étape est
+  inscrite dans dw.journal_reconstruction.
 */
 
 /* Reconstruit dw pour une exécution, dans la transaction de l'appelant. */
@@ -38,6 +39,7 @@ BEGIN
     /* Faits et tables de calcul vidés avant les dimensions qu'ils référencent. */
     EXEC dw.vider_faits;
     EXEC dw.vider_calculs;
+    EXEC dw.vider_tableau_qualite;
 
     /* Dimensions (script 002). */
     EXEC dw.construire_dim_date @id_execution;
@@ -60,5 +62,9 @@ BEGIN
     EXEC dw.calculer_chantiers @id_execution;
     EXEC dw.calculer_cump @id_execution;
     EXEC dw.calculer_marges @id_execution;
+
+    /* Tableau qualité (socle, script 005). */
+    EXEC dw.construire_dim_controle @id_execution;
+    EXEC dw.construire_fait_anomalie @id_execution;
 END;
 GO
