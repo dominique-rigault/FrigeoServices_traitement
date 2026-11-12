@@ -1270,8 +1270,8 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     lignes rattachées que le pack déclare (`controles_retenue_faits`); pour chaque pack
     qui a un module de vérification (frigeo.packs.<pack>), ses calculs refaits en
     Python et comparés à dw (famille calculs); avec `sorties`, les tables génériques
-    du tableau qualité comparées au registre après nettoyage et aux bilans des
-    contrôles (`controles_tableau_qualite`).
+    du tableau qualité comparées au registre après nettoyage, aux bilans des
+    contrôles et aux lignes non évaluables (`controles_tableau_qualite`).
     """
     from sqlalchemy import text
 
@@ -1440,6 +1440,7 @@ REQUETE_MESURES_NON_DECLAREES = (
     "WHERE s.name = N'dw' AND t.name LIKE N'fait[_]%' "
     "AND ty.name IN (N'bigint', N'decimal', N'numeric', N'float', N'real', N'money', "
     "N'smallmoney') "
+    "AND t.name NOT IN (N'fait_anomalie', N'fait_bilan_controle') "
     "AND NOT EXISTS (SELECT 1 FROM dw.contrat_mesure AS m "
     "WHERE m.table_fait = t.name AND m.colonne_fait = c.name) "
     "AND NOT EXISTS (SELECT 1 FROM dw.mesure_calculee AS k "
@@ -1572,7 +1573,8 @@ def controles_regroupements(regroupements: list[tuple], correspondances: pd.Data
 
 REQUETE_TABLEAU_QUALITE = (
     "SELECT COUNT(*) FROM sys.tables "
-    "WHERE schema_id = SCHEMA_ID(N'dw') AND name IN (N'dim_controle', N'fait_anomalie')"
+    "WHERE schema_id = SCHEMA_ID(N'dw') "
+    "AND name IN (N'dim_controle', N'fait_anomalie', N'fait_bilan_controle')"
 )
 REQUETE_RETENUES = (
     "SELECT table_fait, table_source, cle, table_reference FROM dw.contrat_retenue "
@@ -1835,16 +1837,20 @@ def _nombre_lu(valeur):
     return valeur_lue(valeur)
 
 
-def controles_tableau_qualite(anomalies: pd.DataFrame, bilans: tuple) -> list[ControleFait]:
+def controles_tableau_qualite(anomalies: pd.DataFrame, bilans: tuple,
+                              non_evaluables: tuple) -> list[ControleFait]:
     """Contrôles des tables génériques du tableau qualité (socle, script 005), sans
     valeur du client.
 
     `anomalies` : registre après nettoyage (`SortiesQualite.anomalies_nettoyees`);
-    `bilans` : bilans des contrôles, brut et nettoyé. dw.dim_controle doit avoir un
-    membre par contrôle distinct des deux bilans, et dw.fait_anomalie une ligne par
-    anomalie du registre après nettoyage, chacune reliée à son contrôle (aucun
-    membre -2), les anomalies sans ligne source (les totaux par période) restant
-    sans id_chargement.
+    `bilans` et `non_evaluables` : bilans des contrôles et lignes non évaluables,
+    brut puis nettoyé. dw.dim_controle doit avoir un membre par contrôle distinct
+    des deux bilans; dw.fait_anomalie, une ligne par anomalie du registre après
+    nettoyage, chacune reliée à son contrôle (aucun membre -2), les anomalies sans
+    ligne source (les totaux par période) restant sans id_chargement; et
+    dw.fait_bilan_controle, une ligne par contrôle de chaque bilan, reliée à son
+    contrôle, dont les compteurs et les non évaluables retrouvent, état par état,
+    les totaux des sorties du traitement.
     """
     from .anomalies import ISSUE_A_ARBITRER, ISSUE_ANOMALIE, ISSUE_INFORMATION
 
@@ -1872,6 +1878,31 @@ def controles_tableau_qualite(anomalies: pd.DataFrame, bilans: tuple) -> list[Co
         ControleFait("dw.fait_anomalie : anomalies sans ligne source (totaux par période)",
                      sans_ligne,
                      "SELECT COUNT(*) FROM dw.fait_anomalie WHERE id_chargement IS NULL"),
+        ControleFait("dw.fait_bilan_controle : lignes (brut / nettoyé)",
+                     " / ".join(str(len(bilan)) for bilan in bilans),
+                     "SELECT COUNT(CASE WHEN etat = N'brut' THEN 1 END), "
+                     "COUNT(CASE WHEN etat = N'nettoyé' THEN 1 END) "
+                     "FROM dw.fait_bilan_controle"),
+        *(ControleFait(
+            f"dw.fait_bilan_controle, état {etat} : contrôlées / anomalies / à arbitrer "
+            "/ informations",
+            " / ".join(str(int(pd.to_numeric(bilan[colonne]).sum()))
+                       for colonne in ("controlees", "anomalies", "a_arbitrer",
+                                       "informations")),
+            "SELECT COALESCE(SUM(controlees), 0), COALESCE(SUM(anomalies), 0), "
+            "COALESCE(SUM(a_arbitrer), 0), COALESCE(SUM(informations), 0) "
+            f"FROM dw.fait_bilan_controle WHERE etat = N'{etat}'",
+        ) for etat, bilan in zip((ETAT_BRUT, ETAT_NETTOYE), bilans)),
+        ControleFait("dw.fait_bilan_controle : non évaluables (brut / nettoyé)",
+                     " / ".join(str(len(lignes)) for lignes in non_evaluables),
+                     "SELECT COALESCE(SUM(CASE WHEN etat = N'brut' "
+                     "THEN non_evaluables END), 0), "
+                     "COALESCE(SUM(CASE WHEN etat = N'nettoyé' "
+                     "THEN non_evaluables END), 0) "
+                     "FROM dw.fait_bilan_controle"),
+        ControleFait("dw.fait_bilan_controle : contrôles absents de dw.dim_controle "
+                     "(membre -2)", 0,
+                     "SELECT COUNT(*) FROM dw.fait_bilan_controle WHERE id_controle = -2"),
     ]
 
 
@@ -1942,13 +1973,14 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
                                                  ecriture.id_execution)
         if sorties is not None:
             curseur.execute(REQUETE_TABLEAU_QUALITE)
-            if int(curseur.fetchone()[0]) < 2:
+            if int(curseur.fetchone()[0]) < 3:
                 ajouter(FAMILLE_DW, "tables du tableau qualité (dw.dim_controle, "
                         "dw.fait_anomalie)", "présentes",
                         "absentes (script sql/socle/005 non appliqué ?)")
             else:
                 controles += controles_tableau_qualite(
-                    sorties.anomalies_nettoyees, (sorties.bilan_brut, sorties.bilan_nettoye)
+                    sorties.anomalies_nettoyees, (sorties.bilan_brut, sorties.bilan_nettoye),
+                    (sorties.non_evaluables_brutes, sorties.non_evaluables_nettoyees),
                 )
         for controle in controles:
             if controle.requete is None:

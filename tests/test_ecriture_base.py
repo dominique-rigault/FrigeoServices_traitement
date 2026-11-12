@@ -807,21 +807,34 @@ def test_controles_tableau_qualite():
         "issue": ["anomalie", "à arbitrer", "information", "anomalie"],
         "fichier_source": ["f.csv", "f.csv", None, ""],
     })
-    bilans = (pd.DataFrame({"controle": ["c1", "c2"]}),
-              pd.DataFrame({"controle": ["c1", "c2", "c3"]}))
-    controles = controles_tableau_qualite(anomalies, bilans)
-    assert [(c.libelle.split(" :")[0], c.attendu) for c in controles] == [
+    compteurs = {"controlees": [10, 20], "anomalies": [2, 1], "a_arbitrer": [1, 0],
+                 "informations": [0, 3]}
+    bilans = (pd.DataFrame({"controle": ["c1", "c2"], **compteurs}),
+              pd.DataFrame({"controle": ["c1", "c2", "c3"],
+                            **{c: v + [5] for c, v in compteurs.items()}}))
+    non_evaluables = (pd.DataFrame({"controle": ["c1"] * 4}),
+                      pd.DataFrame({"controle": ["c1"] * 2}))
+    controles = controles_tableau_qualite(anomalies, bilans, non_evaluables)
+    assert [(c.libelle.split(" :")[0].split(",")[0], c.attendu) for c in controles] == [
         ("dw.dim_controle", 3),
         ("dw.fait_anomalie", 4),
         ("dw.fait_anomalie", "2 / 1 / 1"),
         ("dw.fait_anomalie", 0),
         ("dw.fait_anomalie", 2),
+        ("dw.fait_bilan_controle", "2 / 3"),
+        ("dw.fait_bilan_controle", "30 / 3 / 1 / 3"),
+        ("dw.fait_bilan_controle", "35 / 8 / 6 / 8"),
+        ("dw.fait_bilan_controle", "4 / 2"),
+        ("dw.fait_bilan_controle", 0),
     ]
     assert controles[2].requete == (
         "SELECT COUNT(CASE WHEN issue = N'anomalie' THEN 1 END), "
         "COUNT(CASE WHEN issue = N'à arbitrer' THEN 1 END), "
         "COUNT(CASE WHEN issue = N'information' THEN 1 END) FROM dw.fait_anomalie"
     )
+    assert "état brut" in controles[6].libelle and "WHERE etat = N'brut'" in controles[6].requete
+    assert ("état nettoyé" in controles[7].libelle
+            and "WHERE etat = N'nettoyé'" in controles[7].requete)
     assert all(c.probleme is None for c in controles)
 
 

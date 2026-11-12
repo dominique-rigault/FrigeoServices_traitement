@@ -66,5 +66,6 @@ BEGIN
     /* Tableau qualité (socle, script 005). */
     EXEC dw.construire_dim_controle @id_execution;
     EXEC dw.construire_fait_anomalie @id_execution;
+    EXEC dw.construire_fait_bilan_controle @id_execution;
 END;
 GO

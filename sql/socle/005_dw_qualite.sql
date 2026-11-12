@@ -19,17 +19,24 @@
     qualite : une valeur d'une colonne sensible y est déjà « masqué ».
     Une anomalie sans ligne source (un total par période) reste, sans
     id_chargement. Le registre brut reste dans qualite.
+  - dw.fait_bilan_controle : le taux par contrôle, une ligne par contrôle
+    et par état (brut : la qualité des fichiers livrés; nettoyé : ce qui
+    reste après nettoyage) : lignes contrôlées, anomalies, écarts à
+    arbitrer, informations, taux, lignes distinctes, et les lignes non
+    évaluables comptées à part depuis qualite.non_evaluable, pour
+    distinguer « contrôlé sans écart » de « non contrôlable ».
 
   Comme les dimensions du pack : clé technique numérotée dans l'ordre
   binaire, membres -1 « (non renseigné) » et -2 « (introuvable) », libellé
   du contrôle en classement binaire, tables vidées puis remplies à chaque
   reconstruction, étapes inscrites dans dw.journal_reconstruction.
 
-  Le pack appelle les trois procédures depuis dw.reconstruire :
+  Le pack appelle les quatre procédures depuis dw.reconstruire :
   dw.vider_tableau_qualite avec les autres vidages, puis
-  dw.construire_dim_controle et dw.construire_fait_anomalie. Un pack qui ne
-  les appelle pas laisse ces tables vides, ce que la vérification sort en
-  non conforme (limite au README).
+  dw.construire_dim_controle, dw.construire_fait_anomalie et
+  dw.construire_fait_bilan_controle. Un pack qui ne les appelle pas laisse
+  ces tables vides, ce que la vérification sort en non conforme (limite au
+  README).
 */
 
 /*
@@ -84,12 +91,36 @@ CREATE TABLE dw.fait_anomalie (
 );
 GO
 
-/* Vide les tables du tableau qualité, avant les dimensions qu'elles référencent. */
+/*
+  Le bilan d'un contrôle dans un état : les compteurs de
+  qualite.bilan_controle, plus les lignes non évaluables du contrôle.
+*/
+CREATE TABLE dw.fait_bilan_controle (
+    id_fait_bilan_controle  int            NOT NULL,
+    etat                    nvarchar(10)   NOT NULL,
+    id_controle             int            NOT NULL,
+    controlees              int            NULL,
+    anomalies               int            NULL,
+    a_arbitrer              int            NULL,
+    informations            int            NULL,
+    non_evaluables          int            NOT NULL,
+    taux                    decimal(9, 4)  NULL,
+    lignes_distinctes       int            NULL,
+    CONSTRAINT pk_fait_bilan_controle PRIMARY KEY (id_fait_bilan_controle),
+    CONSTRAINT uq_fait_bilan_controle UNIQUE (etat, id_controle),
+    CONSTRAINT ck_fait_bilan_controle_etat CHECK (etat IN (N'brut', N'nettoyé')),
+    CONSTRAINT fk_fait_bilan_controle_controle
+        FOREIGN KEY (id_controle) REFERENCES dw.dim_controle (id_controle)
+);
+GO
+
+/* Vide les tables du tableau qualité, avant la dimension qu'elles référencent. */
 CREATE PROCEDURE dw.vider_tableau_qualite
 AS
 BEGIN
     SET NOCOUNT ON;
     DELETE FROM dw.fait_anomalie;
+    DELETE FROM dw.fait_bilan_controle;
 END;
 GO
 
@@ -168,5 +199,50 @@ BEGIN
 
     DECLARE @lignes int = @@ROWCOUNT;
     EXEC dw.inscrire_etape @id_execution, N'fait_anomalie', @lignes, @debut;
+END;
+GO
+
+
+CREATE PROCEDURE dw.construire_fait_bilan_controle
+    @id_execution int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
+
+    DELETE FROM dw.fait_bilan_controle;
+    WITH non_evaluables AS (
+        SELECT etat, controle COLLATE Latin1_General_100_BIN2 AS controle,
+               COUNT(*) AS lignes
+        FROM qualite.non_evaluable
+        WHERE id_execution = @id_execution
+        GROUP BY etat, controle COLLATE Latin1_General_100_BIN2
+    )
+    INSERT INTO dw.fait_bilan_controle (
+        id_fait_bilan_controle, etat, id_controle, controlees, anomalies, a_arbitrer,
+        informations, non_evaluables, taux, lignes_distinctes
+    )
+    SELECT ROW_NUMBER() OVER (ORDER BY CASE b.etat WHEN N'brut' THEN 0 ELSE 1 END,
+                              b.controle COLLATE Latin1_General_100_BIN2),
+           b.etat,
+           CASE WHEN b.controle = N'' THEN -1 ELSE COALESCE(c.id_controle, -2) END,
+           b.controlees,
+           b.anomalies,
+           b.a_arbitrer,
+           b.informations,
+           COALESCE(n.lignes, 0),
+           b.taux,
+           b.lignes_distinctes
+    FROM qualite.bilan_controle AS b
+    LEFT JOIN dw.dim_controle AS c
+        ON c.controle = b.controle COLLATE Latin1_General_100_BIN2
+       AND c.id_controle >= 1
+    LEFT JOIN non_evaluables AS n
+        ON n.etat = b.etat
+       AND n.controle = b.controle COLLATE Latin1_General_100_BIN2
+    WHERE b.id_execution = @id_execution;
+
+    DECLARE @lignes int = @@ROWCOUNT;
+    EXEC dw.inscrire_etape @id_execution, N'fait_bilan_controle', @lignes, @debut;
 END;
 GO
