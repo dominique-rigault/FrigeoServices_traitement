@@ -1161,6 +1161,7 @@ FAMILLE_QUALITE = "qualite"
 FAMILLE_DW = "dw"
 FAMILLE_RETENUE = "retenue"
 FAMILLE_CALCULS = "calculs"
+FAMILLE_PBI = "pbi"
 CONTRAT_RESPECTE = "respecté"
 CONTRAT_NON_RESPECTE = "non respecté"
 VALEUR_MASQUEE = "masqué"
@@ -1269,9 +1270,12 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     chaque fait, retenue égale ligne à ligne à celle de sa ligne de propre et des
     lignes rattachées que le pack déclare (`controles_retenue_faits`); pour chaque pack
     qui a un module de vérification (frigeo.packs.<pack>), ses calculs refaits en
-    Python et comparés à dw (famille calculs); avec `sorties`, les tables génériques
-    du tableau qualité comparées au registre après nettoyage, aux bilans des
-    contrôles et aux lignes non évaluables (`controles_tableau_qualite`).
+    Python et comparés à dw (famille calculs); chaque vue du schéma pbi conforme au
+    contrat (dw.contrat_vue, dw.source_vue) : colonnes exactement celles déclarées et
+    lignes égales à la source, vue par vue (famille pbi, `_verifier_vues`); avec
+    `sorties`, les tables génériques du tableau qualité comparées au registre après
+    nettoyage, aux bilans des contrôles et aux lignes non évaluables
+    (`controles_tableau_qualite`).
     """
     from sqlalchemy import text
 
@@ -1989,9 +1993,60 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
             curseur.execute(controle.requete)
             ajouter(FAMILLE_DW, controle.libelle, controle.attendu,
                     _obtenu(tuple(curseur.fetchone())), controle.masque)
+        _verifier_vues(curseur, ajouter)
         _verifier_packs(curseur, ecriture, sorties, ajouter)
     finally:
         curseur.close()
+
+
+REQUETE_CONTRAT_VUES = "SELECT vue, colonne FROM dw.contrat_vue ORDER BY vue, colonne"
+REQUETE_SOURCES_VUES = "SELECT vue, source FROM dw.source_vue ORDER BY vue"
+REQUETE_COLONNES_VUES = (
+    "SELECT o.name, c.name FROM sys.columns AS c "
+    "JOIN sys.objects AS o ON o.object_id = c.object_id "
+    "WHERE o.schema_id = SCHEMA_ID(N'pbi') AND o.type = N'V'"
+)
+
+
+def _verifier_vues(curseur, ajouter) -> None:
+    """Contrôles de la famille pbi : chaque vue du schéma pbi respecte le contrat avec
+    le rapport (dw.contrat_vue, dw.source_vue, socle script 006). Les colonnes réelles
+    des vues, lues dans sys.columns, doivent être exactement celles déclarées, vue par
+    vue (une colonne ajoutée, retirée ou renommée sort en non conforme avant que le
+    rapport ne casse), et chaque vue doit compter autant de lignes que sa source."""
+    curseur.execute(REQUETE_CONTRAT_VUES)
+    attendues: dict[str, set] = {}
+    for vue, colonne in curseur.fetchall():
+        attendues.setdefault(vue, set()).add(colonne)
+    curseur.execute(REQUETE_COLONNES_VUES)
+    reelles: dict[str, set] = {}
+    for vue, colonne in curseur.fetchall():
+        reelles.setdefault(vue, set()).add(colonne)
+
+    ajouter(FAMILLE_PBI, "vues du schéma pbi déclarées dans dw.contrat_vue",
+            " / ".join(sorted(attendues)), " / ".join(sorted(reelles)))
+    for vue in sorted(attendues):
+        manquantes = attendues[vue] - reelles.get(vue, set())
+        en_trop = reelles.get(vue, set()) - attendues[vue]
+        ecart = "; ".join(
+            partie for partie in (
+                "colonnes manquantes : " + ", ".join(sorted(manquantes)) if manquantes else "",
+                "colonnes en trop : " + ", ".join(sorted(en_trop)) if en_trop else "",
+            ) if partie
+        )
+        ajouter(FAMILLE_PBI, f"pbi.[{vue}] : colonnes conformes au contrat", "", ecart)
+
+    curseur.execute(REQUETE_SOURCES_VUES)
+    for vue, source in curseur.fetchall():
+        objet = source.split(" (")[0]
+        curseur.execute(f"SELECT COUNT(*) FROM pbi.[{vue}]")
+        lignes_vue = int(curseur.fetchone()[0])
+        if vue == "Chantiers":
+            curseur.execute("SELECT COUNT(DISTINCT id_chantier) FROM dw.fait_intervention")
+        else:
+            curseur.execute(f"SELECT COUNT(*) FROM {objet}")
+        ajouter(FAMILLE_PBI, f"pbi.[{vue}] : lignes égales à {source}",
+                int(curseur.fetchone()[0]), lignes_vue)
 
 
 def modules_verification(packs: list[str]) -> list[tuple[str, object]]:
