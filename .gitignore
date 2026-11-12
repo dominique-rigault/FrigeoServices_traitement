@@ -13,6 +13,9 @@ __pycache__/
 .ipynb_checkpoints/
 *.pyc
 
+# Power BI (hors le guide docs/powerbi.md)
+powerbi/
+
 # Divers
 .vscode/settings.json
 *.egg-info/

@@ -23,8 +23,8 @@ La mission consiste à charger ces exports tels quels, contrôler leur qualité,
 | 4 | Contrôles des règles de gestion et rapprochements entre sources, formulaire des règles de gestion pour le métier | Python, Excel, Jupyter | 05 | Terminé |
 | 5 | Table des anomalies, gravité et indicateurs affectés, export CSV | Python, Jupyter | 06 | Terminé |
 | 6 | Règles de nettoyage explicites, décisions du métier ligne par ligne, journal des corrections | Python, Excel, Jupyter | 07 | Terminé |
-| 7 | Base SQL Server (socle, écriture et vérification des données chargées et nettoyées et des sorties de la qualité), puis modèle en étoile, indicateurs et marge opérationnelle | SQL Server, Python, Azure SQL Database | 07 | En cours (socle, écriture et modèle en étoile vérifié de bout en bout terminés; lignes non retenues, chantiers, CUMP, coûts et marge par intervention calculés et vérifiés; anomalies et taux par contrôle dans le modèle; vues pour Power BI à venir) |
-| 8 | Tableaux de bord direction et qualité | Power BI | aucun | À venir |
+| 7 | Base SQL Server (socle, écriture et vérification des données chargées et nettoyées et des sorties de la qualité), puis modèle en étoile, indicateurs et marge opérationnelle | SQL Server, Python, Azure SQL Database | 07 | En cours (socle, écriture et modèle en étoile vérifié de bout en bout terminés; lignes non retenues, chantiers, CUMP, coûts et marge par intervention calculés et vérifiés; anomalies et taux par contrôle dans le modèle; vues pour Power BI et guide du modèle de vérification terminés) |
+| 8 | Tableaux de bord direction et qualité | Power BI | aucun | À venir (modèle de vérification en tableaux bruts décrit dans `docs/powerbi.md`) |
 | 9 | Documentation de la méthode, des choix et des limites | Markdown | aucun | À venir |
 | 10 | Déploiement sur Azure et passation | Azure, Power Automate | aucun | À venir |
 
@@ -122,6 +122,7 @@ notebooks/   un notebook par étape, numérotés dans l'ordre d'exécution (01 �
 sql/         scripts T-SQL (étape 7) : socle commun (socle/) et pack métier (packs/)
 src/         fonctions Python réutilisables (lecture, lignage, contrôles); vérification des calculs de chaque pack (src/frigeo/packs/)
 tests/       tests automatisés sur données fictives
+docs/        guides (modèle Power BI)
 ```
 
 ## Installation
@@ -154,6 +155,10 @@ data/
   anomalies/        table des anomalies, bilan par contrôle et lignes non évaluables en CSV (étape 5, et après nettoyage à l'étape 6)
   nettoyage/        journal et bilan du nettoyage en CSV (étape 6)
 ```
+
+## Power BI
+
+Power BI n'importe que les vues du schéma `pbi` de la base, en mode Import, et n'écrit aucune règle métier : tout le calcul vit dans la base, versionné et vérifié. Le guide `docs/powerbi.md` décrit le modèle de vérification (`.pbit`) de la sous-étape 7.6, en tableaux bruts, paramétré par le serveur et la base. Le coût salarial et la marge sont exposés au grain de l'intervention (les masquer serait illusoire, la marge les redonnant par soustraction) : la protection est l'accès au rapport, réservé à la direction. Les fichiers Power BI restent hors du dépôt (`powerbi/` ignoré, sauf le guide).
 
 ## Conventions de travail
 
