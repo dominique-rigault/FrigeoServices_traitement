@@ -158,7 +158,7 @@ data/
 
 ## Power BI
 
-Power BI n'importe que les vues du schéma `pbi` de la base, en mode Import, et n'écrit aucune règle métier : tout le calcul vit dans la base, versionné et vérifié. Le guide `docs/powerbi.md` décrit le modèle de vérification (`.pbit`) de la sous-étape 7.6, en tableaux bruts, paramétré par le serveur et la base. Le coût salarial et la marge sont exposés au grain de l'intervention (les masquer serait illusoire, la marge les redonnant par soustraction) : la protection est l'accès au rapport, réservé à la direction. Les fichiers Power BI restent hors du dépôt (`powerbi/` ignoré, sauf le guide).
+Power BI n'importe que les vues du schéma `pbi` de la base, en mode Import, et n'écrit aucune règle métier : tout le calcul vit dans la base, versionné et vérifié. Le guide `docs/powerbi.md` décrit le modèle de vérification de la sous-étape 7.6, en tableaux bruts, paramétré par le serveur et la base. Le coût salarial et la marge sont exposés au grain de l'intervention (les masquer serait illusoire, la marge les redonnant par soustraction) : la protection est l'accès au rapport, réservé à la direction. Le modèle `powerbi/frigeo_verification.pbit` est versionné : il ne contient aucune donnée et sert de point de départ aux missions suivantes. Le fichier de travail `.pbix` reste hors du dépôt.
 
 ## Conventions de travail
 

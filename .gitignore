@@ -13,8 +13,9 @@ __pycache__/
 .ipynb_checkpoints/
 *.pyc
 
-# Power BI (hors le guide docs/powerbi.md)
-powerbi/
+# Power BI : seul le modèle .pbit (sans données) est versionné
+powerbi/*
+!powerbi/*.pbit
 
 # Divers
 .vscode/settings.json
