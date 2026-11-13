@@ -122,13 +122,14 @@ et sert aussi de point de départ aux missions suivantes. Il est versionné
 
 ### Table de dates
 
-Le Calendrier n'est pas marqué comme table de dates : Power BI l'exige sans
-valeur vide, alors que ses membres -1 (date absente) et -2 (date hors
-calendrier) n'ont pas de date. Le modèle de vérification n'en a pas besoin.
-Le choix est à faire à l'étape 8, avec les comparaisons temporelles : soit
-retirer ces deux membres de la vue `pbi.Calendrier` (les faits concernés
-tombant dans la ligne « (Vide) » de Power BI), soit écrire des mesures qui
-lèvent elles-mêmes le filtre du calendrier (`REMOVEFILTERS`).
+Depuis l'étape 8, la vue `pbi.Calendrier` exclut les membres -1 (date
+absente) et -2 (date hors calendrier), qui n'ont pas de date : Power BI
+refuse de marquer une table de dates dont la colonne de dates a des vides.
+Les faits qui citent ces membres tombent dans la ligne « (Vide) » des axes
+de dates. Le modèle de vérification n'a pas besoin du marquage et reste
+sans table de dates marquée; les tableaux de bord de l'étape 8 marquent le
+Calendrier (*Outils de table > Marquer comme table de dates*, colonne
+[Date]) pour les fonctions de comparaison temporelle (SAMEPERIODLASTYEAR).
 
 ## Vérifier les indicateurs
 
@@ -159,10 +160,11 @@ Un écart se diagnostique dans la base, pas dans Power BI.
 
 ### Valeurs de contrôle du jeu Frigéo (période de fin 2026-03)
 
-- Dimensions, membres -1 et -2 compris en plus : Calendrier 1 095 jours
-  (2025 à 2027), 5 catégories, 8 articles, 254 pièces, 46 comptes,
-  17 intervenants, 850 clients, 25 fournisseurs (7 codes clients et
-  1 code fournisseur rattachés à un code principal par le métier).
+- Dimensions, membres -1 et -2 compris en plus, sauf le Calendrier qui les
+  exclut : Calendrier 1 095 jours (2025 à 2027), 5 catégories, 8 articles,
+  254 pièces, 46 comptes, 17 intervenants, 850 clients, 25 fournisseurs
+  (7 codes clients et 1 code fournisseur rattachés à un code principal par
+  le métier).
 - Faits : Interventions 10 180, Consommations de pièces 6 509, Lignes de
   facture 22 626, Achats 3 495, Écritures comptables 54 161, Stock mensuel
   des pièces 3 810 (254 pièces sur 15 mois), Chantiers 10 171 (7 chantiers

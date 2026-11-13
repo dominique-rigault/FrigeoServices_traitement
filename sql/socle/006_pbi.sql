@@ -15,7 +15,9 @@
   reconstruction, seulement vidées et remplies.
 */
 
-/* Une vue pbi et l'objet dont elle compte les lignes (schéma.objet). */
+/* Une vue pbi et l'objet dont elle compte les lignes (schéma.objet). Une
+   annotation « (où …) » déclare une condition appliquée au décompte de la
+   source; toute autre annotation est un simple commentaire. */
 CREATE TABLE dw.source_vue (
     vue     nvarchar(128)  NOT NULL,
     source  nvarchar(260)  NOT NULL,

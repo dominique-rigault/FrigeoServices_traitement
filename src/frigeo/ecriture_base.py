@@ -1272,7 +1272,8 @@ def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
     qui a un module de vérification (frigeo.packs.<pack>), ses calculs refaits en
     Python et comparés à dw (famille calculs); chaque vue du schéma pbi conforme au
     contrat (dw.contrat_vue, dw.source_vue) : colonnes exactement celles déclarées et
-    lignes égales à la source, vue par vue (famille pbi, `_verifier_vues`); avec
+    lignes égales à la source, au besoin restreinte par son annotation « (où …) »,
+    vue par vue (famille pbi, `_verifier_vues`); avec
     `sorties`, les tables génériques du tableau qualité comparées au registre après
     nettoyage, aux bilans des contrôles et aux lignes non évaluables
     (`controles_tableau_qualite`).
@@ -2013,7 +2014,8 @@ def _verifier_vues(curseur, ajouter) -> None:
     le rapport (dw.contrat_vue, dw.source_vue, socle script 006). Les colonnes réelles
     des vues, lues dans sys.columns, doivent être exactement celles déclarées, vue par
     vue (une colonne ajoutée, retirée ou renommée sort en non conforme avant que le
-    rapport ne casse), et chaque vue doit compter autant de lignes que sa source."""
+    rapport ne casse), et chaque vue doit compter autant de lignes que sa source,
+    restreinte à la condition qu'une annotation « (où …) » de dw.source_vue déclare."""
     curseur.execute(REQUETE_CONTRAT_VUES)
     attendues: dict[str, set] = {}
     for vue, colonne in curseur.fetchall():
@@ -2038,11 +2040,14 @@ def _verifier_vues(curseur, ajouter) -> None:
 
     curseur.execute(REQUETE_SOURCES_VUES)
     for vue, source in curseur.fetchall():
-        objet = source.split(" (")[0]
+        objet, _, annotation = source.partition(" (")
+        annotation = annotation.removesuffix(")")
         curseur.execute(f"SELECT COUNT(*) FROM pbi.[{vue}]")
         lignes_vue = int(curseur.fetchone()[0])
         if vue == "Chantiers":
             curseur.execute("SELECT COUNT(DISTINCT id_chantier) FROM dw.fait_intervention")
+        elif annotation.startswith("où "):
+            curseur.execute(f"SELECT COUNT(*) FROM {objet} WHERE {annotation.removeprefix('où ')}")
         else:
             curseur.execute(f"SELECT COUNT(*) FROM {objet}")
         ajouter(FAMILLE_PBI, f"pbi.[{vue}] : lignes égales à {source}",

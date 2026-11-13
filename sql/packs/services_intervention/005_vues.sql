@@ -9,8 +9,11 @@
   que la vérification compare à la base dans les deux sens.
 
   Exposition décidée à la sous-étape 7.6 : les membres spéciaux -1 et -2
-  restent (les faits les citent); les colonnes internes (id_chargement,
-  lignes_source, codes_en_doublon, statut des valeurs de liste) et les
+  restent (les faits les citent), sauf dans [Calendrier], marquée table de
+  dates par les tableaux de bord de l'étape 8 (Power BI refuse une date
+  vide; les faits concernés tombent dans la ligne « (Vide) » des axes de
+  dates); les colonnes internes (id_chargement, lignes_source,
+  codes_en_doublon, statut des valeurs de liste) et les
   dates des référentiels (entrée, sortie, création, fin de relation) ne
   sortent pas; aucune donnée personnelle au-delà du nom, du prénom et du
   poste de l'intervenant, nécessaires au pilotage. Le coût salarial et la
@@ -37,7 +40,8 @@ SELECT id_date AS [Clé date],
        feries_declares AS [Jours fériés déclarés],
        ferie AS [Férié],
        ouvre AS [Ouvré]
-FROM dw.dim_date;
+FROM dw.dim_date
+WHERE id_date > 0; -- sans les membres -1 et -2, pour marquer la table de dates
 GO
 
 CREATE VIEW pbi.[Catégories d'intervention] AS
@@ -280,7 +284,7 @@ GO
 
 /* Déclaration des vues : le contrat avec le rapport. */
 INSERT INTO dw.source_vue (vue, source) VALUES
-    (N'Calendrier', N'dw.dim_date'),
+    (N'Calendrier', N'dw.dim_date (où id_date > 0)'),
     (N'Catégories d''intervention', N'dw.dim_categorie'),
     (N'Articles facturés', N'dw.dim_article'),
     (N'Pièces', N'dw.dim_piece'),
