@@ -3,7 +3,8 @@
 Ce guide décrit le modèle Power BI de la sous-étape 7.6 : un rapport de
 **vérification**, en tableaux bruts, qui importe les vues `pbi` et permet de
 comparer les indicateurs aux valeurs de référence. La mise en page des deux
-tableaux de bord (direction, qualité) relève de l'étape 8.
+tableaux de bord (direction, qualité) relève de l'étape 8 (voir
+`tableaux_bord.md`).
 
 Le livrable est un **modèle** Power BI, `powerbi/frigeo_verification.pbit`,
 paramétré par le serveur et le nom de la base : le même fichier s'ouvre chez
