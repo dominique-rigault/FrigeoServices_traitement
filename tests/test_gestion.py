@@ -68,6 +68,7 @@ from frigeo.gestion import (
     Constats,
     TypeRegle,
     catalogue_types,
+    charger_jours_feries,
     charger_regles_gestion,
     completer_jours_feries,
     completer_parametres_communs,
@@ -3896,6 +3897,29 @@ def test_jours_feries_du_fichier_et_commentaire(tmp_path):
         lire_fichier_gestion(chemin)
     assert lire_fichier_gestion(tmp_path / "absent.yaml") == {}
 
+
+
+def test_charger_jours_feries(tmp_path):
+    chemin = tmp_path / "gestion.yaml"
+    chemin.write_text(
+        "jours_feries:\n  2026: ['2026-05-01', 2026-01-01]\n  '2025': []\n"
+        "regles: []\n",
+        encoding="utf-8",
+    )
+    assert charger_jours_feries(chemin) == {
+        2025: [], 2026: [dt.date(2026, 1, 1), dt.date(2026, 5, 1)],
+    }
+    assert list(charger_jours_feries(chemin)) == [2025, 2026]
+    chemin.write_text("regles: []\n", encoding="utf-8")
+    assert charger_jours_feries(chemin) == {}
+    assert charger_jours_feries(tmp_path / "absent.yaml") == {}
+    chemin.write_text("jours_feries:\n  2025: ['2026-05-01', 'x']\n", encoding="utf-8")
+    with pytest.raises(ValueError) as erreur:
+        charger_jours_feries(chemin)
+    assert str(erreur.value).splitlines()[1:] == [
+        "  jours_feries : année 2025 : 2026-05-01 n'est pas de cette année",
+        "  jours_feries : année 2025 : 'x' n'est pas une date AAAA-MM-JJ",
+    ]
 
 def test_completer_jours_feries_sans_modifier_les_arguments():
     regles = [_horaires(), {k: v for k, v in _horaires().items() if k != "feries"}, "x"]

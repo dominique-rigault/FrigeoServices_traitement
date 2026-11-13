@@ -78,6 +78,8 @@ regles:
 # identique_hors_cle false = deux lignes pareilles hors clé sont normales dans cette table.
 # table_des_lignes = table des lignes d'une table d'en-têtes : deux en-têtes pareils hors
 # clé ne sont signalés que si leurs lignes sont pareilles aussi.
+# regrouper_codes true = référentiel à clé d'une colonne dont deux codes d'une même entité
+# peuvent être regroupés sous un code principal par le métier (classeur d'arbitrage).
 doublons:
   interventions:
     cle: [id_intervention]
@@ -110,6 +112,7 @@ doublons:
     presume_unique:
       - [raison_sociale, cp]
     identique_hors_cle: false
+    regrouper_codes: true
   fournisseurs:
     cle: [code_fournisseur]
     unique:
@@ -117,6 +120,7 @@ doublons:
     presume_unique:
       - [raison_sociale]
     identique_hors_cle: false
+    regrouper_codes: true
   catalogue_pieces:
     cle: [ref_piece]
     unique:

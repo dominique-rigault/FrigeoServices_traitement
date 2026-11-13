@@ -4507,6 +4507,32 @@ def charger_regles_gestion(chemin: str | Path | None = None) -> list:
     return regles
 
 
+
+def charger_jours_feries(chemin: str | Path | None = None) -> dict[int, list[dt.date]]:
+    """Jours fériés déclarés sous la clé `jours_feries` de config/gestion.yaml : année
+    vers liste triée de ses dates, dans l'ordre des années.
+
+    Une année déclarée avec une liste vide est rendue avec une liste vide : elle est
+    déclarée, sans jour férié. Un fichier absent, ou sans la clé, ne donne aucune
+    année. Des jours fériés mal formés sont refusés (`ValueError`), tous les problèmes
+    étant listés en une fois, comme par `charger_regles_gestion`.
+    """
+    chemin = Path(chemin) if chemin is not None else chemin_regles_gestion()
+    contenu = lire_fichier_gestion(chemin)
+    if CLE_JOURS_FERIES not in contenu:
+        return {}
+    jours_feries = contenu[CLE_JOURS_FERIES]
+    problemes = _problemes_feries(jours_feries)
+    if problemes:
+        raise ValueError(
+            f"Jours fériés invalides ({chemin})\n  "
+            + "\n  ".join(f"{CLE_JOURS_FERIES} : {probleme}" for probleme in problemes)
+        )
+    return {
+        _annee_feries(cle): sorted(_jour_ferie(valeur) for valeur in jours)
+        for cle, jours in sorted(jours_feries.items(), key=lambda item: _annee_feries(item[0]))
+    }
+
 def _problemes_de_donnees(regles: list, tables: dict, dictionnaire: dict) -> list[str]:
     """Tables, colonnes et natures des règles confrontées aux données et au dictionnaire."""
     problemes = []

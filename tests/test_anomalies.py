@@ -29,6 +29,7 @@ from frigeo.anomalies import (
     dossier_anomalies,
     ecrire_anomalies,
     lignes_non_evaluables,
+    lignes_non_retenues,
     problemes_qualification,
     qualifier,
     reunir_anomalies,
@@ -1187,3 +1188,52 @@ def test_ecriture_des_lignes_non_evaluables_refusee(tmp_path, monkeypatch):
                          DECLARATIONS, non_evaluables=non_evaluables.iloc[:1])
     assert str(cible) in str(erreur.value) and "Rien n'a été modifié" in str(erreur.value)
     assert _etat(dossier) == avant
+
+
+# --- Lignes retenues pour les indicateurs (étape 7.4a) --------------------------------
+
+
+def _anomalie(**valeurs):
+    ligne = {
+        "table": "interventions", "fichier_source": "interventions_2025.csv",
+        "feuille_source": None, "num_ligne_source": 2, "issue": "anomalie",
+        "gravite": "bloquante", "decision_metier": None,
+    }
+    ligne.update(valeurs)
+    return ligne
+
+
+def test_lignes_non_retenues():
+    anomalies = pd.DataFrame([
+        _anomalie(),
+        _anomalie(champ="autre"),  # même ligne, une seule fois
+        _anomalie(num_ligne_source="3", issue="à arbitrer"),
+        _anomalie(num_ligne_source=4.0, table="factures_entetes",
+                  fichier_source="factures_2025.xlsx", feuille_source="Entetes"),
+        _anomalie(num_ligne_source=5, gravite="majeure"),
+        _anomalie(num_ligne_source=6, issue="information"),
+        _anomalie(num_ligne_source=7, decision_metier="garder le 2026-10-20"),
+        _anomalie(num_ligne_source=None, fichier_source=None),  # total d'une période
+        _anomalie(num_ligne_source=float("nan")),
+    ])
+    assert lignes_non_retenues(anomalies) == {
+        ("interventions", "interventions_2025.csv", None, 2),
+        ("interventions", "interventions_2025.csv", None, 3),
+        ("factures_entetes", "factures_2025.xlsx", "Entetes", 4),
+    }
+
+
+def test_lignes_non_retenues_sans_anomalie_ni_decision():
+    assert lignes_non_retenues(None) == set()
+    assert lignes_non_retenues(pd.DataFrame()) == set()
+    sans_decision = pd.DataFrame([_anomalie()]).drop(columns="decision_metier")
+    assert lignes_non_retenues(sans_decision) == {
+        ("interventions", "interventions_2025.csv", None, 2)
+    }
+
+
+def test_lignes_non_retenues_numero_invalide_refuse_sans_valeur():
+    with pytest.raises(ValueError) as erreur:
+        lignes_non_retenues(pd.DataFrame([_anomalie(num_ligne_source="2;3")]))
+    assert "2;3" not in str(erreur.value)
+    assert "1 anomalie(s) bloquante(s)" in str(erreur.value)

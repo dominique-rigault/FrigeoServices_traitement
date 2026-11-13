@@ -64,7 +64,11 @@ from .controles import (
     problemes_regles_complementaires,
 )
 from .dictionnaire import STATUTS, _valeurs_renseignees, dossier_sauvegardes
-from .doublons import CLE_TABLE_DES_LIGNES, problemes_declarations_doublons
+from .doublons import (
+    CLE_REGROUPER_CODES,
+    CLE_TABLE_DES_LIGNES,
+    problemes_declarations_doublons,
+)
 from .formulaires import (
     FOND_MODIFIABLE,
     FORMAT_EFFECTIF,
@@ -164,7 +168,8 @@ COLONNES_LUHN = (
 )
 COLONNES_DOUBLONS = ("table", "type", "colonnes", "origine", "observé", "statut", "commentaire")
 COLONNES_TABLES = (
-    "table", "lignes", "clé_en_vigueur", "identiques_hors_clé", CLE_TABLE_DES_LIGNES
+    "table", "lignes", "clé_en_vigueur", "identiques_hors_clé", CLE_TABLE_DES_LIGNES,
+    CLE_REGROUPER_CODES,
 )
 COLONNES_MOTIFS = ("table", "colonne", "motif")
 COLONNES_DUREES = ("table", "colonne", "duree")
@@ -212,6 +217,7 @@ LARGEURS = {
     "clé_en_vigueur": 34,
     "identiques_hors_clé": 20,
     CLE_TABLE_DES_LIGNES: 20,
+    CLE_REGROUPER_CODES: 16,
     "motif": 50,
     "duree": 12,
 }
@@ -564,7 +570,8 @@ def lignes_doublons(tables: dict, dictionnaire: dict, contenu: dict) -> list[dic
 def lignes_tables(tables: dict, dictionnaire: dict, contenu: dict) -> list[dict]:
     """Lignes de la feuille des tables : faut-il chercher les lignes identiques hors
     de la clé (« non » quand deux enregistrements peuvent y être pareils) ? La table
-    des lignes d'une table d'en-têtes est affichée en lecture seule."""
+    des lignes d'une table d'en-têtes, et le regroupement des codes d'un
+    référentiel (« oui »), sont affichés en lecture seule."""
     declarations = _section(contenu, CLE_DOUBLONS)
     return [
         {
@@ -575,6 +582,9 @@ def lignes_tables(tables: dict, dictionnaire: dict, contenu: dict) -> list[dict]
                 NON if declarations.get(table, {}).get("identique_hors_cle") is False else OUI
             ),
             CLE_TABLE_DES_LIGNES: declarations.get(table, {}).get(CLE_TABLE_DES_LIGNES),
+            CLE_REGROUPER_CODES: (
+                OUI if declarations.get(table, {}).get(CLE_REGROUPER_CODES) is True else None
+            ),
         }
         for table, donnees in tables.items()
         if table in dictionnaire
@@ -687,7 +697,10 @@ def _mode_emploi(periode_fin: str, lignes: dict) -> list[str]:
         "s'applique qu'à une table qui a une clé. La colonne table_des_lignes, en "
         "lecture seule, nomme la table des lignes d'une table d'en-têtes (déclarée par "
         "le consultant) : deux en-têtes pareils n'y sont signalés que si leurs lignes "
-        "sont pareilles aussi.",
+        "sont pareilles aussi. La colonne regrouper_codes, en lecture seule, vaut oui "
+        "pour un référentiel (clients, fournisseurs) dont deux codes d'une même entité "
+        "peuvent être regroupés par le métier dans le classeur d'arbitrage (déclaré par "
+        "le consultant).",
         "",
         f"Feuille « {FEUILLE_MOTIFS} » : lecture seule",
         "Les motifs (expressions régulières) sont écrits par le consultant et repris "
@@ -1198,8 +1211,9 @@ def _importer_doublons(
                     f"(déclarer une clé, ou choisir {OUI})"
                 )
             declaration[REGLE_IDENTIQUES] = False
-        if CLE_TABLE_DES_LIGNES in ancienne:
-            declaration[CLE_TABLE_DES_LIGNES] = ancienne[CLE_TABLE_DES_LIGNES]
+        for cle in (CLE_TABLE_DES_LIGNES, CLE_REGROUPER_CODES):
+            if cle in ancienne:
+                declaration[cle] = ancienne[cle]
         if declaration:
             nouvelles[table] = declaration
     for table, declaration in declarations.items():
@@ -1434,6 +1448,8 @@ COMMENTAIRE_DOUBLONS = """\
 # identique_hors_cle false = deux lignes pareilles hors clé sont normales dans cette table.
 # table_des_lignes = table des lignes d'une table d'en-têtes : deux en-têtes pareils hors
 # clé ne sont signalés que si leurs lignes sont pareilles aussi.
+# regrouper_codes true = référentiel à clé d'une colonne dont deux codes d'une même entité
+# peuvent être regroupés sous un code principal par le métier (classeur d'arbitrage).
 """
 COMMENTAIRE_ECARTEES = """\
 # Propositions du formulaire écartées par le métier, qui ne sont plus proposées

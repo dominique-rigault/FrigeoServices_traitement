@@ -20,6 +20,7 @@ from frigeo.decisions import (
     ETAT_VALABLE,
     FEUILLE_ARBITRAGE,
     SORTE_CELLULE,
+    SORTE_CODE,
     SORTE_ECART,
     SORTE_LIGNE,
     _mode_emploi,
@@ -481,6 +482,7 @@ def test_aller_retour_complet(tmp_path, monkeypatch):
     assert entree == {
         "date": "2026-10-20 10:00:00", "classeur": "a.xlsx", "periode_fin": "2026-03",
         "decisions": 5, "remplacees": 0, "corriger": 2, "garder": 2, "retirer": 1,
+        "rattacher": 0,
     }
     enregistrees = charger_decisions(fichier)
     assert enregistrees["meta"]["imports"] == [entree]
@@ -576,7 +578,8 @@ def test_import_problemes_listes_en_une_fois(tmp_path):
         "(date impossible)" in message
     assert "ligne 3 : décision corriger impossible pour un élément de sorte ligne " \
         "(possibles : retirer, garder)" in message
-    assert "ligne 4 : décision 'supprimer' hors du menu (corriger, garder, retirer)" in message
+    assert "ligne 4 : décision 'supprimer' hors du menu (corriger, garder, retirer, " \
+        "rattacher)" in message
     assert "ligne 6 : décision corriger sans valeur retenue" in message
     assert "ligne 7 : décision retirer impossible pour un élément de sorte écart" in message
 
@@ -723,7 +726,7 @@ def test_problemes_d_une_decision(tmp_path):
         "décision a : décision 'corriger' impossible pour la sorte ligne",
         "décision a : valeur retenue absente ou d'un type non admis",
         "décision b : sorte 'colonne' inconnue",
-        "décision c : valeur retenue donnée sans la décision corriger",
+        "décision c : valeur retenue donnée sans la décision corriger ou rattacher",
         "décision d : valeur retenue absente ou d'un type non admis",
         "décision e : empreinte absente",
         "décision e : decide_le 'AAAA-MM-JJ HH:MM:SS' attendu",
@@ -802,7 +805,8 @@ def test_mode_emploi_avec_separateur_des_milliers():
     })
     texte = " ".join(_mode_emploi("2026-03", elements))
     assert f"Contenu : 1{milliers}204 lignes" in texte
-    assert f"dont 1{milliers}200 cellules, 3 lignes et 1 écarts; 1{milliers}001 lignes" in texte
+    assert f"dont 1{milliers}200 cellules, 3 lignes, 0 codes et 1 écarts; 1{milliers}001 " \
+        "lignes" in texte
 
 
 # --- retrait des décisions caduques --------------------------------------------
@@ -1119,3 +1123,248 @@ def test_date_inversee_proposee_dans_le_classeur(tmp_path):
     _remplir(chemin, {"f1": ("corriger", ..., None)})
     arbitrage = importer_arbitrage(chemin, DICTIONNAIRE, nb_imports=0)
     assert list(arbitrage.decisions["valeur_retenue"]) == ["25/03/2025"]
+
+
+# --- codes en doublon (regroupement sous un code principal) ----------------------
+
+
+DECLARATIONS_CODES = {
+    "clients": {"cle": ["code"], "unique": [["siret"]], "presume_unique": [["nom"]],
+                "regrouper_codes": True},
+}
+
+
+def _clients():
+    """Clients : S1 sur C2 puis C1, S2 sur C3 puis C4, C3 sur deux lignes, S4 sur un
+    code vide puis C5, nom X sur C1 puis C5."""
+    return {
+        "clients": _table(
+            fichier="clients.csv",
+            code=["C2", "C1", "C3", "C3", "C4", None, "C5"],
+            siret=["S1", "S1", "S2", "S3", "S2", "S4", "S4"],
+            nom=["a", "X", "b", "c", "d", "e", "x"],
+        )
+    }
+
+
+def _dictionnaire_reel(tables):
+    """Dictionnaire complet (règles observées sans contrainte) des tables reçues."""
+
+    def regle(nom, valeur="aucune"):
+        return {"regle": valeur, "proposition": valeur, "statut": "observé", "motif": "m",
+                "a_arbitrer": {}, "commentaire": "", "revu_le": None,
+                **({"liste": []} if nom in ("valeurs", "format") else {})}
+
+    return {
+        table: {
+            colonne: {
+                "obligatoire": regle("obligatoire", "facultatif"),
+                "nature": regle("nature", "texte"),
+                "valeurs": regle("valeurs"),
+                "format": regle("format"),
+            }
+            for colonne in donnees.columns
+            if colonne not in ("fichier_source", "feuille_source", "num_ligne_source")
+        }
+        for table, donnees in tables.items()
+    }
+
+
+def _anomalies_reelles(tables, declarations):
+    dictionnaire = _dictionnaire_reel(tables)
+    ecarts, bilan = controler(tables, dictionnaire, {}, {})
+    doublons, bilan_doublons = detecter_doublons(tables, declarations, {})
+    ecarts_gestion, bilan_gestion = controler_gestion(
+        tables, dictionnaire, [], declarations, doublons, {}
+    )
+    return reunir_anomalies(
+        tables, ecarts, doublons, ecarts_gestion, bilan, bilan_doublons, bilan_gestion,
+        declarations, {},
+    )
+
+
+def _elements_clients(tables=None, declarations=DECLARATIONS_CODES, decisions=None):
+    tables = tables or _clients()
+    anomalies = _anomalies_reelles(tables, declarations)
+    return elements_a_arbitrer(tables, anomalies, decisions or AUCUNE_DECISION,
+                               declarations=declarations)
+
+
+def _resume(elements):
+    return [
+        (ligne.sorte, ligne.num_ligne_source, ligne.champ,
+         None if _vide(ligne.proposition) else ligne.proposition)
+        for ligne in elements.itertuples(index=False)
+    ]
+
+
+def _vide(valeur):
+    return valeur is None or (not isinstance(valeur, str) and pd.isna(valeur))
+
+
+def test_codes_en_doublon_arbitres_comme_codes():
+    elements = _elements_clients()
+    # Lignes Excel : C2 2, C1 3, C3 4 et 5, C4 6, code vide 7, C5 8.
+    assert _resume(elements) == [
+        # La clé en double reste une ligne.
+        ("ligne", 4, "code", None),
+        ("ligne", 5, "code", None),
+        # SIRET S1 : C2 est la première ligne, proposée comme code principal de C1,
+        # bien que C1 vienne avant dans l'ordre des codes.
+        ("code", 2, "siret", None),
+        ("code", 3, "siret", "C2"),
+        # SIRET S2 : C3 (ligne 4) principal de C4.
+        ("code", 4, "siret", None),
+        ("code", 6, "siret", "C3"),
+        # SIRET S4 : la ligne sans code reste une ligne et n'est pas candidate.
+        ("ligne", 7, "siret", None),
+        ("code", 8, "siret", None),
+        # Nom X (présumé unique, après normalisation) : C1 principal de C5.
+        ("code", 3, "nom", None),
+        ("code", 8, "nom", "C1"),
+    ]
+    assert (elements["etat_decision"] == ETAT_SANS_DECISION).all()
+    # Empreinte de la ligne entière, comme pour une ligne.
+    par_ligne = elements.groupby("num_ligne_source")["empreinte"].nunique()
+    assert (par_ligne == 1).all()
+
+
+def test_codes_sans_declaration_ou_cle_masquee_restent_des_lignes():
+    sans = {"clients": {"cle": ["code"], "unique": [["siret"]], "presume_unique": [["nom"]]}}
+    elements = _elements_clients(declarations=sans)
+    assert set(elements["sorte"]) == {SORTE_LIGNE}
+    # Clé sensible : masquée dans la table des doublons comme dans celle des
+    # anomalies, la ligne reste une ligne.
+    tables = _clients()
+    doublons, _ = detecter_doublons(tables, DECLARATIONS_CODES,
+                                    {"clients": frozenset({"code"})})
+    assert (doublons["cle"] == "masqué").all()
+    anomalies = _anomalies_reelles(tables, DECLARATIONS_CODES)
+    anomalies["cle"] = "masqué"
+    elements = elements_a_arbitrer(tables, anomalies, AUCUNE_DECISION,
+                                   declarations=DECLARATIONS_CODES)
+    assert set(elements["sorte"]) == {SORTE_LIGNE}
+
+
+def test_code_principal_preremplit_et_menu_des_codes(tmp_path):
+    chemin = exporter_arbitrage(_elements_clients(), "2026-03", tmp_path / "a.xlsx",
+                                nb_imports=0)
+    classeur = load_workbook(chemin)
+    feuille = classeur[FEUILLE_ARBITRAGE]
+    lignes = [dict(zip(COLONNES_ARBITRAGE, ligne))
+              for ligne in list(feuille.iter_rows(values_only=True))[1:]]
+    retenues = [(l["num_ligne_source"], l["champ"], l["valeur_retenue"])
+                for l in lignes if l["sorte"] == SORTE_CODE]
+    assert retenues == [(2, "siret", None), (3, "siret", "C2"), (4, "siret", None),
+                        (6, "siret", "C3"), (8, "siret", None), (3, "nom", None),
+                        (8, "nom", "C1")]
+    menus = {tuple(m.formula1.strip('"').split(","))
+             for m in feuille.data_validations.dataValidation}
+    assert ("rattacher", "garder", "retirer") in menus
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "dont 0 cellules, 3 lignes, 7 codes et 0 écarts" in notice
+    assert "code : la ligne d'un référentiel" in notice
+
+
+def _decisions_codes(chemin, decisions):
+    """Remplit le classeur par (numéro de ligne source, champ) : (décision, valeur)."""
+    classeur = load_workbook(chemin)
+    feuille = classeur[FEUILLE_ARBITRAGE]
+    colonnes = {nom: indice for indice, nom in enumerate(COLONNES_ARBITRAGE, start=1)}
+    for numero in range(2, feuille.max_row + 1):
+        repere = (
+            int(feuille.cell(row=numero, column=colonnes["num_ligne_source"]).value),
+            feuille.cell(row=numero, column=colonnes["champ"]).value,
+        )
+        if repere in decisions:
+            choix, valeur = decisions[repere]
+            feuille.cell(row=numero, column=colonnes["decision"]).value = choix
+            if valeur is not ...:
+                feuille.cell(row=numero, column=colonnes["valeur_retenue"]).value = valeur
+    classeur.save(chemin)
+
+
+def test_rattacher_importe_et_enregistre(tmp_path, monkeypatch):
+    instants = iter([datetime(2026, 11, 9, 10, 0, s) for s in range(0, 60, 5)])
+    monkeypatch.setattr(module_dictionnaire, "_maintenant", lambda: next(instants))
+    chemin = exporter_arbitrage(_elements_clients(), "2026-03", tmp_path / "a.xlsx",
+                                nb_imports=0)
+    _decisions_codes(chemin, {
+        (2, "siret"): ("garder", None),
+        (3, "siret"): ("rattacher", ...),
+        (6, "siret"): ("rattacher", " C3 "),
+        (5, "code"): ("retirer", None),
+    })
+    arbitrage = importer_arbitrage(chemin, {}, nb_imports=0)
+    assert arbitrage.avertissements == []
+    par_ligne = {(d["num_ligne_source"], d["champ"]): d
+                 for d in arbitrage.decisions.to_dict("records")}
+    assert par_ligne[(3, "siret")]["valeur_retenue"] == "C2"
+    assert par_ligne[(6, "siret")]["valeur_retenue"] == "C3"
+    assert par_ligne[(3, "siret")]["nature"] is None
+    assert par_ligne[(3, "siret")]["sorte"] == SORTE_CODE
+    assert par_ligne[(2, "siret")]["valeur_retenue"] is None
+    fichier = tmp_path / "decisions.yaml"
+    _, entree = ecrire_decisions(arbitrage, "2026-03", fichier)
+    assert (entree["rattacher"], entree["garder"], entree["retirer"]) == (2, 1, 1)
+    enregistrees = charger_decisions(fichier)
+    elements = _elements_clients(decisions=enregistrees)
+    etats = {(e.num_ligne_source, e.champ): e.etat_decision
+             for e in elements.itertuples(index=False)}
+    assert etats[(3, "siret")] == ETAT_VALABLE
+    assert etats[(8, "nom")] == ETAT_SANS_DECISION
+
+
+def test_rattacher_problemes_a_l_import(tmp_path):
+    chemin = exporter_arbitrage(_elements_clients(), "2026-03", tmp_path / "a.xlsx",
+                                nb_imports=0)
+    # Lignes Excel dans l'ordre des éléments : 4 code, 5 code, 2 siret, 3 siret,
+    # 4 siret, 6 siret, 7 siret, 8 siret, 3 nom, 8 nom (lignes 2 à 11).
+    _decisions_codes(chemin, {
+        (4, "siret"): ("rattacher", None),
+        (6, "siret"): ("rattacher", "C4"),
+        (3, "siret"): ("rattacher", ...),
+        (3, "nom"): ("rattacher", "C5"),
+        (2, "siret"): ("rattacher", "C9"),
+        (8, "siret"): ("rattacher", "C3"),
+        (4, "code"): ("rattacher", "C1"),
+    })
+    with pytest.raises(ValueError) as erreur:
+        importer_arbitrage(chemin, {}, nb_imports=0)
+    message = str(erreur.value)
+    assert "ligne 6 : décision rattacher sans code principal" in message
+    assert "ligne 7 : le code principal est le code de la ligne elle-même" in message
+    assert "ligne 10 : le même code est rattaché à un autre code principal ligne 5" in message
+    assert "ligne 5 : le code principal est lui-même rattaché à un autre code ligne 4" \
+        in message
+    assert "ligne 2 : décision rattacher impossible pour un élément de sorte ligne" in message
+    assert "5 problèmes" in message
+
+
+def test_problemes_d_une_decision_rattacher():
+    from frigeo.decisions import problemes_decisions
+
+    base = {
+        "sorte": "code", "table": "clients", "fichier_source": "c.csv", "feuille_source": None,
+        "num_ligne_source": 3, "champ": "siret", "constat": "c", "empreinte": "e",
+        "decision": "rattacher", "valeur_retenue": "C2", "nature": None, "commentaire": None,
+        "decide_le": "2026-11-09 10:00:00", "classeur": "a.xlsx",
+    }
+    ancien = {"date": "2026-10-20 10:00:00", "classeur": "a", "periode_fin": "2026-03",
+              "decisions": 1, "remplacees": 0, "corriger": 0, "garder": 0, "retirer": 1}
+    nouveau = {**ancien, "date": "2026-11-09 10:00:00", "rattacher": 1}
+    assert problemes_decisions({"meta": {"structure": 1, "imports": [ancien, nouveau]},
+                                "decisions": {"a": base}}) == []
+    mauvaises = {
+        "a": {**base, "valeur_retenue": None},
+        "b": {**base, "valeur_retenue": "  "},
+        "c": {**base, "decision": "garder"},
+        "d": {**base, "sorte": "ligne"},
+    }
+    assert problemes_decisions({"meta": {"structure": 1, "imports": []},
+                                "decisions": mauvaises}) == [
+        "décision a : code principal absent (texte attendu)",
+        "décision b : code principal absent (texte attendu)",
+        "décision c : valeur retenue donnée sans la décision corriger ou rattacher",
+        "décision d : décision 'rattacher' impossible pour la sorte ligne",
+    ]

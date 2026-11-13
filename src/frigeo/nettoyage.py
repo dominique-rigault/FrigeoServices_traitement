@@ -125,6 +125,7 @@ from .doublons import (
     SEPARATEUR,
     _texte,
     charger_declarations_doublons,
+    codes_a_regrouper,
     detecter_doublons,
 )
 from .profilage import _interpretations, signature
@@ -195,6 +196,23 @@ RAISON_SOURCE_MODIFIEE = "source modifiée depuis la décision"
 RAISON_INTROUVABLE = "ligne source introuvable"
 RAISON_ILLISIBLE = "valeur retenue illisible dans la nature en vigueur"
 RAISONS_DECISION = (RAISON_SOURCE_MODIFIEE, RAISON_INTROUVABLE, RAISON_ILLISIBLE)
+# Raisons de non-application d'une décision « rattacher » (codes en doublon).
+RAISON_SANS_REGROUPEMENT = "table non déclarée regrouper_codes"
+RAISON_CODE_VIDE = "code de la ligne vide"
+RAISON_MEME_CODE = "code principal égal au code de la ligne"
+RAISON_CONTRADICTOIRE = "code rattaché à plusieurs codes principaux"
+RAISON_EN_CHAINE = "code principal lui-même rattaché"
+RAISON_PRINCIPAL_ABSENT = "code principal absent de la table nettoyée"
+RAISONS_RATTACHEMENT = (
+    RAISON_SOURCE_MODIFIEE,
+    RAISON_INTROUVABLE,
+    RAISON_SANS_REGROUPEMENT,
+    RAISON_CODE_VIDE,
+    RAISON_MEME_CODE,
+    RAISON_CONTRADICTOIRE,
+    RAISON_EN_CHAINE,
+    RAISON_PRINCIPAL_ABSENT,
+)
 
 RAISON_FORME_NON_UNIQUE = "forme du référentiel non unique"
 RAISON_FORME_MINORITAIRE = "forme du référentiel minoritaire dans la table"
@@ -239,6 +257,8 @@ COLONNES_DECISIONS_CADUQUES = (
     "decide_le",
     "classeur",
 )
+# Codes en doublon regroupés sous un code principal (décisions « rattacher »).
+COLONNES_CORRESPONDANCES = ("table", "colonne", "code_doublon", "code_principal", "id_decision")
 COLONNES_CATALOGUE_NETTOYAGE = ("rang", "regle_nettoyage", "source", "corrige", "ne_corrige_jamais")
 
 _CATALOGUE = {
@@ -311,16 +331,22 @@ _CATALOGUE = {
         "décidé de retirer, dans le classeur d'arbitrage (data/config/decisions.yaml) : "
         "la cellule reçoit la valeur retenue, écrite dans la représentation de la "
         "nature de sa colonne, ou la ligne est retirée, si la donnée n'a pas changé "
-        "depuis la décision (même empreinte); corrections d'abord, retraits ensuite",
+        "depuis la décision (même empreinte); corrections d'abord, retraits ensuite. "
+        "Un code que le métier a décidé de rattacher à un code principal est regroupé "
+        "sous ce code dans la base, la ligne restant telle quelle",
         "une donnée modifiée depuis la décision (source corrigée ou réexportée); une "
         "ligne source introuvable; une valeur retenue illisible dans la nature en "
-        "vigueur de sa colonne; un élément que le métier a décidé de garder",
+        "vigueur de sa colonne; un élément que le métier a décidé de garder; un code "
+        "principal absent de la table nettoyée, lui-même rattaché, ou un code rattaché "
+        "à plusieurs codes principaux",
     ),
 }
 
-Nettoyage = namedtuple("Nettoyage", ["tables", "journal", "bilan", "caduques"])
-Nettoyage.__doc__ = """Résultat de `nettoyer` : tables nettoyées, journal, bilan et décisions
-caduques."""
+Nettoyage = namedtuple(
+    "Nettoyage", ["tables", "journal", "bilan", "caduques", "correspondances"]
+)
+Nettoyage.__doc__ = """Résultat de `nettoyer` : tables nettoyées, journal, bilan, décisions
+caduques et correspondances des codes en doublon."""
 
 Reparation = namedtuple("Reparation", ["texte", "raison", "passes", "encodages"])
 Reparation.__doc__ = """Résultat de `reparer_encodage`.
@@ -1018,11 +1044,15 @@ def _detail_decision(identifiant: str, decision: dict) -> str:
     )
 
 
-def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_tables: list):
+def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_tables: list,
+                    regroupees: dict | None = None):
     """Règle `decision` : applique aux tables nettoyées (modifiées sur place) les
-    décisions « corriger » puis « retirer » du métier.
+    décisions « corriger » puis « retirer » du métier, puis retient les décisions
+    « rattacher » (`_rattachements`), `regroupees` donnant la colonne du code de
+    chaque table déclarée `regrouper_codes`.
 
-    Rend (corrections, retraits, lignes du bilan, caduques) : une correction est
+    Rend (corrections, retraits, lignes du bilan, caduques, correspondances) : une
+    correction est
     (table, étiquette de la ligne, colonne, valeur avant, valeur après, détail), un
     retrait (table, étiquette, détail), une décision caduque (identifiant, décision),
     écartée parce que sa donnée a changé depuis la décision. Les décisions sont
@@ -1032,7 +1062,9 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
     lignage, après les corrections, pour un retrait. Une valeur retenue est écrite
     telle qu'enregistrée si la nature de la colonne n'a pas changé depuis la
     décision, sinon relue dans la nature en vigueur (`decisions.lire_valeur_retenue`).
-    Une décision « garder » ne change rien.
+    Une décision « garder » ne change rien, ni une décision « rattacher » : le
+    regroupement des codes se fait dans la base, d'après les correspondances
+    rendues.
     """
     from .decisions import (
         DECISION_CORRIGER,
@@ -1125,6 +1157,11 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
     for table, etiquettes in a_retirer.items():
         nettoyees[table] = nettoyees[table].drop(index=sorted(etiquettes))
 
+    correspondances, comptes_codes, caduques_codes = _rattachements(
+        nettoyees, ordonnees, regroupees or {}, situer
+    )
+    caduques += caduques_codes
+
     def rang_bilan(cle):
         table, colonne = cle
         if table not in nettoyees:
@@ -1148,7 +1185,101 @@ def _regle_decision(nettoyees: dict, decisions: dict, dictionnaire: dict, ordre_
                 "raisons": _texte_raisons(raisons, RAISONS_DECISION),
             }
         )
-    return corrections, retraits, lignes, caduques
+    for table in sorted(comptes_codes, key=lambda t: rang_bilan((t, None))):
+        visees, appliquees, raisons, colonne = comptes_codes[table]
+        lignes.append(
+            {
+                "regle_nettoyage": REGLE_DECISION,
+                "table": table,
+                "colonne": colonne,
+                "visees": visees,
+                "corrigees": appliquees,
+                "non_corrigees": visees - appliquees,
+                "raisons": _texte_raisons(raisons, RAISONS_RATTACHEMENT),
+            }
+        )
+    return corrections, retraits, lignes, caduques, correspondances
+
+
+def _rattachements(nettoyees: dict, ordonnees: list, regroupees: dict, situer):
+    """Décisions « rattacher » retenues, sur les tables nettoyées après les
+    corrections et les retraits.
+
+    Une décision est retenue si sa table est déclarée `regrouper_codes`, si sa ligne
+    est retrouvée par son lignage avec l'empreinte de la décision (ligne entière hors
+    lignage, comme pour un retrait; sinon elle est caduque), si son code n'est pas
+    vide et diffère du code principal, si ce code n'est pas rattaché à un autre code
+    principal par une autre décision, si le code principal n'est pas lui-même
+    rattaché (pas de chaîne) et s'il porte au moins une ligne de la table nettoyée.
+    Les codes se comparent tels quels, espaces en bord ôtées.
+
+    Rend (correspondances, comptes, caduques) : une correspondance par code en
+    doublon (`COLONNES_CORRESPONDANCES`, la première décision dans l'ordre d'examen
+    en donne l'identifiant); par table, [visées, appliquées, raisons, colonne du
+    code]; les décisions caduques (identifiant, décision).
+    """
+    from .decisions import DECISION_RATTACHER, _empreinte, _forme
+
+    comptes: dict[str, list] = {}
+    candidats, caduques = [], []
+    for identifiant, decision in ordonnees:
+        if decision["decision"] != DECISION_RATTACHER:
+            continue
+        table = decision["table"]
+        colonne = regroupees.get(table)
+        compte = comptes.setdefault(table, [0, 0, Counter(), colonne])
+        compte[0] += 1
+        if colonne is None:
+            compte[2][RAISON_SANS_REGROUPEMENT] += 1
+            continue
+        position = situer(table, decision)
+        donnees = nettoyees.get(table)
+        if position is None or colonne not in _colonnes_de_donnees(donnees):
+            compte[2][RAISON_INTROUVABLE] += 1
+            continue
+        ligne = donnees.iloc[position]
+        empreinte = _empreinte(
+            f"{c}={_forme(ligne[c])}" for c in _colonnes_de_donnees(donnees)
+        )
+        if empreinte != decision["empreinte"]:
+            compte[2][RAISON_SOURCE_MODIFIEE] += 1
+            caduques.append((identifiant, decision))
+            continue
+        code = _texte(ligne[colonne]).strip()
+        principal = _texte(decision["valeur_retenue"]).strip()
+        if not code:
+            compte[2][RAISON_CODE_VIDE] += 1
+        elif code == principal:
+            compte[2][RAISON_MEME_CODE] += 1
+        else:
+            candidats.append((identifiant, table, colonne, code, principal))
+
+    principaux: dict[tuple, set] = {}
+    for _, table, _, code, principal in candidats:
+        principaux.setdefault((table, code), set()).add(principal)
+    presents = {
+        table: {_texte(v).strip() for v in nettoyees[table][colonne]}
+        for table, colonne in regroupees.items()
+        if table in nettoyees and colonne in nettoyees[table].columns
+    }
+    correspondances, vus = [], set()
+    for identifiant, table, colonne, code, principal in candidats:
+        compte = comptes[table]
+        if len(principaux[(table, code)]) > 1:
+            compte[2][RAISON_CONTRADICTOIRE] += 1
+        elif (table, principal) in principaux:
+            compte[2][RAISON_EN_CHAINE] += 1
+        elif principal not in presents.get(table, set()):
+            compte[2][RAISON_PRINCIPAL_ABSENT] += 1
+        else:
+            compte[1] += 1
+            if (table, code) not in vus:
+                vus.add((table, code))
+                correspondances.append(
+                    {"table": table, "colonne": colonne, "code_doublon": code,
+                     "code_principal": principal, "id_decision": identifiant}
+                )
+    return correspondances, comptes, caduques
 
 
 def _texte_raisons(raisons: Counter, ordre) -> str | None:
@@ -1175,7 +1306,8 @@ def nettoyer(
     marque aussi des colonnes sensibles. `sensibles` (config/sensibilite.yaml par
     défaut) est vérifiée avant tout (`RuntimeError` si elle est incohérente).
     `declarations` (bloc `doublons` de config/controles.yaml par défaut) donne la clé
-    de chaque table, reprise dans le journal. `date_coupure` (fin de la période
+    de chaque table, reprise dans le journal, et les tables dont les codes en doublon
+    peuvent être regroupés (`regrouper_codes`). `date_coupure` (fin de la période
     extraite, `perimetre.date_coupure`) sert à la règle `nature` : une année écrite
     sur deux chiffres n'est complétée en 20AA que si la date obtenue ne la dépasse
     pas; sans elle, ces dates ne sont pas converties, et le bilan le dit.
@@ -1215,17 +1347,25 @@ def nettoyer(
 
     Bilan (`COLONNES_BILAN_NETTOYAGE`) : une ligne par règle et par colonne qui a au
     moins une cellule visée (par table, sans colonne, pour les doublons et les
-    retraits décidés par le métier), avec les
+    retraits décidés par le métier; par table, avec la colonne du code, pour les
+    rattachements de codes décidés par le métier, comptés en corrigés quand ils
+    sont retenus), avec les
     cellules (ou lignes) visées, corrigées, non corrigées, et le décompte des raisons
     de non-correction (textes séparés par « ; »).
 
     Décisions caduques (`COLONNES_DECISIONS_CADUQUES`) : une ligne par décision
-    « corriger » ou « retirer » écartée parce que sa donnée a changé depuis la
-    décision (raison « source modifiée depuis la décision » du bilan), dans l'ordre
+    « corriger », « retirer » ou « rattacher » écartée parce que sa donnée a changé
+    depuis la décision (raison « source modifiée depuis la décision » du bilan), dans l'ordre
     où la règle `decision` les examine; elles ne peuvent plus s'appliquer, et
     `decisions.retirer_decisions` les retire du fichier des décisions. Aucune valeur
     n'y figure. Une décision « garder », une ligne source introuvable ou une valeur
     retenue illisible n'y sont pas.
+
+    Correspondances (`COLONNES_CORRESPONDANCES`) : une ligne par code en doublon
+    regroupé sous un code principal, d'après les décisions « rattacher » retenues
+    (voir `_rattachements`), avec la table et la colonne du code (noms du
+    dictionnaire) et l'identifiant de la décision. Les codes ne sont pas des
+    colonnes sensibles (une table à clé sensible n'a pas de décision « rattacher »).
     """
     if sensibles is None:
         sensibles = charger_sensibilite()
@@ -1303,7 +1443,7 @@ def nettoyer(
     for table, donnees in brutes.items():
         cle = [c for c in declarations.get(table, {}).get("cle", []) if c in donnees.columns]
         cles[table] = (cle, any(est_sensible(sensibles, table, c) for c in cle))
-    journal, bilan, caduques = [], [], []
+    journal, bilan, caduques, correspondances = [], [], [], []
 
     def ligne_du_journal(rang_regle, rang_table, table, position, **champs) -> dict:
         """Ligne du journal pour la ligne source de la table reçue à cette position."""
@@ -1331,8 +1471,9 @@ def nettoyer(
 
     for rang_regle, regle_nettoyage in enumerate(REGLES_NETTOYAGE):
         if regle_nettoyage == REGLE_DECISION:
-            corrections, retraits, lignes_bilan, caduques = _regle_decision(
-                nettoyees, decisions["decisions"], dictionnaire, list(tables)
+            corrections, retraits, lignes_bilan, caduques, correspondances = _regle_decision(
+                nettoyees, decisions["decisions"], dictionnaire, list(tables),
+                codes_a_regrouper(declarations),
             )
             bilan.extend(lignes_bilan)
             rangs_tables = {table: rang for rang, table in enumerate(tables)}
@@ -1554,7 +1695,10 @@ def nettoyer(
         columns=list(COLONNES_DECISIONS_CADUQUES),
         dtype=object,
     )
-    return Nettoyage(nettoyees, journal, bilan, caduques)
+    correspondances = pd.DataFrame(
+        correspondances, columns=list(COLONNES_CORRESPONDANCES), dtype=object
+    )
+    return Nettoyage(nettoyees, journal, bilan, caduques, correspondances)
 
 
 COLONNES_COMPARAISON = (

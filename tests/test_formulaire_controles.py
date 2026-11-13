@@ -227,9 +227,9 @@ def test_lignes_des_tables_et_des_motifs():
     tables, dictionnaire, contenu, _ = _jeu()
     assert lignes_tables(tables, dictionnaire, contenu) == [
         {"table": "factures", "lignes": 4, "clé_en_vigueur": "num", "identiques_hors_clé": "non",
-         "table_des_lignes": None},
+         "table_des_lignes": None, "regrouper_codes": None},
         {"table": "parametres", "lignes": 1, "clé_en_vigueur": None,
-         "identiques_hors_clé": "oui", "table_des_lignes": None},
+         "identiques_hors_clé": "oui", "table_des_lignes": None, "regrouper_codes": None},
     ]
     assert lignes_motifs(contenu) == [
         {"table": "factures", "colonne": "code", "motif": "[A-Z][0-9]+"}
@@ -995,3 +995,28 @@ def test_table_des_lignes_en_lecture_seule_et_reprise(tmp_path):
     assert "  factures:\n    cle: [num]\n    table_des_lignes: lignes\n" in texte
     assert yaml.safe_load(texte) == contenu
     assert "# table_des_lignes = table des lignes d'une table d'en-têtes" in texte
+
+
+def test_regrouper_codes_en_lecture_seule_et_repris(tmp_path):
+    tables, dictionnaire, contenu, sensibles = _jeu()
+    contenu["doublons"] = {
+        "factures": {"cle": ["num"], "unique": [["code"]], "regrouper_codes": True},
+    }
+    assert [l["regrouper_codes"] for l in lignes_tables(tables, dictionnaire, contenu)] == [
+        "oui", None,
+    ]
+    chemin = exporter_formulaire(tables, dictionnaire, contenu, sensibles, "2026-03",
+                                 tmp_path / "f.xlsx", empreinte="abc123")
+    classeur = load_workbook(chemin)
+    feuille = classeur["tables"]
+    rang = COLONNES_TABLES.index("regrouper_codes") + 1
+    assert feuille.cell(row=2, column=rang).value == "oui"
+    assert feuille.cell(row=2, column=rang).protection.locked
+    notice = " ".join(str(c.value) for c in classeur["mode_emploi"]["A"] if c.value)
+    assert "La colonne regrouper_codes, en lecture seule" in notice
+    formulaire = importer_formulaire(chemin, dictionnaire, contenu, empreinte="abc123")
+    assert formulaire.contenu == contenu and formulaire.changements.empty
+    texte = texte_controles(contenu)
+    assert "    unique:\n      - [code]\n    regrouper_codes: true\n" in texte
+    assert yaml.safe_load(texte) == contenu
+    assert "# regrouper_codes true = référentiel" in texte

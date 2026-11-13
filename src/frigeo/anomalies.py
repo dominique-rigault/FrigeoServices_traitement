@@ -30,6 +30,10 @@ par contrôle. Rien n'est corrigé.
 data/anomalies/ (`anomalies_AAAA-MM.csv`, `bilan_AAAA-MM.csv`), après avoir vérifié
 qu'aucune valeur sensible n'y est visible; c'est la seule fonction du module qui
 écrit sur disque.
+
+`lignes_non_retenues` (étape 7.4a) désigne, d'après la table des anomalies après
+nettoyage, les lignes sources exclues des indicateurs : celles qui portent une
+anomalie bloquante que le métier n'a pas résolue.
 """
 
 from __future__ import annotations
@@ -152,6 +156,22 @@ def _controle_format(table, colonne, regle) -> str:
 
 def _controle_doublons(table, constat, colonnes) -> str:
     return f"{table} {constat} ({colonnes})"
+
+
+_GROUPE_DOUBLON = re.compile(r", groupe (\d+) de \d+ lignes$")
+
+
+def _detail_doublon(portee, comparaison, groupe, taille_groupe) -> str:
+    """Détail d'un doublon : portée, comparaison, numéro et taille du groupe."""
+    return f"{portee}, {comparaison}, groupe {groupe} de {taille_groupe} lignes"
+
+
+def groupe_doublon(detail) -> int | None:
+    """Numéro du groupe dans le détail d'un doublon (`_detail_doublon`), ou None."""
+    if not isinstance(detail, str):
+        return None
+    trouve = _GROUPE_DOUBLON.search(detail)
+    return int(trouve.group(1)) if trouve else None
 
 
 def _controle_gestion(ref, libelle) -> str:
@@ -353,8 +373,9 @@ def reunir_anomalies(
                 "constat": ligne.constat,
                 "issue": ligne.issue,
                 "statut_regle": None,
-                "detail": f"{ligne.portee}, {ligne.comparaison}, groupe {ligne.groupe} "
-                f"de {ligne.taille_groupe} lignes",
+                "detail": _detail_doublon(
+                    ligne.portee, ligne.comparaison, ligne.groupe, ligne.taille_groupe
+                ),
                 "proposition": None,
             }
         )
@@ -1484,3 +1505,54 @@ def ecrire_anomalies(
         )
     _ecrire_fichiers(sorties)
     return chemins
+
+
+# --- Lignes retenues pour les indicateurs (étape 7.4a) --------------------------------
+
+# Issues d'une anomalie non résolue : une information n'écarte jamais une ligne.
+ISSUES_NON_RESOLUES = (ISSUE_ANOMALIE, ISSUE_A_ARBITRER)
+
+
+def lignes_non_retenues(anomalies: pd.DataFrame | None) -> set[tuple[str, str, str | None, int]]:
+    """Lignes sources exclues des indicateurs, par (table, fichier_source,
+    feuille_source, num_ligne_source), la feuille valant None pour un fichier sans
+    feuille.
+
+    Une ligne n'est pas retenue si elle porte au moins une anomalie de gravité
+    bloquante, d'issue anomalie ou à arbitrer, sans décision du métier
+    (`decision_metier` vide). Une décision du métier, quelle qu'elle soit (garder,
+    rattacher), résout l'anomalie. Une anomalie sans ligne source (total d'une
+    période) n'écarte aucune ligne. `anomalies` est la table des anomalies après
+    nettoyage (`COLONNES_ANOMALIES_NETTOYEES`); une table sans colonne
+    `decision_metier` est lue comme sans décision. Un numéro de ligne qui n'est pas
+    un entier est refusé (`ValueError`), sans valeur du client.
+    """
+    if anomalies is None or not len(anomalies):
+        return set()
+    resultat = set()
+    refusees = 0
+    for anomalie in anomalies.to_dict("records"):
+        if anomalie.get("gravite") != GRAVITE_BLOQUANTE:
+            continue
+        if anomalie.get("issue") not in ISSUES_NON_RESOLUES:
+            continue
+        if _texte(anomalie.get(COLONNE_DECISION_METIER)).strip():
+            continue
+        table = _texte(anomalie.get("table"))
+        fichier = _texte(anomalie.get("fichier_source"))
+        numero = _texte(anomalie.get("num_ligne_source")).strip()
+        if not table or not fichier or not numero:
+            continue
+        if numero.endswith(".0"):
+            numero = numero[:-2]
+        if not numero.isdigit():
+            refusees += 1
+            continue
+        feuille = _texte(anomalie.get("feuille_source")) or None
+        resultat.add((table, fichier, feuille, int(numero)))
+    if refusees:
+        raise ValueError(
+            f"Lignes non retenues : {refusees} anomalie(s) bloquante(s) dont le numéro de "
+            "ligne source n'est pas un entier"
+        )
+    return resultat

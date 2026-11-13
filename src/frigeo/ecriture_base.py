@@ -1,0 +1,2076 @@
+"""Écriture des données dans la base (étape 7.2c).
+
+Une exécution du traitement écrit en base les tables chargées (schéma chargement,
+valeurs telles que livrées, en texte) et les tables nettoyées (schéma propre,
+valeurs typées), avec leur lignage, et les inscrit dans le schéma qualite
+(execution, journal_chargement, correspondance_colonne). Les autres tables de
+qualite (anomalies, bilans, journal du nettoyage, décisions) s'ajoutent dans la
+même transaction par le paramètre `completer`, avec `CompleterQualite` (7.2d), ainsi
+que les tables de référence issues de la configuration (7.3a) : jours fériés de
+config/gestion.yaml et valeurs admises des listes fermées du dictionnaire. Si un
+pack déclare la procédure dw.reconstruire, elle est appelée en dernier, dans la même
+transaction (7.3b) : propre et dw ne peuvent pas être désaccordés. Avant lui, le
+rattachement des lignes à leurs référentiels (7.3d, module `rattachement`) est écrit
+dans qualite.regle_rattachement et qualite.rattachement, pour que dw relie chaque
+fait au bon membre de dimension.
+
+Cycle d'une exécution :
+
+1. l'exécution est inscrite « en cours » dans qualite.execution, et validée à part;
+2. les valeurs sont préparées en Python, sans toucher la base : un garde-fou
+   (texte de plus de 4 000 caractères, date avec une heure, nombre de plus de
+   8 décimales ou trop grand) arrête l'écriture, tous les problèmes étant listés en
+   une fois, sans aucune valeur;
+3. une seule transaction supprime les tables générées, supprime les exécutions
+   précédentes de la même période de fin (y compris celles qui ont échoué), recrée
+   les tables, inscrit les fichiers chargés et la correspondance des colonnes,
+   insère les données, écrit les autres tables de qualite, reconstruit dw si un
+   pack le prévoit, puis passe l'exécution à « réussie »;
+4. en cas d'erreur, la transaction est annulée (l'exécution précédente et ses
+   tables restent intactes) et l'exécution passe à « échouée », avec le message.
+
+Valeurs de chargement. Un texte est gardé tel quel, chaîne vide comprise; une
+cellule absente devient NULL. Une valeur native d'Excel s'écrit sous une forme fixe
+(`texte_livre`) : entier 123, nombre 12.5 (point décimal, jamais d'exposant), date
+2025-03-14 suivie de l'heure si elle n'est pas minuit.
+
+Valeurs de propre. Une cellule vide au sens du traitement (absente, chaîne vide ou
+faite d'espaces) devient NULL, y compris en texte. Les dates, heures et entiers
+sont lus par `typage.lire`, la reconnaissance des contrôles; les décimaux sont
+convertis par Decimal à partir du texte (12,5) ou de l'écriture la plus courte du
+nombre Excel, jamais par un flottant. Une valeur illisible devient NULL, et le
+nombre de ces cellules est rendu par colonne.
+
+Transmission. Les valeurs, exactes en Python, sont transmises au serveur sous
+leur écriture ISO (2025-03-14, 08:30:00, 12.5), que SQL Server convertit sans
+ambiguïté dans le type de la colonne, par lots de `TAILLE_LOT` lignes et avec la
+taille réelle des textes de chaque lot : sans cela, le pilote réserverait 8 Ko par
+cellule nvarchar(4000).
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import hashlib
+import math
+import re
+from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation, localcontext
+from pathlib import Path
+from typing import Callable
+
+import pandas as pd
+
+from .anomalies import GRAVITE_BLOQUANTE, ISSUES_NON_RESOLUES
+from .perimetre import tables_du_flux
+from .structure_base import (
+    COLONNE_RETENUE,
+    FAMILLE_DATE,
+    FAMILLE_DECIMAL,
+    FAMILLE_ENTIER,
+    FAMILLE_HEURE,
+    REQUETE_TABLES_EXISTANTES,
+    SCHEMA_CHARGEMENT,
+    SCHEMA_PROPRE,
+    TableBase,
+    charger_structure,
+    colonnes_techniques,
+    ddl_structure,
+    ddl_suppression,
+    lignes_correspondance,
+)
+from .typage import ETAT_ILLISIBLE, ETAT_LUE, lire
+
+LONGUEUR_MAX_TEXTE = 4000
+DECIMALES_MAX = 8
+CHIFFRES_ENTIERS_MAX = 20  # decimal(28, 8)
+ENTIER_MAX = 2**63 - 1  # bigint
+TAILLE_LOT = 5000
+LONGUEUR_MAX_DETAIL = 4000
+
+STATUT_EN_COURS = "en cours"
+STATUT_REUSSIE = "réussie"
+STATUT_ECHOUEE = "échouée"
+
+# Tables de qualite rattachées à une exécution, dans l'ordre où leurs lignes sont
+# supprimées : d'abord celles qui pointent vers journal_chargement.
+TABLES_FILLES_EXECUTION = (
+    "rattachement",
+    "regle_rattachement",
+    "anomalie",
+    "non_evaluable",
+    "journal_nettoyage",
+    "bilan_controle",
+    "bilan_nettoyage",
+    "correspondance_cle",
+    "decision",
+    "jour_ferie",
+    "valeur_liste",
+    "correspondance_colonne",
+    "journal_chargement",
+)
+
+PROBLEME_LONGUEUR = f"texte de plus de {LONGUEUR_MAX_TEXTE} caractères"
+PROBLEME_HEURE = "date avec une heure autre que minuit"
+PROBLEME_DECIMALES = f"nombre de plus de {DECIMALES_MAX} décimales"
+PROBLEME_GRAND = "nombre trop grand pour la colonne"
+
+
+class ErreurEcriture(Exception):
+    """Écriture en base impossible; le message ne porte aucune valeur du client."""
+
+
+# --- Valeurs -----------------------------------------------------------------------
+
+
+def _absente(valeur) -> bool:
+    if valeur is None or valeur is pd.NaT:
+        return True
+    return isinstance(valeur, float) and math.isnan(valeur)
+
+
+def longueur_sql(texte: str) -> int:
+    """Longueur d'un texte comptée comme nvarchar (unités UTF-16) : un caractère hors
+    du plan de base, un émoji par exemple, en compte deux."""
+    return len(texte.encode("utf-16-le")) // 2
+
+
+def _decimal_en_texte(nombre: Decimal) -> str:
+    texte = format(nombre, "f")
+    if "." in texte:
+        texte = texte.rstrip("0").rstrip(".")
+    return "0" if texte in ("-0", "") else texte
+
+
+def texte_livre(valeur) -> str | None:
+    """Écriture en texte d'une valeur telle que livrée, pour le schéma chargement.
+
+    Un texte est rendu tel quel, chaîne vide comprise; une valeur absente (None,
+    NaN, NaT) donne None. Entier : 123; nombre : écriture la plus courte, point
+    décimal, sans exposant (12.5, 0.00001, 12 pour 12.0); date : 2025-03-14, suivie
+    de l'heure si elle n'est pas minuit; heure : 08:30:00. Tout autre type est écrit
+    par str().
+    """
+    if _absente(valeur):
+        return None
+    if isinstance(valeur, str):
+        return valeur
+    if isinstance(valeur, bool):
+        return str(valeur)
+    if isinstance(valeur, int):
+        return str(valeur)
+    if isinstance(valeur, float):
+        if math.isinf(valeur):
+            return str(valeur)
+        return _decimal_en_texte(Decimal(repr(valeur)))
+    if isinstance(valeur, dt.datetime):
+        if valeur.time() == dt.time(0):
+            return valeur.strftime("%Y-%m-%d")
+        return valeur.isoformat(sep=" ")
+    if isinstance(valeur, (dt.date, dt.time)):
+        return valeur.isoformat()
+    return str(valeur)
+
+
+def _decimal(valeur) -> Decimal:
+    """Valeur exacte d'un nombre lu : texte (virgule ou point) ou nombre Excel."""
+    if isinstance(valeur, str):
+        return Decimal(valeur.strip().replace(",", "."))
+    if isinstance(valeur, int):
+        return Decimal(valeur)
+    return Decimal(repr(float(valeur)))
+
+
+def _probleme_decimal(nombre: Decimal) -> str | None:
+    signe, chiffres, exposant = nombre.normalize().as_tuple()
+    if not isinstance(exposant, int):
+        return PROBLEME_GRAND
+    if -exposant > DECIMALES_MAX:
+        return PROBLEME_DECIMALES
+    if len(chiffres) + exposant > CHIFFRES_ENTIERS_MAX:
+        return PROBLEME_GRAND
+    return None
+
+
+@dataclass
+class Colonne:
+    """Valeurs d'une colonne prêtes à transmettre, et ce qu'en dit la préparation."""
+
+    valeurs: list
+    illisibles: int = 0
+    problemes: dict[str, int] = field(default_factory=dict)
+    positions_illisibles: list[int] = field(default_factory=list)
+
+    def compter(self, probleme: str) -> None:
+        self.problemes[probleme] = self.problemes.get(probleme, 0) + 1
+
+
+def valeurs_chargement(serie: pd.Series) -> Colonne:
+    """Valeurs d'une colonne de chargement : texte tel que livré."""
+    colonne = Colonne([texte_livre(v) for v in serie])
+    for texte in colonne.valeurs:
+        if texte is not None and longueur_sql(texte) > LONGUEUR_MAX_TEXTE:
+            colonne.compter(PROBLEME_LONGUEUR)
+    return colonne
+
+
+def _vide(valeur) -> bool:
+    return _absente(valeur) or (isinstance(valeur, str) and valeur.strip() == "")
+
+
+def valeurs_propre(serie: pd.Series, famille: str, nature: str) -> Colonne:
+    """Valeurs d'une colonne de propre, dans l'écriture ISO de leur type.
+
+    Une cellule vide donne None. Une valeur illisible dans la nature de la colonne
+    donne None et est comptée. Un garde-fou déclenché est compté dans `problemes`.
+    """
+    serie = serie.reset_index(drop=True)
+    if famille not in (FAMILLE_DATE, FAMILLE_HEURE, FAMILLE_ENTIER, FAMILLE_DECIMAL):
+        colonne = Colonne([None if _vide(v) else texte_livre(v) for v in serie])
+        for texte in colonne.valeurs:
+            if texte is not None and longueur_sql(texte) > LONGUEUR_MAX_TEXTE:
+                colonne.compter(PROBLEME_LONGUEUR)
+        return colonne
+
+    lecture = lire(serie, nature)
+    lues = lecture.etats == ETAT_LUE
+    positions = [int(p) for p in lecture.etats.index[lecture.etats == ETAT_ILLISIBLE]]
+    colonne = Colonne([None] * len(serie), illisibles=len(positions), positions_illisibles=positions)
+    for position in lues[lues].index:
+        if famille == FAMILLE_DATE:
+            instant = pd.Timestamp(lecture.valeurs.iloc[position])
+            if instant != instant.normalize():
+                colonne.compter(PROBLEME_HEURE)
+                continue
+            colonne.valeurs[position] = instant.date().isoformat()
+        elif famille == FAMILLE_HEURE:
+            secondes = int(pd.Timedelta(lecture.valeurs.iloc[position]).total_seconds())
+            colonne.valeurs[position] = dt.time(
+                secondes // 3600, secondes % 3600 // 60, secondes % 60
+            ).isoformat()
+        elif famille == FAMILLE_ENTIER:
+            entier = int(str(serie.iloc[position]).strip())
+            if abs(entier) > ENTIER_MAX:
+                colonne.compter(PROBLEME_GRAND)
+                continue
+            colonne.valeurs[position] = str(entier)
+        else:
+            try:
+                nombre = _decimal(serie.iloc[position])
+            except InvalidOperation:
+                colonne.illisibles += 1
+                colonne.positions_illisibles.append(int(position))
+                continue
+            probleme = _probleme_decimal(nombre)
+            if probleme:
+                colonne.compter(probleme)
+                continue
+            colonne.valeurs[position] = _decimal_en_texte(nombre)
+    return colonne
+
+
+# --- Fichiers chargés --------------------------------------------------------------
+
+
+def empreinte_fichier(chemin: str | Path) -> str:
+    """Empreinte SHA-256 des octets du fichier, tels quels."""
+    calcul = hashlib.sha256()
+    with open(chemin, "rb") as flux:
+        for bloc in iter(lambda: flux.read(1 << 20), b""):
+            calcul.update(bloc)
+    return calcul.hexdigest()
+
+
+def _feuille(valeur) -> str | None:
+    return None if _vide(valeur) else str(valeur)
+
+
+COLONNES_JOURNAL_CHARGEMENT = (
+    "fichier_source",
+    "feuille_source",
+    "periode_export",
+    "empreinte_sha256",
+    "nb_lignes",
+)
+
+
+def lignes_journal_chargement(perimetre, tables: dict[str, pd.DataFrame]) -> list[dict]:
+    """Une ligne par fichier et par feuille du périmètre qui donne une table.
+
+    Un classeur à deux feuilles donne deux lignes, de même empreinte. `nb_lignes`
+    est le nombre de lignes chargées depuis ce fichier et cette feuille (0 si le
+    fichier n'en a donné aucune).
+    """
+    comptes: dict[tuple, int] = {}
+    for donnees in tables.values():
+        if donnees.empty:
+            continue
+        cles = zip(donnees["fichier_source"], donnees["feuille_source"].map(_feuille))
+        for cle in cles:
+            comptes[cle] = comptes.get(cle, 0) + 1
+    lignes = []
+    for fichier in perimetre.fichiers:
+        empreinte = empreinte_fichier(fichier["chemin"])
+        flux = perimetre.config["flux"][fichier["flux"]]
+        feuilles = []
+        for nom_table, options in tables_du_flux(flux).items():
+            if nom_table in tables and options.get("feuille") not in feuilles:
+                feuilles.append(options.get("feuille"))
+        for feuille in feuilles:
+            lignes.append(
+                {
+                    "fichier_source": fichier["fichier"],
+                    "feuille_source": feuille,
+                    "periode_export": fichier["periode"],
+                    "empreinte_sha256": empreinte,
+                    "nb_lignes": comptes.get((fichier["fichier"], feuille), 0),
+                }
+            )
+    return lignes
+
+
+# --- Préparation -------------------------------------------------------------------
+
+
+@dataclass
+class TablePreparee:
+    """Lignes d'une table prêtes à insérer dans un schéma, sans id_chargement."""
+
+    table: TableBase
+    schema: str
+    colonnes: list[str]
+    lignage: list[tuple]  # (fichier_source, feuille_source) de chaque ligne
+    lignes: list[list]
+
+
+COLONNES_CELLULES_ILLISIBLES = (
+    "table", "colonne", "fichier_source", "feuille_source", "num_ligne_source",
+)
+
+
+@dataclass
+class Preparation:
+    tables: list[TablePreparee]
+    journal: list[dict]
+    illisibles: pd.DataFrame  # table, colonne, cellules
+    # Une ligne par cellule illisible de propre : table, colonne, lignage.
+    cellules_illisibles: pd.DataFrame
+
+
+def _lignage(donnees: pd.DataFrame, schema: str,
+             non_retenues: set | None = None) -> tuple[list[tuple], list[list]]:
+    """Lignage de chaque ligne, puis colonnes techniques du schéma : en propre,
+    retenue vaut 0 pour une ligne dont (fichier, feuille, numéro) est dans
+    `non_retenues`, 1 sinon."""
+    n = len(donnees)
+    fichiers = [str(v) for v in donnees["fichier_source"]]
+    feuilles = [_feuille(v) for v in donnees.get("feuille_source", pd.Series([None] * n))]
+    periodes = [None if _absente(v) else str(v) for v in donnees.get("periode_export", pd.Series([None] * n))]
+    numeros = [int(v) for v in donnees["num_ligne_source"]]
+    colonnes = [periodes, fichiers, feuilles, numeros]
+    if schema == SCHEMA_PROPRE:
+        exclues = non_retenues or set()
+        colonnes.append(
+            [0 if cle in exclues else 1 for cle in zip(fichiers, feuilles, numeros)]
+        )
+    if schema == SCHEMA_CHARGEMENT:
+        nb_champs = donnees.get("nb_champs_source", pd.Series([None] * n))
+        colonnes.append([None if _absente(v) else int(v) for v in nb_champs])
+        colonnes.append(
+            valeurs_chargement(donnees.get("champs_excedentaires", pd.Series([None] * n))).valeurs
+        )
+    return list(zip(fichiers, feuilles)), colonnes
+
+
+def preparer(
+    perimetre,
+    tables: dict[str, pd.DataFrame],
+    tables_nettoyees: dict[str, pd.DataFrame],
+    structure: dict[str, TableBase],
+    non_retenues: set[tuple] | None = None,
+) -> Preparation:
+    """Valeurs de toutes les tables, sans toucher la base.
+
+    Les tables de la structure doivent toutes être présentes, chargées et nettoyées.
+    Un garde-fou déclenché lève `ErreurEcriture`, qui liste tous les problèmes par
+    table, colonne et nombre de cellules, sans aucune valeur.
+
+    `non_retenues` (`anomalies.lignes_non_retenues`) donne les lignes nettoyées
+    exclues des indicateurs, par (table, fichier, feuille, numéro de ligne) : leur
+    colonne retenue vaut 0 dans propre, celle des autres lignes 1. Une ligne non
+    retenue absente des tables nettoyées (table hors structure ou ligne introuvable)
+    est un problème : la table des anomalies ne correspondrait pas aux données.
+    """
+    par_table: dict[str, set] = {}
+    for table, fichier, feuille, numero in non_retenues or set():
+        par_table.setdefault(table, set()).add((fichier, feuille, numero))
+    problemes, illisibles, cellules, preparees = [], [], [], []
+    manquantes = [
+        f"{nom} ({etat})"
+        for nom in structure
+        for etat, source in (("chargée", tables), ("nettoyée", tables_nettoyees))
+        if nom not in source
+    ]
+    if manquantes:
+        raise ErreurEcriture("Tables absentes des données : " + ", ".join(manquantes))
+    for nom in sorted(set(par_table) - set(structure)):
+        problemes.append(
+            f"{nom} : {len(par_table[nom])} ligne(s) non retenue(s) d'une table absente de la "
+            "structure"
+        )
+    for schema, source in ((SCHEMA_CHARGEMENT, tables), (SCHEMA_PROPRE, tables_nettoyees)):
+        for nom, table in structure.items():
+            donnees = source[nom]
+            absentes = [c.source for c in table.colonnes if c.source not in donnees.columns]
+            if absentes:
+                problemes.append(f"{schema}.{table.nom} : colonnes absentes {', '.join(absentes)}")
+                continue
+            lignage, colonnes = _lignage(donnees, schema, par_table.get(nom))
+            if schema == SCHEMA_PROPRE and nom in par_table:
+                introuvables = len(par_table[nom] - set(zip(*colonnes[1:4])))
+                if introuvables:
+                    problemes.append(
+                        f"{schema}.{table.nom} : {introuvables} ligne(s) non retenue(s) absente(s) "
+                        "des données nettoyées"
+                    )
+            for c in table.colonnes:
+                if schema == SCHEMA_CHARGEMENT:
+                    resultat = valeurs_chargement(donnees[c.source])
+                else:
+                    resultat = valeurs_propre(donnees[c.source], c.famille, c.nature)
+                    if resultat.illisibles:
+                        illisibles.append(
+                            {"table": nom, "colonne": c.source, "cellules": resultat.illisibles}
+                        )
+                        numeros = colonnes[3]
+                        cellules += [
+                            {"table": nom, "colonne": c.source, "fichier_source": lignage[p][0],
+                             "feuille_source": lignage[p][1], "num_ligne_source": numeros[p]}
+                            for p in resultat.positions_illisibles
+                        ]
+                for probleme, nombre in resultat.problemes.items():
+                    problemes.append(
+                        f"{schema}.{table.nom}.{c.nom} ({nom}.{c.source}) : {nombre} cellule(s), "
+                        f"{probleme}"
+                    )
+                colonnes.append(resultat.valeurs)
+            noms = [t.nom for t in colonnes_techniques(schema) if not t.identite]
+            noms.remove("id_chargement")
+            noms += [c.nom for c in table.colonnes]
+            preparees.append(
+                TablePreparee(table, schema, noms, lignage, [list(l) for l in zip(*colonnes)])
+            )
+    if problemes:
+        raise ErreurEcriture(
+            "Écriture en base arrêtée par les garde-fous\n  " + "\n  ".join(problemes)
+        )
+    journal = lignes_journal_chargement(perimetre, tables)
+    connus = {(l["fichier_source"], l["feuille_source"]) for l in journal}
+    hors_journal = sorted(
+        {f"{p.schema}.{p.table.nom}" for p in preparees for cle in p.lignage if cle not in connus}
+    )
+    if hors_journal:
+        raise ErreurEcriture(
+            "Lignes dont le fichier n'est pas dans le périmètre : " + ", ".join(hors_journal)
+        )
+    return Preparation(
+        preparees,
+        journal,
+        pd.DataFrame(illisibles, columns=["table", "colonne", "cellules"]),
+        pd.DataFrame(cellules, columns=list(COLONNES_CELLULES_ILLISIBLES)),
+    )
+
+
+# --- Base --------------------------------------------------------------------------
+
+_VALEUR_TRONQUEE = re.compile(r"(Truncated value|Valeur tronquée)\s*:.*", re.IGNORECASE | re.DOTALL)
+
+
+def message_sans_valeur(erreur: Exception) -> str:
+    """Message d'une erreur, sans la valeur tronquée que cite SQL Server."""
+    return _VALEUR_TRONQUEE.sub(r"\1 : (masquée)", str(erreur))[:LONGUEUR_MAX_DETAIL]
+
+
+def _tailles(lot: list[list], types: list[str]) -> list:
+    import pyodbc
+
+    tailles = []
+    for position, type_sql in enumerate(types):
+        if type_sql in ("int", "bit"):
+            tailles.append((pyodbc.SQL_INTEGER, 0, 0))
+        else:
+            longueur = max(
+                (longueur_sql(l[position]) for l in lot if l[position] is not None), default=1
+            )
+            tailles.append((pyodbc.SQL_WVARCHAR, max(1, longueur), 0))
+    return tailles
+
+
+def _inserer(curseur, preparee: TablePreparee, ids: dict[tuple, int]) -> int:
+    colonnes = ["id_chargement", *preparee.colonnes]
+    types_techniques = {t.nom: t.type_sql for t in colonnes_techniques(preparee.schema)}
+    # Une colonne bit reçoit un entier (0 ou 1), que SQL Server convertit.
+    types = [
+        "int" if types_techniques.get(c) in ("int", "bit") else "texte" for c in colonnes
+    ]
+    lignes = [[ids[cle], *ligne] for cle, ligne in zip(preparee.lignage, preparee.lignes)]
+    instruction = (
+        f"INSERT INTO {preparee.schema}.{preparee.table.nom} ({', '.join(colonnes)}) "
+        f"VALUES ({', '.join('?' * len(colonnes))})"
+    )
+    try:
+        for debut in range(0, len(lignes), TAILLE_LOT):
+            lot = lignes[debut:debut + TAILLE_LOT]
+            curseur.setinputsizes(_tailles(lot, types))
+            curseur.executemany(instruction, lot)
+    finally:
+        # Les tailles déclarées resteraient appliquées aux instructions suivantes.
+        curseur.setinputsizes(None)
+    return len(lignes)
+
+
+def _inscrire_execution(moteur, periode_fin: str, version: str | None) -> int:
+    with moteur.begin() as conn:
+        curseur = conn.connection.cursor()
+        try:
+            curseur.execute(
+                "INSERT INTO qualite.execution (periode_fin, version_traitement) "
+                "OUTPUT INSERTED.id_execution VALUES (?, ?)",
+                periode_fin, version,
+            )
+            return int(curseur.fetchone()[0])
+        finally:
+            curseur.close()
+
+
+def _marquer_echec(moteur, id_execution: int, message: str) -> None:
+    with moteur.begin() as conn:
+        curseur = conn.connection.cursor()
+        try:
+            curseur.execute(
+                "UPDATE qualite.execution SET statut = ?, fin = SYSUTCDATETIME(), detail = ? "
+                "WHERE id_execution = ?",
+                STATUT_ECHOUEE, message[:LONGUEUR_MAX_DETAIL], id_execution,
+            )
+        finally:
+            curseur.close()
+
+
+def _supprimer_precedentes(curseur, periode_fin: str, id_execution: int) -> None:
+    precedentes = (
+        "SELECT id_execution FROM qualite.execution WHERE periode_fin = ? AND id_execution <> ?"
+    )
+    for table in TABLES_FILLES_EXECUTION:
+        curseur.execute(
+            f"DELETE FROM qualite.{table} WHERE id_execution IN ({precedentes})",
+            periode_fin, id_execution,
+        )
+    curseur.execute(
+        "DELETE FROM qualite.execution WHERE periode_fin = ? AND id_execution <> ?",
+        periode_fin, id_execution,
+    )
+
+
+def _inscrire_fichiers(curseur, id_execution: int, journal: list[dict]) -> dict[tuple, int]:
+    ids = {}
+    for ligne in journal:
+        curseur.execute(
+            "INSERT INTO qualite.journal_chargement (id_execution, "
+            + ", ".join(COLONNES_JOURNAL_CHARGEMENT)
+            + ") OUTPUT INSERTED.id_chargement VALUES (?, ?, ?, ?, ?, ?)",
+            id_execution, *(ligne[c] for c in COLONNES_JOURNAL_CHARGEMENT),
+        )
+        ids[(ligne["fichier_source"], ligne["feuille_source"])] = int(curseur.fetchone()[0])
+    return ids
+
+
+def _inscrire_correspondance(curseur, id_execution: int, structure) -> None:
+    lignes = lignes_correspondance(structure)
+    if not lignes:
+        return
+    colonnes = list(lignes[0])
+    curseur.executemany(
+        f"INSERT INTO qualite.correspondance_colonne (id_execution, {', '.join(colonnes)}) "
+        f"VALUES ({', '.join('?' * (len(colonnes) + 1))})",
+        [[id_execution, *(l[c] for c in colonnes)] for l in lignes],
+    )
+
+
+@dataclass
+class Ecriture:
+    """Résultat d'une écriture réussie."""
+
+    id_execution: int
+    lignes: pd.DataFrame  # table, chargement, propre
+    illisibles: pd.DataFrame  # table, colonne, cellules
+    fichiers: int
+    preparation: Preparation | None = None  # valeurs écrites, pour verifier_base
+    # Journal de la reconstruction de dw (ordre, étape, lignes), None sans pack qui
+    # déclare dw.reconstruire.
+    journal_dw: list[tuple[int, str, int]] | None = None
+
+
+def ecrire_base(
+    moteur,
+    periode_fin: str,
+    perimetre,
+    tables: dict[str, pd.DataFrame],
+    tables_nettoyees: dict[str, pd.DataFrame],
+    structure: dict[str, TableBase] | None = None,
+    version: str | None = None,
+    completer: Callable | None = None,
+    non_retenues: set[tuple] | None = None,
+) -> Ecriture:
+    """Écrit une exécution complète en base (voir le cycle en tête du module).
+
+    `completer(curseur, id_execution, ids_chargement)` écrit, dans la même
+    transaction, les autres tables de qualite; `ids_chargement` associe
+    (fichier_source, feuille_source) à son id_chargement. `version` vaut par défaut
+    la version du traitement lue dans Git. Après `completer`, la procédure
+    dw.reconstruire est appelée si un pack la déclare : une erreur de sa part (contrat
+    d'entrée non respecté) fait échouer toute l'exécution. `non_retenues`
+    (`anomalies.lignes_non_retenues` de la table des anomalies après nettoyage) donne
+    les lignes dont la colonne retenue de propre vaut 0 (voir `preparer`); sans lui,
+    toutes les lignes sont retenues, ce que la vérification (`verifier_base`) signale
+    s'il existe des anomalies bloquantes non résolues.
+    """
+    from .base import reconstruire_dw, version_traitement
+
+    structure = structure or charger_structure()
+    version = version if version is not None else version_traitement()
+    id_execution = _inscrire_execution(moteur, periode_fin, version)
+    try:
+        preparation = preparer(perimetre, tables, tables_nettoyees, structure, non_retenues)
+        comptes: dict[str, dict[str, int]] = {}
+        journal_dw = None
+        with moteur.begin() as conn:
+            curseur = conn.connection.cursor()
+            curseur.fast_executemany = True
+            try:
+                existantes = [tuple(l) for l in curseur.execute(REQUETE_TABLES_EXISTANTES).fetchall()]
+                for instruction in ddl_suppression(existantes):
+                    curseur.execute(instruction)
+                _supprimer_precedentes(curseur, periode_fin, id_execution)
+                for instruction in ddl_structure(structure):
+                    curseur.execute(instruction)
+                ids = _inscrire_fichiers(curseur, id_execution, preparation.journal)
+                _inscrire_correspondance(curseur, id_execution, structure)
+                for preparee in preparation.tables:
+                    nombre = _inserer(curseur, preparee, ids)
+                    comptes.setdefault(preparee.table.source, {})[preparee.schema] = nombre
+                if completer is not None:
+                    completer(curseur, id_execution, ids)
+                journal_dw = reconstruire_dw(curseur, id_execution)
+                curseur.execute(
+                    "UPDATE qualite.execution SET statut = ?, fin = SYSUTCDATETIME() "
+                    "WHERE id_execution = ?",
+                    STATUT_REUSSIE, id_execution,
+                )
+            finally:
+                curseur.close()
+    except Exception as erreur:
+        message = message_sans_valeur(erreur)
+        _marquer_echec(moteur, id_execution, message)
+        if isinstance(erreur, ErreurEcriture):
+            raise
+        raise ErreurEcriture(f"Écriture en base échouée (exécution {id_execution}) : {message}") from None
+    lignes = pd.DataFrame(
+        [
+            {"table": nom, SCHEMA_CHARGEMENT: n.get(SCHEMA_CHARGEMENT, 0), SCHEMA_PROPRE: n.get(SCHEMA_PROPRE, 0)}
+            for nom, n in comptes.items()
+        ],
+        columns=["table", SCHEMA_CHARGEMENT, SCHEMA_PROPRE],
+    )
+    return Ecriture(
+        id_execution, lignes, preparation.illisibles, len(preparation.journal), preparation,
+        journal_dw,
+    )
+
+
+# --- Tables de qualite (7.2d) -------------------------------------------------------
+
+ETAT_BRUT = "brut"
+ETAT_NETTOYE = "nettoyé"
+
+# Colonnes des fichiers du traitement renommées en base (« table » est réservé en T-SQL).
+RENOMMAGES = {"table": "table_source"}
+# Clé provisoire d'une ligne : (fichier_source, feuille_source) de sa ligne source,
+# remplacée à l'insertion par id_chargement.
+CLE_LIGNAGE = "__lignage"
+# Clé provisoire de la ligne du référentiel d'un rattachement, remplacée à l'insertion
+# par id_chargement_reference.
+CLE_LIGNAGE_REFERENCE = "__lignage_reference"
+# Clé provisoire vers la colonne d'id_chargement qui la remplace, dans cet ordre.
+CLES_LIGNAGE = {CLE_LIGNAGE: "id_chargement", CLE_LIGNAGE_REFERENCE: "id_chargement_reference"}
+
+REQUETE_COLONNES_QUALITE = (
+    "SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_SCALE "
+    "FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_SCHEMA = N'qualite'"
+)
+TYPES_ENTIERS = ("int", "bigint", "smallint", "tinyint")
+
+
+@dataclass
+class SortiesQualite:
+    """Sorties du traitement à écrire dans qualite, telles que les produit le
+    notebook 07 (mêmes tables que les fichiers CSV de data/anomalies et
+    data/nettoyage)."""
+
+    anomalies_brutes: pd.DataFrame
+    bilan_brut: pd.DataFrame
+    non_evaluables_brutes: pd.DataFrame
+    anomalies_nettoyees: pd.DataFrame
+    bilan_nettoye: pd.DataFrame
+    non_evaluables_nettoyees: pd.DataFrame
+    journal_nettoyage: pd.DataFrame
+    bilan_nettoyage: pd.DataFrame
+    decisions: dict
+    dictionnaire: dict
+    cle_empreinte: str
+    # Jours fériés de config/gestion.yaml (`gestion.charger_jours_feries`).
+    jours_feries: dict = field(default_factory=dict)
+    # Rattachement des lignes aux référentiels (`rattachement.rattacher`), None s'il
+    # n'est pas calculé : aucune ligne dans les deux tables du rattachement.
+    rattachements: object = None
+    # Codes en doublon regroupés sous un code principal (`nettoyage.nettoyer`,
+    # membre correspondances), None : aucune ligne dans qualite.correspondance_cle.
+    correspondances: pd.DataFrame | None = None
+
+
+def _cle_lignage(enregistrement: dict, fichier: str = "fichier_source",
+                 feuille: str = "feuille_source") -> tuple | None:
+    valeur = enregistrement.get(fichier)
+    if _vide(valeur):
+        return None
+    return (str(valeur), _feuille(enregistrement.get(feuille)))
+
+
+def _lignes(donnees: pd.DataFrame, communs: dict, lignage: bool = True) -> list[dict]:
+    lignes = []
+    for enregistrement in donnees.to_dict("records"):
+        ligne = dict(communs)
+        for colonne, valeur in enregistrement.items():
+            ligne[RENOMMAGES.get(colonne, colonne)] = valeur
+        if lignage:
+            ligne[CLE_LIGNAGE] = _cle_lignage(enregistrement)
+        lignes.append(ligne)
+    return lignes
+
+
+def champ_sensible(sensibles: dict, dictionnaire: dict, table, champ) -> bool:
+    """Vrai pour une colonne classée sensible ou masquée par le dictionnaire, comme
+    dans la cellule # COLONNES SENSIBLES du notebook 07."""
+    from .confidentialite import est_sensible
+    from .dictionnaire import est_masquee
+
+    if _vide(table) or _vide(champ):
+        return False
+    if est_sensible(sensibles, table, champ):
+        return True
+    regles = dictionnaire.get(table, {}).get(champ)
+    return bool(regles) and (est_masquee(regles["valeurs"]) or est_masquee(regles["format"]))
+
+
+def lignes_decisions(decisions: dict, dictionnaire: dict, sensibles: dict, cle: str) -> list[dict]:
+    """Lignes de qualite.decision, sans id_execution, telles qu'enregistrées.
+
+    Sur un champ sensible, valeur_retenue reste vide et son empreinte (clé du
+    journal du nettoyage) est écrite dans empreinte_valeur_retenue.
+    """
+    from .decisions import CHAMPS_DECISION
+    from .nettoyage import empreinte_valeur
+
+    lignes = []
+    for identifiant, decision in (decisions.get("decisions") or {}).items():
+        ligne = {"id_decision": identifiant}
+        for champ in CHAMPS_DECISION:
+            ligne[RENOMMAGES.get(champ, champ)] = decision.get(champ)
+        retenue = ligne["valeur_retenue"]
+        ligne["empreinte_valeur_retenue"] = None
+        if champ_sensible(sensibles, dictionnaire, decision.get("table"), decision.get("champ")):
+            ligne["valeur_retenue"] = None
+            if not _absente(retenue):
+                ligne["empreinte_valeur_retenue"] = empreinte_valeur(retenue, cle)
+        lignes.append(ligne)
+    return lignes
+
+
+def _sensibles(sensibles: dict | None) -> dict:
+    """Colonnes sensibles données, ou celles de config/sensibilite.yaml."""
+    from .confidentialite import charger_sensibilite
+
+    return charger_sensibilite() if sensibles is None else sensibles
+
+
+def lignes_jours_feries(jours_feries: dict) -> list[dict]:
+    """Lignes de qualite.jour_ferie, sans id_execution : une par jour férié déclaré,
+    dans l'ordre des années puis des jours. Une année déclarée sans jour férié donne
+    une ligne sans jour, pour qu'elle reste distincte d'une année non déclarée."""
+    lignes = []
+    for annee, jours in jours_feries.items():
+        if not jours:
+            lignes.append({"annee": annee, "jour": None})
+        lignes += [{"annee": annee, "jour": jour} for jour in jours]
+    return lignes
+
+
+def lignes_valeurs_liste(dictionnaire: dict, sensibles: dict) -> list[dict]:
+    """Lignes de qualite.valeur_liste, sans id_execution : une par valeur admise de
+    chaque colonne dont la règle `valeurs` en vigueur est une liste fermée.
+
+    Une valeur est admise quand le contrôle de la liste ne la signale pas : valide,
+    documentée, ou proposée par la génération et pas encore revue (statut observé).
+    Les valeurs invalides, à arbitrer ou écartées ne sont pas reprises. Le rang suit
+    l'ordre de la liste du dictionnaire, à partir de 1, parmi les valeurs admises. Une
+    colonne sensible (`champ_sensible`) n'est pas reprise.
+    """
+    from .controles import _issue_element
+    from .dictionnaire import LISTE_FERMEE
+
+    lignes = []
+    for table, colonnes in dictionnaire.items():
+        for colonne, regles in colonnes.items():
+            valeurs = regles["valeurs"]
+            if valeurs["regle"] != LISTE_FERMEE or champ_sensible(
+                sensibles, dictionnaire, table, colonne
+            ):
+                continue
+            admises = [
+                element for element in valeurs["liste"]
+                if _issue_element(element) in (None, "non revue")
+            ]
+            lignes += [
+                {"table_source": table, "colonne_source": colonne, "rang": rang,
+                 "valeur": element["valeur"], "statut": element["statut"]}
+                for rang, element in enumerate(admises, start=1)
+            ]
+    return lignes
+
+
+def lignes_regles_rattachement(rattachements) -> list[dict]:
+    """Lignes de qualite.regle_rattachement, sans id_execution : une par rattachement,
+    numéroté par son rang (id_regle), colonnes reliées par « , »."""
+    if rattachements is None:
+        return []
+    return [
+        {"id_regle": rang, "table_source": r.table, "cle": ", ".join(r.cle),
+         "table_reference": r.table_reference, "cle_reference": ", ".join(r.cle_reference),
+         "comparaison": r.comparaison, "colonne_date": r.date, "debut": r.debut,
+         "fin": r.fin, "refs": ", ".join(r.refs)}
+        for rang, r in enumerate(rattachements.regles, start=1)
+    ]
+
+
+def lignes_rattachement(rattachements) -> list[dict]:
+    """Lignes de qualite.rattachement, sans id_execution : une par ligne rattachée, la
+    ligne source et celle du référentiel portant chacune sa clé de lignage
+    (`CLE_LIGNAGE`, `CLE_LIGNAGE_REFERENCE`), remplacée à l'insertion par leur
+    id_chargement."""
+    if rattachements is None:
+        return []
+    return [
+        {"id_regle": int(l["regle"]),
+         "num_ligne_source": int(l["num_ligne_source"]),
+         CLE_LIGNAGE: _cle_lignage(l),
+         "num_ligne_reference": int(l["num_ligne_reference"]),
+         CLE_LIGNAGE_REFERENCE: _cle_lignage(l, "fichier_reference", "feuille_reference"),
+         "candidates": int(l["candidates"]),
+         "choix_par_date": bool(l["choix_par_date"])}
+        for l in rattachements.lignes.to_dict("records")
+    ]
+
+
+def lignes_correspondances(correspondances: pd.DataFrame | None) -> list[dict]:
+    """Lignes de qualite.correspondance_cle, sans id_execution : une par code en
+    doublon regroupé sous son code principal."""
+    if correspondances is None:
+        return []
+    return [
+        {"table_source": c["table"], "colonne_cle": c["colonne"],
+         "code_doublon": c["code_doublon"], "code_principal": c["code_principal"],
+         "id_decision": c["id_decision"]}
+        for c in correspondances.to_dict("records")
+    ]
+
+
+def lignes_qualite(sorties: SortiesQualite, sensibles: dict | None = None) -> dict[str, list[dict]]:
+    """Lignes de chaque table de qualite, sans id_execution, valeurs telles que dans
+    les fichiers du traitement (une valeur masquée reste « masqué »).
+
+    Chaque ligne au grain d'une ligne source porte sa clé de lignage (`CLE_LIGNAGE`),
+    remplacée par id_chargement à l'insertion; une ligne de rattachement porte en plus
+    celle de la ligne du référentiel (`CLE_LIGNAGE_REFERENCE`). Les tables suivent
+    l'ordre d'insertion : une règle de rattachement avant ses lignes, une décision
+    avant les correspondances de codes qui la citent.
+    """
+    sensibles = _sensibles(sensibles)
+    brut, nettoye = {"etat": ETAT_BRUT}, {"etat": ETAT_NETTOYE}
+    return {
+        "anomalie": _lignes(sorties.anomalies_brutes, brut)
+        + _lignes(sorties.anomalies_nettoyees, nettoye),
+        "non_evaluable": _lignes(sorties.non_evaluables_brutes, brut)
+        + _lignes(sorties.non_evaluables_nettoyees, nettoye),
+        "bilan_controle": _lignes(sorties.bilan_brut, brut, lignage=False)
+        + _lignes(sorties.bilan_nettoye, nettoye, lignage=False),
+        "journal_nettoyage": _lignes(sorties.journal_nettoyage, {}),
+        "bilan_nettoyage": _lignes(sorties.bilan_nettoyage, {}, lignage=False),
+        "decision": lignes_decisions(
+            sorties.decisions, sorties.dictionnaire, sensibles, sorties.cle_empreinte
+        ),
+        "jour_ferie": lignes_jours_feries(sorties.jours_feries),
+        "valeur_liste": lignes_valeurs_liste(sorties.dictionnaire, sensibles),
+        "regle_rattachement": lignes_regles_rattachement(sorties.rattachements),
+        "rattachement": lignes_rattachement(sorties.rattachements),
+        "correspondance_cle": lignes_correspondances(sorties.correspondances),
+    }
+
+
+def problemes_sorties(
+    sorties: SortiesQualite,
+    periode_fin: str,
+    sensibles: dict | None = None,
+    declarations: dict | None = None,
+) -> list[str]:
+    """Les refus de l'écriture des fichiers CSV, appliqués aux sorties avant leur
+    écriture en base : colonnes attendues, table qualifiée, valeur ou clé sensible
+    non masquée, empreintes du journal, fichier des décisions."""
+    from .anomalies import _problemes_ecriture, _problemes_non_evaluables
+    from .decisions import problemes_decisions
+    from .nettoyage import (
+        COLONNES_BILAN_NETTOYAGE,
+        COLONNES_JOURNAL,
+        empreintes_incoherentes,
+        journal_non_masque,
+    )
+
+    problemes = []
+    for etat, anomalies, bilan, non_evaluables, nettoyees in (
+        (ETAT_BRUT, sorties.anomalies_brutes, sorties.bilan_brut, sorties.non_evaluables_brutes, False),
+        (ETAT_NETTOYE, sorties.anomalies_nettoyees, sorties.bilan_nettoye,
+         sorties.non_evaluables_nettoyees, True),
+    ):
+        trouves = _problemes_ecriture(anomalies, bilan, periode_fin, sensibles, declarations, nettoyees)
+        if not trouves:
+            trouves = _problemes_non_evaluables(non_evaluables, bilan, sensibles, declarations)
+        problemes += [f"anomalies, état {etat} : {p}" for p in trouves]
+    for nom, donnees, attendues in (
+        ("journal du nettoyage", sorties.journal_nettoyage, COLONNES_JOURNAL),
+        ("bilan du nettoyage", sorties.bilan_nettoyage, COLONNES_BILAN_NETTOYAGE),
+    ):
+        if list(donnees.columns) != list(attendues):
+            problemes.append(f"{nom} : colonnes attendues, dans cet ordre, {', '.join(attendues)}")
+    if list(sorties.journal_nettoyage.columns) == list(COLONNES_JOURNAL):
+        fautives = journal_non_masque(sorties.journal_nettoyage, sensibles, declarations)
+        if not fautives.empty:
+            problemes.append(
+                f"journal du nettoyage : {len(fautives)} lignes dont une valeur ou la clé "
+                "d'une colonne sensible n'est pas masquée"
+            )
+        if not empreintes_incoherentes(sorties.journal_nettoyage).empty:
+            problemes.append("journal du nettoyage : empreintes qui ne suivent pas le masquage")
+    problemes += [f"décisions : {p}" for p in problemes_decisions(sorties.decisions)]
+    problemes += _problemes_correspondances(sorties.correspondances, sorties.decisions)
+    return problemes
+
+
+def _problemes_correspondances(correspondances, decisions: dict) -> list[str]:
+    """Colonnes des correspondances de codes, et décision citée présente dans le
+    fichier des décisions."""
+    from .nettoyage import COLONNES_CORRESPONDANCES
+
+    if correspondances is None:
+        return []
+    if list(correspondances.columns) != list(COLONNES_CORRESPONDANCES):
+        return [
+            "correspondances des codes : colonnes attendues, dans cet ordre, "
+            + ", ".join(COLONNES_CORRESPONDANCES)
+        ]
+    connues = set((decisions or {}).get("decisions") or {})
+    absentes = sorted({str(i) for i in correspondances["id_decision"] if i not in connues})
+    if absentes:
+        return [
+            "correspondances des codes : décisions absentes du fichier des décisions "
+            f"({', '.join(absentes)})"
+        ]
+    return []
+
+
+def valeur_sql(valeur, type_sql: str, echelle=None):
+    """Valeur transmise pour une colonne de qualite, selon son type en base.
+
+    Entier : int (None si vide; un numéro lu 2.0 vaut 2); décimal : texte arrondi à
+    l'échelle de la colonne, comme le taux des fichiers; bit : 0 ou 1; tout autre
+    type : texte tel que dans les fichiers (`texte_livre`).
+    """
+    from .anomalies import _numero
+
+    if type_sql in TYPES_ENTIERS:
+        return _numero(valeur)
+    if type_sql in ("decimal", "numeric"):
+        if _vide(valeur):
+            return None
+        return f"{float(valeur):.{int(echelle or 0)}f}"
+    if type_sql == "bit":
+        return None if _absente(valeur) else int(bool(valeur))
+    return texte_livre(valeur)
+
+
+def convertir_lignes(
+    table: str,
+    lignes: list[dict],
+    colonnes_base: dict[str, tuple],
+    ids_chargement: dict[tuple, int],
+    communs: dict,
+) -> tuple[list[str], list[list], list[str]]:
+    """Colonnes, valeurs et problèmes d'une table de qualite avant insertion.
+
+    `colonnes_base` donne, par colonne de la table en base, (type, longueur maximale
+    en caractères, échelle). Problèmes, sans aucune valeur : colonne inconnue de la
+    table, texte plus long que sa colonne, fichier source (ou fichier du référentiel)
+    absent du journal des chargements. Chaque clé provisoire de lignage
+    (`CLES_LIGNAGE`) présente dans une ligne devient sa colonne d'id_chargement, en
+    fin de ligne, dans l'ordre de `CLES_LIGNAGE`.
+    """
+    problemes: list[str] = []
+    if not lignes:
+        return [], [], problemes
+    # Colonnes de toutes les lignes, dans l'ordre de leur première apparition : les
+    # anomalies brutes n'ont pas la colonne decision_metier des anomalies nettoyées.
+    noms = list(communs)
+    for ligne in lignes:
+        noms += [c for c in ligne if c not in CLES_LIGNAGE and c not in noms]
+    cles_presentes = [c for c in CLES_LIGNAGE if any(c in ligne for ligne in lignes)]
+    noms += [CLES_LIGNAGE[c] for c in cles_presentes]
+    inconnues = [c for c in noms if c not in colonnes_base]
+    if inconnues:
+        return noms, [], [f"qualite.{table} : colonnes inconnues en base {', '.join(inconnues)}"]
+    trop_longues: dict[str, int] = {}
+    hors_journal = 0
+    valeurs = []
+    for ligne in lignes:
+        complete = {**communs, **ligne}
+        absente = False
+        for cle_provisoire in cles_presentes:
+            if cle_provisoire not in ligne:
+                continue
+            cle = ligne[cle_provisoire]
+            absente = absente or (cle is not None and cle not in ids_chargement)
+            complete[CLES_LIGNAGE[cle_provisoire]] = (
+                None if cle is None else ids_chargement.get(cle)
+            )
+        hors_journal += absente
+        rangee = []
+        for nom in noms:
+            type_sql, longueur, echelle = colonnes_base[nom]
+            valeur = valeur_sql(complete.get(nom), type_sql, echelle)
+            if isinstance(valeur, str) and longueur and longueur > 0 and longueur_sql(valeur) > longueur:
+                trop_longues[nom] = trop_longues.get(nom, 0) + 1
+            rangee.append(valeur)
+        valeurs.append(rangee)
+    for nom, nombre in trop_longues.items():
+        longueur = colonnes_base[nom][1]
+        problemes.append(
+            f"qualite.{table}.{nom} : {nombre} valeur(s) de plus de {longueur} caractères"
+        )
+    if hors_journal:
+        problemes.append(
+            f"qualite.{table} : {hors_journal} ligne(s) dont le fichier source n'est pas "
+            "dans le journal des chargements"
+        )
+    return noms, valeurs, problemes
+
+
+def _inserer_qualite(curseur, table: str, noms: list[str], valeurs: list[list], colonnes_base) -> None:
+    import pyodbc
+
+    instruction = (
+        f"INSERT INTO qualite.{table} ({', '.join(noms)}) VALUES ({', '.join('?' * len(noms))})"
+    )
+    try:
+        for debut in range(0, len(valeurs), TAILLE_LOT):
+            lot = valeurs[debut:debut + TAILLE_LOT]
+            tailles = []
+            for position, nom in enumerate(noms):
+                type_sql = colonnes_base[nom][0]
+                if type_sql == "bigint":
+                    tailles.append((pyodbc.SQL_BIGINT, 0, 0))
+                elif type_sql in TYPES_ENTIERS or type_sql == "bit":
+                    tailles.append((pyodbc.SQL_INTEGER, 0, 0))
+                else:
+                    longueur = max(
+                        (longueur_sql(l[position]) for l in lot if l[position] is not None),
+                        default=1,
+                    )
+                    tailles.append((pyodbc.SQL_WVARCHAR, max(1, longueur), 0))
+            curseur.setinputsizes(tailles)
+            curseur.executemany(instruction, lot)
+    finally:
+        curseur.setinputsizes(None)
+
+
+class CompleterQualite:
+    """Fonction `completer` de `ecrire_base` qui écrit les sorties dans qualite.
+
+    Les refus (`problemes_sorties`, longueurs, lignage) sont tous listés dans une
+    seule `ErreurEcriture`, avant la première insertion : la transaction est annulée
+    et l'exécution inscrite « échouée ». Après l'écriture, `comptes` donne le nombre
+    de lignes écrites par table.
+    """
+
+    def __init__(self, sorties: SortiesQualite, periode_fin: str,
+                 sensibles: dict | None = None, declarations: dict | None = None):
+        self.sorties = sorties
+        self.periode_fin = periode_fin
+        self.sensibles = sensibles
+        self.declarations = declarations
+        self.comptes: dict[str, int] = {}
+
+    def __call__(self, curseur, id_execution: int, ids_chargement: dict[tuple, int]) -> None:
+        problemes = problemes_sorties(self.sorties, self.periode_fin, self.sensibles, self.declarations)
+        if problemes:
+            raise ErreurEcriture(
+                "Écriture de qualite refusée\n  " + "\n  ".join(problemes)
+            )
+        colonnes_base: dict[str, dict[str, tuple]] = {}
+        for table, colonne, type_sql, longueur, echelle in curseur.execute(
+            REQUETE_COLONNES_QUALITE
+        ).fetchall():
+            colonnes_base.setdefault(table, {})[colonne] = (type_sql, longueur, echelle)
+        preparees = []
+        for table, lignes in lignes_qualite(self.sorties, self.sensibles).items():
+            noms, valeurs, trouves = convertir_lignes(
+                table, lignes, colonnes_base.get(table, {}), ids_chargement,
+                {"id_execution": id_execution},
+            )
+            problemes += trouves
+            preparees.append((table, noms, valeurs))
+        if problemes:
+            raise ErreurEcriture("Écriture de qualite refusée\n  " + "\n  ".join(problemes))
+        for table, noms, valeurs in preparees:
+            if valeurs:
+                _inserer_qualite(curseur, table, noms, valeurs, colonnes_base[table])
+            self.comptes[table] = len(valeurs)
+
+
+# --- Vérification de bout en bout (7.2e) --------------------------------------------
+
+COLONNES_VERIFICATION = ["famille", "controle", "attendu", "obtenu", "conforme"]
+FAMILLE_EXECUTION = "exécution"
+FAMILLE_ILLISIBLES = "illisibles"
+FAMILLE_QUALITE = "qualite"
+FAMILLE_DW = "dw"
+FAMILLE_RETENUE = "retenue"
+FAMILLE_CALCULS = "calculs"
+FAMILLE_PBI = "pbi"
+CONTRAT_RESPECTE = "respecté"
+CONTRAT_NON_RESPECTE = "non respecté"
+VALEUR_MASQUEE = "masqué"
+TABLES_AVEC_ETAT = ("anomalie", "non_evaluable", "bilan_controle")
+TABLES_AVEC_LIGNAGE = ("anomalie", "non_evaluable", "journal_nettoyage")
+
+
+def attendus_table(preparee: TablePreparee) -> list[tuple[str, str, object, bool]]:
+    """Agrégats attendus d'une table préparée : (libellé, expression SQL, valeur
+    attendue, valeur à masquer).
+
+    Pour toute table : nombre de lignes (et, en propre, de lignes non retenues), puis
+    nombre de cellules renseignées de chaque colonne de données. En propre, en plus :
+    somme exacte d'une colonne entière ou
+    décimale, plus petite et plus grande valeur d'une date ou d'une heure (écriture ISO).
+    Les agrégats d'une colonne sensible, hors décomptes, sont à masquer à l'affichage.
+    """
+    nom = f"{preparee.schema}.{preparee.table.nom}"
+    attendus = [(f"{nom} : lignes", "COUNT(*)", len(preparee.lignes), False)]
+    if COLONNE_RETENUE in preparee.colonnes:
+        rang = preparee.colonnes.index(COLONNE_RETENUE)
+        attendus.append((
+            f"{nom} : lignes non retenues",
+            f"COUNT(CASE WHEN {COLONNE_RETENUE} = 0 THEN 1 END)",
+            sum(1 for l in preparee.lignes if l[rang] == 0),
+            False,
+        ))
+    debut = len(preparee.colonnes) - len(preparee.table.colonnes)
+    for rang, colonne in enumerate(preparee.table.colonnes):
+        valeurs = [l[debut + rang] for l in preparee.lignes if l[debut + rang] is not None]
+        libelle = f"{nom}.{colonne.nom}"
+        attendus.append((f"{libelle} : cellules renseignées", f"COUNT({colonne.nom})", len(valeurs), False))
+        if preparee.schema != SCHEMA_PROPRE:
+            continue
+        if colonne.famille in (FAMILLE_ENTIER, FAMILLE_DECIMAL):
+            with localcontext() as contexte:
+                contexte.prec = 60
+                somme = sum((Decimal(v) for v in valeurs), Decimal(0)) if valeurs else None
+            attendus.append((f"{libelle} : somme", f"SUM({colonne.nom})", somme, colonne.sensible))
+        elif colonne.famille in (FAMILLE_DATE, FAMILLE_HEURE):
+            attendus.append((f"{libelle} : minimum", f"MIN({colonne.nom})",
+                             min(valeurs) if valeurs else None, colonne.sensible))
+            attendus.append((f"{libelle} : maximum", f"MAX({colonne.nom})",
+                             max(valeurs) if valeurs else None, colonne.sensible))
+    return attendus
+
+
+def valeur_lue(valeur):
+    """Valeur rendue par le serveur, sous la forme des valeurs attendues : nombre en
+    Decimal, date ou heure en écriture ISO."""
+    if valeur is None or isinstance(valeur, bool):
+        return valeur
+    if isinstance(valeur, (dt.date, dt.time)):
+        return valeur.isoformat()
+    if isinstance(valeur, (int, float, Decimal)):
+        return Decimal(str(valeur))
+    return valeur
+
+
+def _affiche(valeur):
+    if isinstance(valeur, Decimal):
+        return _decimal_en_texte(valeur)
+    return valeur
+
+
+def conformite(attendu, obtenu) -> bool:
+    """Égalité d'un agrégat attendu et lu : un entier attendu est comparé en Decimal."""
+    if isinstance(attendu, int) and not isinstance(attendu, bool) and isinstance(obtenu, Decimal):
+        attendu = Decimal(attendu)
+    return attendu == obtenu
+
+
+def verifier_base(moteur, ecriture: Ecriture, periode_fin: str,
+                  sorties: SortiesQualite | None = None,
+                  sensibles: dict | None = None) -> pd.DataFrame:
+    """Relit la base après une écriture et compare avec ce que Python a préparé.
+
+    Une ligne par contrôle (`COLONNES_VERIFICATION`), en décomptes et agrégats
+    seulement, ceux d'une colonne sensible étant affichés « masqué » : exécution
+    unique de la période, au statut réussie; lignes et cellules renseignées de chaque
+    table de chargement et de propre, sommes, minimums et maximums de propre;
+    cellules illisibles de propre rattachées à une anomalie après nettoyage (même
+    ligne source, même champ); lignes non retenues de chaque table de propre égales,
+    ligne à ligne, à celles qui portent une anomalie bloquante non résolue de
+    qualite.anomalie (`controles_retenue_propre`); avec `sorties`, lignes de chaque
+    table de qualite par état (jours fériés, valeurs des listes fermées,
+    rattachements et correspondances des codes en doublon compris, `sensibles` étant
+    celui de l'écriture), id_chargement renseigné pour toute ligne qui a un fichier
+    source,
+    et, par rattachement, lignes rattachées, choisies parmi plusieurs candidates et
+    choisies par la date;
+    pour dw, procédure de reconstruction présente si et seulement si l'écriture l'a
+    appelée, et, si elle l'a été, journal de la reconstruction identique à celui de
+    l'écriture et contrat d'entrée respecté par propre et par les rattachements de
+    l'exécution; pour chaque fait déclaré par le pack, autant de lignes que dans propre
+    et, avec `sorties`, membres -1 et -2 (ou liens non renseignés et introuvables, ou
+    numéros renseignés) égaux aux clés vides, introuvables (ou lignes rattachées) du
+    bilan des rattachements (`controles_faits`); pour chaque table dont le pack regroupe
+    les codes en doublon, aucun membre pour un code en doublon et, avec `sorties`, les
+    codes en doublon comptés sur les membres principaux (`controles_regroupements`);
+    pour chaque mesure déclarée par le pack, somme (et, pour une mesure à une seule
+    source, valeurs renseignées) égale à celle de ses colonnes de propre, aucune
+    colonne numérique d'un fait sans mesure déclarée, et, pour chaque date d'un fait
+    lue sur sa ligne de propre, jour du calendrier égal à celui de propre ligne à
+    ligne, autant de -1 que de dates vides et aucun -2 (`controles_mesures`); pour
+    chaque fait, retenue égale ligne à ligne à celle de sa ligne de propre et des
+    lignes rattachées que le pack déclare (`controles_retenue_faits`); pour chaque pack
+    qui a un module de vérification (frigeo.packs.<pack>), ses calculs refaits en
+    Python et comparés à dw (famille calculs); chaque vue du schéma pbi conforme au
+    contrat (dw.contrat_vue, dw.source_vue) : colonnes exactement celles déclarées et
+    lignes égales à la source, vue par vue (famille pbi, `_verifier_vues`); avec
+    `sorties`, les tables génériques du tableau qualité comparées au registre après
+    nettoyage, aux bilans des contrôles et aux lignes non évaluables
+    (`controles_tableau_qualite`).
+    """
+    from sqlalchemy import text
+
+    from .anomalies import _colonnes_du_champ
+
+    controles = []
+
+    def ajouter(famille, controle, attendu, obtenu, masque=False):
+        conforme = conformite(attendu, obtenu)
+        if masque:
+            attendu = obtenu = VALEUR_MASQUEE
+        controles.append(
+            {"famille": famille, "controle": controle, "attendu": _affiche(attendu),
+             "obtenu": _affiche(obtenu), "conforme": conforme}
+        )
+
+    preparation = ecriture.preparation
+    execution = {"e": ecriture.id_execution}
+    with moteur.connect() as conn:
+        executions = conn.execute(
+            text("SELECT id_execution, statut FROM qualite.execution WHERE periode_fin = :p"),
+            {"p": periode_fin},
+        ).all()
+        ajouter(FAMILLE_EXECUTION, f"exécutions de la période {periode_fin}", 1, len(executions))
+        ajouter(FAMILLE_EXECUTION, "exécution écrite, au statut réussie",
+                f"{ecriture.id_execution} {STATUT_REUSSIE}",
+                ", ".join(f"{i} {s}" for i, s in executions) or None)
+
+        for preparee in preparation.tables:
+            attendus = attendus_table(preparee)
+            ligne = conn.execute(
+                text(f"SELECT {', '.join(a[1] for a in attendus)} "
+                     f"FROM {preparee.schema}.{preparee.table.nom}")
+            ).one()
+            for (libelle, _, attendu, masque), obtenu in zip(attendus, ligne):
+                ajouter(preparee.schema, libelle, attendu, valeur_lue(obtenu), masque)
+
+        connues = set()
+        for table, champ, fichier, feuille, numero in conn.execute(
+            text("SELECT table_source, champ, fichier_source, feuille_source, num_ligne_source "
+                 "FROM qualite.anomalie WHERE id_execution = :e AND etat = N'nettoyé'"),
+            execution,
+        ).all():
+            for autre, colonne in _colonnes_du_champ(table, champ):
+                connues.add((autre, colonne, fichier, _feuille(feuille), numero))
+        cellules = preparation.cellules_illisibles
+        rattachees = sum(
+            1 for c in cellules.itertuples(index=False)
+            if (c.table, c.colonne, c.fichier_source, c.feuille_source, c.num_ligne_source) in connues
+        )
+        ajouter(FAMILLE_ILLISIBLES, "cellules illisibles de propre rattachées à une anomalie "
+                "après nettoyage", len(cellules), rattachees)
+
+        for controle in controles_retenue_propre(preparation, ecriture.id_execution):
+            ajouter(FAMILLE_RETENUE, controle.libelle, controle.attendu,
+                    _obtenu(tuple(conn.execute(text(controle.requete)).one())))
+
+        if sorties is not None:
+            attendus_qualite = {
+                ("anomalie", ETAT_BRUT): len(sorties.anomalies_brutes),
+                ("anomalie", ETAT_NETTOYE): len(sorties.anomalies_nettoyees),
+                ("non_evaluable", ETAT_BRUT): len(sorties.non_evaluables_brutes),
+                ("non_evaluable", ETAT_NETTOYE): len(sorties.non_evaluables_nettoyees),
+                ("bilan_controle", ETAT_BRUT): len(sorties.bilan_brut),
+                ("bilan_controle", ETAT_NETTOYE): len(sorties.bilan_nettoye),
+                ("journal_nettoyage", None): len(sorties.journal_nettoyage),
+                ("bilan_nettoyage", None): len(sorties.bilan_nettoyage),
+                ("decision", None): len(sorties.decisions.get("decisions") or {}),
+                ("jour_ferie", None): len(lignes_jours_feries(sorties.jours_feries)),
+                ("valeur_liste", None): len(lignes_valeurs_liste(
+                    sorties.dictionnaire, _sensibles(sensibles)
+                )),
+                ("regle_rattachement", None): len(lignes_regles_rattachement(
+                    sorties.rattachements
+                )),
+                ("rattachement", None): len(lignes_rattachement(sorties.rattachements)),
+                ("correspondance_cle", None): len(lignes_correspondances(
+                    sorties.correspondances
+                )),
+            }
+            for (table, etat), attendu in attendus_qualite.items():
+                filtre = " AND etat = :etat" if etat else ""
+                obtenu = conn.execute(
+                    text(f"SELECT COUNT(*) FROM qualite.{table} WHERE id_execution = :e{filtre}"),
+                    {**execution, **({"etat": etat} if etat else {})},
+                ).scalar()
+                libelle = f"qualite.{table}" + (f", état {etat}" if etat else "") + " : lignes"
+                ajouter(FAMILLE_QUALITE, libelle, attendu, obtenu)
+            for table in TABLES_AVEC_LIGNAGE:
+                obtenu = conn.execute(
+                    text(f"SELECT COUNT(*) FROM qualite.{table} WHERE id_execution = :e "
+                         "AND fichier_source IS NOT NULL AND fichier_source <> N'' "
+                         "AND id_chargement IS NULL"),
+                    execution,
+                ).scalar()
+                ajouter(FAMILLE_QUALITE, f"qualite.{table} : lignes avec un fichier source "
+                        "sans id_chargement", 0, obtenu)
+            if sorties.rattachements is not None:
+                _verifier_rattachements(conn, ecriture.id_execution, sorties.rattachements,
+                                        ajouter)
+        _verifier_dw(conn, ecriture, ajouter,
+                     None if sorties is None else sorties.rattachements,
+                     None if sorties is None else sorties.correspondances,
+                     sorties)
+    return pd.DataFrame(controles, columns=COLONNES_VERIFICATION)
+
+
+def _verifier_rattachements(conn, id_execution: int, rattachements, ajouter) -> None:
+    """Lignes de qualite.rattachement par rattachement, et parmi elles celles choisies
+    entre plusieurs lignes du référentiel, puis par la date, comparées au calcul."""
+    from sqlalchemy import text
+
+    lues = {
+        int(regle): (int(lignes), int(plusieurs), int(par_date))
+        for regle, lignes, plusieurs, par_date in conn.execute(
+            text("SELECT id_regle, COUNT(*), "
+                 "SUM(CASE WHEN candidates > 1 THEN 1 ELSE 0 END), "
+                 "SUM(CAST(choix_par_date AS int)) "
+                 "FROM qualite.rattachement WHERE id_execution = :e GROUP BY id_regle"),
+            {"e": id_execution},
+        ).all()
+    }
+    bilan = rattachements.bilan.set_index("regle")
+    for rang, regle in enumerate(rattachements.regles, start=1):
+        attendu = (int(bilan.loc[rang, "rattachees"]), int(bilan.loc[rang, "plusieurs_candidates"]),
+                   int(bilan.loc[rang, "choisies_par_date"]))
+        ajouter(FAMILLE_QUALITE,
+                f"qualite.rattachement {rang} ({regle.libelle()}) : lignes, parmi plusieurs "
+                "candidates, choisies par la date",
+                " / ".join(map(str, attendu)), " / ".join(map(str, lues.get(rang, (0, 0, 0)))))
+
+
+# Formes du contrôle d'un rattachement sur un fait (dw.contrat_rattachement.forme).
+FORME_MEMBRE = "membre"
+FORME_LIEN = "lien"
+FORME_NUMERO = "numero"
+LIEN_NON_RENSEIGNE = "non renseignée"
+LIEN_INTROUVABLE = "introuvable"
+_NOM_DW = re.compile(r"[a-z_][a-z0-9_]*")
+REQUETE_FAITS_SOURCES = "SELECT table_fait, table_source FROM dw.source_fait ORDER BY table_fait"
+REQUETE_CONTRATS_FAITS = (
+    "SELECT table_source, cle, table_reference, table_fait, colonne_fait, forme "
+    "FROM dw.contrat_rattachement WHERE table_fait IS NOT NULL ORDER BY id_contrat"
+)
+REQUETE_REGROUPEMENTS = (
+    "SELECT table_source, table_dimension, colonne_code FROM dw.regroupement_codes "
+    "ORDER BY table_source"
+)
+REQUETE_MESURES = (
+    "SELECT table_fait, colonne_fait, table_propre, colonne_propre, signe "
+    "FROM dw.contrat_mesure ORDER BY table_fait, colonne_fait, signe DESC, table_propre, "
+    "colonne_propre"
+)
+REQUETE_DATES = (
+    "SELECT table_fait, colonne_fait, table_propre, colonne_propre "
+    "FROM dw.contrat_date ORDER BY table_fait, colonne_fait"
+)
+# Colonnes numériques (hors int, réservé aux clés et au lignage) des tables de faits
+# qui ne sont déclarées ni dans dw.contrat_mesure, ni comme mesures calculées par le
+# pack (dw.mesure_calculee, vérifiées par son module de vérification).
+REQUETE_MESURES_NON_DECLAREES = (
+    "SELECT COUNT(*) FROM sys.columns AS c "
+    "JOIN sys.tables AS t ON t.object_id = c.object_id "
+    "JOIN sys.schemas AS s ON s.schema_id = t.schema_id "
+    "JOIN sys.types AS ty ON ty.user_type_id = c.user_type_id "
+    "WHERE s.name = N'dw' AND t.name LIKE N'fait[_]%' "
+    "AND ty.name IN (N'bigint', N'decimal', N'numeric', N'float', N'real', N'money', "
+    "N'smallmoney') "
+    "AND t.name NOT IN (N'fait_anomalie', N'fait_bilan_controle') "
+    "AND NOT EXISTS (SELECT 1 FROM dw.contrat_mesure AS m "
+    "WHERE m.table_fait = t.name AND m.colonne_fait = c.name) "
+    "AND NOT EXISTS (SELECT 1 FROM dw.mesure_calculee AS k "
+    "WHERE k.table_fait = t.name AND k.colonne_fait = c.name)"
+)
+
+
+@dataclass(frozen=True)
+class ControleFait:
+    """Un contrôle d'un fait de dw : libellé, valeur attendue (calculée en Python) et
+    requête qui rend la valeur obtenue en une ligne, une colonne par nombre (None si
+    le contrôle est impossible, `probleme` disant pourquoi). `masque` : agrégat d'une
+    colonne sensible, affiché « masqué »."""
+
+    libelle: str
+    attendu: object
+    requete: str | None
+    probleme: str | None = None
+    masque: bool = False
+
+
+def _nom_dw(nom) -> bool:
+    return isinstance(nom, str) and _NOM_DW.fullmatch(nom) is not None
+
+
+def controles_faits(sources: list[tuple], contrats: list[tuple], lignes: pd.DataFrame,
+                    bilan: pd.DataFrame | None) -> list[ControleFait]:
+    """Contrôles des faits déclarés par le pack, sans valeur du client.
+
+    `sources` : (fait, table du dictionnaire) de dw.source_fait; chaque fait doit avoir
+    autant de lignes que Python en a écrit dans propre pour sa table (`lignes`, colonnes
+    table et propre de `Ecriture.lignes`). `contrats` : (table, clé, référentiel, fait,
+    colonne, forme) de dw.contrat_rattachement; avec le bilan des rattachements
+    (`rattachement.Rattachements.bilan`, le premier rattachement de même table, clé et
+    référentiel faisant foi, comme dw.regle_rattachement), la colonne du fait doit
+    compter :
+
+    - forme membre : autant de -1 que de clés vides et de -2 que de clés introuvables;
+    - forme lien : autant de « non renseignée » et d'« introuvable »;
+    - forme numero : autant de valeurs renseignées que de lignes rattachées.
+
+    Sans bilan, seuls les nombres de lignes sont contrôlés. Un nom de fait ou de colonne
+    qui n'est pas un identifiant simple, un fait sans table dans propre ou un
+    rattachement absent du bilan rendent un contrôle impossible (`probleme`).
+    """
+    controles = []
+    propre = {str(t): int(n) for t, n in zip(lignes["table"], lignes[SCHEMA_PROPRE])}
+    for fait, table in sources:
+        libelle = f"dw.{fait} : une ligne par ligne de propre.{table}"
+        if not _nom_dw(fait):
+            controles.append(ControleFait(libelle, None, None, "nom de fait invalide"))
+        elif table not in propre:
+            controles.append(ControleFait(libelle, None, None, "table absente de l'écriture"))
+        else:
+            controles.append(
+                ControleFait(libelle, propre[table], f"SELECT COUNT(*) FROM dw.{fait}")
+            )
+    if bilan is None:
+        return controles
+    premiers: dict[tuple, dict] = {}
+    for ligne in bilan.to_dict("records"):
+        premiers.setdefault((ligne["table"], ligne["cle"], ligne["table_reference"]), ligne)
+    for table, cle, reference, fait, colonne, forme in contrats:
+        libelle = f"dw.{fait}.{colonne} ({forme}) : rattachement {table}.{cle} vers {reference}"
+        ligne = premiers.get((table, cle, reference))
+        if not (_nom_dw(fait) and _nom_dw(colonne)):
+            controles.append(ControleFait(libelle, None, None, "nom de fait ou de colonne invalide"))
+        elif ligne is None:
+            controles.append(ControleFait(libelle, None, None, "rattachement absent du bilan"))
+        elif forme == FORME_MEMBRE:
+            controles.append(ControleFait(
+                libelle + ", membres -1 / -2",
+                f"{int(ligne['cles_vides'])} / {int(ligne['introuvables'])}",
+                f"SELECT SUM(CASE WHEN {colonne} = -1 THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN {colonne} = -2 THEN 1 ELSE 0 END) FROM dw.{fait}",
+            ))
+        elif forme == FORME_LIEN:
+            controles.append(ControleFait(
+                libelle + f", {LIEN_NON_RENSEIGNE} / {LIEN_INTROUVABLE}",
+                f"{int(ligne['cles_vides'])} / {int(ligne['introuvables'])}",
+                f"SELECT SUM(CASE WHEN {colonne} = N'{LIEN_NON_RENSEIGNE}' THEN 1 ELSE 0 END), "
+                f"SUM(CASE WHEN {colonne} = N'{LIEN_INTROUVABLE}' THEN 1 ELSE 0 END) "
+                f"FROM dw.{fait}",
+            ))
+        elif forme == FORME_NUMERO:
+            controles.append(ControleFait(
+                libelle + ", renseignés",
+                int(ligne["rattachees"]),
+                f"SELECT COUNT({colonne}) FROM dw.{fait}",
+            ))
+        else:
+            controles.append(ControleFait(libelle, None, None, "forme inconnue"))
+    return controles
+
+
+def controles_regroupements(regroupements: list[tuple], correspondances: pd.DataFrame | None,
+                            id_execution: int) -> list[ControleFait]:
+    """Contrôles des codes en doublon regroupés par le pack, sans valeur du client.
+
+    `regroupements` : (table du dictionnaire, dimension, colonne du code) de
+    dw.regroupement_codes. Pour chacun, aucun membre de la dimension n'a pour code un
+    code en doublon de la table dans qualite.correspondance_cle; avec `correspondances`
+    (`nettoyage.nettoyer`), la somme de codes_en_doublon des membres est le nombre de
+    codes en doublon de la table, ce qui suppose que chaque code principal a son
+    membre. Les faits qui citent un code en doublon sont couverts par les membres -1
+    et -2 de `controles_faits` : un code en doublon sans membre y serait introuvable.
+    """
+    controles = []
+    for table, dimension, colonne in regroupements:
+        libelle = f"dw.{dimension} : codes en doublon de {table}"
+        if not (_nom_dw(table) and _nom_dw(dimension) and _nom_dw(colonne)):
+            controles.append(ControleFait(libelle, None, None,
+                                          "nom de table, de dimension ou de colonne invalide"))
+            continue
+        controles.append(ControleFait(
+            libelle + ", aucun n'a de membre",
+            0,
+            f"SELECT COUNT(*) FROM dw.{dimension} AS d "
+            f"JOIN qualite.correspondance_cle AS c ON c.code_doublon = d.{colonne} "
+            f"WHERE c.id_execution = {int(id_execution)} AND c.table_source = N'{table}'",
+        ))
+        if correspondances is not None:
+            controles.append(ControleFait(
+                libelle + ", comptés sur les membres principaux (codes_en_doublon)",
+                int((correspondances["table"] == table).sum()),
+                f"SELECT COALESCE(SUM(codes_en_doublon), 0) FROM dw.{dimension}",
+            ))
+    return controles
+
+
+REQUETE_TABLEAU_QUALITE = (
+    "SELECT COUNT(*) FROM sys.tables "
+    "WHERE schema_id = SCHEMA_ID(N'dw') "
+    "AND name IN (N'dim_controle', N'fait_anomalie', N'fait_bilan_controle')"
+)
+REQUETE_RETENUES = (
+    "SELECT table_fait, table_source, cle, table_reference FROM dw.contrat_retenue "
+    "ORDER BY table_fait, id_contrat"
+)
+
+
+def _litteral(texte: str) -> str:
+    """Littéral nvarchar de T-SQL."""
+    return "N'" + str(texte).replace("'", "''") + "'"
+
+
+def _anomalie_bloquante_non_resolue(table_source: str, id_execution: int, alias: str) -> str:
+    """Condition SQL : la ligne de propre `alias` porte, dans qualite.anomalie (état
+    nettoyé de l'exécution), une anomalie bloquante non résolue de sa table, la règle
+    de `anomalies.lignes_non_retenues`."""
+    issues = ", ".join(_litteral(i) for i in ISSUES_NON_RESOLUES)
+    return (
+        "EXISTS (SELECT 1 FROM qualite.anomalie AS a "
+        f"WHERE a.id_execution = {int(id_execution)} AND a.etat = {_litteral(ETAT_NETTOYE)} "
+        f"AND a.table_source = {_litteral(table_source)} "
+        f"AND a.id_chargement = {alias}.id_chargement "
+        f"AND a.num_ligne_source = {alias}.num_ligne_source "
+        f"AND a.gravite = {_litteral(GRAVITE_BLOQUANTE)} AND a.issue IN ({issues}) "
+        "AND (a.decision_metier IS NULL OR LTRIM(RTRIM(a.decision_metier)) = N''))"
+    )
+
+
+def controles_retenue_propre(preparation: Preparation, id_execution: int) -> list[ControleFait]:
+    """Contrôles de la colonne retenue de chaque table de propre contre qualite.anomalie,
+    sans valeur du client : lignes dont la retenue ne suit pas la règle (0 si et
+    seulement si la ligne porte une anomalie bloquante non résolue) et anomalies
+    bloquantes non résolues dont la ligne n'est pas dans propre, « 0 / 0 » attendu.
+    Le contrôle est fait par le lignage, en base, indépendamment de la préparation :
+    il signale une écriture faite sans les lignes non retenues."""
+    controles = []
+    issues = ", ".join(_litteral(i) for i in ISSUES_NON_RESOLUES)
+    for preparee in preparation.tables:
+        if preparee.schema != SCHEMA_PROPRE:
+            continue
+        table, source = preparee.table.nom, preparee.table.source
+        ecarts = (
+            f"SELECT COUNT(*) FROM {SCHEMA_PROPRE}.{table} AS p WHERE p.{COLONNE_RETENUE} <> "
+            f"CASE WHEN {_anomalie_bloquante_non_resolue(source, id_execution, 'p')} "
+            "THEN 0 ELSE 1 END"
+        )
+        orphelines = (
+            "SELECT COUNT(*) FROM (SELECT DISTINCT a.id_chargement, a.num_ligne_source "
+            "FROM qualite.anomalie AS a "
+            f"WHERE a.id_execution = {int(id_execution)} AND a.etat = {_litteral(ETAT_NETTOYE)} "
+            f"AND a.table_source = {_litteral(source)} AND a.num_ligne_source IS NOT NULL "
+            f"AND a.gravite = {_litteral(GRAVITE_BLOQUANTE)} AND a.issue IN ({issues}) "
+            "AND (a.decision_metier IS NULL OR LTRIM(RTRIM(a.decision_metier)) = N'') "
+            f"AND NOT EXISTS (SELECT 1 FROM {SCHEMA_PROPRE}.{table} AS p "
+            "WHERE p.id_chargement = a.id_chargement "
+            "AND p.num_ligne_source = a.num_ligne_source)) AS o"
+        )
+        controles.append(ControleFait(
+            f"{SCHEMA_PROPRE}.{table} : lignes dont la retenue ne suit pas les anomalies "
+            "bloquantes non résolues / anomalies bloquantes non résolues hors de propre",
+            "0 / 0",
+            f"SELECT ({ecarts}), ({orphelines})",
+        ))
+    return controles
+
+
+def controles_retenue_faits(sources: list[tuple], retenues: list[tuple],
+                            preparation: Preparation, id_execution: int) -> list[ControleFait]:
+    """Contrôles de la colonne retenue des faits déclarés par le pack, sans valeur du
+    client.
+
+    `sources` : (fait, table du dictionnaire) de dw.source_fait; `retenues` : (fait,
+    table, clé, référentiel) de dw.contrat_retenue. Ligne à ligne, par le lignage, un
+    fait doit être retenu si et seulement si sa ligne de propre l'est et, pour chaque
+    rattachement déclaré pour lui, la ligne rattachée (quand elle est trouvée) l'est
+    aussi : 0 écart attendu. Un nom de fait invalide, une table absente de propre, un
+    rattachement déclaré sur une autre table que celle du fait, ou un référentiel
+    absent de propre rendent le contrôle impossible (`probleme`).
+    """
+    noms = {p.table.source: p.table.nom for p in preparation.tables if p.schema == SCHEMA_PROPRE}
+    par_fait: dict[str, list[tuple]] = {}
+    for fait, table, cle, reference in retenues:
+        par_fait.setdefault(fait, []).append((table, cle, reference))
+    controles = []
+    for fait, table in sources:
+        declares = par_fait.get(fait, [])
+        libelle = (f"dw.{fait} : lignes dont la retenue diffère de celle de propre.{table}"
+                   + "".join(f" et de {r} par {t}.{c}" for t, c, r in declares))
+        if not _nom_dw(fait):
+            controles.append(ControleFait(libelle, None, None, "nom de fait invalide"))
+            continue
+        if table not in noms:
+            controles.append(ControleFait(libelle, None, None, "table absente de propre"))
+            continue
+        if any(t != table for t, _, _ in declares):
+            controles.append(ControleFait(
+                libelle, None, None, "rattachement déclaré sur une autre table que celle du fait"
+            ))
+            continue
+        if any(r not in noms for _, _, r in declares):
+            controles.append(ControleFait(libelle, None, None, "référentiel absent de propre"))
+            continue
+        jointures, conditions = [], [f"p.{COLONNE_RETENUE} = 0"]
+        for rang, (t, cle, reference) in enumerate(declares, start=1):
+            regle = (f"dw.regle_rattachement({int(id_execution)}, {_litteral(t)}, "
+                     f"{_litteral(cle)}, {_litteral(reference)})")
+            jointures.append(
+                f"LEFT JOIN qualite.rattachement AS r{rang} "
+                f"ON r{rang}.id_execution = {int(id_execution)} AND r{rang}.id_regle = {regle} "
+                f"AND r{rang}.id_chargement = p.id_chargement "
+                f"AND r{rang}.num_ligne_source = p.num_ligne_source "
+                f"LEFT JOIN {SCHEMA_PROPRE}.{noms[reference]} AS h{rang} "
+                f"ON h{rang}.id_chargement = r{rang}.id_chargement_reference "
+                f"AND h{rang}.num_ligne_source = r{rang}.num_ligne_reference"
+            )
+            conditions.append(f"h{rang}.{COLONNE_RETENUE} = 0")
+        requete = (
+            f"SELECT COUNT(*) FROM dw.{fait} AS f "
+            f"JOIN {SCHEMA_PROPRE}.{noms[table]} AS p "
+            "ON p.id_chargement = f.id_chargement AND p.num_ligne_source = f.num_ligne_source "
+            + "".join(j + " " for j in jointures)
+            + f"WHERE f.{COLONNE_RETENUE} <> CASE WHEN {' OR '.join(conditions)} "
+            "THEN 0 ELSE 1 END"
+        )
+        controles.append(ControleFait(libelle, 0, requete))
+    return controles
+
+
+def _tables_propre(preparation: Preparation) -> dict[str, TablePreparee]:
+    return {p.table.nom: p for p in preparation.tables if p.schema == SCHEMA_PROPRE}
+
+
+def _valeurs_propre(propres: dict[str, TablePreparee], table, colonne):
+    """Valeurs écrites dans propre.table.colonne et sa colonne de données, ou le
+    problème qui l'en empêche (texte)."""
+    if not (_nom_dw(table) and _nom_dw(colonne)):
+        return None, None, "nom de table ou de colonne de propre invalide"
+    preparee = propres.get(table)
+    if preparee is None:
+        return None, None, "table absente de l'écriture"
+    if colonne not in preparee.colonnes:
+        return None, None, "colonne absente de l'écriture"
+    rang = preparee.colonnes.index(colonne)
+    donnees = [c for c in preparee.table.colonnes if c.nom == colonne]
+    return [l[rang] for l in preparee.lignes], (donnees[0] if donnees else None), None
+
+
+def _terme(rang: int, table: str, colonne: str, signe) -> str:
+    nom = f"propre.{table}.{colonne}"
+    if rang == 0:
+        return nom if signe == 1 else f"-{nom}"
+    return f" + {nom}" if signe == 1 else f" - {nom}"
+
+
+def controles_mesures(mesures: list[tuple], dates: list[tuple],
+                      preparation: Preparation) -> list[ControleFait]:
+    """Contrôles des mesures et des dates des faits déclarés par le pack, sans valeur
+    du client, contre les lignes que Python a écrites dans propre (`preparation`).
+
+    `mesures` : (fait, mesure, table de propre, colonne de propre, signe) de
+    dw.contrat_mesure, une mesure calculée ayant une ligne par colonne source. Pour
+    chaque mesure, la somme de la colonne du fait est égale à la somme, affectée du
+    signe, de ses colonnes sources (exacte, un vide ne comptant pas); pour une mesure
+    à une seule source, leurs nombres de valeurs renseignées sont égaux aussi. La
+    somme est masquée à l'affichage si une colonne source est sensible. Enfin, toute
+    colonne numérique (hors int) d'une table de faits doit être déclarée.
+
+    `dates` : (fait, colonne, table de propre, colonne de propre) de dw.contrat_date,
+    pour une date lue sur la ligne même de propre dont le fait a une ligne : aucune
+    ligne du fait dont la clé du calendrier ne désigne pas le jour de propre de même
+    lignage (-1 pour une date vide, un jour hors calendrier étant un écart), puis
+    autant de -1 que de dates vides et aucun -2.
+
+    Un nom qui n'est pas un identifiant simple, un signe autre que 1 ou -1, une table
+    ou une colonne absente de l'écriture ou une date qui n'en est pas une rendent un
+    contrôle impossible (`probleme`).
+    """
+    propres = _tables_propre(preparation)
+    controles = []
+    groupes: dict[tuple, list[tuple]] = {}
+    for fait, mesure, table, colonne, signe in mesures:
+        groupes.setdefault((fait, mesure), []).append((table, colonne, signe))
+    for (fait, mesure), sources in groupes.items():
+        termes = "".join(_terme(r, t, c, s) for r, (t, c, s) in enumerate(sources))
+        libelle = f"dw.{fait}.{mesure} : somme, égale à {termes}"
+        probleme = None
+        if not (_nom_dw(fait) and _nom_dw(mesure)):
+            probleme = "nom de fait ou de mesure invalide"
+        elif any(s not in (1, -1) for _, _, s in sources):
+            probleme = "signe invalide"
+        lues = []
+        for table, colonne, signe in sources:
+            valeurs, donnee, absente = _valeurs_propre(propres, table, colonne)
+            probleme = probleme or absente
+            lues.append((valeurs, donnee, signe))
+        if probleme:
+            controles.append(ControleFait(libelle, None, None, probleme))
+            continue
+        with localcontext() as contexte:
+            contexte.prec = 60
+            somme = sum(
+                (int(signe) * Decimal(v) for valeurs, _, signe in lues for v in valeurs
+                 if v is not None),
+                Decimal(0),
+            )
+        masque = any(d is not None and d.sensible for _, d, _ in lues)
+        controles.append(ControleFait(
+            libelle, somme, f"SELECT COALESCE(SUM({mesure}), 0) FROM dw.{fait}", masque=masque
+        ))
+        if len(sources) == 1:
+            table, colonne, _ = sources[0]
+            controles.append(ControleFait(
+                f"dw.{fait}.{mesure} : valeurs renseignées, comme propre.{table}.{colonne}",
+                sum(1 for v in lues[0][0] if v is not None),
+                f"SELECT COUNT({mesure}) FROM dw.{fait}",
+            ))
+    if mesures:
+        controles.append(ControleFait(
+            "dw : colonnes numériques des faits sans mesure déclarée (dw.contrat_mesure, "
+            "dw.mesure_calculee)",
+            0, REQUETE_MESURES_NON_DECLAREES,
+        ))
+    for fait, colonne, table, source in dates:
+        libelle = f"dw.{fait}.{colonne} : jour du calendrier égal à propre.{table}.{source}"
+        valeurs, donnee, probleme = _valeurs_propre(propres, table, source)
+        if not (_nom_dw(fait) and _nom_dw(colonne)):
+            probleme = "nom de fait ou de colonne invalide"
+        elif probleme is None and (donnee is None or donnee.famille != FAMILLE_DATE):
+            probleme = "colonne de propre qui n'est pas une date"
+        if probleme:
+            controles.append(ControleFait(libelle, None, None, probleme))
+            continue
+        controles.append(ControleFait(
+            libelle + ", lignes en écart",
+            0,
+            f"SELECT COUNT(*) FROM dw.{fait} AS f "
+            f"LEFT JOIN propre.{table} AS p ON p.id_chargement = f.id_chargement "
+            f"AND p.num_ligne_source = f.num_ligne_source "
+            f"LEFT JOIN dw.dim_date AS d ON d.id_date = f.{colonne} "
+            f"WHERE p.id_chargement IS NULL "
+            f"OR (p.{source} IS NULL AND f.{colonne} <> -1) "
+            f"OR (p.{source} IS NOT NULL AND (d.date_jour IS NULL OR d.date_jour <> p.{source}))",
+        ))
+        controles.append(ControleFait(
+            libelle + ", membres -1 / -2",
+            f"{sum(1 for v in valeurs if v is None)} / 0",
+            f"SELECT SUM(CASE WHEN {colonne} = -1 THEN 1 ELSE 0 END), "
+            f"SUM(CASE WHEN {colonne} = -2 THEN 1 ELSE 0 END) FROM dw.{fait}",
+        ))
+    return controles
+
+
+def _nombre_lu(valeur):
+    """Nombre rendu par le serveur : entier tel quel, autre nombre en Decimal, NULL
+    compté comme zéro."""
+    if valeur is None:
+        return 0
+    if isinstance(valeur, int) and not isinstance(valeur, bool):
+        return valeur
+    return valeur_lue(valeur)
+
+
+def controles_tableau_qualite(anomalies: pd.DataFrame, bilans: tuple,
+                              non_evaluables: tuple) -> list[ControleFait]:
+    """Contrôles des tables génériques du tableau qualité (socle, script 005), sans
+    valeur du client.
+
+    `anomalies` : registre après nettoyage (`SortiesQualite.anomalies_nettoyees`);
+    `bilans` et `non_evaluables` : bilans des contrôles et lignes non évaluables,
+    brut puis nettoyé. dw.dim_controle doit avoir un membre par contrôle distinct
+    des deux bilans; dw.fait_anomalie, une ligne par anomalie du registre après
+    nettoyage, chacune reliée à son contrôle (aucun membre -2), les anomalies sans
+    ligne source (les totaux par période) restant sans id_chargement; et
+    dw.fait_bilan_controle, une ligne par contrôle de chaque bilan, reliée à son
+    contrôle, dont les compteurs et les non évaluables retrouvent, état par état,
+    les totaux des sorties du traitement.
+    """
+    from .anomalies import ISSUE_A_ARBITRER, ISSUE_ANOMALIE, ISSUE_INFORMATION
+
+    membres = len({str(c) for bilan in bilans for c in bilan["controle"]})
+    issues = anomalies["issue"].astype(str)
+    par_issue = " / ".join(
+        str(int((issues == issue).sum()))
+        for issue in (ISSUE_ANOMALIE, ISSUE_A_ARBITRER, ISSUE_INFORMATION)
+    )
+    compte_issues = ", ".join(
+        f"COUNT(CASE WHEN issue = N'{issue}' THEN 1 END)"
+        for issue in (ISSUE_ANOMALIE, ISSUE_A_ARBITRER, ISSUE_INFORMATION)
+    )
+    sans_ligne = int(sum(1 for v in anomalies["fichier_source"] if _vide(v)))
+    return [
+        ControleFait("dw.dim_controle : membres (hors membres spéciaux)", membres,
+                     "SELECT COUNT(*) FROM dw.dim_controle WHERE id_controle >= 1"),
+        ControleFait("dw.fait_anomalie : anomalies du registre après nettoyage",
+                     len(anomalies), "SELECT COUNT(*) FROM dw.fait_anomalie"),
+        ControleFait("dw.fait_anomalie : anomalies / à arbitrer / informations", par_issue,
+                     f"SELECT {compte_issues} FROM dw.fait_anomalie"),
+        ControleFait("dw.fait_anomalie : anomalies dont le contrôle est absent de "
+                     "dw.dim_controle (membre -2)", 0,
+                     "SELECT COUNT(*) FROM dw.fait_anomalie WHERE id_controle = -2"),
+        ControleFait("dw.fait_anomalie : anomalies sans ligne source (totaux par période)",
+                     sans_ligne,
+                     "SELECT COUNT(*) FROM dw.fait_anomalie WHERE id_chargement IS NULL"),
+        ControleFait("dw.fait_bilan_controle : lignes (brut / nettoyé)",
+                     " / ".join(str(len(bilan)) for bilan in bilans),
+                     "SELECT COUNT(CASE WHEN etat = N'brut' THEN 1 END), "
+                     "COUNT(CASE WHEN etat = N'nettoyé' THEN 1 END) "
+                     "FROM dw.fait_bilan_controle"),
+        *(ControleFait(
+            f"dw.fait_bilan_controle, état {etat} : contrôlées / anomalies / à arbitrer "
+            "/ informations",
+            " / ".join(str(int(pd.to_numeric(bilan[colonne]).sum()))
+                       for colonne in ("controlees", "anomalies", "a_arbitrer",
+                                       "informations")),
+            "SELECT COALESCE(SUM(controlees), 0), COALESCE(SUM(anomalies), 0), "
+            "COALESCE(SUM(a_arbitrer), 0), COALESCE(SUM(informations), 0) "
+            f"FROM dw.fait_bilan_controle WHERE etat = N'{etat}'",
+        ) for etat, bilan in zip((ETAT_BRUT, ETAT_NETTOYE), bilans)),
+        ControleFait("dw.fait_bilan_controle : non évaluables (brut / nettoyé)",
+                     " / ".join(str(len(lignes)) for lignes in non_evaluables),
+                     "SELECT COALESCE(SUM(CASE WHEN etat = N'brut' "
+                     "THEN non_evaluables END), 0), "
+                     "COALESCE(SUM(CASE WHEN etat = N'nettoyé' "
+                     "THEN non_evaluables END), 0) "
+                     "FROM dw.fait_bilan_controle"),
+        ControleFait("dw.fait_bilan_controle : contrôles absents de dw.dim_controle "
+                     "(membre -2)", 0,
+                     "SELECT COUNT(*) FROM dw.fait_bilan_controle WHERE id_controle = -2"),
+    ]
+
+
+def _obtenu(rangee: tuple):
+    """Valeur obtenue d'un contrôle de fait : un nombre, ou « n / m »."""
+    nombres = [_nombre_lu(v) for v in rangee]
+    return nombres[0] if len(nombres) == 1 else " / ".join(str(_affiche(n)) for n in nombres)
+
+
+def _journal_en_texte(journal) -> str | None:
+    return "; ".join(f"{ordre}. {etape} {lignes}" for ordre, etape, lignes in journal) or None
+
+
+def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
+                 correspondances=None, sorties=None) -> None:
+    """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte, puis
+    ceux des faits déclarés par le pack (`controles_faits`), des codes en doublon
+    qu'il regroupe (`controles_regroupements`), des mesures et des dates des faits
+    (`controles_mesures`) et de leur retenue (`controles_retenue_faits`), enfin ceux
+    des calculs, par le module de vérification de chaque pack (`_verifier_packs`)."""
+    import pyodbc
+
+    from .base import procedure_reconstruction_presente
+
+    curseur = conn.connection.cursor()
+    try:
+        presente = procedure_reconstruction_presente(curseur)
+        appelee = ecriture.journal_dw is not None
+        ajouter(FAMILLE_DW, "procédure dw.reconstruire présente si l'écriture l'a appelée",
+                appelee, presente)
+        if not appelee or not presente:
+            return
+        curseur.execute(
+            "SELECT ordre, etape, lignes FROM dw.journal_reconstruction "
+            "WHERE id_execution = ? ORDER BY ordre",
+            ecriture.id_execution,
+        )
+        lu = [(int(o), e, int(l)) for o, e, l in curseur.fetchall()]
+        ajouter(FAMILLE_DW, f"dw.journal_reconstruction de l'exécution {ecriture.id_execution}",
+                _journal_en_texte(ecriture.journal_dw), _journal_en_texte(lu))
+        try:
+            curseur.execute("EXEC dw.verifier_contrat ?", ecriture.id_execution)
+            while curseur.nextset():
+                pass
+            contrat = CONTRAT_RESPECTE
+        except pyodbc.Error:
+            contrat = CONTRAT_NON_RESPECTE
+        ajouter(FAMILLE_DW, "contrat d'entrée du pack respecté par propre et les rattachements",
+                CONTRAT_RESPECTE, contrat)
+        curseur.execute(REQUETE_FAITS_SOURCES)
+        sources = [tuple(r) for r in curseur.fetchall()]
+        curseur.execute(REQUETE_CONTRATS_FAITS)
+        contrats = [tuple(r) for r in curseur.fetchall()]
+        bilan = None if rattachements is None else rattachements.bilan
+        curseur.execute(REQUETE_REGROUPEMENTS)
+        regroupements = [tuple(r) for r in curseur.fetchall()]
+        curseur.execute(REQUETE_MESURES)
+        mesures = [(f, m, t, c, int(s)) for f, m, t, c, s in curseur.fetchall()]
+        curseur.execute(REQUETE_DATES)
+        dates = [tuple(r) for r in curseur.fetchall()]
+        curseur.execute(REQUETE_RETENUES)
+        retenues = [tuple(r) for r in curseur.fetchall()]
+        controles = controles_faits(sources, contrats, ecriture.lignes, bilan) + \
+            controles_regroupements(regroupements, correspondances, ecriture.id_execution)
+        if ecriture.preparation is not None:
+            controles += controles_mesures(mesures, dates, ecriture.preparation)
+            controles += controles_retenue_faits(sources, retenues, ecriture.preparation,
+                                                 ecriture.id_execution)
+        if sorties is not None:
+            curseur.execute(REQUETE_TABLEAU_QUALITE)
+            if int(curseur.fetchone()[0]) < 3:
+                ajouter(FAMILLE_DW, "tables du tableau qualité (dw.dim_controle, "
+                        "dw.fait_anomalie)", "présentes",
+                        "absentes (script sql/socle/005 non appliqué ?)")
+            else:
+                controles += controles_tableau_qualite(
+                    sorties.anomalies_nettoyees, (sorties.bilan_brut, sorties.bilan_nettoye),
+                    (sorties.non_evaluables_brutes, sorties.non_evaluables_nettoyees),
+                )
+        for controle in controles:
+            if controle.requete is None:
+                ajouter(FAMILLE_DW, controle.libelle, controle.probleme, None)
+                continue
+            curseur.execute(controle.requete)
+            ajouter(FAMILLE_DW, controle.libelle, controle.attendu,
+                    _obtenu(tuple(curseur.fetchone())), controle.masque)
+        _verifier_vues(curseur, ajouter)
+        _verifier_packs(curseur, ecriture, sorties, ajouter)
+    finally:
+        curseur.close()
+
+
+REQUETE_CONTRAT_VUES = "SELECT vue, colonne FROM dw.contrat_vue ORDER BY vue, colonne"
+REQUETE_SOURCES_VUES = "SELECT vue, source FROM dw.source_vue ORDER BY vue"
+REQUETE_COLONNES_VUES = (
+    "SELECT o.name, c.name FROM sys.columns AS c "
+    "JOIN sys.objects AS o ON o.object_id = c.object_id "
+    "WHERE o.schema_id = SCHEMA_ID(N'pbi') AND o.type = N'V'"
+)
+
+
+def _verifier_vues(curseur, ajouter) -> None:
+    """Contrôles de la famille pbi : chaque vue du schéma pbi respecte le contrat avec
+    le rapport (dw.contrat_vue, dw.source_vue, socle script 006). Les colonnes réelles
+    des vues, lues dans sys.columns, doivent être exactement celles déclarées, vue par
+    vue (une colonne ajoutée, retirée ou renommée sort en non conforme avant que le
+    rapport ne casse), et chaque vue doit compter autant de lignes que sa source."""
+    curseur.execute(REQUETE_CONTRAT_VUES)
+    attendues: dict[str, set] = {}
+    for vue, colonne in curseur.fetchall():
+        attendues.setdefault(vue, set()).add(colonne)
+    curseur.execute(REQUETE_COLONNES_VUES)
+    reelles: dict[str, set] = {}
+    for vue, colonne in curseur.fetchall():
+        reelles.setdefault(vue, set()).add(colonne)
+
+    ajouter(FAMILLE_PBI, "vues du schéma pbi déclarées dans dw.contrat_vue",
+            " / ".join(sorted(attendues)), " / ".join(sorted(reelles)))
+    for vue in sorted(attendues):
+        manquantes = attendues[vue] - reelles.get(vue, set())
+        en_trop = reelles.get(vue, set()) - attendues[vue]
+        ecart = "; ".join(
+            partie for partie in (
+                "colonnes manquantes : " + ", ".join(sorted(manquantes)) if manquantes else "",
+                "colonnes en trop : " + ", ".join(sorted(en_trop)) if en_trop else "",
+            ) if partie
+        )
+        ajouter(FAMILLE_PBI, f"pbi.[{vue}] : colonnes conformes au contrat", "", ecart)
+
+    curseur.execute(REQUETE_SOURCES_VUES)
+    for vue, source in curseur.fetchall():
+        objet = source.split(" (")[0]
+        curseur.execute(f"SELECT COUNT(*) FROM pbi.[{vue}]")
+        lignes_vue = int(curseur.fetchone()[0])
+        if vue == "Chantiers":
+            curseur.execute("SELECT COUNT(DISTINCT id_chantier) FROM dw.fait_intervention")
+        else:
+            curseur.execute(f"SELECT COUNT(*) FROM {objet}")
+        ajouter(FAMILLE_PBI, f"pbi.[{vue}] : lignes égales à {source}",
+                int(curseur.fetchone()[0]), lignes_vue)
+
+
+def modules_verification(packs: list[str]) -> list[tuple[str, object]]:
+    """Modules de vérification des calculs (frigeo.packs.<pack>) des packs qui en ont
+    un, dans l'ordre de `packs`."""
+    import importlib
+    import importlib.util
+
+    modules = []
+    for pack in packs:
+        nom = f"{__package__}.packs.{pack}"
+        if importlib.util.find_spec(nom) is not None:
+            modules.append((pack, importlib.import_module(nom)))
+    return modules
+
+
+def _verifier_packs(curseur, ecriture: Ecriture, sorties, ajouter, packs=None) -> None:
+    """Contrôles de la famille calculs : la fonction `verifier` du module de chaque
+    pack de config/base.yaml qui en a un (voir frigeo.packs)."""
+    from .base import lire_packs
+
+    for _, module in modules_verification(lire_packs() if packs is None else packs):
+        module.verifier(
+            curseur, ecriture, sorties,
+            lambda controle, attendu, obtenu, masque=False:
+                ajouter(FAMILLE_CALCULS, controle, attendu, obtenu, masque),
+        )

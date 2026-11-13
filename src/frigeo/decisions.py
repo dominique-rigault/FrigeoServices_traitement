@@ -6,12 +6,15 @@ du nettoyage ne savent pas trancher (une anomalie de cellule non corrigée, un �
 double) est soumis au métier dans un classeur Excel d'arbitrage, puis ses décisions
 sont relues, contrôlées et enregistrées dans un fichier hors du dépôt.
 
-Trois sortes d'éléments (voir `elements_a_arbitrer`) :
+Quatre sortes d'éléments (voir `elements_a_arbitrer`) :
 
 - « cellule » : une anomalie de format, ou un écart « à arbitrer » d'une règle de
   gestion qui porte sur une seule colonne d'une ligne; décisions « corriger » (avec
   la valeur retenue) ou « garder » (la valeur est juste);
 - « ligne » : une ligne en doublon; décisions « retirer » ou « garder »;
+- « code » : une ligne d'un référentiel déclaré `regrouper_codes` dont le code est
+  en doublon d'un autre code (même SIRET par exemple); décisions « rattacher »
+  (avec le code principal en valeur retenue), « garder » ou « retirer »;
 - « écart » : un écart « à arbitrer » d'une règle de gestion qui porte sur
   plusieurs colonnes, ou sur un total de période; décision « garder » (examiné).
 
@@ -62,6 +65,7 @@ from .anomalies import (
     _index_lignage,
     _regle_format,
     _repere,
+    groupe_doublon,
 )
 from .controles import ISSUE_A_ARBITRER, ISSUE_ANOMALIE, _colonnes_de_donnees, _valeur_constatee
 from .dictionnaire import (
@@ -70,7 +74,13 @@ from .dictionnaire import (
     horodater,
     lire_instant,
 )
-from .doublons import SEPARATEUR, _texte
+from .doublons import (
+    CONSTAT_EXACT,
+    SEPARATEUR,
+    _texte,
+    charger_declarations_doublons,
+    codes_a_regrouper,
+)
 from .formulaires import FOND_MODIFIABLE, dossier_formulaires, rendre_modifiable, texte_entier
 from .gestion import (
     CONSTAT_APRES_NORMALISATION,
@@ -86,17 +96,22 @@ from .typage import NATURES_DATE, NATURES_LISIBLES, ecrire_date
 SORTE_CELLULE = "cellule"
 SORTE_LIGNE = "ligne"
 SORTE_ECART = "écart"
-SORTES = (SORTE_CELLULE, SORTE_LIGNE, SORTE_ECART)
+SORTE_CODE = "code"
+SORTES = (SORTE_CELLULE, SORTE_LIGNE, SORTE_ECART, SORTE_CODE)
 
 DECISION_CORRIGER = "corriger"
 DECISION_GARDER = "garder"
 DECISION_RETIRER = "retirer"
-DECISIONS = (DECISION_CORRIGER, DECISION_GARDER, DECISION_RETIRER)
+DECISION_RATTACHER = "rattacher"
+DECISIONS = (DECISION_CORRIGER, DECISION_GARDER, DECISION_RETIRER, DECISION_RATTACHER)
 DECISIONS_PAR_SORTE = {
     SORTE_CELLULE: (DECISION_CORRIGER, DECISION_GARDER),
     SORTE_LIGNE: (DECISION_RETIRER, DECISION_GARDER),
     SORTE_ECART: (DECISION_GARDER,),
+    SORTE_CODE: (DECISION_RATTACHER, DECISION_GARDER, DECISION_RETIRER),
 }
+# Décisions qui portent une valeur retenue (la valeur juste, ou le code principal).
+DECISIONS_AVEC_VALEUR = (DECISION_CORRIGER, DECISION_RATTACHER)
 
 ETAT_SANS_DECISION = "sans décision"
 ETAT_VALABLE = "décision valable"
@@ -200,6 +215,8 @@ CHAMPS_DECISION = (
     "classeur",
 )
 CHAMPS_IMPORT = ("date", "classeur", "periode_fin", "decisions", "remplacees", *DECISIONS)
+# Nombre absent des imports enregistrés avant l'arrivée de cette décision (étape 7.3f).
+CHAMPS_IMPORT_FACULTATIFS = (DECISION_RATTACHER,)
 CHAMPS_RETRAIT = ("date", "periode_fin", "decisions", "identifiants")
 CLES_META = ("structure", "imports", "retraits")
 COLONNES_DECISIONS_LUES = (
@@ -268,7 +285,9 @@ def problemes_decisions(contenu) -> list[str]:
     precedent = None
     for rang, entree in enumerate(imports, start=1):
         ou = f"meta, import {rang}"
-        if not isinstance(entree, dict) or set(entree) != set(CHAMPS_IMPORT):
+        if not isinstance(entree, dict) or set(entree) not in (
+            set(CHAMPS_IMPORT), set(CHAMPS_IMPORT) - set(CHAMPS_IMPORT_FACULTATIFS)
+        ):
             problemes.append(f"{ou} : champs attendus {', '.join(CHAMPS_IMPORT)}")
             continue
         instant = lire_instant(entree["date"])
@@ -323,8 +342,12 @@ def problemes_decisions(contenu) -> list[str]:
         retenue = decision["valeur_retenue"]
         if choix == DECISION_CORRIGER and not _valeur_admise(retenue):
             problemes.append(f"{ou} : valeur retenue absente ou d'un type non admis")
-        if choix != DECISION_CORRIGER and retenue is not None:
-            problemes.append(f"{ou} : valeur retenue donnée sans la décision corriger")
+        if choix == DECISION_RATTACHER and (not isinstance(retenue, str) or not retenue.strip()):
+            problemes.append(f"{ou} : code principal absent (texte attendu)")
+        if choix not in DECISIONS_AVEC_VALEUR and retenue is not None:
+            problemes.append(
+                f"{ou} : valeur retenue donnée sans la décision corriger ou rattacher"
+            )
     return problemes
 
 
@@ -398,6 +421,56 @@ def _sorte(ligne, donnees: pd.DataFrame | None) -> str | None:
             return SORTE_CELLULE
         return SORTE_ECART
     return None
+
+
+def _code_regroupable(ligne, regroupees: dict[str, str]) -> bool:
+    """Ligne de doublon d'un référentiel déclaré `regrouper_codes`, sur des colonnes
+    autres que sa clé (deux codes différents pour une même entité), dont la clé
+    n'est pas masquée."""
+    colonne = regroupees.get(ligne.table)
+    return (
+        colonne is not None
+        and ligne.etape == ETAPE_DOUBLONS
+        and ligne.constat != CONSTAT_EXACT
+        and _texte(ligne.champ) != colonne
+        and _texte(ligne.cle) not in ("", VALEUR_MASQUEE)
+    )
+
+
+def _code(donnees: pd.DataFrame, position: int, colonne: str) -> str | None:
+    """Code d'une ligne (texte sans espaces en bord), None s'il est vide."""
+    texte = _texte(donnees.iloc[position][colonne]).strip()
+    return texte or None
+
+
+def _ordre_lignage(fichier, feuille, numero) -> tuple:
+    return (_texte(fichier), _texte(feuille), int(numero))
+
+
+def _codes_principaux(anomalies: pd.DataFrame, index: dict, regroupees: dict) -> dict:
+    """Code principal proposé pour chaque groupe de codes en doublon : celui de la
+    première ligne du groupe dans l'ordre du lignage (fichier, feuille, numéro de
+    ligne), parmi les lignes retrouvées dont le code n'est pas vide. Clé : (contrôle,
+    numéro du groupe)."""
+    premieres: dict[tuple, tuple] = {}
+    for ligne in anomalies.itertuples(index=False):
+        if not _code_regroupable(ligne, regroupees) or pd.isna(ligne.num_ligne_source):
+            continue
+        groupe = groupe_doublon(ligne.detail)
+        reperes, donnees = index.get(ligne.table, ({}, None))
+        position = reperes.get(
+            _repere(ligne.fichier_source, ligne.feuille_source, ligne.num_ligne_source)
+        )
+        if groupe is None or position is None:
+            continue
+        code = _code(donnees, position, regroupees[ligne.table])
+        if code is None:
+            continue
+        ordre = _ordre_lignage(ligne.fichier_source, ligne.feuille_source, ligne.num_ligne_source)
+        cle = (ligne.controle, groupe)
+        if cle not in premieres or ordre < premieres[cle][0]:
+            premieres[cle] = (ordre, code)
+    return {cle: code for cle, (_, code) in premieres.items()}
 
 
 def _formes_proposees(tables: dict[str, pd.DataFrame], regles_gestion: list):
@@ -474,6 +547,7 @@ def elements_a_arbitrer(
     anomalies: pd.DataFrame,
     decisions: dict | None = None,
     regles_gestion: list | None = None,
+    declarations: dict | None = None,
 ) -> pd.DataFrame:
     """Éléments soumis au métier, avec l'état de leur décision.
 
@@ -484,17 +558,20 @@ def elements_a_arbitrer(
 
     Éléments retenus, dans l'ordre de la table des anomalies : les anomalies de
     l'étape format (cellule); les lignes en doublon, anomalies ou à arbitrer
-    (ligne); les écarts « à arbitrer » de l'étape gestion, cellule s'ils portent
-    sur une seule colonne d'une ligne repérée, écart sinon. Les autres anomalies de
-    gestion et les informations n'en font pas partie.
+    (ligne, ou code pour un doublon hors de la clé d'un référentiel déclaré
+    `regrouper_codes` dans `declarations`, bloc `doublons` de config/controles.yaml
+    par défaut, quand la ligne a un code et qu'il n'est pas masqué); les écarts
+    « à arbitrer » de l'étape gestion, cellule s'ils portent sur une seule colonne
+    d'une ligne repérée, écart sinon. Les autres anomalies de gestion et les
+    informations n'en font pas partie.
 
     La valeur affichée est lue dans la table par le lignage, y compris pour une
     colonne sensible : ce tableau porte des valeurs du client et ne doit pas être
     affiché. `empreinte` est le hachage de la valeur de la cellule (cellule), de
-    la ligne hors lignage (ligne), ou des valeurs de l'écart (écart : valeurs des
-    colonnes citées, lues dans la table; si l'une est d'une table liée, celles de
-    la table et la valeur de la table des anomalies; sans lignage, la valeur et la
-    clé de la table des anomalies).
+    la ligne hors lignage (ligne ou code), ou des valeurs de l'écart (écart :
+    valeurs des colonnes citées, lues dans la table; si l'une est d'une table liée,
+    celles de la table et la valeur de la table des anomalies; sans lignage, la
+    valeur et la clé de la table des anomalies).
 
     `etat_decision` : « sans décision », « décision caduque » (une décision existe
     pour cet identifiant, mais l'empreinte ou la sorte a changé), « décision
@@ -510,7 +587,9 @@ def elements_a_arbitrer(
     config/gestion.yaml par défaut) donne le référentiel de chaque règle. Une
     anomalie de nature sur une colonne de date, sans proposition, reçoit la date lue
     mois puis jour quand la valeur est impossible lue jour puis mois mais valide lue
-    mois puis jour (`date_inversee_proposee`).
+    mois puis jour (`date_inversee_proposee`). Une ligne de sorte code reçoit le code
+    principal proposé, celui de la première ligne de son groupe dans l'ordre du
+    lignage, s'il n'est pas le sien.
     """
     manquantes = [c for c in COLONNES_ANOMALIES if c not in anomalies.columns]
     if manquantes:
@@ -522,11 +601,15 @@ def elements_a_arbitrer(
     enregistrees = decisions["decisions"]
     if regles_gestion is None:
         regles_gestion = charger_regles_gestion()
+    if declarations is None:
+        declarations = charger_declarations_doublons()
+    regroupees = codes_a_regrouper(declarations)
     forme_proposee = _formes_proposees(tables, regles_gestion)
     index = {}
     for table, donnees in tables.items():
         donnees = donnees.reset_index(drop=True)
         index[table] = (_index_lignage(donnees), donnees)
+    principaux = _codes_principaux(anomalies, index, regroupees)
 
     lignes = []
     for ligne in anomalies.itertuples(index=False):
@@ -540,6 +623,12 @@ def elements_a_arbitrer(
                 _repere(ligne.fichier_source, ligne.feuille_source, ligne.num_ligne_source)
             )
         valeur, empreinte, proposition = ligne.valeur, None, ligne.proposition
+        if position is not None and sorte == SORTE_LIGNE and _code_regroupable(ligne, regroupees):
+            code = _code(donnees, position, regroupees[ligne.table])
+            if code is not None:
+                sorte = SORTE_CODE
+                principal = principaux.get((ligne.controle, groupe_doublon(ligne.detail)))
+                proposition = principal if principal not in (None, code) else None
         if position is not None:
             source = donnees.iloc[position]
             if (
@@ -559,7 +648,7 @@ def elements_a_arbitrer(
                 nature = _texte(ligne.regle)[len(PREFIXE_NATURE):]
                 proposition = date_inversee_proposee(source[ligne.champ], nature) or proposition
             colonnes = _colonnes_locales(ligne.champ, donnees)
-            if sorte == SORTE_LIGNE:
+            if sorte in (SORTE_LIGNE, SORTE_CODE):
                 empreinte = _empreinte(
                     f"{c}={_forme(source[c])}" for c in _colonnes_de_donnees(donnees)
                 )
@@ -666,7 +755,8 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
         f"Période de fin : {periode_fin}. Classeur généré le {date.today():%d/%m/%Y}.",
         f"Contenu : {texte_entier(len(elements))} lignes dans la feuille "
         f"« {FEUILLE_ARBITRAGE} », dont {texte_entier(par_sorte[SORTE_CELLULE])} cellules, "
-        f"{texte_entier(par_sorte[SORTE_LIGNE])} lignes et "
+        f"{texte_entier(par_sorte[SORTE_LIGNE])} lignes, "
+        f"{texte_entier(par_sorte[SORTE_CODE])} codes et "
         f"{texte_entier(par_sorte[SORTE_ECART])} écarts; {texte_entier(caduques)} lignes "
         "avaient une décision devenue caduque (la donnée a changé depuis).",
         REPERE_IMPORTS,
@@ -682,12 +772,23 @@ def _mode_emploi(periode_fin: str, elements: pd.DataFrame) -> list[str]:
         "normal; elle ne sera plus proposée tant qu'elle ne change pas).",
         "ligne : retirer (la ligne est retirée des données nettoyées) ou garder (la "
         "ligne est à conserver telle quelle).",
+        "code : la ligne d'un référentiel (client, fournisseur) dont le code semble "
+        "désigner la même entité qu'un autre code (même SIRET par exemple). rattacher "
+        "(c'est la même entité : écrire son code principal dans la colonne "
+        "valeur_retenue; les chiffres du code de la ligne seront comptés avec ceux du "
+        "code principal, et la ligne reste dans les données nettoyées), garder (c'est "
+        "une autre entité, ou c'est la ligne du code principal) ou retirer (la ligne "
+        "est retirée des données nettoyées). Dans un groupe, choisir garder pour la "
+        "ligne du code principal et rattacher pour les autres. Un code principal ne "
+        "peut pas être lui-même rattaché à un autre code.",
         "écart : garder (l'écart a été examiné; il ne sera plus proposé tant que les "
         "valeurs ne changent pas).",
         "La colonne valeur_retenue est préremplie avec la correction proposée par "
         "l'outil quand il en propose une : la vérifier avant de choisir corriger. Elle "
-        "n'est lue qu'avec la décision corriger. Pour une clé écrite autrement que dans "
-        "son référentiel (constat « trouvée après normalisation seulement »), c'est la "
+        "n'est lue qu'avec les décisions corriger et rattacher. Pour une ligne de sorte "
+        "code, c'est le code de la première ligne du groupe (dans l'ordre des fichiers "
+        "et des lignes), proposé comme code principal. Pour une clé écrite autrement "
+        "que dans son référentiel (constat « trouvée après normalisation seulement »), c'est la "
         "forme du référentiel, y compris sur une colonne sensible. Pour une date "
         "impossible lue jour puis mois mais valide lue mois puis jour, c'est cette date, "
         "le jour et le mois étant sans doute inversés.",
@@ -776,7 +877,7 @@ def exporter_arbitrage(
         proposition = element["proposition"]
         prerempli = (
             proposition
-            if element["sorte"] == SORTE_CELLULE
+            if element["sorte"] in (SORTE_CELLULE, SORTE_CODE)
             and not _est_vide(proposition)
             and proposition != VALEUR_MASQUEE
             else None
@@ -937,7 +1038,10 @@ def importer_arbitrage(
     le numéro de ligne Excel : décision hors menu, décision qui ne convient pas à
     la sorte, « corriger » sans valeur retenue, valeur retenue illisible dans la
     nature de sa colonne, identifiant absent ou en double, colonne inconnue du
-    dictionnaire, deux corrections différentes d'une même cellule. Les
+    dictionnaire, deux corrections différentes d'une même cellule, « rattacher »
+    sans code principal ou au code de la ligne elle-même, un même code rattaché à
+    deux codes principaux différents, un code principal lui-même rattaché dans le
+    classeur. L'existence du code principal est vérifiée au nettoyage. Les
     avertissements (valeur retenue ou commentaire ignorés) ne bloquent pas.
     """
     chemin = Path(chemin)
@@ -960,6 +1064,7 @@ def importer_arbitrage(
     problemes, avertissements, decisions = [], [], []
     vus: dict[str, int] = {}
     corrections: dict[tuple, tuple[int, object]] = {}
+    rattachements: dict[tuple, tuple[int, str]] = {}
     for numero, ligne in lignes:
         ou = f"ligne {numero}"
         identifiant = _choix(ligne["id_anomalie"])
@@ -1021,6 +1126,23 @@ def importer_arbitrage(
                 )
                 continue
             corrections[cellule] = (numero, retenue)
+        elif choix == DECISION_RATTACHER:
+            retenue = unicodedata.normalize("NFC", _texte(ligne["valeur_retenue"])).strip()
+            propre = _texte(ligne["cle"]).strip()
+            if not retenue:
+                problemes.append(f"{ou} : décision rattacher sans code principal")
+                continue
+            if retenue == propre:
+                problemes.append(f"{ou} : le code principal est le code de la ligne elle-même")
+                continue
+            code = (table, propre)
+            if code in rattachements and rattachements[code][1] != retenue:
+                problemes.append(
+                    f"{ou} : le même code est rattaché à un autre code principal ligne "
+                    f"{rattachements[code][0]}"
+                )
+                continue
+            rattachements[code] = (numero, retenue)
         elif not _est_vide(ligne["valeur_retenue"]) and _texte(ligne["valeur_retenue"]) != _texte(
             ligne["proposition"]
         ):
@@ -1046,6 +1168,12 @@ def importer_arbitrage(
         )
         if not decisions[-1]["empreinte"]:
             problemes.append(f"{ou} : empreinte absente (colonne empreinte masquée)")
+    for (table, propre), (numero, principal) in rattachements.items():
+        if (table, principal) in rattachements:
+            problemes.append(
+                f"ligne {numero} : le code principal est lui-même rattaché à un autre code "
+                f"ligne {rattachements[(table, principal)][0]}"
+            )
     if problemes:
         raise ValueError(
             f"Classeur d'arbitrage invalide ({chemin}), {len(problemes)} problèmes\n  "

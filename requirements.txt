@@ -7,4 +7,6 @@ pyyaml
 charset-normalizer
 nbstripout
 pytest
+pyodbc
+sqlalchemy
 -e .

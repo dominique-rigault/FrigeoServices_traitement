@@ -13,6 +13,10 @@ __pycache__/
 .ipynb_checkpoints/
 *.pyc
 
+# Power BI : seul le modèle .pbit (sans données) est versionné
+powerbi/*
+!powerbi/*.pbit
+
 # Divers
 .vscode/settings.json
 *.egg-info/

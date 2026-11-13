@@ -12,6 +12,7 @@ from frigeo.doublons import (
     COLONNES_NON_CHERCHES,
     _signatures_des_lignes,
     charger_declarations_doublons,
+    codes_a_regrouper,
     detecter_doublons,
     doublons_non_cherches,
     normaliser,
@@ -547,3 +548,31 @@ def test_problemes_de_la_table_des_lignes():
     assert problemes_declarations_doublons(
         {"e": {"cle": ["num"], "table_des_lignes": "l"}, "l": lignes}
     ) == []
+
+
+def test_problemes_de_regrouper_codes():
+    declarations = {
+        "a": {"cle": ["code"], "unique": [["siret"]], "regrouper_codes": False},
+        "b": {"unique": [["siret"]], "regrouper_codes": True},
+        "c": {"cle": ["code", "n"], "unique": [["siret"]], "regrouper_codes": True},
+        "d": {"cle": ["code"], "identique_hors_cle": False, "regrouper_codes": True},
+        "e": {"cle": ["num"], "table_des_lignes": "f", "regrouper_codes": True},
+        "f": {"cle": ["num", "n"]},
+    }
+    problemes = problemes_declarations_doublons(declarations)
+    assert problemes == [
+        "a, regrouper_codes : la valeur attendue est true (pour ne pas regrouper, retirer "
+        "la ligne)",
+        "b, regrouper_codes : sans clé déclarée, il n'y a pas de code à regrouper",
+        "c, regrouper_codes : la clé doit tenir sur une seule colonne (un code)",
+        "d, regrouper_codes : aucun constat ne peut proposer de regroupement (déclarer "
+        "unique ou presume_unique, ou chercher les lignes identiques hors clé)",
+        "e, regrouper_codes : sans objet pour une table d'en-têtes de documents",
+    ]
+    valides = {
+        "clients": {"cle": ["code"], "unique": [["siret"]], "regrouper_codes": True},
+        "fournisseurs": {"cle": ["code"], "regrouper_codes": True},
+        "autres": {"cle": ["code"]},
+    }
+    assert problemes_declarations_doublons(valides) == []
+    assert codes_a_regrouper(valides) == {"clients": "code", "fournisseurs": "code"}
