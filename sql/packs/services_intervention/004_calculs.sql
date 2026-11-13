@@ -15,8 +15,9 @@
   construction par dw.verifier_parametres, contre les valeurs admises des
   listes fermées du dictionnaire (qualite.valeur_liste) : une valeur
   renommée par le métier fait échouer l'exécution, au lieu de vider
-  silencieusement un calcul. Pour un autre client, ce sont les premières
-  lignes du pack à revoir.
+  silencieusement un calcul. dw.verifier_parametres contrôle de même le
+  libellé de référence des articles (dw.libelle_article, script 002). Pour
+  un autre client, ce sont les premières lignes du pack à revoir.
 
   Chantiers : un chantier sur plusieurs jours (installation) n'a pas
   d'identifiant dans les fichiers. Il se reconnaît à sa facture : une seule
@@ -185,7 +186,8 @@ GO
 /* Vérifie les paramètres de calcul pour une exécution : valeur d'une liste
    absente des valeurs admises de qualite.valeur_liste, date invalide, type
    de contrat admis sans taux de charges, taux déclaré pour un type de contrat
-   qui n'est pas admis. Lève une erreur qui liste tous les écarts, par
+   qui n'est pas admis, code article admis sans libellé de référence,
+   libellé déclaré pour un code article qui n'est pas admis. Lève une erreur qui liste tous les écarts, par
    paramètre, sans valeur; sinon inscrit l'étape dans le journal. */
 CREATE PROCEDURE dw.verifier_parametres
     @id_execution int
@@ -234,6 +236,23 @@ BEGIN
                           WHERE a.table_source = N'intervenants'
                             AND a.colonne_source = N'type_contrat'
                             AND a.valeur = t.type_contrat COLLATE Latin1_General_100_BIN2)
+        UNION ALL
+        SELECT 4, a.valeur,
+               N'code article admis de factures_lignes.code_article sans libellé de référence '
+               + N'(dw.libelle_article)'
+        FROM admis AS a
+        WHERE a.table_source = N'factures_lignes' AND a.colonne_source = N'code_article'
+          AND NOT EXISTS (SELECT 1 FROM dw.libelle_article AS l
+                          WHERE l.code_article = a.valeur COLLATE Latin1_General_100_BIN2)
+        UNION ALL
+        SELECT 5, l.code_article COLLATE DATABASE_DEFAULT,
+               N'libellé de référence déclaré pour un code article absent des valeurs admises '
+               + N'de factures_lignes.code_article'
+        FROM dw.libelle_article AS l
+        WHERE NOT EXISTS (SELECT 1 FROM admis AS a
+                          WHERE a.table_source = N'factures_lignes'
+                            AND a.colonne_source = N'code_article'
+                            AND a.valeur = l.code_article COLLATE Latin1_General_100_BIN2)
     )
     INSERT INTO @ecarts (texte)
     SELECT texte FROM constats ORDER BY rang, objet;
@@ -255,7 +274,8 @@ BEGIN
 
     DECLARE @lignes int =
         (SELECT COUNT(*) FROM dw.parametre_calcul)
-        + (SELECT COUNT(*) FROM dw.parametre_taux_charges);
+        + (SELECT COUNT(*) FROM dw.parametre_taux_charges)
+        + (SELECT COUNT(*) FROM dw.libelle_article);
     EXEC dw.inscrire_etape @id_execution, N'paramètres de calcul', @lignes, @debut;
 END;
 GO

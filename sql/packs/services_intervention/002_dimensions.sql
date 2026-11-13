@@ -49,7 +49,6 @@ INSERT INTO dw.contrat_entree (table_propre, colonne, famille) VALUES
     (N'clients', N'date_fin_relation', N'date'),
     (N'clients', N'statut', N'texte'),
     (N'factures_lignes', N'code_article', N'texte'),
-    (N'factures_lignes', N'libelle', N'texte'),
     (N'fec', N'compte_num', N'texte'),
     (N'fec', N'compte_lib', N'texte'),
     (N'fournisseurs', N'code_fournisseur', N'texte'),
@@ -209,7 +208,32 @@ BEGIN
 END;
 GO
 
-/* Articles facturés (main d'œuvre, déplacement, forfaits) : codes distincts de factures_lignes.code_article, aucun référentiel ne les décrivant. Le compte de produit d'un article n'apparaît nulle part ligne à ligne. */
+/* Libellé de référence de chaque article facturé : valeur propre au client,
+   tirée de sa grille tarifaire, aucun fichier ne décrivant les articles (le
+   libellé d'une ligne de facture varie : désignation de la pièce, date de la
+   visite). Vérifiée avant toute construction par dw.verifier_parametres
+   (script 004) contre les valeurs admises de factures_lignes.code_article :
+   un code admis sans libellé, ou un libellé pour un code inconnu, fait échouer
+   l'exécution. Pour un autre client, c'est sa grille qui remplace celle-ci. */
+CREATE TABLE dw.libelle_article (
+    code_article  nvarchar(450)   COLLATE Latin1_General_100_BIN2 NOT NULL,
+    libelle       nvarchar(4000)  NOT NULL,
+    CONSTRAINT pk_libelle_article PRIMARY KEY (code_article)
+);
+GO
+
+INSERT INTO dw.libelle_article (code_article, libelle) VALUES
+    (N'MO-STD', N'Main d''oeuvre heure normale'),
+    (N'MO-URG', N'Main d''oeuvre urgence (soir, samedi, férié)'),
+    (N'DEPL', N'Forfait déplacement'),
+    (N'CTRL-F', N'Forfait contrôle d''étanchéité'),
+    (N'PREV-F', N'Visite préventive sous contrat (déplacement inclus)'),
+    (N'INST-F', N'Forfait installation et mise en service'),
+    (N'PIECE', N'Pièces détachées (libellé variable)'),
+    (N'FLUIDE', N'Fluide frigorigène');
+GO
+
+/* Articles facturés (main d'œuvre, déplacement, forfaits) : codes distincts de factures_lignes.code_article, avec le libellé de référence de dw.libelle_article (NULL pour un code hors des valeurs admises, déjà signalé dans qualite). Le compte de produit d'un article n'apparaît nulle part ligne à ligne. */
 CREATE TABLE dw.dim_article (
     id_article          int             NOT NULL,
     code_article        nvarchar(450)   COLLATE Latin1_General_100_BIN2 NOT NULL,
@@ -231,28 +255,15 @@ BEGIN
     VALUES (-1, N'(non renseigné)', NULL),
            (-2, N'(introuvable)', NULL);
 
-    /* Libellé le plus fréquent de chaque code (un libellé vide ne compte pas, à
-       égalité le premier dans l'ordre binaire). */
-    WITH frequences AS (
-        SELECT p.code_article COLLATE Latin1_General_100_BIN2 AS code,
-               p.libelle COLLATE Latin1_General_100_BIN2 AS libelle,
-               COUNT(*) AS lignes
+    WITH codes AS (
+        SELECT DISTINCT p.code_article COLLATE Latin1_General_100_BIN2 AS code
         FROM propre.factures_lignes AS p
         WHERE p.code_article IS NOT NULL
-        GROUP BY p.code_article COLLATE Latin1_General_100_BIN2, p.libelle COLLATE Latin1_General_100_BIN2
-    ),
-    rangs AS (
-        SELECT code, libelle,
-               ROW_NUMBER() OVER (
-                   PARTITION BY code
-                   ORDER BY CASE WHEN libelle IS NULL THEN 1 ELSE 0 END,
-                            lignes DESC, libelle) AS rang
-        FROM frequences
     )
     INSERT INTO dw.dim_article (id_article, code_article, libelle)
-    SELECT ROW_NUMBER() OVER (ORDER BY code), code, libelle
-    FROM rangs
-    WHERE rang = 1;
+    SELECT ROW_NUMBER() OVER (ORDER BY c.code), c.code, l.libelle
+    FROM codes AS c
+    LEFT JOIN dw.libelle_article AS l ON l.code_article = c.code;
 
     DECLARE @lignes int = @@ROWCOUNT;
     EXEC dw.inscrire_etape @id_execution, N'dim_article', @lignes, @debut;
