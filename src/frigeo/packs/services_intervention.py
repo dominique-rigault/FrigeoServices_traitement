@@ -47,12 +47,16 @@ les lignes de facture et le CA. L'égalité est exacte pour des montants au cent
 le CA de chaque intervention étant arrondi au centime, des montants plus fins
 donneraient un écart d'arrondi.
 
+Période chargée (`bornes_periode_chargee`) : dans dw.dim_date, periode_chargee
+vaut 1 jusqu'au dernier jour du mois de la période de fin, 0 au-delà, sans vide.
+
 Aucune valeur du client n'est affichée : seulement des décomptes et des dates de
 paramètres.
 """
 
 from __future__ import annotations
 
+from datetime import date, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Callable
 
@@ -66,6 +70,12 @@ TYPE_STOCK = "solde_jamais_negatif"
 
 REQUETE_PARAMETRES = "SELECT cle, valeur FROM dw.parametre_calcul ORDER BY cle"
 REQUETE_PERIODE = "SELECT periode_fin FROM qualite.execution WHERE id_execution = ?"
+REQUETE_CALENDRIER = (
+    "SELECT CONVERT(char(10), MAX(CASE WHEN periode_chargee = 1 THEN date_jour END), 23), "
+    "CONVERT(char(10), MIN(CASE WHEN periode_chargee = 0 THEN date_jour END), 23), "
+    "SUM(CASE WHEN date_jour IS NOT NULL AND periode_chargee IS NULL THEN 1 ELSE 0 END) "
+    "FROM dw.dim_date"
+)
 REQUETE_CUMP = (
     "SELECT p.ref_piece, k.mois, k.stock_debut, k.cump_debut, k.quantite_achetee, "
     "k.valeur_achats, k.quantite_consommee, k.stock_fin, k.cump_fin "
@@ -689,6 +699,15 @@ def dates_stock_initial(regles: list) -> list[str]:
     return sorted(dates)
 
 
+
+def bornes_periode_chargee(periode_fin: str) -> str:
+    """Dernier jour de la période chargée et premier jour après (AAAA-MM-JJ), pour une
+    période de fin AAAA-MM."""
+    annee, mois = int(periode_fin[:4]), int(periode_fin[5:7])
+    suivant = date(annee + mois // 12, mois % 12 + 1, 1)
+    return f"{(suivant - timedelta(days=1)).isoformat()} / {suivant.isoformat()}"
+
+
 # --- Vérification ----------------------------------------------------------------
 
 
@@ -705,6 +724,15 @@ def verifier(curseur, ecriture, sorties, ajouter: Callable, regles: list | None 
     ajouter("date du stock initial de dw.parametre_calcul égale à celle de la règle de stock "
             "de config/gestion.yaml", " / ".join(dates) or None,
             parametres.get("date_stock_initial"))
+
+    curseur.execute(REQUETE_PERIODE, ecriture.id_execution)
+    periode = curseur.fetchall()
+    curseur.execute(REQUETE_CALENDRIER)
+    bornes = curseur.fetchall()[0]
+    ajouter("dw.dim_date : dernier jour de la période chargée / premier jour après / "
+            "jours sans valeur",
+            f"{bornes_periode_chargee(str(periode[0][0]))} / 0" if periode else None,
+            " / ".join("" if v is None else str(v).strip() for v in bornes))
 
     libelle = ("dw.fait_intervention : interventions dont le chantier, le rang du jour ou le "
                "nombre de jours diffère du recalcul")

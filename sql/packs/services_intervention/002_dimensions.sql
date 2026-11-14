@@ -75,7 +75,10 @@ GO
   calculé à partir du lundi 1er janvier 1900, sans dépendre des réglages de
   langue du serveur (1 lundi, 7 dimanche). Jours fériés de qualite.jour_ferie :
   pour une année dont les jours fériés ne sont pas déclarés, ferie et ouvre
-  restent vides plutôt que faux.
+  restent vides plutôt que faux. periode_chargee vaut 1 jusqu'au dernier jour
+  du mois de periode_fin, 0 au-delà : les tableaux de bord filtrent dessus, pour
+  que les mois sans données et la comparaison à l'année précédente s'arrêtent à
+  la période chargée.
 */
 CREATE TABLE dw.dim_date (
     id_date          int            NOT NULL,
@@ -91,6 +94,7 @@ CREATE TABLE dw.dim_date (
     feries_declares  bit            NULL,
     ferie            bit            NULL,
     ouvre            bit            NULL,
+    periode_chargee  bit            NULL,
     CONSTRAINT pk_dim_date PRIMARY KEY (id_date),
     INDEX ux_dim_date_jour UNIQUE (date_jour) WHERE date_jour IS NOT NULL
 );
@@ -114,6 +118,11 @@ BEGIN
     ), @annee_fin - 1);
     DECLARE @premier date = DATEFROMPARTS(@annee_debut, 1, 1);
     DECLARE @dernier date = DATEFROMPARTS(@annee_fin, 12, 31);
+    DECLARE @fin_chargee date = (
+        SELECT EOMONTH(DATEFROMPARTS(CAST(LEFT(periode_fin, 4) AS int),
+                                     CAST(RIGHT(periode_fin, 2) AS int), 1))
+        FROM qualite.execution WHERE id_execution = @id_execution
+    );
 
     DELETE FROM dw.dim_date;
     INSERT INTO dw.dim_date (id_date, libelle) VALUES
@@ -142,7 +151,8 @@ BEGIN
         FROM jours AS j
     )
     INSERT INTO dw.dim_date (id_date, date_jour, libelle, annee, trimestre, mois, libelle_mois,
-                             annee_mois, jour_semaine, libelle_jour, feries_declares, ferie, ouvre)
+                             annee_mois, jour_semaine, libelle_jour, feries_declares, ferie, ouvre,
+                             periode_chargee)
     SELECT annee * 10000 + mois * 100 + DAY(jour),
            jour,
            CONVERT(nvarchar(10), jour, 103),
@@ -158,7 +168,8 @@ BEGIN
            declares,
            CASE WHEN declares = 1 THEN est_ferie END,
            CASE WHEN declares = 1 THEN
-               CASE WHEN jour_semaine <= 5 AND est_ferie = 0 THEN 1 ELSE 0 END END
+               CASE WHEN jour_semaine <= 5 AND est_ferie = 0 THEN 1 ELSE 0 END END,
+           CASE WHEN jour <= @fin_chargee THEN 1 ELSE 0 END
     FROM feries;
 
     DECLARE @lignes int = @@ROWCOUNT;

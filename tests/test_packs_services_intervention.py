@@ -7,6 +7,7 @@ import pandas as pd
 from frigeo.ecriture_base import modules_verification
 from frigeo.packs.services_intervention import (
     achats_retenus,
+    bornes_periode_chargee,
     chantiers_attendus,
     comparer_chantiers,
     consommations,
@@ -212,13 +213,15 @@ class _Curseur:
     """Faux curseur : rend, pour chaque requête, les lignes de la première table citée."""
 
     def __init__(self, parametres, chantiers, cump=(), couts=(), marges=(), periode="2025-02",
-                 rapprochement=((Decimal(0), None, None, None, None),)):
+                 rapprochement=((Decimal(0), None, None, None, None),),
+                 calendrier=(("2025-02-28", "2025-03-01", 0),)):
         self.resultats = {
             "dw.fait_ligne_facture": list(rapprochement),
             "dw.parametre_taux_charges": [("CDI", "taux_charges_cdi_cdd")],
             "dw.parametre_calcul": parametres, "dw.cump_mensuel": list(cump),
             "dw.fait_consommation": list(couts), "cout_salarial": list(marges),
             "dw.fait_intervention": chantiers, "qualite.execution": [(periode,)],
+            "dw.dim_date": list(calendrier),
         }
         self.courant = None
 
@@ -245,20 +248,22 @@ def test_verifier():
     regles = [{"type": "solde_jamais_negatif", "date_initial": dt.date(2025, 1, 1)}]
     verifier(curseur, ecriture, sorties, lambda *c: controles.append(c), regles)
     assert [c[1:3] for c in controles] == [
-        ("2025-01-01", "2025-01-01"), (0, 0), ("0 / 0", "0 / 0"),
+        ("2025-01-01", "2025-01-01"),
+        ("2025-02-28 / 2025-03-01 / 0", "2025-02-28 / 2025-03-01 / 0"),
+        (0, 0), ("0 / 0", "0 / 0"),
         (2, 2), (0, 0), (0, 0), ("aucun", "aucun"), (Decimal(0), Decimal(0)),
         (0, 0), ("intervenant non rattaché 1", "intervenant non rattaché 1"), (0, 0),
         (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)),
         (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)),
         (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)), ("0 / 0 / 0 / 0", "0 / 0 / 0 / 0"),
     ]
-    assert controles[12][3] is True  # coût salarial total masqué
+    assert controles[13][3] is True  # coût salarial total masqué
     # Un CUMP qui diffère d'un mois sort en écart.
     cump[1] = cump[1][:-1] + (Decimal("10.4"),)
     controles.clear()
     verifier(_Curseur(list(PARAMETRES.items()), [], cump, (), marges), ecriture, sorties,
              lambda *c: controles.append(c), regles)
-    assert controles[4][1:] == (0, 1)
+    assert controles[5][1:] == (0, 1)
 
 
 def test_verifier_sans_rattachements():
@@ -267,8 +272,24 @@ def test_verifier_sans_rattachements():
     ecriture = SimpleNamespace(preparation=_preparation(), id_execution=1)
     verifier(curseur, ecriture, None, lambda *c: controles.append(c), [])
     assert controles[0][1:] == (None, "2025-01-01")
-    assert controles[1][1:] == ("rattachements absents", None)
-    assert len(controles) == 2
+    assert controles[1][1] == controles[1][2]
+    assert controles[2][1:] == ("rattachements absents", None)
+    assert len(controles) == 3
+
+
+def test_bornes_periode_chargee():
+    assert bornes_periode_chargee("2026-03") == "2026-03-31 / 2026-04-01"
+    assert bornes_periode_chargee("2025-12") == "2025-12-31 / 2026-01-01"
+    assert bornes_periode_chargee("2024-02") == "2024-02-29 / 2024-03-01"
+
+
+def test_verifier_periode_chargee_ecart():
+    curseur = _Curseur(list(PARAMETRES.items()), [],
+                       calendrier=(("2025-03-31", "2025-04-01", 1),))
+    controles = []
+    ecriture = SimpleNamespace(preparation=_preparation(), id_execution=1)
+    verifier(curseur, ecriture, None, lambda *c: controles.append(c), [])
+    assert controles[1][1:] == ("2025-02-28 / 2025-03-01 / 0", "2025-03-31 / 2025-04-01 / 1")
 
 
 # --- CUMP et coût des pièces -----------------------------------------------------

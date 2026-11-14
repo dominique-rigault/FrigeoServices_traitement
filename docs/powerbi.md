@@ -132,6 +132,14 @@ sans table de dates marquée; les tableaux de bord de l'étape 8 marquent le
 Calendrier (*Outils de table > Marquer comme table de dates*, colonne
 [Date]) pour les fonctions de comparaison temporelle (SAMEPERIODLASTYEAR).
 
+La colonne `Période chargée` (Vrai jusqu'au dernier jour du mois de la
+période de fin, faux au-delà) sert de filtre de niveau rapport aux tableaux
+de bord : le Calendrier va jusqu'au 31 décembre de l'année qui suit la
+période de fin, pour les échéances, et sans ce filtre les mois sans données
+apparaîtraient sur les axes et l'année en cours serait comparée à toute
+l'année précédente. Elle est calculée dans la base et contrôlée par la
+vérification (famille calculs).
+
 ## Vérifier les indicateurs
 
 Des mesures DAX simples suffisent à comparer aux valeurs de référence (aucune

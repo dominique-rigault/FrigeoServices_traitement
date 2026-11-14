@@ -39,7 +39,8 @@ SELECT id_date AS [Clé date],
        libelle_jour AS [Nom du jour],
        feries_declares AS [Jours fériés déclarés],
        ferie AS [Férié],
-       ouvre AS [Ouvré]
+       ouvre AS [Ouvré],
+       periode_chargee AS [Période chargée]
 FROM dw.dim_date
 WHERE id_date > 0; -- sans les membres -1 et -2, pour marquer la table de dates
 GO
@@ -315,6 +316,7 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Calendrier', N'Jours fériés déclarés'),
     (N'Calendrier', N'Férié'),
     (N'Calendrier', N'Ouvré'),
+    (N'Calendrier', N'Période chargée'),
     (N'Catégories d''intervention', N'Clé catégorie'),
     (N'Catégories d''intervention', N'Catégorie'),
     (N'Articles facturés', N'Clé article'),
