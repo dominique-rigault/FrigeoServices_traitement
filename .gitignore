@@ -13,9 +13,10 @@ __pycache__/
 .ipynb_checkpoints/
 *.pyc
 
-# Power BI : seul le modèle .pbit (sans données) est versionné
+# Power BI : seuls les modèles .pbit (sans données) et le thème sont versionnés
 powerbi/*
 !powerbi/*.pbit
+!powerbi/frigeo_theme.json
 
 # Divers
 .vscode/settings.json

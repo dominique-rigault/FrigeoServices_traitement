@@ -1,0 +1,38 @@
+{
+  "name": "Frigéo sobre",
+  "dataColors": ["#2E7D1E", "#3B6FB6", "#B9731F", "#C2416B", "#6E57C9", "#A3ABA6"],
+  "foreground": "#212529",
+  "foregroundNeutralSecondary": "#5F6B66",
+  "foregroundNeutralTertiary": "#8A948F",
+  "background": "#FFFFFF",
+  "backgroundLight": "#F4F8F0",
+  "backgroundNeutral": "#DDE6D8",
+  "tableAccent": "#2E7D1E",
+  "good": "#2E7D1E",
+  "neutral": "#B9731F",
+  "bad": "#B42318",
+  "maximum": "#2E7D1E",
+  "center": "#EAF3E2",
+  "minimum": "#FFFFFF",
+  "textClasses": {
+    "callout": {"fontSize": 24, "fontFace": "Segoe UI Semibold", "color": "#212529"},
+    "title": {"fontSize": 12, "fontFace": "Segoe UI Semibold", "color": "#212529"},
+    "header": {"fontSize": 12, "fontFace": "Segoe UI Semibold", "color": "#212529"},
+    "label": {"fontSize": 10, "fontFace": "Segoe UI", "color": "#5F6B66"}
+  },
+  "visualStyles": {
+    "*": {
+      "*": {
+        "border": [{"show": false}],
+        "dropShadow": [{"show": false}],
+        "background": [{"show": true, "color": {"solid": {"color": "#FFFFFF"}}, "transparency": 0}]
+      }
+    },
+    "page": {
+      "*": {
+        "background": [{"color": {"solid": {"color": "#F4F8F0"}}, "transparency": 0}],
+        "outspace": [{"color": {"solid": {"color": "#F4F8F0"}}, "transparency": 0}]
+      }
+    }
+  }
+}
