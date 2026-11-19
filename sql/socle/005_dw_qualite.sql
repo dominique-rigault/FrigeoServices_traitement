@@ -25,6 +25,12 @@
     arbitrer, informations, taux, lignes distinctes, et les lignes non
     évaluables comptées à part depuis qualite.non_evaluable, pour
     distinguer « contrôlé sans écart » de « non contrôlable ».
+  - dw.controles_bloquants : fonction qui donne, pour chaque ligne source
+    (id_chargement, num_ligne_source), les contrôles de ses anomalies
+    bloquantes non résolues (registre après nettoyage, issue anomalie ou à
+    arbitrer, sans décision du métier), soit la règle qui exclut une ligne
+    des indicateurs (étape 7.4a). Le pack s'en sert pour écrire le motif de
+    non-retenue de chaque ligne de fait.
 
   Comme les dimensions du pack : clé technique numérotée dans l'ordre
   binaire, membres -1 « (non renseigné) » et -2 « (introuvable) », libellé
@@ -245,4 +251,32 @@ BEGIN
     DECLARE @lignes int = @@ROWCOUNT;
     EXEC dw.inscrire_etape @id_execution, N'fait_bilan_controle', @lignes, @debut;
 END;
+GO
+
+/*
+  Contrôles des anomalies qui excluent une ligne source des indicateurs :
+  anomalies bloquantes du registre après nettoyage, d'issue anomalie ou à
+  arbitrer, sans décision du métier (la règle de frigeo.anomalies,
+  lignes_non_retenues). Une ligne par ligne source et par contrôle distinct;
+  une anomalie sans ligne source (un total par période) n'exclut aucune
+  ligne et ne sort pas.
+*/
+CREATE FUNCTION dw.controles_bloquants (
+    @id_execution int
+)
+RETURNS TABLE
+AS
+RETURN (
+    SELECT DISTINCT a.id_chargement,
+           a.num_ligne_source,
+           a.controle COLLATE Latin1_General_100_BIN2 AS controle
+    FROM qualite.anomalie AS a
+    WHERE a.id_execution = @id_execution
+      AND a.etat = N'nettoyé'
+      AND a.gravite = N'bloquante'
+      AND a.issue IN (N'anomalie', N'à arbitrer')
+      AND (a.decision_metier IS NULL OR LTRIM(RTRIM(a.decision_metier)) = N'')
+      AND a.id_chargement IS NOT NULL
+      AND a.num_ligne_source IS NOT NULL
+);
 GO

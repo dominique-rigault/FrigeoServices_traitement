@@ -21,8 +21,9 @@
   illusoire, la marge et les autres composantes les redonnant par
   soustraction; la protection est l'accès au rapport (README). Le lignage
   (fichier, feuille, ligne) reste sur chaque fait, pour la descente
-  jusqu'aux lignes. Les colonnes [Intervenant], [Client] et [Fournisseur]
-  donnent un libellé d'affichage (nom complet ou raison sociale, sinon le
+  jusqu'aux lignes, avec [Motif de non-retenue] (le contrôle qui exclut la
+  ligne des indicateurs, script 003). Les colonnes [Intervenant], [Client]
+  et [Fournisseur] donnent un libellé d'affichage (nom complet ou raison sociale, sinon le
   code), calculé ici plutôt que dans le rapport.
 */
 
@@ -152,6 +153,7 @@ SELECT id_fait_intervention AS [Clé intervention],
        motif_calcul AS [Motif de calcul],
        alerte_marge_negative AS [Alerte marge négative],
        retenue AS [Retenue pour les indicateurs],
+       motif_non_retenue AS [Motif de non-retenue],
        fichier_source AS [Fichier source],
        feuille_source AS [Feuille source],
        num_ligne_source AS [Ligne source]
@@ -171,6 +173,7 @@ SELECT id_fait_consommation AS [Clé consommation],
        cout_ht AS [Coût HT],
        motif_calcul AS [Motif de calcul],
        retenue AS [Retenue pour les indicateurs],
+       motif_non_retenue AS [Motif de non-retenue],
        fichier_source AS [Fichier source],
        feuille_source AS [Feuille source],
        num_ligne_source AS [Ligne source]
@@ -199,6 +202,7 @@ SELECT id_fait_ligne_facture AS [Clé ligne de facture],
        montant_ht AS [Montant HT],
        taux_tva AS [Taux de TVA],
        retenue AS [Retenue pour les indicateurs],
+       motif_non_retenue AS [Motif de non-retenue],
        fichier_source AS [Fichier source],
        feuille_source AS [Feuille source],
        num_ligne_source AS [Ligne source]
@@ -222,6 +226,7 @@ SELECT id_fait_achat AS [Clé achat],
        pu_achat_ht AS [Prix unitaire d'achat HT],
        montant_ht AS [Montant HT],
        retenue AS [Retenue pour les indicateurs],
+       motif_non_retenue AS [Motif de non-retenue],
        fichier_source AS [Fichier source],
        feuille_source AS [Feuille source],
        num_ligne_source AS [Ligne source]
@@ -244,6 +249,7 @@ SELECT id_fait_ecriture AS [Clé écriture],
        credit AS [Crédit],
        solde AS [Solde],
        retenue AS [Retenue pour les indicateurs],
+       motif_non_retenue AS [Motif de non-retenue],
        fichier_source AS [Fichier source],
        feuille_source AS [Feuille source],
        num_ligne_source AS [Ligne source]
@@ -397,6 +403,7 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Interventions', N'Motif de calcul'),
     (N'Interventions', N'Alerte marge négative'),
     (N'Interventions', N'Retenue pour les indicateurs'),
+    (N'Interventions', N'Motif de non-retenue'),
     (N'Interventions', N'Fichier source'),
     (N'Interventions', N'Feuille source'),
     (N'Interventions', N'Ligne source'),
@@ -412,6 +419,7 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Consommations de pièces', N'Coût HT'),
     (N'Consommations de pièces', N'Motif de calcul'),
     (N'Consommations de pièces', N'Retenue pour les indicateurs'),
+    (N'Consommations de pièces', N'Motif de non-retenue'),
     (N'Consommations de pièces', N'Fichier source'),
     (N'Consommations de pièces', N'Feuille source'),
     (N'Consommations de pièces', N'Ligne source'),
@@ -436,6 +444,7 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Lignes de facture', N'Montant HT'),
     (N'Lignes de facture', N'Taux de TVA'),
     (N'Lignes de facture', N'Retenue pour les indicateurs'),
+    (N'Lignes de facture', N'Motif de non-retenue'),
     (N'Lignes de facture', N'Fichier source'),
     (N'Lignes de facture', N'Feuille source'),
     (N'Lignes de facture', N'Ligne source'),
@@ -455,6 +464,7 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Achats', N'Prix unitaire d''achat HT'),
     (N'Achats', N'Montant HT'),
     (N'Achats', N'Retenue pour les indicateurs'),
+    (N'Achats', N'Motif de non-retenue'),
     (N'Achats', N'Fichier source'),
     (N'Achats', N'Feuille source'),
     (N'Achats', N'Ligne source'),
@@ -473,6 +483,7 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Écritures comptables', N'Crédit'),
     (N'Écritures comptables', N'Solde'),
     (N'Écritures comptables', N'Retenue pour les indicateurs'),
+    (N'Écritures comptables', N'Motif de non-retenue'),
     (N'Écritures comptables', N'Fichier source'),
     (N'Écritures comptables', N'Feuille source'),
     (N'Écritures comptables', N'Ligne source'),

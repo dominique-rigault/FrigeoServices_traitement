@@ -37,8 +37,13 @@ GO
 
 /*
   Vues génériques du tableau qualité : les anomalies du registre après
-  nettoyage, le taux par contrôle dans les deux états et le journal des
-  chargements, lus dans dw et qualite, identiques chez tous les clients.
+  nettoyage, le taux par contrôle dans les deux états, son historique par
+  exécution et le journal des chargements, lus dans dw et qualite,
+  identiques chez tous les clients.
+
+  [Ordre de gravité] (1 bloquante, 2 majeure, 3 mineure, 9 autre) sert au
+  tri de la gravité dans le rapport (Trier par colonne), qui sinon suivrait
+  l'ordre alphabétique.
 */
 
 CREATE VIEW pbi.[Contrôles] AS
@@ -49,9 +54,18 @@ SELECT id_controle AS [Clé contrôle],
        champ AS [Champ],
        regle AS [Règle],
        gravite AS [Gravité],
+       CASE gravite WHEN N'bloquante' THEN 1 WHEN N'majeure' THEN 2
+                    WHEN N'mineure' THEN 3 ELSE 9 END AS [Ordre de gravité],
        indicateurs AS [Indicateurs affectés]
 FROM dw.dim_controle;
 GO
+
+/*
+  Anomalies : [Anomalie ouverte] vaut 1 pour une anomalie d'issue anomalie
+  ou à arbitrer sans décision du métier, la règle qui exclut une ligne des
+  indicateurs quand l'anomalie est bloquante (dw.controles_bloquants); une
+  information n'est jamais ouverte.
+*/
 
 CREATE VIEW pbi.[Anomalies] AS
 SELECT id_fait_anomalie AS [Clé anomalie],
@@ -67,7 +81,12 @@ SELECT id_fait_anomalie AS [Clé anomalie],
        detail AS [Détail],
        proposition AS [Proposition],
        gravite AS [Gravité],
+       CASE gravite WHEN N'bloquante' THEN 1 WHEN N'majeure' THEN 2
+                    WHEN N'mineure' THEN 3 ELSE 9 END AS [Ordre de gravité],
        decision_metier AS [Décision du métier],
+       CAST(CASE WHEN issue IN (N'anomalie', N'à arbitrer')
+                  AND (decision_metier IS NULL OR LTRIM(RTRIM(decision_metier)) = N'')
+                 THEN 1 ELSE 0 END AS bit) AS [Anomalie ouverte],
        fichier_source AS [Fichier source],
        feuille_source AS [Feuille source],
        num_ligne_source AS [Ligne source]
@@ -86,6 +105,46 @@ SELECT id_fait_bilan_controle AS [Clé bilan],
        taux AS [Taux d'anomalies],
        lignes_distinctes AS [Lignes distinctes]
 FROM dw.fait_bilan_controle;
+GO
+
+/*
+  Historique des contrôles : le bilan des contrôles de chaque exécution
+  réussie (une par période de fin, rejouer une période remplaçant son
+  exécution), dans les deux états, lu dans qualite.bilan_controle, pour
+  suivre mois après mois la qualité des fichiers livrés. Le contrôle et sa
+  gravité sont ceux de l'exécution; [Clé contrôle] relie la ligne au
+  contrôle de la dernière reconstruction, -2 quand il n'y figure plus. Les
+  non évaluables sont comptés à part, comme dans le bilan.
+*/
+CREATE VIEW pbi.[Historique des contrôles] AS
+SELECT b.id_bilan_controle AS [Clé historique],
+       e.periode_fin AS [Période de fin],
+       e.fin AS [Fin de l'exécution (UTC)],
+       b.etat AS [État],
+       CASE WHEN b.controle = N'' THEN -1 ELSE COALESCE(c.id_controle, -2) END
+           AS [Clé contrôle],
+       b.controle AS [Contrôle],
+       b.gravite AS [Gravité],
+       b.controlees AS [Lignes contrôlées],
+       b.anomalies AS [Anomalies],
+       b.a_arbitrer AS [À arbitrer],
+       b.informations AS [Informations],
+       n.lignes AS [Non évaluables],
+       b.taux AS [Taux d'anomalies]
+FROM qualite.bilan_controle AS b
+JOIN qualite.execution AS e
+    ON e.id_execution = b.id_execution AND e.statut = N'réussie'
+LEFT JOIN dw.dim_controle AS c
+    ON c.controle = b.controle COLLATE Latin1_General_100_BIN2
+   AND c.id_controle >= 1
+OUTER APPLY (
+    SELECT COUNT(*) AS lignes
+    FROM qualite.non_evaluable AS v
+    WHERE v.id_execution = b.id_execution
+      AND v.etat = b.etat
+      AND v.controle COLLATE Latin1_General_100_BIN2
+          = b.controle COLLATE Latin1_General_100_BIN2
+) AS n;
 GO
 
 /*
@@ -113,6 +172,7 @@ INSERT INTO dw.source_vue (vue, source) VALUES
     (N'Contrôles', N'dw.dim_controle'),
     (N'Anomalies', N'dw.fait_anomalie'),
     (N'Bilan des contrôles', N'dw.fait_bilan_controle'),
+    (N'Historique des contrôles', N'qualite.bilan_controle (où id_execution IN (SELECT id_execution FROM qualite.execution WHERE statut = N''réussie''))'),
     (N'Chargements', N'qualite.journal_chargement');
 GO
 
@@ -124,6 +184,7 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Contrôles', N'Champ'),
     (N'Contrôles', N'Règle'),
     (N'Contrôles', N'Gravité'),
+    (N'Contrôles', N'Ordre de gravité'),
     (N'Contrôles', N'Indicateurs affectés'),
     (N'Anomalies', N'Clé anomalie'),
     (N'Anomalies', N'Identifiant d''anomalie'),
@@ -138,7 +199,9 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Anomalies', N'Détail'),
     (N'Anomalies', N'Proposition'),
     (N'Anomalies', N'Gravité'),
+    (N'Anomalies', N'Ordre de gravité'),
     (N'Anomalies', N'Décision du métier'),
+    (N'Anomalies', N'Anomalie ouverte'),
     (N'Anomalies', N'Fichier source'),
     (N'Anomalies', N'Feuille source'),
     (N'Anomalies', N'Ligne source'),
@@ -152,6 +215,19 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Bilan des contrôles', N'Non évaluables'),
     (N'Bilan des contrôles', N'Taux d''anomalies'),
     (N'Bilan des contrôles', N'Lignes distinctes'),
+    (N'Historique des contrôles', N'Clé historique'),
+    (N'Historique des contrôles', N'Période de fin'),
+    (N'Historique des contrôles', N'Fin de l''exécution (UTC)'),
+    (N'Historique des contrôles', N'État'),
+    (N'Historique des contrôles', N'Clé contrôle'),
+    (N'Historique des contrôles', N'Contrôle'),
+    (N'Historique des contrôles', N'Gravité'),
+    (N'Historique des contrôles', N'Lignes contrôlées'),
+    (N'Historique des contrôles', N'Anomalies'),
+    (N'Historique des contrôles', N'À arbitrer'),
+    (N'Historique des contrôles', N'Informations'),
+    (N'Historique des contrôles', N'Non évaluables'),
+    (N'Historique des contrôles', N'Taux d''anomalies'),
     (N'Chargements', N'Clé chargement'),
     (N'Chargements', N'Période de fin'),
     (N'Chargements', N'Fichier source'),

@@ -1708,6 +1708,44 @@ def controles_retenue_faits(sources: list[tuple], retenues: list[tuple],
     return controles
 
 
+# Motif de non-retenue d'une ligne de fait (étape 8.3a) : colonne écrite par le pack,
+# libellé d'une ligne exclue par plusieurs contrôles distincts.
+COLONNE_MOTIF_NON_RETENUE = "motif_non_retenue"
+MOTIF_PLUSIEURS_CONTROLES = "(plusieurs contrôles)"
+
+
+def controles_motif_non_retenue(sources: list[tuple]) -> list[ControleFait]:
+    """Contrôles du motif de non-retenue des faits déclarés par le pack, sans valeur du
+    client.
+
+    `sources` : (fait, table du dictionnaire) de dw.source_fait. Pour chaque fait, une
+    ligne non retenue doit avoir un motif et une ligne retenue n'en avoir aucun, et
+    chaque motif doit être un contrôle de dw.dim_controle ou « (plusieurs
+    contrôles) » : « 0 / 0 / 0 » attendu. Un nom de fait invalide rend le contrôle
+    impossible (`probleme`).
+    """
+    controles = []
+    for fait, _ in sources:
+        libelle = (f"dw.{fait} : lignes non retenues sans motif / retenues avec motif "
+                   "/ motifs hors des contrôles")
+        if not _nom_dw(fait):
+            controles.append(ControleFait(libelle, None, None, "nom de fait invalide"))
+            continue
+        motif = f"f.{COLONNE_MOTIF_NON_RETENUE}"
+        requete = (
+            f"SELECT COUNT(CASE WHEN f.{COLONNE_RETENUE} = 0 AND {motif} IS NULL THEN 1 END), "
+            f"COUNT(CASE WHEN f.{COLONNE_RETENUE} = 1 AND {motif} IS NOT NULL THEN 1 END), "
+            f"COUNT(CASE WHEN {motif} IS NOT NULL "
+            f"AND {motif} <> {_litteral(MOTIF_PLUSIEURS_CONTROLES)} "
+            "AND c.id_controle IS NULL THEN 1 END) "
+            f"FROM dw.{fait} AS f "
+            "LEFT JOIN dw.dim_controle AS c ON c.id_controle >= 1 "
+            f"AND c.controle = {motif} COLLATE Latin1_General_100_BIN2"
+        )
+        controles.append(ControleFait(libelle, "0 / 0 / 0", requete))
+    return controles
+
+
 def _tables_propre(preparation: Preparation) -> dict[str, TablePreparee]:
     return {p.table.nom: p for p in preparation.tables if p.schema == SCHEMA_PROPRE}
 
@@ -1926,8 +1964,10 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
     """Contrôles de la famille dw de `verifier_base`, sur la connexion ouverte, puis
     ceux des faits déclarés par le pack (`controles_faits`), des codes en doublon
     qu'il regroupe (`controles_regroupements`), des mesures et des dates des faits
-    (`controles_mesures`) et de leur retenue (`controles_retenue_faits`), enfin ceux
-    des calculs, par le module de vérification de chaque pack (`_verifier_packs`)."""
+    (`controles_mesures`) et de leur retenue (`controles_retenue_faits`), ceux du
+    tableau qualité (`controles_tableau_qualite`) et du motif de non-retenue des faits
+    (`controles_motif_non_retenue`), enfin ceux des calculs, par le module de
+    vérification de chaque pack (`_verifier_packs`)."""
     import pyodbc
 
     from .base import procedure_reconstruction_presente
@@ -1987,6 +2027,7 @@ def _verifier_dw(conn, ecriture: Ecriture, ajouter, rattachements=None,
                     sorties.anomalies_nettoyees, (sorties.bilan_brut, sorties.bilan_nettoye),
                     (sorties.non_evaluables_brutes, sorties.non_evaluables_nettoyees),
                 )
+                controles += controles_motif_non_retenue(sources)
         for controle in controles:
             if controle.requete is None:
                 ajouter(FAMILLE_DW, controle.libelle, controle.probleme, None)

@@ -19,6 +19,7 @@ from frigeo.ecriture_base import (
     controles_faits,
     controles_mesures,
     controles_regroupements,
+    controles_motif_non_retenue,
     controles_retenue_faits,
     controles_tableau_qualite,
     controles_retenue_propre,
@@ -1056,3 +1057,22 @@ def test_controles_retenue_faits_impossibles_sans_requete(jeu):
         "rattachement déclaré sur une autre table que celle du fait", "référentiel absent de propre",
     ]
     assert all(c.requete is None and c.attendu is None for c in controles)
+
+
+def test_controles_motif_non_retenue():
+    sources = [("fait_intervention", "interventions"), ("fait x", "interventions")]
+    controle, invalide = controles_motif_non_retenue(sources)
+    assert controle.attendu == "0 / 0 / 0" and controle.probleme is None
+    assert controle.libelle == (
+        "dw.fait_intervention : lignes non retenues sans motif / retenues avec motif "
+        "/ motifs hors des contrôles"
+    )
+    assert "f.retenue = 0 AND f.motif_non_retenue IS NULL" in controle.requete
+    assert "f.retenue = 1 AND f.motif_non_retenue IS NOT NULL" in controle.requete
+    assert "f.motif_non_retenue <> N'(plusieurs contrôles)'" in controle.requete
+    assert "AND c.id_controle IS NULL THEN 1 END) FROM dw.fait_intervention AS f " \
+        "LEFT JOIN dw.dim_controle AS c ON c.id_controle >= 1" in controle.requete
+    assert controle.requete.endswith(
+        "AND c.controle = f.motif_non_retenue COLLATE Latin1_General_100_BIN2"
+    )
+    assert invalide.probleme == "nom de fait invalide" and invalide.requete is None

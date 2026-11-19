@@ -7,7 +7,8 @@
   de calcul (script 004), le vidage des faits et des tables de calcul, la
   construction des dimensions (script 002), puis celle des faits
   (script 003), un fait lié à un autre (une consommation à son
-  intervention) après celui-ci, puis les calculs (script 004 : chantiers,
+  intervention) après celui-ci, et le motif de non-retenue de leurs lignes,
+  puis les calculs (script 004 : chantiers,
   CUMP et coût des pièces, puis marges, qui en dépendent), enfin les tables
   génériques du tableau qualité (socle, script 005). Chaque étape est
   inscrite dans dw.journal_reconstruction.
@@ -57,6 +58,7 @@ BEGIN
     EXEC dw.construire_fait_ligne_facture @id_execution;
     EXEC dw.construire_fait_achat @id_execution;
     EXEC dw.construire_fait_ecriture @id_execution;
+    EXEC dw.calculer_motifs_non_retenue @id_execution;
 
     /* Calculs (script 004). */
     EXEC dw.calculer_chantiers @id_execution;

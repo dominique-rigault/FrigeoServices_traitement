@@ -36,6 +36,14 @@
   intervention non retenue (consommation, ligne de facture) reste retenue : le
   CA et le stock ne dépendent pas de l'intervention.
 
+  Motif de non-retenue (étape 8.3a) : dw.calculer_motifs_non_retenue,
+  appelée après les cinq faits, écrit dans motif_non_retenue le contrôle de
+  l'anomalie qui exclut la ligne (dw.controles_bloquants, socle script 005),
+  celui de son en-tête pour une ligne de document exclue par lui, et
+  « (plusieurs contrôles) » quand la ligne et son en-tête en portent
+  plusieurs distincts; NULL pour une ligne retenue. Le tableau qualité en
+  tire le poids des lignes exclues par motif.
+
   Mesures et dates : chaque colonne numérique d'un fait reprise de propre est
   déclarée dans dw.contrat_mesure, et chaque date lue sur la ligne même du
   fait dans dw.contrat_date, pour la vérification de l'écriture.
@@ -164,6 +172,7 @@ CREATE TABLE dw.fait_intervention (
     motif_calcul          nvarchar(100)   NULL,
     alerte_marge_negative bit             NULL,
     retenue               bit             NOT NULL,
+    motif_non_retenue     nvarchar(400)   NULL,
     id_chargement         int             NOT NULL,
     fichier_source        nvarchar(260)   NOT NULL,
     feuille_source        nvarchar(128)   NULL,
@@ -274,6 +283,7 @@ CREATE TABLE dw.fait_consommation (
     cout_ht               decimal(19, 2)  NULL,
     motif_calcul          nvarchar(100)   NULL,
     retenue               bit             NOT NULL,
+    motif_non_retenue     nvarchar(400)   NULL,
     id_chargement         int             NOT NULL,
     fichier_source        nvarchar(260)   NOT NULL,
     feuille_source        nvarchar(128)   NULL,
@@ -462,6 +472,7 @@ CREATE TABLE dw.fait_ligne_facture (
     montant_ht             decimal(28, 8)  NULL,
     taux_tva               decimal(28, 8)  NULL,
     retenue                bit             NOT NULL,
+    motif_non_retenue      nvarchar(400)   NULL,
     id_chargement          int             NOT NULL,
     fichier_source         nvarchar(260)   NOT NULL,
     feuille_source         nvarchar(128)   NULL,
@@ -624,6 +635,7 @@ CREATE TABLE dw.fait_achat (
     pu_achat_ht              decimal(28, 8)  NULL,
     montant_ht               decimal(28, 8)  NULL,
     retenue                  bit             NOT NULL,
+    motif_non_retenue        nvarchar(400)   NULL,
     id_chargement            int             NOT NULL,
     fichier_source           nvarchar(260)   NOT NULL,
     feuille_source           nvarchar(128)   NULL,
@@ -801,6 +813,7 @@ CREATE TABLE dw.fait_ecriture (
     credit            decimal(28, 8)  NULL,
     solde             decimal(28, 8)  NOT NULL,
     retenue           bit             NOT NULL,
+    motif_non_retenue nvarchar(400)   NULL,
     id_chargement     int             NOT NULL,
     fichier_source    nvarchar(260)   NOT NULL,
     feuille_source    nvarchar(128)   NULL,
@@ -868,5 +881,125 @@ BEGIN
 
     DECLARE @lignes int = @@ROWCOUNT;
     EXEC dw.inscrire_etape @id_execution, N'fait_ecriture', @lignes, @debut;
+END;
+GO
+
+/*
+  Motif de non-retenue de chaque ligne de fait (voir l'en-tête du script) :
+  les contrôles de ses anomalies bloquantes non résolues et, pour une ligne
+  de facture ou d'achat, ceux de son en-tête rattaché (dw.contrat_retenue).
+  Un seul contrôle distinct donne son libellé, plusieurs donnent
+  « (plusieurs contrôles) ». Les lignes retenues gardent NULL.
+*/
+CREATE PROCEDURE dw.calculer_motifs_non_retenue
+    @id_execution int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
+    DECLARE @plusieurs nvarchar(400) = N'(plusieurs contrôles)';
+    DECLARE @r_facture int =
+        dw.regle_rattachement(@id_execution, N'factures_lignes', N'num_facture',
+                              N'factures_entetes');
+    DECLARE @r_achat int =
+        dw.regle_rattachement(@id_execution, N'achats_lignes', N'num_piece_achat',
+                              N'achats_entetes');
+    DECLARE @lignes int = 0;
+
+    WITH motifs AS (
+        SELECT f.id_fait_intervention AS id, MIN(c.controle) AS controle,
+               COUNT(*) AS nb
+        FROM dw.fait_intervention AS f
+        JOIN dw.controles_bloquants(@id_execution) AS c
+            ON c.id_chargement = f.id_chargement AND c.num_ligne_source = f.num_ligne_source
+        GROUP BY f.id_fait_intervention
+    )
+    UPDATE f
+    SET motif_non_retenue = CASE WHEN m.nb = 1 THEN m.controle ELSE @plusieurs END
+    FROM dw.fait_intervention AS f
+    JOIN motifs AS m ON m.id = f.id_fait_intervention;
+    SET @lignes += @@ROWCOUNT;
+
+    WITH motifs AS (
+        SELECT f.id_fait_consommation AS id, MIN(c.controle) AS controle,
+               COUNT(*) AS nb
+        FROM dw.fait_consommation AS f
+        JOIN dw.controles_bloquants(@id_execution) AS c
+            ON c.id_chargement = f.id_chargement AND c.num_ligne_source = f.num_ligne_source
+        GROUP BY f.id_fait_consommation
+    )
+    UPDATE f
+    SET motif_non_retenue = CASE WHEN m.nb = 1 THEN m.controle ELSE @plusieurs END
+    FROM dw.fait_consommation AS f
+    JOIN motifs AS m ON m.id = f.id_fait_consommation;
+    SET @lignes += @@ROWCOUNT;
+
+    WITH controles AS (
+        SELECT f.id_fait_ligne_facture AS id, c.controle
+        FROM dw.fait_ligne_facture AS f
+        JOIN dw.controles_bloquants(@id_execution) AS c
+            ON c.id_chargement = f.id_chargement AND c.num_ligne_source = f.num_ligne_source
+        UNION
+        SELECT f.id_fait_ligne_facture, c.controle
+        FROM dw.fait_ligne_facture AS f
+        JOIN qualite.rattachement AS r
+            ON r.id_execution = @id_execution AND r.id_regle = @r_facture
+           AND r.id_chargement = f.id_chargement AND r.num_ligne_source = f.num_ligne_source
+        JOIN dw.controles_bloquants(@id_execution) AS c
+            ON c.id_chargement = r.id_chargement_reference
+           AND c.num_ligne_source = r.num_ligne_reference
+    ),
+    motifs AS (
+        SELECT id, MIN(controle) AS controle, COUNT(*) AS nb
+        FROM controles
+        GROUP BY id
+    )
+    UPDATE f
+    SET motif_non_retenue = CASE WHEN m.nb = 1 THEN m.controle ELSE @plusieurs END
+    FROM dw.fait_ligne_facture AS f
+    JOIN motifs AS m ON m.id = f.id_fait_ligne_facture;
+    SET @lignes += @@ROWCOUNT;
+
+    WITH controles AS (
+        SELECT f.id_fait_achat AS id, c.controle
+        FROM dw.fait_achat AS f
+        JOIN dw.controles_bloquants(@id_execution) AS c
+            ON c.id_chargement = f.id_chargement AND c.num_ligne_source = f.num_ligne_source
+        UNION
+        SELECT f.id_fait_achat, c.controle
+        FROM dw.fait_achat AS f
+        JOIN qualite.rattachement AS r
+            ON r.id_execution = @id_execution AND r.id_regle = @r_achat
+           AND r.id_chargement = f.id_chargement AND r.num_ligne_source = f.num_ligne_source
+        JOIN dw.controles_bloquants(@id_execution) AS c
+            ON c.id_chargement = r.id_chargement_reference
+           AND c.num_ligne_source = r.num_ligne_reference
+    ),
+    motifs AS (
+        SELECT id, MIN(controle) AS controle, COUNT(*) AS nb
+        FROM controles
+        GROUP BY id
+    )
+    UPDATE f
+    SET motif_non_retenue = CASE WHEN m.nb = 1 THEN m.controle ELSE @plusieurs END
+    FROM dw.fait_achat AS f
+    JOIN motifs AS m ON m.id = f.id_fait_achat;
+    SET @lignes += @@ROWCOUNT;
+
+    WITH motifs AS (
+        SELECT f.id_fait_ecriture AS id, MIN(c.controle) AS controle,
+               COUNT(*) AS nb
+        FROM dw.fait_ecriture AS f
+        JOIN dw.controles_bloquants(@id_execution) AS c
+            ON c.id_chargement = f.id_chargement AND c.num_ligne_source = f.num_ligne_source
+        GROUP BY f.id_fait_ecriture
+    )
+    UPDATE f
+    SET motif_non_retenue = CASE WHEN m.nb = 1 THEN m.controle ELSE @plusieurs END
+    FROM dw.fait_ecriture AS f
+    JOIN motifs AS m ON m.id = f.id_fait_ecriture;
+    SET @lignes += @@ROWCOUNT;
+
+    EXEC dw.inscrire_etape @id_execution, N'motifs_non_retenue', @lignes, @debut;
 END;
 GO
