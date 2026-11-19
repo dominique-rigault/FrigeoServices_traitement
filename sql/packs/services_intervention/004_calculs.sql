@@ -89,6 +89,20 @@
   consommation non retenue, en fin de liste). Le coût horaire chargé, qui
   révèle le salaire, n'est gardé nulle part.
 
+  Alerte « marge négative » (étape 8.2d) : dw.calculer_alertes lit la marge
+  au niveau du chantier, le forfait d'une installation étant sur son premier
+  jour et les jours suivants à 0. Un chantier est en alerte quand tous ses
+  jours sont retenus, que son premier jour est facturable et ni annulé ni
+  reporté (une annulation sur place, où seul le déplacement est facturé, est
+  une pratique normale), qu'au moins une ligne de facture retenue cite l'un de
+  ses jours (un chantier pas encore facturé relève de l'alerte des
+  interventions non facturées), qu'aucun jour n'est sans marge (pas de marge
+  fausse) et que la somme des marges de ses jours est négative.
+  alerte_marge_negative porte la même valeur sur chaque jour du chantier, 0
+  hors alerte : le rapport descend ainsi du chantier aux composantes de coût
+  de ses jours sans relation entre Chantiers et Interventions. Les valeurs de
+  facturable et de statut sont des paramètres de calcul.
+
   Arrondis et types : les opérandes sont ramenés à 6 décimales au plus pour
   que les produits et le quotient gardent toutes leurs décimales utiles
   (règles de précision de T-SQL); le seul arrondi est donc celui qui est
@@ -152,7 +166,13 @@ INSERT INTO dw.parametre_calcul
     (N'type_piece_facture', N'Facture', N'texte', N'factures_entetes', N'type_piece',
      N'Type de pièce d''une facture (par opposition à un avoir)'),
     (N'date_stock_initial', N'2025-01-01', N'date', NULL, NULL,
-     N'Date du stock et du CUMP initiaux du catalogue (aussi date_initial de la règle R19)');
+     N'Date du stock et du CUMP initiaux du catalogue (aussi date_initial de la règle R19)'),
+    (N'valeur_facturable', N'O', N'texte', N'interventions', N'facturable',
+     N'Valeur de facturable d''une intervention facturable (alerte marge négative)'),
+    (N'statut_annule', N'Annulée', N'texte', N'interventions', N'statut',
+     N'Statut d''une intervention annulée (alerte marge négative)'),
+    (N'statut_reporte', N'Reportée', N'texte', N'interventions', N'statut',
+     N'Statut d''une intervention reportée (alerte marge négative)');
 GO
 
 /* Colonne de propre.parametres_couts qui donne le taux de charges d'un type
@@ -742,5 +762,57 @@ BEGIN
 
     DECLARE @lignes int = (SELECT COUNT(*) FROM dw.fait_intervention WHERE marge IS NOT NULL);
     EXEC dw.inscrire_etape @id_execution, N'marges', @lignes, @debut;
+END;
+GO
+
+/*
+  Alerte « marge négative » de chaque intervention, lue au niveau de son
+  chantier (voir l'en-tête du script). Appelée après dw.calculer_marges.
+*/
+CREATE PROCEDURE dw.calculer_alertes
+    @id_execution int
+AS
+BEGIN
+    SET NOCOUNT ON;
+    DECLARE @debut datetime2(0) = SYSUTCDATETIME();
+    DECLARE @facturable nvarchar(4000) = dw.parametre(N'valeur_facturable');
+    DECLARE @annule nvarchar(4000) = dw.parametre(N'statut_annule');
+    DECLARE @reporte nvarchar(4000) = dw.parametre(N'statut_reporte');
+    IF @facturable IS NULL OR @annule IS NULL OR @reporte IS NULL
+        THROW 50024, N'dw.calculer_alertes : paramètre valeur_facturable, statut_annule ou statut_reporte absent de dw.parametre_calcul.', 1;
+
+    WITH facturees AS (
+        SELECT DISTINCT l.id_fait_intervention
+        FROM dw.fait_ligne_facture AS l
+        WHERE l.retenue = 1 AND l.id_fait_intervention IS NOT NULL
+    ),
+    chantiers AS (
+        SELECT i.id_chantier,
+               MIN(CAST(i.retenue AS int)) AS retenu,
+               MAX(CASE WHEN i.jour_chantier = 1
+                         AND i.facturable = @facturable COLLATE Latin1_General_100_BIN2
+                        THEN 1 ELSE 0 END) AS facturable,
+               MAX(CASE WHEN i.jour_chantier = 1
+                         AND (i.statut = @annule COLLATE Latin1_General_100_BIN2
+                              OR i.statut = @reporte COLLATE Latin1_General_100_BIN2)
+                        THEN 1 ELSE 0 END) AS annule_ou_reporte,
+               MAX(CASE WHEN f.id_fait_intervention IS NOT NULL THEN 1 ELSE 0 END) AS facture,
+               SUM(CASE WHEN i.marge IS NULL THEN 1 ELSE 0 END) AS jours_sans_marge,
+               SUM(i.marge) AS marge
+        FROM dw.fait_intervention AS i
+        LEFT JOIN facturees AS f ON f.id_fait_intervention = i.id_fait_intervention
+        GROUP BY i.id_chantier
+    )
+    UPDATE i
+    SET alerte_marge_negative =
+            CASE WHEN c.retenu = 1 AND c.facturable = 1 AND c.annule_ou_reporte = 0
+                      AND c.facture = 1 AND c.jours_sans_marge = 0 AND c.marge < 0
+                 THEN 1 ELSE 0 END
+    FROM dw.fait_intervention AS i
+    JOIN chantiers AS c ON c.id_chantier = i.id_chantier;
+
+    DECLARE @lignes int =
+        (SELECT COUNT(*) FROM dw.fait_intervention WHERE alerte_marge_negative = 1);
+    EXEC dw.inscrire_etape @id_execution, N'alertes', @lignes, @debut;
 END;
 GO

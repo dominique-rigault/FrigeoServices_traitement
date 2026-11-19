@@ -7,6 +7,7 @@ import pandas as pd
 from frigeo.ecriture_base import modules_verification
 from frigeo.packs.services_intervention import (
     achats_retenus,
+    alertes_attendues,
     bornes_periode_chargee,
     chantiers_attendus,
     comparer_chantiers,
@@ -33,6 +34,9 @@ PARAMETRES = {
     "article_chantier": "INST-F",
     "type_piece_facture": "Facture",
     "date_stock_initial": "2025-01-01",
+    "valeur_facturable": "O",
+    "statut_annule": "Annulée",
+    "statut_reporte": "Reportée",
 }
 
 
@@ -214,12 +218,13 @@ class _Curseur:
 
     def __init__(self, parametres, chantiers, cump=(), couts=(), marges=(), periode="2025-02",
                  rapprochement=((Decimal(0), None, None, None, None),),
-                 calendrier=(("2025-02-28", "2025-03-01", 0),)):
+                 calendrier=(("2025-02-28", "2025-03-01", 0),), alertes=()):
         self.resultats = {
             "dw.fait_ligne_facture": list(rapprochement),
             "dw.parametre_taux_charges": [("CDI", "taux_charges_cdi_cdd")],
             "dw.parametre_calcul": parametres, "dw.cump_mensuel": list(cump),
             "dw.fait_consommation": list(couts), "cout_salarial": list(marges),
+            "alerte_marge_negative": list(alertes),
             "dw.fait_intervention": chantiers, "qualite.execution": [(periode,)],
             "dw.dim_date": list(calendrier),
         }
@@ -241,6 +246,7 @@ def test_verifier():
         list(PARAMETRES.items()),
         [("interventions.csv", None, 2, "interventions.csv", None, 2, 1, 1)],
         cump, (), marges,
+        alertes=[("interventions.csv", None, 2, "interventions.csv", None, 2, False)],
     )
     controles = []
     ecriture = SimpleNamespace(preparation=_preparation(), id_execution=1)
@@ -256,6 +262,7 @@ def test_verifier():
         (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)),
         (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)),
         (Decimal(0), Decimal(0)), (Decimal(0), Decimal(0)), ("0 / 0 / 0 / 0", "0 / 0 / 0 / 0"),
+        (0, 0), ("0 / 0", "0 / 0"),
     ]
     assert controles[13][3] is True  # coût salarial total masqué
     # Un CUMP qui diffère d'un mois sort en écart.
@@ -587,3 +594,42 @@ def test_rapprochement_ca():
     assert (retenues, non_retenues, ca, sans_intervention, sans_ca) == (
         d(19), d(6), d(2), d(7), d(10))
     assert retenues == ca + sans_intervention + sans_ca
+
+
+# --- Alerte « marge négative » ---------------------------------------------------
+
+
+def test_alertes_attendues():
+    d = Decimal
+    base = {"retenue": 1, "facturable": "O", "statut": "Réalisée"}
+    interventions = {
+        _i(2): base, _i(3): base, _i(4): base,  # chantier de trois jours
+        _i(5): base,  # marge négative, facturée : en alerte
+        _i(6): base,  # marge positive
+        _i(7): dict(base, facturable="N"),
+        _i(8): dict(base, statut="Annulée"),
+        _i(9): dict(base, statut=None),  # statut vide : réalisée
+        _i(10): base,  # pas encore facturée
+        _i(11): base,  # marge vide
+        _i(12): dict(base, retenue=0),
+    }
+    chantiers = {_i(2): (_i(2), 1, 3), _i(3): (_i(2), 2, 3), _i(4): (_i(2), 3, 3)}
+
+    def marge(valeur):
+        return (None, None, None, None, None if valeur is None else d(valeur), None)
+
+    marges = {_i(2): marge("100"), _i(3): marge("-60"), _i(4): marge("-50"),
+              _i(5): marge("-1"), _i(6): marge("5"), _i(7): marge("-1"),
+              _i(8): marge("-1"), _i(9): marge("-1"), _i(10): marge("-1"),
+              _i(11): marge(None), _i(12): marge("-1")}
+    lignes = [(_i(2), True, d(500)), (_i(5), True, d(10)), (_i(6), True, d(10)),
+              (_i(7), True, d(0)), (_i(8), True, d(20)), (_i(9), True, d(10)),
+              (_i(10), False, d(10)), (_i(11), True, d(10)), (_i(12), True, d(10))]
+    alertes = alertes_attendues(interventions, chantiers, marges, lignes, PARAMETRES)
+    # Le chantier (100 - 60 - 50 = -10) est en alerte sur ses trois jours, bien que
+    # seul le premier porte une ligne de facture.
+    assert alertes == {_i(2): 1, _i(3): 1, _i(4): 1, _i(5): 1, _i(6): 0, _i(7): 0,
+                       _i(8): 0, _i(9): 1, _i(10): 0, _i(11): 0, _i(12): 0}
+    # Un jour du chantier sans marge : pas d'alerte.
+    marges[_i(3)] = marge(None)
+    assert alertes_attendues(interventions, chantiers, marges, lignes, PARAMETRES)[_i(2)] == 0

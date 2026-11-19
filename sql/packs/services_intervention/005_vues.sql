@@ -89,13 +89,22 @@ SELECT id_intervenant AS [Clé intervenant],
 FROM dw.dim_intervenant;
 GO
 
+/*
+  Clients : [Type de commerce] nomme les cas sans type pour les axes des
+  graphiques, au lieu d'un vide que Power BI regrouperait sans distinction :
+  « (client introuvable) » pour le membre -2 (marge d'interventions dont le
+  client est absent du référentiel), « (non renseigné) » pour le membre -1
+  et pour un client sans type.
+*/
 CREATE VIEW pbi.[Clients] AS
 SELECT id_client AS [Clé client],
        code_client AS [Code client],
        COALESCE(NULLIF(raison_sociale, N''),
                 code_client COLLATE DATABASE_DEFAULT) AS [Client],
        raison_sociale AS [Raison sociale],
-       type_commerce AS [Type de commerce],
+       CASE WHEN id_client = -2 THEN N'(client introuvable)'
+            WHEN NULLIF(type_commerce, N'') IS NULL THEN N'(non renseigné)'
+            ELSE type_commerce END AS [Type de commerce],
        cp AS [Code postal],
        ville AS [Ville],
        contrat_maintenance AS [Contrat de maintenance],
@@ -141,6 +150,7 @@ SELECT id_fait_intervention AS [Clé intervention],
        cout_pieces AS [Coût des pièces],
        marge AS [Marge opérationnelle],
        motif_calcul AS [Motif de calcul],
+       alerte_marge_negative AS [Alerte marge négative],
        retenue AS [Retenue pour les indicateurs],
        fichier_source AS [Fichier source],
        feuille_source AS [Feuille source],
@@ -261,6 +271,9 @@ GO
   valeurs connues, comme dans le rapport. Les clés de date, de client et
   d'intervenant sont celles du premier jour. [Retenue pour les indicateurs]
   vaut 1 quand tous les jours sont retenus, [Jours non retenus] les compte.
+  [Alerte marge négative] est celle de ses jours (script 004), la même sur
+  chacun : Interventions la porte aussi, pour descendre aux composantes de
+  coût de chaque jour.
 */
 CREATE VIEW pbi.[Chantiers] AS
 SELECT id_chantier AS [Clé chantier],
@@ -278,7 +291,8 @@ SELECT id_chantier AS [Clé chantier],
        SUM(cout_deplacement) AS [Coût de déplacement],
        SUM(cout_pieces) AS [Coût des pièces],
        CASE WHEN SUM(CASE WHEN marge IS NULL THEN 1 ELSE 0 END) = 0
-            THEN SUM(marge) END AS [Marge opérationnelle]
+            THEN SUM(marge) END AS [Marge opérationnelle],
+       CAST(MAX(CAST(alerte_marge_negative AS int)) AS bit) AS [Alerte marge négative]
 FROM dw.fait_intervention
 GROUP BY id_chantier;
 GO
@@ -381,6 +395,7 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Interventions', N'Coût des pièces'),
     (N'Interventions', N'Marge opérationnelle'),
     (N'Interventions', N'Motif de calcul'),
+    (N'Interventions', N'Alerte marge négative'),
     (N'Interventions', N'Retenue pour les indicateurs'),
     (N'Interventions', N'Fichier source'),
     (N'Interventions', N'Feuille source'),
@@ -483,5 +498,6 @@ INSERT INTO dw.contrat_vue (vue, colonne) VALUES
     (N'Chantiers', N'Coût salarial'),
     (N'Chantiers', N'Coût de déplacement'),
     (N'Chantiers', N'Coût des pièces'),
-    (N'Chantiers', N'Marge opérationnelle');
+    (N'Chantiers', N'Marge opérationnelle'),
+    (N'Chantiers', N'Alerte marge négative');
 GO

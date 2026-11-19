@@ -62,6 +62,7 @@ BEGIN
     EXEC dw.calculer_chantiers @id_execution;
     EXEC dw.calculer_cump @id_execution;
     EXEC dw.calculer_marges @id_execution;
+    EXEC dw.calculer_alertes @id_execution;
 
     /* Tableau qualité (socle, script 005). */
     EXEC dw.construire_dim_controle @id_execution;

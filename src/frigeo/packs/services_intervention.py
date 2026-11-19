@@ -47,6 +47,14 @@ les lignes de facture et le CA. L'égalité est exacte pour des montants au cent
 le CA de chaque intervention étant arrondi au centime, des montants plus fins
 donneraient un écart d'arrondi.
 
+Alerte « marge négative » (`alertes_attendues`) : un chantier (les chantiers
+recalculés, une autre intervention étant son propre chantier) est en alerte quand
+tous ses jours sont retenus, que son premier jour est facturable et ni annulé ni
+reporté, qu'une ligne de facture retenue cite l'un de ses jours, qu'aucun jour n'est
+sans marge et que la somme des marges recalculées de ses jours est négative; chaque
+jour porte la valeur de son chantier, comme dw.calculer_alertes. Les valeurs de
+facturable et de statut sont lues dans dw.parametre_calcul.
+
 Période chargée (`bornes_periode_chargee`) : dans dw.dim_date, periode_chargee
 vaut 1 jusqu'au dernier jour du mois de la période de fin, 0 au-delà, sans vide.
 
@@ -137,6 +145,14 @@ REQUETE_RAPPROCHEMENT = (
     "FROM dw.fait_ligne_facture AS l "
     "LEFT JOIN dw.fait_intervention AS i ON i.id_fait_intervention = l.id_fait_intervention"
 )
+
+REQUETE_ALERTES = (
+    "SELECT f.fichier_source, f.feuille_source, f.num_ligne_source, "
+    "c.fichier_source, c.feuille_source, c.num_ligne_source, f.alerte_marge_negative "
+    "FROM dw.fait_intervention AS f "
+    "JOIN dw.fait_intervention AS c ON c.id_fait_intervention = f.id_chantier"
+)
+PARAMETRES_ALERTE = ("valeur_facturable", "statut_annule", "statut_reporte")
 
 REQUETE_CHANTIERS = (
     "SELECT f.fichier_source, f.feuille_source, f.num_ligne_source, "
@@ -625,6 +641,50 @@ def marges_attendues(
     return resultat
 
 
+def alertes_attendues(
+    interventions: dict[Lignage, dict],
+    chantiers: dict[Lignage, tuple[Lignage, int, int]],
+    marges: dict[Lignage, tuple],
+    lignes_facture: list[tuple[Lignage, bool, Decimal | None]],
+    parametres: dict[str, str],
+) -> dict[Lignage, int]:
+    """Alerte « marge négative » de chaque intervention, par lignage : 1 si son chantier
+    est en alerte, 0 sinon (voir l'en-tête du module).
+
+    `chantiers` : les chantiers de plusieurs jours (`chantiers_attendus`), une autre
+    intervention étant son propre chantier; `marges` : `marges_attendues`;
+    `lignes_facture` : `lignes_facture_liees`; `parametres` : ceux de
+    dw.parametre_calcul.
+    """
+    facturees = {intervention for intervention, retenue, _ in lignes_facture if retenue}
+    annules = {parametres["statut_annule"], parametres["statut_reporte"]}
+    groupes: dict[Lignage, list[Lignage]] = {}
+    for cle in interventions:
+        groupes.setdefault(chantiers.get(cle, (cle, 1, 1))[0], []).append(cle)
+    resultat = {}
+    for premier, jours in groupes.items():
+        debut = interventions[premier]
+        marges_jours = [marges[j][4] if j in marges else None for j in jours]
+        alerte = (
+            all(interventions[j].get("retenue") == 1 for j in jours)
+            and debut.get("facturable") == parametres["valeur_facturable"]
+            and debut.get("statut") not in annules
+            and any(j in facturees for j in jours)
+            and None not in marges_jours
+            and sum(marges_jours, Decimal(0)) < 0
+        )
+        for jour in jours:
+            resultat[jour] = int(alerte)
+    return resultat
+
+
+def _resume_alertes(alertes: dict[Lignage, tuple[Lignage, int | None]]) -> str:
+    """« chantiers en alerte / interventions concernées », pour des alertes données par
+    lignage avec le lignage du premier jour de leur chantier."""
+    en_alerte = [premier for premier, alerte in alertes.values() if alerte == 1]
+    return f"{len(set(en_alerte))} / {len(en_alerte)}"
+
+
 def _ligne_facture_retenue(cle: Lignage, ligne: dict, entetes: dict[Lignage, dict],
                            lien_entete: dict) -> bool:
     """Retenue du fait d'une ligne de facture : la ligne, et son en-tête s'il est trouvé."""
@@ -768,10 +828,11 @@ def verifier(curseur, ecriture, sorties, ajouter: Callable, regles: list | None 
     )
     ajouter(libelle, 0, ecarts)
     ajouter(libelle_resume, resume_attendu, resume_obtenu)
-    _verifier_cump(curseur, ecriture, rattachements, parametres, ajouter)
+    _verifier_cump(curseur, ecriture, rattachements, parametres, ajouter, attendus)
 
 
-def _verifier_cump(curseur, ecriture, rattachements, parametres: dict, ajouter) -> None:
+def _verifier_cump(curseur, ecriture, rattachements, parametres: dict, ajouter,
+                   chantiers: dict) -> None:
     """Contrôles du CUMP mensuel et du coût des pièces (voir l'en-tête du module)."""
     libelle_cump = ("dw.cump_mensuel : pièces et mois dont le stock, les mouvements ou le "
                     "CUMP diffèrent du recalcul")
@@ -819,12 +880,14 @@ def _verifier_cump(curseur, ecriture, rattachements, parametres: dict, ajouter) 
             _motifs(couts), _motifs(couts_obtenus))
     ajouter("dw.fait_consommation : coût total des pièces", _total(couts),
             _total(couts_obtenus))
-    _verifier_marges(curseur, ecriture, rattachements, consommees, couts, ajouter)
+    _verifier_marges(curseur, ecriture, rattachements, consommees, couts, ajouter, chantiers,
+                     parametres)
 
 
 def _verifier_marges(curseur, ecriture, rattachements, consommees: dict, couts: dict,
-                     ajouter) -> None:
-    """Contrôles de la marge opérationnelle de chaque intervention."""
+                     ajouter, chantiers: dict, parametres: dict) -> None:
+    """Contrôles de la marge opérationnelle de chaque intervention, puis de l'alerte
+    « marge négative »."""
     preparation = ecriture.preparation
     curseur.execute(REQUETE_TAUX)
     taux = {str(t): str(c) for t, c in curseur.fetchall()}
@@ -839,14 +902,16 @@ def _verifier_marges(curseur, ecriture, rattachements, consommees: dict, couts: 
     lien_entete = liens(rattachements, "factures_lignes", "num_facture", "factures_entetes")
     lien_intervention = liens(rattachements, "factures_lignes", "id_intervention",
                               "interventions")
+    interventions = table_propre(preparation, "interventions")
+    liees = lignes_facture_liees(lignes, entetes, lien_entete, lien_intervention)
     marges = marges_attendues(
-        table_propre(preparation, "interventions"),
+        interventions,
         table_propre(preparation, "intervenants"),
         liens(rattachements, "interventions", "intervenant", "intervenants"),
         table_propre(preparation, "remunerations"),
         table_propre(preparation, "parametres_couts"),
         taux,
-        lignes_facture_liees(lignes, entetes, lien_entete, lien_intervention),
+        liees,
         consommations_liees,
     )
     curseur.execute(REQUETE_MARGES)
@@ -887,3 +952,20 @@ def _verifier_marges(curseur, ecriture, rattachements, consommees: dict, couts: 
             "/ lignes retenues d'une intervention sans CA / lignes non retenues",
             _texte_montants((*detail, non_retenues)),
             _texte_montants((ca, sans_intervention, sans_ca, non_retenues_lues)))
+
+    libelle_alertes = ("dw.fait_intervention : interventions dont l'alerte de marge négative "
+                       "diffère du recalcul")
+    if any(p not in parametres for p in PARAMETRES_ALERTE):
+        ajouter(libelle_alertes, "paramètre de l'alerte absent de dw.parametre_calcul", None)
+        return
+    alertes = alertes_attendues(interventions, chantiers, marges, liees, parametres)
+    attendues = {c: (chantiers.get(c, (c, 1, 1))[0], v) for c, v in alertes.items()}
+    curseur.execute(REQUETE_ALERTES)
+    lues = {
+        lignage(f, fe, n): (lignage(cf, cfe, cn), None if a is None else int(a))
+        for f, fe, n, cf, cfe, cn, a in curseur.fetchall()
+    }
+    ajouter(libelle_alertes, 0, _ecarts({c: v[1] for c, v in attendues.items()},
+                                        {c: v[1] for c, v in lues.items()}))
+    ajouter("dw.fait_intervention : chantiers en alerte de marge négative / interventions "
+            "concernées", _resume_alertes(attendues), _resume_alertes(lues))
